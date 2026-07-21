@@ -589,6 +589,75 @@ check("agg: 正常時は1回だけ呼ぶ", len(_ask_log) == 1)
 check("agg: 全プロポーザー失敗は__ERROR__",
       f.aggregate("Q?", [("m1", "__ERROR__: x")]).startswith("__ERROR__"))
 
+# ---------- agg: 保険2(insurance-2)フォールバックが [Execution check: ...] を漏らさない ----------
+# 2026-07-22: aggregate() は以前、コード付き提案に実行結果タグを付ける際に `good` 自体を
+# タグ付き版で上書きしていた。保険2(統合失敗時に good から直接返す)経路は「主アグリゲータ」と
+# 「JP_AGGREGATOR(think=False)再統合」の両方が空/エラーを返す場合に到達する
+# (2026-07-04 の空返答実測に基づく既知の実運用経路)。このタグ/生トレースバックが
+# ユーザー向け回答にそのまま漏れていたバグの回帰テスト。
+
+
+def _fake_ask_always_empty(model, messages, temperature, think=None, fmt=None,
+                            label=None, num_predict=None):
+    """主アグリゲータ・再統合(保険1)ともに空/エラーを返し、保険2まで必ず落とす。"""
+    return "" if label != "force_error" else "__ERROR__"
+
+
+_orig_code_execution = f.CODE_EXECUTION
+_orig_critique = f.critique
+f.CODE_EXECUTION = True
+
+_code_ans = "Here you go:\n\n```python\nprint(2 + 2)\n```\n"
+_prose_ans = "This is a plain prose answer with no code block at all, just text."
+
+try:
+    # --- critique が最初の合格案をそのまま採用するケース ---
+    f.ask = _fake_ask_always_empty
+    f.critique = lambda question, answer: (True, "")
+    out = f.aggregate("Q?", [("m1", _code_ans), ("m2", _prose_ans)])
+    check("agg: 保険2(critique採用)はコード本文を含む", "print(2 + 2)" in out)
+    check("agg: 保険2(critique採用)は[Execution check:]タグを漏らさない",
+          "[Execution check:" not in out)
+
+    # --- critique が全案を却下し、最長案(max fallback)まで落ちるケース ---
+    # コード付き案をわざと最長にして、タグ付け前の `good`(クリーン版)から
+    # 選ばれることを検証する。
+    _code_ans_long = _code_ans + ("x" * 200)
+    f.critique = lambda question, answer: (False, "no good")
+    out2 = f.aggregate("Q?", [("m1", _prose_ans), ("m2", _code_ans_long)])
+    check("agg: 保険2(最長fallback)は最長案(コード付き)を返す", "print(2 + 2)" in out2)
+    check("agg: 保険2(最長fallback)は[Execution check:]タグを漏らさない",
+          "[Execution check:" not in out2)
+finally:
+    f.ask = _orig_ask
+    f.critique = _orig_critique
+    f.CODE_EXECUTION = _orig_code_execution
+
+# ---------- agg: 正常時、アグリゲータへの user プロンプトにはタグが残っていること ----------
+# (AGGREGATOR_SYS ルール6はこのタグを判断材料にするため、アグリゲータ自身が見る
+#  プロンプトからタグを消してはいけない。good を汚さない修正がここを壊していないことの回帰確認)
+_captured_user = []
+
+
+def _fake_ask_capture(model, messages, temperature, think=None, fmt=None,
+                       label=None, num_predict=None):
+    for msg in messages:
+        if msg.get("role") == "user":
+            _captured_user.append(msg.get("content", ""))
+    return "aggregated!"
+
+
+f.CODE_EXECUTION = True
+f.ask = _fake_ask_capture
+try:
+    out3 = f.aggregate("Q?", [("m1", _code_ans), ("m2", _prose_ans)])
+finally:
+    f.ask = _orig_ask
+    f.CODE_EXECUTION = _orig_code_execution
+check("agg: 正常系はアグリゲータ出力をそのまま返す", out3 == "aggregated!")
+check("agg: アグリゲータへのプロンプトには[Execution check: PASSED]が残る",
+      any("[Execution check: PASSED]" in u for u in _captured_user))
+
 # ---------- get_proposals の多様性（先頭はドラフト無しで新規回答） ----------
 _seen_refs = []
 

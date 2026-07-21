@@ -2011,6 +2011,12 @@ def aggregate(question, proposals):
         return "__ERROR__: 全プロポーザーが失敗しました（モデル/Ollama/VRAM を確認）。"
     # コード付き提案には実行結果の証拠を添える。どの案が実際に動くかは決定的情報なので、
     # アグリゲータの取捨選択の判断材料として最強（AGGREGATOR_SYS のルール6が対応）。
+    # 【2026-07-22 修正】以前はここで `good` 自体をタグ付き版で上書きしていたため、
+    # 保険2（統合失敗時に good から直接返す）が [Execution check: ...] タグや生の
+    # トレースバックをユーザー向け回答に漏らしていた。`good` はクリーンな
+    # (model, strip_think(answer)) のまま保持し、タグ付きビューは別変数
+    # （annotated）に持たせて、アグリゲータへの block 文字列構築にのみ使う。
+    annotated = good
     if CODE_EXECUTION:
         annotated = []
         for m, ans in good:
@@ -2020,11 +2026,10 @@ def aggregate(question, proposals):
                        else f"[Execution check: FAILED]\n{issue}")
                 ans = f"{ans}\n\n{tag}"
             annotated.append((m, ans))
-        good = annotated
 
-    labels = [chr(ord("A") + i) for i in range(len(good))]
+    labels = [chr(ord("A") + i) for i in range(len(annotated))]
     block = "\n\n".join(
-        f"Answer {lab}:\n{ans}" for lab, (_m, ans) in zip(labels, good)
+        f"Answer {lab}:\n{ans}" for lab, (_m, ans) in zip(labels, annotated)
     )
     user = f"Question:\n{question}\n\n{block}"
 
