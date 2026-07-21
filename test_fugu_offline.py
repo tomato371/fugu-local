@@ -311,6 +311,87 @@ check("sc: 抽出0票なら None を返す(MoAへフォールバック)", _res4 
 check("sc: 拮抗なし時は _arbitrate 未使用・勝者サンプルの本文を採用(従来通り)",
       _res is not None and _res["text"].startswith("reasoning..."))
 
+# ---------- SC_MIN_VOTES の床を最終returnにも適用（SC_MAX消化パス） ----------
+# 2026-07-21: ループ内の早期確定条件（cnt==n and n>=SC_MIN_VOTES / n>=4 and cnt*2>n）は
+# while ループの break だけを守っており、SC_MAX 消化で抜けた最終 return には床が
+# 掛かっていなかった。thinking打ち切りで __ERROR__、PoT失敗、\boxed{}欠落などにより
+# ほとんどのサンプルが抽出失敗すると、1〜2票しか無い「勝者」がそのまま確定扱いで返る
+# 疑似全会一致バグが再現する。ここでは終始 2 サンプルしか抽出成功しない（残りは全て
+# 抽出不能）状況を作り、SC_MAX に到達して None（MoA フォールバック）になること、かつ
+# 無限ループせず打ち切られることを検証する。
+_orig_min_votes2 = f.SC_MIN_VOTES
+_sc_calls.clear()
+_seq5 = (["\\boxed{42}", "\\boxed{42}"]
+         + ["すみません、答えが導けませんでした。"] * 60)  # 以降は一切抽出できない
+
+
+def _fake_sc_ask5(model, messages, temperature, think=None, fmt=None,
+                  label=None, num_predict=None, num_ctx=None):
+    _sc_calls.append(model)
+    idx = len(_sc_calls) - 1
+    return _seq5[idx] if idx < len(_seq5) else "すみません、答えが導けませんでした。"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ask = _fake_sc_ask5
+    _res5 = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+    f.SC_MIN_VOTES = _orig_min_votes2
+check("sc: SC_MAX消化まで無限ループせず打ち切られる(有限回で終了)",
+      0 < len(_sc_calls) <= f.SC_MAX + 10)
+check("sc: 最終return(SC_MAX消化パス)でも SC_MIN_VOTES 未満の勝者は None(床が効く)",
+      _res5 is None)
+
+# 境界値の回帰ガード: SC_MAX 消化パスでも勝者票数がちょうど SC_MIN_VOTES(3) に達して
+# いれば床は発火せず、通常どおり dict を返さねばならない（floor の over-fire 防止）。
+# 早期break条件（unanimous/majority）はどの中間状態でも満たさないよう票を分散させ、
+# 最終的に SC_MAX 消化で抜けた時点で初めて勝者(42)が3票に達するようにしてある。
+_orig_min_votes3 = f.SC_MIN_VOTES
+_sc_calls.clear()
+_seq6 = ["\\boxed{7}", "\\boxed{9}"]                      # batch1: idx0-1 (残り idx2-5 は抽出不能)
+_seq6 += ["error"] * 4
+_seq6 += ["\\boxed{42}", "\\boxed{42}", "\\boxed{7}", "error"]   # batch2: idx6-9
+_seq6 += ["\\boxed{42}", "error", "error", "error"]              # batch3: idx10-13
+_seq6 += ["error"] * 4                                             # batch4: idx14-17
+_seq6 += ["error"] * 4                                             # batch5: idx18-21
+_seq6 += ["error"] * 20                                            # 余裕分
+
+
+def _fake_sc_ask6(model, messages, temperature, think=None, fmt=None,
+                  label=None, num_predict=None, num_ctx=None):
+    _sc_calls.append(model)
+    idx = len(_sc_calls) - 1
+    return _seq6[idx] if idx < len(_seq6) else "error"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ask = _fake_sc_ask6
+    _res6 = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+    f.SC_MIN_VOTES = _orig_min_votes3
+check("sc: SC_MAX消化パスでも勝者票数=SC_MIN_VOTESなら床は発火しない(通常確定)",
+      _res6 is not None and _res6["answer"] == "42")
+check("sc: 床が過剰発火していない場合はvotes/n_samplesも通常どおり返る",
+      _res6 is not None and _res6["votes"].get("42") == 3 and _res6["n_samples"] == 22)
+
 # ---------- 拮抗時の裁定（_arbitrate）----------
 # 上位2クラスが同数で並ぶと _arbitrate が呼ばれる。かつては裁定役の答えだけを採用し、
 # 本文(res['text'])は SAMPLE プールから _representative_text で再選出していたため、

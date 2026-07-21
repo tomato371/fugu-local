@@ -2356,6 +2356,16 @@ def solve_verifiable(question, task_type="math", history=None):
         arb_result = _arbitrate(question, task_type, samples, classes)
         if arb_result:
             top, rep = arb_result
+    # 2026-07-21: ループ内の早期確定条件（cnt==n and n>=SC_MIN_VOTES / n>=4 and cnt*2>n）は
+    # SC_MIN_VOTES 未満の疑似全会一致を弾くが、それは while ループの break 条件だけの話。
+    # SC_MAX 消化で抜けた場合（多くのサンプルが __ERROR__/抽出失敗/\boxed{}欠落 等で無効票になった
+    # ケース）はここを素通りしてしまい、1〜2票しか残っていない「勝者」をそのまま確定扱いで返して
+    # いた。理由は違えど中身は同じ疑似全会一致問題なので、最終returnにも同じ床（floor）をかける。
+    # ただし裁定（_arbitrate）が成功して rep が既に埋まっている場合は、裁定役が新たに出した
+    # answer/text をそのまま尊重し、票数に関わらずここでは弾かない。
+    if rep is None and cnt < SC_MIN_VOTES:
+        print(f"   [SC] 確定票が {cnt} 票のみ (< SC_MIN_VOTES={SC_MIN_VOTES}) → MoA フォールバックへ")
+        return None
     if rep is None:
         rep = _representative_text(samples, top)
     print(f"   [SC] 確定: {top}  (票 {cnt}/{len(answers)}, サンプル計 {len(samples)})")
