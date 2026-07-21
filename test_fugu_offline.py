@@ -1378,6 +1378,170 @@ finally:
     urllib.request.urlopen = _orig_urlopen
     f.time.sleep = _orig_sleep
 
+# ---------- fugu_answer: SC結果のユーザー提示 ----------
+# fugu_answer() の自己一貫性投票(SC)結果 → ユーザー提示の接合点（行 2602-2615 付近）の回帰テスト。
+# solve_verifiable の戻り値と、本文から実際に抽出した答え(extract_final_answer/answers_equivalent
+# は本物をそのまま使う)がずれた場合にのみ「(自己一貫性投票による最終解答: X)」を付記し、
+# 一致すれば本文をそのまま返す。None ならMoA(合議)へフォールバックする、という分岐を検証する。
+# validate_plan() 済みの明示プランを渡して conduct() を経由させない。
+
+_orig_sc_enabled = f.SC_ENABLED
+_orig_solve_verifiable = f.solve_verifiable
+_orig_get_proposals = f.get_proposals
+_orig_aggregate = f.aggregate
+
+
+def _validated_plan(task_type, mode="moa", rounds=1):
+    # default_plan()/validate_plan() が生成する形と同じキー構成の明示プラン。
+    return {
+        "mode": mode,
+        "task_type": task_type,
+        "selected_proposers": ["m1", "m2", "m3"],
+        "rounds": rounds,
+        "use_image_generation": False,
+        "image_only": False,
+        "make_pptx": False,
+        "search_required": False,
+        "reason": "test",
+        "_fallback": False,
+    }
+
+
+def _make_moa_forbidden(touched_list):
+    """SCが成功した経路ではget_proposals/aggregateへ絶対に到達してはならないことを
+    検証するための番人。呼ばれたら記録した上で必ず例外を送出する。"""
+    def _get_proposals_forbidden(*a, **kw):
+        touched_list.append(True)
+        raise AssertionError("SC成功時はMoA(get_proposals)へ到達してはならない")
+
+    def _aggregate_forbidden(*a, **kw):
+        touched_list.append(True)
+        raise AssertionError("SC成功時はMoA(aggregate)へ到達してはならない")
+
+    return _get_proposals_forbidden, _aggregate_forbidden
+
+
+# --- Case A: 本文の結論(裁定等で差し替わった\boxed)が投票結果と食い違う → 明示注記が付く ---
+_moa_touched_a = []
+_get_proposals_never_a, _aggregate_never_a = _make_moa_forbidden(_moa_touched_a)
+
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "5",
+        "text": "途中式…裁定により \\boxed{7} に差し替え。",
+        "votes": {"7": 2, "5": 1},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_a
+    f.aggregate = _aggregate_never_a
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_a = f.fugu_answer("2+3は?", plan=_validated_plan("math"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer: 本文の結論と投票結果が食い違う場合は明示注記を付す",
+      "(自己一貫性投票による最終解答: 5)" in _ans_a)
+check("fugu_answer: 食い違いケースでも元の本文はそのまま含まれる",
+      "裁定により \\boxed{7} に差し替え。" in _ans_a)
+check("fugu_answer: 食い違いケースはSC経路で返りMoAへ到達しない", not _moa_touched_a)
+
+# --- Case B: 本文の結論(\boxedの答え)が投票結果と一致 → 注記なしでそのまま返す（math） ---
+_moa_touched_b1 = []
+_get_proposals_never_b1, _aggregate_never_b1 = _make_moa_forbidden(_moa_touched_b1)
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "42",
+        "text": "計算の結果、\\boxed{42} である。",
+        "votes": {"42": 3},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_b1
+    f.aggregate = _aggregate_never_b1
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_b1 = f.fugu_answer("6*7は?", plan=_validated_plan("math"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer: 本文とSC結果(math)が一致すれば注記なし",
+      "自己一貫性投票による最終解答" not in _ans_b1)
+check("fugu_answer: 一致ケース(math)は本文をそのまま返す",
+      _ans_b1 == "計算の結果、\\boxed{42} である。")
+check("fugu_answer: 一致ケース(math)もMoAへ到達しない", not _moa_touched_b1)
+
+# --- Case B': mcq版（選択肢文字が一致） ---
+_moa_touched_b2 = []
+_get_proposals_never_b2, _aggregate_never_b2 = _make_moa_forbidden(_moa_touched_b2)
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "C",
+        "text": "検討の結果、\\boxed{C} が正解。",
+        "votes": {"C": 3},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_b2
+    f.aggregate = _aggregate_never_b2
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_b2 = f.fugu_answer("次のうち正しいものは?", plan=_validated_plan("mcq"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer: 本文とSC結果(mcq選択肢)が一致すれば注記なし",
+      "自己一貫性投票による最終解答" not in _ans_b2)
+check("fugu_answer: 一致ケース(mcq)は本文をそのまま返す",
+      _ans_b2 == "検討の結果、\\boxed{C} が正解。")
+check("fugu_answer: 一致ケース(mcq)もMoAへ到達しない", not _moa_touched_b2)
+
+# --- Case C: solve_verifiable が None(投票不成立) → MoAへフォールスルーする ---
+# plan["rounds"]=MAX_ROUNDS にして、r>=limit のブレークが「計画分残っているか」判定より
+# 先に効くようにし、critique()（本物のask呼び出しを要する）へ到達せずに済ませる
+# （このテストが検証したいのはSC→MoAへの委譲そのものであり、MoAの反復打ち切りロジック自体は
+# 既存の他テストが担保している）。
+_MOA_SENTINEL = "MOA_FALLBACK_SENTINEL: 単体/合議側で生成された最終回答"
+_get_proposals_calls_c = []
+_aggregate_calls_c = []
+
+
+def _fake_get_proposals_c(models, question, reference=None, issue=None, history=None):
+    _get_proposals_calls_c.append((tuple(models), reference, issue))
+    return [(m, "dummy proposal (SCフォールバック検証用ダミー)") for m in models]
+
+
+def _fake_aggregate_c(question, proposals):
+    _aggregate_calls_c.append(len(proposals))
+    return _MOA_SENTINEL
+
+
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: None
+    f.get_proposals = _fake_get_proposals_c
+    f.aggregate = _fake_aggregate_c
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_c = f.fugu_answer(
+            "解けない問題?", plan=_validated_plan("math", mode="moa", rounds=f.MAX_ROUNDS))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer: SCがNoneならMoA(get_proposals/aggregate)へフォールスルーする",
+      _ans_c == _MOA_SENTINEL)
+check("fugu_answer: フォールバック時は実際にget_proposals/aggregateが呼ばれる",
+      len(_get_proposals_calls_c) >= 1 and len(_aggregate_calls_c) >= 1)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
