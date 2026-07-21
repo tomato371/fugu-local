@@ -2124,9 +2124,15 @@ def extract_final_answer(text, task_type="math"):
     boxed = extract_boxed(text)
     if task_type == "mcq":
         if boxed:
-            letters = re.findall(r"[A-E]", normalize_answer(boxed).upper())
-            if letters:
-                return letters[-1]
+            # 2026-07-21: 「A-E のどれかを本文中どこでも最後の1文字」ではなく、boxed 内容の
+            # 先頭にある選択肢文字だけを拾う。答えの文字は慣例的に boxed の先頭に来るため、
+            # \boxed{C, because it is the largest} のような散文混じりでも "Because" の B を
+            # 誤って拾わない。先頭にマッチしなければ（\boxed{None of the above} 等）誤った
+            # 文字を返さず、下の宣言パターン探索 → 最終的に None（無投票、誤投票より安全）に
+            # フォールスルーさせる。
+            m = re.match(r"\(?\s*([A-E])\b", normalize_answer(boxed).upper())
+            if m:
+                return m.group(1)
         for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])?\s*\(?([A-EＡ-Ｅ])\)?(?![A-Za-z])",
                     r"^\s*\(?([A-E])\)?\s*(?:が正解|です)?\s*$"):
             ms = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)

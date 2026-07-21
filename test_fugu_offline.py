@@ -160,6 +160,13 @@ check("sc: 抽出 無しは None", f.extract_final_answer("わかりません") 
 check("sc: mcq boxed", f.extract_final_answer("\\boxed{B}", "mcq") == "B")
 check("sc: mcq 宣言", f.extract_final_answer("正解は (C) です", "mcq") == "C")
 check("sc: mcq 無しは None", f.extract_final_answer("どれも違う", "mcq") is None)
+check("sc: mcq boxed 散文混じりは先頭文字",
+      f.extract_final_answer("reasoning...\\boxed{C, because it is the largest}", "mcq") == "C")
+check("sc: mcq boxed 散文のみは誤答せず None",
+      f.extract_final_answer("\\boxed{None of the above}", "mcq") is None)
+check("sc: mcq boxed 括弧付き先頭文字", f.extract_final_answer("\\boxed{(A)}", "mcq") == "A")
+check("sc: mcq boxed text外殻付き先頭文字", f.extract_final_answer("\\boxed{\\text{D}}", "mcq") == "D")
+check("sc: mcq boxed 選択肢+本文", f.extract_final_answer("\\boxed{A) 5}", "mcq") == "A")
 
 check("sc: 同値 完全一致", f.answers_equivalent("42", "42"))
 check("sc: 同値 分数=小数", f.answers_equivalent("1/2", "0.5"))
