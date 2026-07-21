@@ -1124,9 +1124,14 @@ def extract_code(text):
     return m.group(1) if m else None
 
 
-def run_python(code, timeout=None):
+def run_python(code, timeout=None, stdout_only=False):
     """コードを一時ファイル経由で subprocess 実行する。(ok: bool, output: str) を返す。
-    ok は exit code 0。stdout+stderr の末尾を返す（traceback を修正ヒントに使うため）。"""
+    ok は exit code 0。既定(stdout_only=False)では stdout+stderr 結合の末尾を返す
+    （traceback を修正ヒントに使うため）。stdout_only=True かつ成功時(returncode==0)
+    は stdout のみを返す（sympy/numpy の DeprecationWarning 等が stderr に出て
+    末尾行が汚染され、PoT の投票が壊れるのを防ぐため）。ただし失敗時(returncode!=0)
+    は stdout_only の値によらず常に stdout+stderr の結合を返す — code-repair loop が
+    traceback を見えるようにするため。"""
     timeout = timeout or CODE_EXEC_TIMEOUT
     fd, path = tempfile.mkstemp(suffix=".py")
     try:
@@ -1137,7 +1142,10 @@ def run_python(code, timeout=None):
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout,
         )
-        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if stdout_only and r.returncode == 0:
+            out = (r.stdout or "").strip()
+        else:
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
         return r.returncode == 0, out[-2000:]
     except subprocess.TimeoutExpired:
         return False, f"TIMEOUT: code did not finish within {timeout}s (infinite loop or input() wait?)"
@@ -2217,7 +2225,7 @@ def _sc_sample(model, question, task_type, pot=False, history=None):
         code = extract_code(text)
         if not code:
             return None, text
-        ok, out = run_python(code, timeout=SC_POT_TIMEOUT)
+        ok, out = run_python(code, timeout=SC_POT_TIMEOUT, stdout_only=True)
         out = (out or "").strip()
         if not ok or not out:
             return None, text

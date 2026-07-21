@@ -533,6 +533,51 @@ check("code: 例外を検知して traceback を返す", (not ok) and "boom" in 
 ok, out = f.run_python("while True:\n    pass", timeout=2)
 check("code: 無限ループはタイムアウト", (not ok) and "TIMEOUT" in out)
 
+# stdout_only: 既定(False)は stdout+stderr 結合のまま(バイトレベルで不変)。
+# stdout_only=True かつ成功時は stdout のみ返し、stderr の警告文で末尾行が汚染されない。
+_warn_code = (
+    "import sys\n"
+    "print('a warning', file=sys.stderr)\n"
+    "print('42')\n"
+)
+ok_default, out_default = f.run_python(_warn_code)
+check("code: stdout_only既定Falseはstderrも含む", ok_default and "a warning" in out_default
+      and "42" in out_default)
+ok_only, out_only = f.run_python(_warn_code, stdout_only=True)
+check("code: stdout_only=Trueはstdoutのみ・最終行が正しい値",
+      ok_only and "a warning" not in out_only and out_only.splitlines()[-1].strip() == "42")
+
+# stdout_only=True でも失敗時(returncode!=0)は traceback 込みの結合出力を返す
+# （code-repair loop がエラー内容を見えるようにするための回帰ガード）。
+ok_fail_only, out_fail_only = f.run_python("raise ValueError('boom_stdout_only')", stdout_only=True)
+check("code: stdout_only=Trueでも失敗時はtraceback付き結合出力",
+      (not ok_fail_only) and "boom_stdout_only" in out_fail_only)
+
+# _sc_sample の PoT 分岐: 生成コードが正しい答えを stdout に、警告を stderr に出すケースで、
+# run_python(stdout_only=True) により警告文が投票を汚染しないことを確認する
+# （2026-07-21 修正の回帰ガード。修正前は out.splitlines()[-1] が stderr の警告行になり得た）。
+_orig_ask_pot = f.ask
+
+
+def _fake_ask_pot(model, messages, temperature, think=None, fmt=None,
+                   label=None, num_predict=None, num_ctx=None):
+    return (
+        "考え方の説明です。\n```python\n"
+        "import sys\n"
+        "print('RuntimeWarning: something noisy', file=sys.stderr)\n"
+        "print(7)\n"
+        "```\n"
+    )
+
+
+try:
+    f.ask = _fake_ask_pot
+    _pot_ans, _pot_text = f._sc_sample("m1", "1+2+4=?", "math", pot=True)
+finally:
+    f.ask = _orig_ask_pot
+check("sc: PoT stdout_onlyで警告行ではなく印字された答えが投票になる",
+      _pot_ans == f.normalize_answer("7"))
+
 check("code: code_check 正常コードは None", f.code_check("```python\nprint(1)\n```") is None)
 _issue = f.code_check("```python\n1/0\n```")
 check("code: code_check 失敗はエラー要約", _issue is not None and "ZeroDivision" in _issue)
