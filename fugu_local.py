@@ -2396,6 +2396,23 @@ def solve_verifiable(question, task_type="math", history=None):
         arb_result = _arbitrate(question, task_type, samples, classes)
         if arb_result:
             top, rep = arb_result
+            # 2026-07-22: 裁定役（_arbitrate）は既存の票クラスと無関係な「第三の答え」を
+            # 返すことがある（例: 拮抗した {'1','2'} に対し裁定役が '3' を新規提示）。
+            # 従来はここで cnt/classes を再計算せず、拮抗していた旧トップの票数
+            # （classes[0][1]）をそのまま流用していたため、
+            #   - res['votes'] に裁定結果の答えが載らず、実際は0票の新答えなのに
+            #     まるで敗者候補が「無投票」であるかのような矛盾した内訳になる
+            #   - 直後の「[SC] 確定: {top} (票 {cnt}/...)」ログが、敗者候補（旧トップ）の
+            #     票数を裁定結果の答えの票数であるかのように誤表示する
+            # という報告面のバグがあった。ここでは裁定後の top に対応する真の票数を
+            # classes から同値判定で引き直し（一致するクラスが無ければ 0 票）、
+            # votes 辞書にも裁定結果の答えを必ずキーとして載せる。
+            # なお SC_MIN_VOTES の床判定（下）は rep is not None の間は素通りする既存の
+            # 挙動のままで変更していない。
+            match = next((c for c in classes if answers_equivalent(top, c[0])), None)
+            cnt = match[1] if match else 0
+            if match is None or match[0] != top:
+                classes = classes + [[top, cnt]]
     # 2026-07-21: ループ内の早期確定条件（cnt==n and n>=SC_MIN_VOTES / n>=4 and cnt*2>n）は
     # SC_MIN_VOTES 未満の疑似全会一致を弾くが、それは while ループの break 条件だけの話。
     # SC_MAX 消化で抜けた場合（多くのサンプルが __ERROR__/抽出失敗/\boxed{}欠落 等で無効票になった

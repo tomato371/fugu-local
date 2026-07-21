@@ -216,6 +216,11 @@ finally:
 check("sc: 全会一致で早期確定", _res is not None and _res["answer"] == "42")
 check("sc: 初回バッチのみで停止", len(_sc_calls) == f.SC_INITIAL)
 check("sc: モデルを交互に使う", set(_sc_calls) == {"m1", "m2"})
+# 2026-07-22 回帰: 拮抗/裁定が一切発生しないこのパスでは、今回の裁定後cnt/votes再計算
+# 修正の影響を受けず、votes/n_samples が従来どおり返ることを明示的に確認する。
+check("sc: 拮抗なし(全会一致)のvotes/n_samplesは修正の影響を受けない(不変)",
+      _res is not None and _res["votes"] == {"42": f.SC_INITIAL}
+      and _res["n_samples"] == f.SC_INITIAL)
 
 # 票が割れるケース: 第1バッチで拮抗 → 追加サンプリング後に過半数で確定。
 # バッチ化により第1バッチ(SC_INITIAL)は m1 まとめ→m2 まとめの順。call index で答えを固定し、
@@ -449,6 +454,11 @@ check("arb: 裁定役の答えを採用", _res_arb1 is not None and _res_arb1["a
 check("arb: 本文は裁定役自身の推論(敗者候補の本文ではない)",
       _res_arb1 is not None and "ARBITER_REASONING" in _res_arb1["text"]
       and "sc reasoning candidate" not in _res_arb1["text"])
+# 2026-07-22: 裁定役が既存の票クラス('1')をそのまま支持したケースでは votes 辞書は
+# 従来どおり(裁定前の同値クラス集計そのまま)で、answer は必ずそのキーとして存在すること。
+check("arb: 裁定役が既存候補を採用した場合、votesにanswerがキーとして存在し票数は正しい",
+      _res_arb1 is not None and _res_arb1["answer"] in _res_arb1["votes"]
+      and _res_arb1["votes"]["1"] == _res_arb1["votes"]["2"])
 
 # ケース2: 裁定役が両候補と異なる第三の答えを提示 → 本文が敗者側候補の主張になって
 # はいけない（旧ロジックのバグ: _representative_text が第三の答えと同値のサンプルを
@@ -488,6 +498,16 @@ check("arb: 裁定役が出した第三の答えを採用", _res_arb2 is not Non
 check("arb: 本文は裁定役の推論(第三の答え。敗者候補の主張ではない)",
       _res_arb2 is not None and "ARBITER_REASONING_NEW" in _res_arb2["text"]
       and "sc reasoning candidate" not in _res_arb2["text"])
+# 2026-07-22 本修正の回帰テスト: 裁定役が票の無い第三の答え('3')を採用した場合、
+# res['votes'] にその答えが「真の票数(0票)」で必ずキーとして載ること。また旧トップ
+# ('1'または'2'、どちらも拮抗していた同数票)の票数が、そのまま裁定結果('3')の
+# 票数であるかのように誤って表示されてはならない。
+check("arb: 第三の答え採用時、votesにanswerが0票としてキーで存在する",
+      _res_arb2 is not None and _res_arb2["votes"].get("3") == 0)
+check("arb: 第三の答え採用時、敗者候補('1'/'2')の票数が勝者の票数として流用されていない",
+      _res_arb2 is not None and _res_arb2["votes"]["1"] == _res_arb2["votes"]["2"]
+      and _res_arb2["votes"]["1"] > 0
+      and _res_arb2["votes"]["3"] != _res_arb2["votes"]["1"])
 
 # ---------- task_type ガードレール ----------
 def _tt(q, declared=""):
