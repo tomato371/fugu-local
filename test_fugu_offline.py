@@ -47,6 +47,21 @@ check("strip: think除去", f.strip_think("<think>x</think>answer") == "answer")
 check("strip: thinking除去", f.strip_think("<THINKING>x</THINKING>ans") == "ans")
 check("strip: 対象なしは素通し", f.strip_think("plain") == "plain")
 check("strip: None耐性", f.strip_think(None) is None)
+# 2026-07-22: num_predict 打ち切りで閉じタグの無い '<think>...' が丸ごと
+# 「回答」として漏れる既知の失敗モード（gotcha #2 / #7）の回帰防止。
+check("strip: 閉じタグ無しのthinkは末尾まで丸ごと除去",
+      f.strip_think("<think>Let me compute... maybe 17... no, 42").strip() == "")
+check("strip: 開始タグより前のテキストは保持",
+      f.strip_think("answer is 5 <think>double-checking then cut off") == "answer is 5")
+check("strip: 閉じタグ無しのTHINKINGも大小文字問わず除去",
+      f.strip_think("<THINKING>still going with no closer").strip() == "")
+check("strip: 対応の取れた既存ペアは従来通り除去(回帰)",
+      f.strip_think("<think>x</think>answer") == "answer")
+check("strip: 孤立した</think>閉じタグ単体は無視される",
+      f.strip_think("no opener here </think> tail") == "no opener here </think> tail")
+check("final_answer: 打ち切りthinkの中間値を誤って投票しない(E2E)",
+      f.extract_final_answer(
+          "<think>...intermediate value 17 then output cut off", "math") is None)
 
 # ---------- validate_plan（新スキーマ: mode single|moa / selected_proposers 他） ----------
 f.PROPOSERS = ["qwen3:4b", "phi4-mini", "gemma4:e2b-it-qat"]

@@ -1096,6 +1096,16 @@ _THINK_PATTERNS = [
     re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE),
 ]
+# 2026-07-22: num_predict 打ち切り（gotcha #2）で思考モデルの出力が
+# '<think>途中の推論...' のまま閉じタグが来ずに切れることがある。上の
+# _THINK_PATTERNS は非貪欲マッチのため閉じタグが無いと一切マッチせず、
+# 破棄されるべき生の思考過程がそのまま「回答」として extract_final_answer
+# まで漏れ、抽出失敗 → nums[-1] フォールバックで思考中の中間値が SC 投票の
+# 1票として数えられてしまう(extract_boxed の #2214 と同根の失敗モード)。
+# 対策として、バランス除去の後に「閉じタグの無い開始タグ」を検出したら、
+# その開始タグ以降を末尾まで丸ごと切り捨てる（開始タグより前のテキストは
+# 保持）。無投票の方が誤投票より安全という方針（精度優先）に従う。
+_UNTERMINATED_THINK_OPEN = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
 
 
 def strip_think(text):
@@ -1103,6 +1113,9 @@ def strip_think(text):
         return text
     for pat in _THINK_PATTERNS:
         text = pat.sub("", text)
+    m = _UNTERMINATED_THINK_OPEN.search(text)
+    if m:
+        text = text[:m.start()]
     return text.strip()
 
 
