@@ -265,6 +265,24 @@ check("sc: 抽出 最後の数値 全角ハイフンマイナス(boxed/宣言な
       f.extract_final_answer("結論としては、最終的な値は －5である", "math") == "-5")
 check("sc: 抽出 最後の数値 U+2212マイナスとASCIIの投票クラス一致",
       f.answers_equivalent(f.extract_final_answer("最終値は −5", "math"), "-5"))
+# 2026-07-22: 最後の数値フォールバック（および宣言ブランチの数値部抽出）の整数部
+# 文字クラスを [\d,]* から「桁区切りとして妥当なカンマのみ許容」に厳格化した回帰確認
+# （iteration 13/22/24 と同じ抽出経路の姉妹修正、fugu_local.py 側のコメント参照）。
+# \boxed{} も「答え/正解/answer」宣言も無く、桁区切りとして不正なカンマ区切りの
+# 数値列で終わる文では、1トークンに誤結合された "1,2,3" ではなく最後の数値のみを拾う。
+check("sc: 抽出 最後の数値 不正なカンマ区切り列は結合されない",
+      f.extract_final_answer("the roots are 1,2,3", "math") == "3")
+check("sc: 抽出 最後の数値 座標のカンマ区切りは結合されない",
+      f.extract_final_answer("the point is (1,2)", "math") == "2")
+check("sc: 抽出 最後の数値 不正カンマ区切り列がそのまま誤投票票にならない",
+      f.answers_equivalent(f.extract_final_answer("the roots are 1,2,3", "math"), "3"))
+# 桁区切りとして正当なカンマ(3桁区切り)は引き続き1トークンとして丸ごと拾う回帰確認。
+check("sc: 抽出 最後の数値(boxed/宣言なし) 桁区切り1234",
+      f.extract_final_answer("in total we counted up to 1,234", "math") == "1234")
+check("sc: 抽出 最後の数値(boxed/宣言なし) 桁区切り1234567",
+      f.extract_final_answer("in total we counted up to 1,234,567", "math") == "1234567")
+check("sc: 抽出 最後の数値(boxed/宣言なし) 桁区切り12345",
+      f.extract_final_answer("in total we counted up to 12,345", "math") == "12345")
 check("sc: mcq boxed", f.extract_final_answer("\\boxed{B}", "mcq") == "B")
 check("sc: mcq 宣言", f.extract_final_answer("正解は (C) です", "mcq") == "C")
 check("sc: mcq 無しは None", f.extract_final_answer("どれも違う", "mcq") is None)
