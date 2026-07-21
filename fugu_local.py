@@ -2323,7 +2323,15 @@ def extract_final_answer(text, task_type="math"):
             # 「700 円です」のような後置き単位・助詞を落とす: 数値で始まるなら数値部のみ
             m = re.match(r"-?\d[\d,]*(?:\.\d+)?(?:\s*/\s*\d+)?", cand)
             return m.group(0).replace(" ", "") if m else cand
-    nums = re.findall(r"-?\d[\d,]*(?:\.\d+)?(?:\s*/\s*\d+)?", text)
+    # 2026-07-22: 最後の数値フォールバックは RAW text に対して ASCII の "-?" だけを符号として
+    # 拾っていたため、直前の符号が Unicode マイナス U+2212（−）や全角ハイフンマイナス U+FF0D
+    # （－）だと拾えず、負の答えが正の値として投票されてしまう（例:「結果は −5。」→ "5"）。
+    # 宣言ブランチ（上の boxed / answer-is 分岐）は normalize_answer で全角→半角変換
+    # （iteration 13 の _FW_TRANS）を先に済ませてから数値部を切り出すため符号が保持されるのに対し、
+    # ここは正規化前の生テキストに正規表現をかけるため非対称になっていた。符号クラスに
+    # U+2212/U+FF0D を追加して拾えるようにし、変換自体は既存の normalize_answer(nums[-1]) に
+    # 任せる（二重正規化はしない）。
+    nums = re.findall(r"[-−－]?\d[\d,]*(?:\.\d+)?(?:\s*/\s*\d+)?", text)
     return normalize_answer(nums[-1]) if nums else None
 
 

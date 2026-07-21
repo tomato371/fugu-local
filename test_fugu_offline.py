@@ -234,6 +234,19 @@ check("sc: 抽出 答え宣言 桁区切り+末尾カンマ",
       f.extract_final_answer("the final answer is 1,234,", "math") == "1234")
 check("sc: 抽出 最後の数値(boxedなし) 末尾カンマ",
       f.extract_final_answer("17 * 23 = 391,", "math") == "391")
+# 2026-07-22: 最後の数値フォールバックの符号クラスに Unicode マイナス(U+2212)/
+# 全角ハイフンマイナス(U+FF0D)を追加した回帰確認。\boxed{} も「答え」宣言もない
+# 終端数値のみのケースで、CJK プロポーザが出しがちな全角/Unicode 符号付き負数が
+# 正の値として誤投票されないことを検証する（extract_final_answer 内のコメント参照）。
+check("sc: 抽出 最後の数値 U+2212マイナス(boxed/宣言なし)",
+      f.extract_final_answer("計算の結果は −5", "math") == "-5")
+# 注: 「答え/正解/answer」を含む文言だと宣言ブランチ(2318行目)が先に拾ってしまい
+# ここで検証したい「最後の数値フォールバック」に到達しないため、あえてそれらの
+# キーワードを含まない文言を使う。
+check("sc: 抽出 最後の数値 全角ハイフンマイナス(boxed/宣言なし)",
+      f.extract_final_answer("結論としては、最終的な値は －5である", "math") == "-5")
+check("sc: 抽出 最後の数値 U+2212マイナスとASCIIの投票クラス一致",
+      f.answers_equivalent(f.extract_final_answer("最終値は −5", "math"), "-5"))
 check("sc: mcq boxed", f.extract_final_answer("\\boxed{B}", "mcq") == "B")
 check("sc: mcq 宣言", f.extract_final_answer("正解は (C) です", "mcq") == "C")
 check("sc: mcq 無しは None", f.extract_final_answer("どれも違う", "mcq") is None)
