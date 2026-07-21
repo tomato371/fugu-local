@@ -2213,34 +2213,53 @@ def extract_boxed(text):
     """最後の \\boxed{...} の中身を波括弧の対応を数えて取り出す（無ければ None）。"""
     if not text:
         return None
-    idx = text.rfind("\\boxed{")
-    if idx == -1:
+    # \boxed{ の出現位置を前から全部集めておく（rfind 一発ではなく）。
+    positions = []
+    start = 0
+    while True:
+        idx = text.find("\\boxed{", start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
+    if not positions:
         return None
-    i = idx + len("\\boxed{")
-    depth = 1
-    out = []
-    while i < len(text) and depth > 0:
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                break
-        out.append(c)
-        i += 1
-    # 2026-07-22: while ループが depth>0 のまま text 末尾に達した場合、
-    # \boxed{ が閉じられていない（thinking モデルの num_predict 打ち切り等で
-    # 出力が途中で切れた場合の既知の失敗モード。gotcha #2 参照）。
-    # このとき out には「答え」ではなく切れた出力の残骸が入っているだけなので、
-    # それを answer として返すと solve_verifiable の多数決 (cnt*2 > n) で
-    # 分母 n を水増しし、誤答が票として数えられてしまう。
-    # 「無投票」の方が「誤った票」より安全という方針（精度優先）に従い、
-    # 閉じ括弧に到達できなかった場合は None を返す。
-    if depth > 0:
-        return None
-    ans = "".join(out).strip()
-    return ans or None
+
+    def _scan(idx):
+        """idx にある \\boxed{ を depth 走査。(閉じたか, 中身) を返す。"""
+        i = idx + len("\\boxed{")
+        depth = 1
+        out = []
+        while i < len(text) and depth > 0:
+            c = text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            out.append(c)
+            i += 1
+        return depth == 0, "".join(out)
+
+    # 2026-07-22 (iteration 12, iteration 11 の続き): 末尾に一番近い \boxed{ から
+    # 順に手前へ遡り、波括弧が閉じている（＝打ち切られていない）最初の候補を採用する。
+    # thinking モデルが「先に完結した \boxed{回答} を出してから、2 個目の
+    # \boxed{...} を書き始めた直後に num_predict/num_ctx で打ち切られる」ケースが
+    # 実際に観測されており（gotcha #2）、これまでは text.rfind() で最後の
+    # \boxed{ だけを見て depth>0 なら即 None を返していたため、直前に確定していた
+    # 正しい答えまで一緒に捨てていた。solve_verifiable の多数決は 1 票でも多い方が
+    # 精度に効く（gotcha #7 / 精度優先・時間は気にしない）ため、閉じている
+    # \boxed{} が手前に見つかるならそれを採用して票を救出する。
+    # 一方、iteration 11 で修正した「未確定の残骸を答えとして返さない」動作は
+    # そのまま維持する: 見つかった \boxed{ が一つも閉じていない場合は、
+    # 従来どおり None を返す（無投票の方が誤答票より安全）。
+    for idx in reversed(positions):
+        closed, content = _scan(idx)
+        if closed:
+            ans = content.strip()
+            return ans or None
+    return None
 
 
 def normalize_answer(ans):

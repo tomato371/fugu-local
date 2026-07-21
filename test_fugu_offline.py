@@ -190,6 +190,15 @@ check("sc: boxed 未閉じ・入れ子未対応も None",
       f.extract_boxed("\\boxed{\\frac{1}{2") is None)
 check("sc: boxed 閉じ括弧後に散文があっても正しく抽出",
       f.extract_boxed("\\boxed{7} because it is prime") == "7")
+check("sc: boxed 二重入れ子", f.extract_boxed("\\boxed{\\boxed{5}}") == "5")
+
+# 2026-07-22 (iteration 12): 先に確定した \boxed{回答} があり、後続の
+# \boxed{...} だけが打ち切られている場合は、手前の閉じた票を救出する
+# （iteration 11 / gotcha #2, #7 参照。詳細は extract_boxed 本体のコメント）。
+check("sc: boxed 後続が未閉じでも手前の確定票を救出",
+      f.extract_boxed("\\boxed{42} then \\boxed{the next attempt got cut off") == "42")
+check("sc: boxed 後続が入れ子ごと未閉じでも手前の確定票を救出",
+      f.extract_boxed("\\boxed{7} ... \\boxed{\\frac{1}{2") == "7")
 
 check("sc: 正規化 全角→半角", f.normalize_answer("１２３") == "123")
 check("sc: 正規化 桁区切り除去", f.normalize_answer("12,345") == "12345")
