@@ -957,6 +957,51 @@ check(
     f.extract_code("```json\n{\"a\": 1}\n```") is None,
 )
 
+# 2026-07-22: _extract_code_for_output (_save_as_code が使うファイル出力用抽出) に
+# iteration-7 の extract_code と同じ誤抽出クラスの修正を適用した回帰テスト。
+check(
+    "code_out: jsonブロックの後のbareフェンスからpythonを正しく抽出",
+    f._extract_code_for_output(
+        "```json\n{\"a\": 1}\n```\n```\ndef f():\n    return 42\n```", ".py"
+    ) == "def f():\n    return 42\n",
+)
+check(
+    "code_out: textブロック+ブロック間プロースの後のbareフェンスを正しく抽出",
+    f._extract_code_for_output(
+        "```text\nsome output\n```\n説明のプロース\n```\ndef g():\n    return 1\n```",
+        ".py",
+    ) == "def g():\n    return 1\n",
+)
+check(
+    "code_out: python3タグ単体ブロックを抽出",
+    f._extract_code_for_output("```python3\nprint('hi')\n```", ".py")
+    == "print('hi')\n",
+)
+check(
+    "code_out: jsonブロックに続くpython3ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```json\n{\"x\": 1}\n```\n```python3\nprint('hi')\n```", ".py"
+    ) == "print('hi')\n",
+)
+check(
+    "code_out: 単一pythonブロック(回帰・従来通り)",
+    f._extract_code_for_output("```python\nprint(1)\n```", ".py") == "print(1)\n",
+)
+check(
+    "code_out: 単一bareフェンス(回帰・従来通り)",
+    f._extract_code_for_output("```\nx = 1\n```", ".py") == "x = 1\n",
+)
+check(
+    "code_out: フェンス無しはマークダウン見出し除去にフォールバック(回帰・従来通り)",
+    f._extract_code_for_output("# Title\nSome text\n# Another\nMore text", ".py")
+    == "Some text\nMore text",
+)
+check(
+    "code_out: 唯一のフェンスが別言語(c)の実コードなら保守的に採用(スキップリストで飲み込まない)",
+    f._extract_code_for_output("```c\nint main(){return 0;}\n```", ".py")
+    == "int main(){return 0;}\n",
+)
+
 ok, out = f.run_python("print('hello_runner')")
 check("code: 実行成功", ok and "hello_runner" in out)
 ok, out = f.run_python("raise ValueError('boom')")

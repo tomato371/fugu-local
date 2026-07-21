@@ -2863,9 +2863,21 @@ _CODE_EXTENSIONS = {
 
 def _extract_code_for_output(answer: str, suffix: str) -> str:
     """回答から対象言語のコードブロックを抽出して返す。
-    見つからない場合は回答全体からマークダウン装飾を除いたテキストを返す。"""
+    見つからない場合は回答全体からマークダウン装飾を除いたテキストを返す。
+
+    2026-07-22: iteration-7 の extract_code と同じ誤抽出クラスの修正。
+    旧実装は言語指定ありフェンスを re.search(rf"```{lang}[ \t]*\n(.*?)```") で
+    検索し（```python3 の '3' が [ \t]*\n にマッチせず python3 ブロックを取り
+    こぼす）、言語指定なしフォールバックも re.search(r"```(?:\w+)?[ \t]*\n(.*?)```")
+    による前方走査だったため、```json/```text/```output 等の非コードブロックが
+    先行すると、その閉じフェンスを誤って開始フェンスとみなし、2ブロック間の
+    プロースや先行ブロックの中身をコードとして誤抽出していた。
+    修正: extract_code と同一のフェンス正規表現 re.finditer(r"```([^\n`]*)\n(.*?)```")
+    で全ブロックを一度に収集し、(1) suffix の対象言語タグ一致 → (2) タグ無し
+    (bare) → (3) 既知の非コードタグ以外 の優先順で最初に見つかったブロックの
+    本文を返す。該当ブロックが無ければ従来通りフェンス無しフォールバックを返す。"""
     lang_map = {
-        ".py": ["python", "py"],
+        ".py": ["python", "py", "python3"],
         ".js": ["javascript", "js"],
         ".ts": ["typescript", "ts"],
         ".go": ["go"],
@@ -2879,16 +2891,28 @@ def _extract_code_for_output(answer: str, suffix: str) -> str:
         ".sql": ["sql"],
         ".r": ["r"],
     }
-    langs = lang_map.get(suffix, [])
-    # 言語指定ありフェンスを検索
-    for lang in langs:
-        m = re.search(rf"```{lang}[ \t]*\n(.*?)```", answer, re.DOTALL | re.IGNORECASE)
-        if m:
-            return m.group(1)
-    # 言語指定なしフェンスにフォールバック
-    m = re.search(r"```(?:\w+)?[ \t]*\n(.*?)```", answer, re.DOTALL)
-    if m:
-        return m.group(1)
+    # 非コードとみなす既知のドキュメント系タグ（保守的なスキップリスト）
+    _NON_CODE_TAGS = {
+        "json", "text", "txt", "output", "console", "log",
+        "yaml", "yml", "xml", "csv", "markdown", "md", "diff", "ini", "toml",
+    }
+    langs = {l.lower() for l in lang_map.get(suffix, [])}
+
+    blocks = [(m.group(1).strip().lower(), m.group(2))
+              for m in re.finditer(r"```([^\n`]*)\n(.*?)```", answer, re.DOTALL)]
+
+    # (1) 対象言語タグと一致する最初のブロック
+    for lang, body in blocks:
+        if lang in langs:
+            return body
+    # (2) タグ無し(bare)の最初のブロック
+    for lang, body in blocks:
+        if lang == "":
+            return body
+    # (3) 既知の非コードタグ以外の最初のブロック
+    for lang, body in blocks:
+        if lang not in _NON_CODE_TAGS:
+            return body
     # フェンスなし: マークダウン見出し行を除いた本文を返す
     lines = [l for l in answer.splitlines() if not l.startswith("#")]
     return "\n".join(lines).strip()
