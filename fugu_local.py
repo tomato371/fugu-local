@@ -1117,11 +1117,24 @@ def extract_json(text):
 
 def extract_code(text):
     """回答から最初の ```python コードブロックを抽出（無ければ None）。
-    言語タグ無しフェンスも Python とみなして拾う（proposer には python タグを指示済み）。"""
+    言語タグ無しフェンスも Python とみなして拾う（proposer には python タグを指示済み）。
+    2026-07-22: 旧実装は re.search(r"```(?:python|py)?[ \t]*\n(.*?)```") を使っており、
+    先行する非python フェンス（```json/```bash/```text/```output 等）の開始タグに
+    マッチできず、re.search が前方走査してそのブロックの「閉じフェンス」を開始フェンス
+    と誤認し、2つのブロックの間にあるプロース（地の文）や本文を「コード」として誤抽出
+    していた。これにより code_check が非コードを実行して見せかけの実行失敗を報告し、
+    無駄な修復ラウンド(MAX_ROUNDS_CODE)を消費したり、PoT の投票が壊れたりしていた。
+    修正: 全てのフェンスブロックを走査し、言語タグが python/py/python3 または
+    タグ無し(bare)の「最初のブロック」の本文をそのまま(strip無し)返す。それ以外の
+    タグ(json/bash/sh/text/output/js 等)のブロックは読み飛ばす。該当ブロックが
+    無ければ None。"""
     if not text:
         return None
-    m = re.search(r"```(?:python|py)?[ \t]*\n(.*?)```", text, re.DOTALL)
-    return m.group(1) if m else None
+    for m in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
+        lang = m.group(1).strip().lower()
+        if lang in ("", "python", "py", "python3"):
+            return m.group(2)
+    return None
 
 
 def run_python(code, timeout=None, stdout_only=False):

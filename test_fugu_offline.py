@@ -608,6 +608,26 @@ check("code: python フェンス抽出", f.extract_code("x\n```python\nprint(1)\
 check("code: タグ無しフェンスも拾う", f.extract_code("```\nx = 1\n```") == "x = 1\n")
 check("code: コード無しは None", f.extract_code("no code here") is None)
 
+# 2026-07-22 回帰: 非python フェンス(```json 等)が先行しても、その閉じフェンスを
+# 開始フェンスと誤認してブロック間のプロースを「コード」として誤抽出しないこと。
+check(
+    "code: jsonブロックの後のpythonブロックを正しく抽出",
+    f.extract_code(
+        "Here:\n```json\n{\"a\": 1}\n```\nNow code:\n```python\nprint(2+2)\n```"
+    ) == "print(2+2)\n",
+)
+check(
+    "code: text/outputブロックの後のpythonブロックを正しく抽出",
+    f.extract_code(
+        "```text\nsome output\n```\n説明\n```output\nmore output\n```\n"
+        "```python\nprint(3+3)\n```"
+    ) == "print(3+3)\n",
+)
+check(
+    "code: 非pythonブロックのみなら None",
+    f.extract_code("```json\n{\"a\": 1}\n```") is None,
+)
+
 ok, out = f.run_python("print('hello_runner')")
 check("code: 実行成功", ok and "hello_runner" in out)
 ok, out = f.run_python("raise ValueError('boom')")
@@ -664,6 +684,22 @@ check("code: code_check 正常コードは None", f.code_check("```python\nprint
 _issue = f.code_check("```python\n1/0\n```")
 check("code: code_check 失敗はエラー要約", _issue is not None and "ZeroDivision" in _issue)
 check("code: コード無し回答は None", f.code_check("plain text answer") is None)
+
+# 2026-07-22 回帰: 先行する非pythonブロック(```json)があっても code_check が
+# ブロック間のプロースではなく実物の python を検証すること（見せかけの失敗を防ぐ）。
+_issue_leading_json = f.code_check(
+    "```json\n{\"note\": \"ignore me\"}\n```\n```python\n1/0\n```"
+)
+check(
+    "code: 先行jsonブロックがあってもpythonの失敗を正しく検知",
+    _issue_leading_json is not None and "ZeroDivision" in _issue_leading_json,
+)
+check(
+    "code: 先行jsonブロック+正しいpythonはNone",
+    f.code_check(
+        "```json\n{\"note\": \"ignore me\"}\n```\n```python\nprint(1)\n```"
+    ) is None,
+)
 
 _good_fib = ("説明します。\n```python\n"
              "def fib(n):\n"
