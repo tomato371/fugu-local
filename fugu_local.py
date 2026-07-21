@@ -2525,8 +2525,23 @@ def solve_verifiable(question, task_type="math", history=None):
             # 挙動のままで変更していない。
             match = next((c for c in classes if answers_equivalent(top, c[0])), None)
             cnt = match[1] if match else 0
-            if match is None or match[0] != top:
+            if match is None:
                 classes = classes + [[top, cnt]]
+            elif match[0] != top:
+                # 2026-07-22 (iteration 10 の続き): 上の一致判定は answers_equivalent な
+                # クラスを見つけられるが、そのクラスの代表表記（match[0]）が裁定役の
+                # 返した文字列（top）と食い違うことがある（例: 拮抗クラスの代表が '1/2'
+                # で裁定役は '0.5' と書く、'1000' vs '1,000'、'012' vs '12' など、
+                # 分数⇄小数や桁区切りの書き直しは裁定役がよくやる）。
+                # 旧コードは「match is None or match[0] != top」を一括りにして
+                # 新規クラス [top, cnt] を無条件追加していたため、同値のはずの票が
+                # 旧代表表記のキーと裁定後表記のキーの二つに分裂して計上され
+                # （例: res['votes'] == {'1/2': 3, '0.5': 3}）、合計票数が実際の
+                # 有効票数の2倍になる「truthful でない votes」を生んでいた。これは
+                # iteration 10 が退治したはずの矛盾内訳バグの兄弟ケースにあたる。
+                # ここでは新規クラスを追加せず、一致したクラス自身のキーを裁定後の
+                # 表記に書き換えるだけにして、同じ票が二重に数えられないようにする。
+                classes = [([top, cnt] if c is match else c) for c in classes]
     # 2026-07-21: ループ内の早期確定条件（cnt==n and n>=SC_MIN_VOTES / n>=4 and cnt*2>n）は
     # SC_MIN_VOTES 未満の疑似全会一致を弾くが、それは while ループの break 条件だけの話。
     # SC_MAX 消化で抜けた場合（多くのサンプルが __ERROR__/抽出失敗/\boxed{}欠落 等で無効票になった
