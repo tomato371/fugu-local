@@ -1181,6 +1181,34 @@ check(
     f.extract_code("```json\n{\"a\": 1}\n```") is None,
 )
 
+# 2026-07-22 回帰: extract_code の言語タグ比較を「info string 全体」ではなく
+# 「最初の空白区切りトークン」で行うよう修正（CommonMark の info string 仕様。
+# iteration 7 のブロック選択修正、iteration 18 の _extract_code_for_output 修正に
+# 続く、同じ誤抽出クラスの3件目）。装飾/メタデータ付きの python フェンスが誤って
+# 読み飛ばされないことを確認する。
+check(
+    "code: python+装飾タグ({.line-numbers})も正しく抽出",
+    f.extract_code("```python {.line-numbers}\nprint(1)\n```") == "print(1)\n",
+)
+check(
+    "code: python+装飾タグ(title=...)も正しく抽出",
+    f.extract_code("```python title=\"sol.py\"\nx = 1\n```") == "x = 1\n",
+)
+check(
+    "code: py3タグは受理集合外のためNone(広げすぎていないことの確認)",
+    f.extract_code("```py3\ncode\n```") is None,
+)
+check(
+    "code: 先行する装飾非pythonフェンス(json {.foo})の後のpythonブロックを正しく抽出",
+    f.extract_code(
+        "```json {.foo}\n{\"a\":1}\n```\n```python\ncode\n```"
+    ) == "code\n",
+)
+check(
+    "code: ハイフン複合タグ(python-repl)は空白区切りが無いため受理されない",
+    f.extract_code("```python-repl\ncode\n```") is None,
+)
+
 # 2026-07-22: _extract_code_for_output (_save_as_code が使うファイル出力用抽出) に
 # iteration-7 の extract_code と同じ誤抽出クラスの修正を適用した回帰テスト。
 check(
@@ -1297,6 +1325,24 @@ check(
     f.code_check(
         "```json\n{\"note\": \"ignore me\"}\n```\n```python\nprint(1)\n```"
     ) is None,
+)
+
+# 2026-07-22 回帰: 先行する装飾付き非codeブロック(```json {.foo})があっても、
+# code_check が info string の最初のトークンで正しく python ブロックを見つけ、
+# 見せかけの実行失敗("code execution FAILED")を報告しないこと。
+check(
+    "code: 先行装飾jsonブロック+正しいpythonはNone(見せかけの失敗なし)",
+    f.code_check(
+        "```json {.foo}\n{\"note\": \"ignore me\"}\n```\n```python\nprint(1)\n```"
+    ) is None,
+)
+_issue_leading_decorated_json = f.code_check(
+    "```json {.foo}\n{\"note\": \"ignore me\"}\n```\n```python\n1/0\n```"
+)
+check(
+    "code: 先行装飾jsonブロックがあってもpythonの失敗を正しく検知",
+    _issue_leading_decorated_json is not None
+    and "ZeroDivision" in _issue_leading_decorated_json,
 )
 
 _good_fib = ("説明します。\n```python\n"

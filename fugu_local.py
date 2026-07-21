@@ -1204,8 +1204,23 @@ def extract_code(text):
     無ければ None。"""
     if not text:
         return None
+    # 2026-07-22: CommonMark の info string 仕様では、フェンス開始行の残り全体では
+    # なく「最初の空白区切りトークン」だけが言語タグであり、それ以降は任意の
+    # メタデータ（例: ```python {.line-numbers} や ```python title="sol.py"）。
+    # 旧実装は strip した info string 全体を ("", "python", "py", "python3") と
+    # 比較していたため、```python {.line-numbers} は lang=='python {.line-numbers}'
+    # となって不一致になり、正当な python ブロックが読み飛ばされ、extract_code が
+    # 後続の無関係なブロックを拾うか None を返していた（本関数のブロック選択自体は
+    # iteration 7 で修正済みで、ここではその値の比較方法のみを直す）。
+    # 修正: info string の最初のトークンのみを言語タグとして比較する（空/空白のみの
+    # info string は従来通りタグ無し("")として bare フェンス扱い）。受理集合は
+    # ("", "python", "py", "python3") のまま変更しない。json/bash 等、最初のトークン
+    # が非python なフェンスは装飾の有無に関わらず引き続き読み飛ばされる。
+    # なお _extract_code_for_output（iteration 18 の多段優先ロジック）はこのイテレー
+    # ションではあえて触れていない — 同種の info-string 対応は別途の追随課題とする。
     for m in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
-        lang = m.group(1).strip().lower()
+        info = m.group(1).strip().lower()
+        lang = info.split(None, 1)[0] if info else ""
         if lang in ("", "python", "py", "python3"):
             return m.group(2)
     return None
