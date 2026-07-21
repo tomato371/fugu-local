@@ -2984,7 +2984,22 @@ def _extract_code_for_output(answer: str, suffix: str) -> str:
     修正: extract_code と同一のフェンス正規表現 re.finditer(r"```([^\n`]*)\n(.*?)```")
     で全ブロックを一度に収集し、(1) suffix の対象言語タグ一致 → (2) タグ無し
     (bare) → (3) 既知の非コードタグ以外 の優先順で最初に見つかったブロックの
-    本文を返す。該当ブロックが無ければ従来通りフェンス無しフォールバックを返す。"""
+    本文を返す。該当ブロックが無ければ従来通りフェンス無しフォールバックを返す。
+
+    2026-07-22: iteration 28 で extract_code (L1192, iteration 18 由来の関数) に
+    施した info-string 修正をここにも追随。CommonMark の info string 仕様では
+    フェンス開始行の残り全体ではなく「最初の空白区切りトークン」だけが言語タグで、
+    それ以降は任意のメタデータ（例: ```python title="sol.py" や
+    ```python {.line-numbers}）。旧実装は strip した info string 全体を lang として
+    比較していたため、(1) 装飾付き python フェンスが lang=='python title="sol.py"'
+    などとなって langs との一致 (1) に失敗し、tier-1 の優先扱いを受けられず tier-3
+    （非コードタグ以外なら何でも）に落ちてしまい、(2) 装飾付き非コードフェンス
+    （例: ```json {.line-numbers}）が lang=='json {.line-numbers}' となって
+    _NON_CODE_TAGS の "json" と不一致になり、tier-3 でそのまま採用され、後続の
+    本物の python ブロックより先に JSON/プロースが _save_as_code で .py/.js に
+    書き出されてしまっていた。修正: info string の最初のトークンのみを言語タグ
+    として全3段の判定に使う（extract_code と同じ考え方）。受理集合・優先順位・
+    _NON_CODE_TAGS 自体は変更しない。"""
     lang_map = {
         ".py": ["python", "py", "python3"],
         ".js": ["javascript", "js"],
@@ -3007,7 +3022,11 @@ def _extract_code_for_output(answer: str, suffix: str) -> str:
     }
     langs = {l.lower() for l in lang_map.get(suffix, [])}
 
-    blocks = [(m.group(1).strip().lower(), m.group(2))
+    def _fence_lang(info: str) -> str:
+        info = info.strip().lower()
+        return info.split(None, 1)[0] if info else ""
+
+    blocks = [(_fence_lang(m.group(1)), m.group(2))
               for m in re.finditer(r"```([^\n`]*)\n(.*?)```", answer, re.DOTALL)]
 
     # (1) 対象言語タグと一致する最初のブロック

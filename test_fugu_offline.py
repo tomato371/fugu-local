@@ -1254,6 +1254,31 @@ check(
     == "int main(){return 0;}\n",
 )
 
+# 2026-07-22: iteration 28 の extract_code 修正 (info string は最初の空白区切り
+# トークンのみを言語タグとする) を _extract_code_for_output にも追随適用した
+# 回帰・新規テスト。装飾付き info string (```python title="sol.py" や
+# ```python {.line-numbers}) が tier-1 の対象言語一致から漏れたり、装飾付き
+# 非コードフェンス(```json {.line-numbers})が _NON_CODE_TAGS と不一致になって
+# tier-3 で誤って採用されたりしないことを確認する。
+check(
+    "code_out: title=属性で装飾されたpythonフェンスもtier-1(対象言語一致)で抽出",
+    f._extract_code_for_output(
+        "```python title=\"sol.py\"\nprint(1)\n```", ".py"
+    ) == "print(1)\n",
+)
+check(
+    "code_out: {.line-numbers}属性で装飾されたpythonフェンスもtier-1で抽出",
+    f._extract_code_for_output(
+        "```python {.line-numbers}\nprint(2)\n```", ".py"
+    ) == "print(2)\n",
+)
+check(
+    "code_out: 装飾付き非コードフェンス(json {.foo})はNON_CODE_TAGSとして読み飛ばされ、後続pythonを抽出",
+    f._extract_code_for_output(
+        "```json {.foo}\n{\"a\":1}\n```\n\n```python\nprint(3)\n```", ".py"
+    ) == "print(3)\n",
+)
+
 ok, out = f.run_python("print('hello_runner')")
 check("code: 実行成功", ok and "hello_runner" in out)
 ok, out = f.run_python("raise ValueError('boom')")
