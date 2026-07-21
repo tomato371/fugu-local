@@ -2035,6 +2035,12 @@ SC_ENABLED = True
 SC_INITIAL = 6          # 第1バッチの CoT サンプル数（精度優先で厚め）
 SC_STEP = 4             # 過半数が取れないときの追加サンプル数
 SC_MAX = 20             # 主力 CoT サンプルの上限（PoT・安価票は別枠）。時間無制限方針で高め
+# 全会一致判定 (cnt == n) は抽出成功サンプルのみで n を数えるため、thinking の
+# num_predict 打ち切りで __ERROR__ になる／PoT コードが実行失敗する／\boxed{} が
+# 出ない、といった抽出失敗が第1バッチで多発すると n=1 (残り全滅) でも「全会一致」
+# 扱いになり、事実上 k=1 で確定してしまう（精度優先方針に反する縮退）。過半数側は
+# 既に n>=4 の下限があるため、全会一致側にも同じ考え方の下限を設ける（2026-07-21）。
+SC_MIN_VOTES = 3        # 全会一致で確定してよい最小サンプル数（これ未満は追加サンプリングへ）
 SC_TEMP = 0.7           # 多様性確保（投票の独立性）
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
@@ -2313,8 +2319,11 @@ def solve_verifiable(question, task_type="math", history=None):
         answers = [s["answer"] for s in samples if s["answer"]]
         top, cnt, classes = vote_answers(answers)
         n = len(answers)
-        # 確定条件: 全会一致、または 4 票以上で過半数
-        if top is not None and n > 0 and (cnt == n or (n >= 4 and cnt * 2 > n)):
+        # 確定条件: 全会一致（ただし n < SC_MIN_VOTES の疑似全会一致は不可）、
+        # または 4 票以上で過半数
+        if top is not None and n > 0 and (
+            (cnt == n and n >= SC_MIN_VOTES) or (n >= 4 and cnt * 2 > n)
+        ):
             break
         if main_cot_count() >= SC_MAX:
             break

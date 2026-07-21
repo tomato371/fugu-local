@@ -235,6 +235,71 @@ finally:
 check("sc: 割れたら追加サンプリング", len(_sc_calls) > f.SC_INITIAL)
 check("sc: 追加後に過半数で確定", _res2 is not None and _res2["answer"] == "1")
 
+check("sc: SC_MIN_VOTES 定数", f.SC_MIN_VOTES == 3)
+
+# 疑似全会一致ガード: 第1バッチで抽出成功が1票だけ（他は thinking打ち切り/boxed無しで
+# 抽出失敗）だと、旧ロジックでは cnt(1)==n(1) で「全会一致」扱いになり k=1 で確定して
+# しまっていた（2026-07-21 に発見・修正）。SC_MIN_VOTES 導入後は n<3 の全会一致では
+# 確定させず、add_batch(SC_STEP) で追加サンプリングされることを検証する。
+_orig_min_votes = f.SC_MIN_VOTES
+_sc_calls.clear()
+_seq3 = (["\\boxed{42}"] + ["すみません、答えが導けませんでした。"] * 5
+         + ["\\boxed{42}"] * 100)  # 第1バッチ: 1票のみ抽出成功、以降は追加分がすべて42に収束
+
+
+def _fake_sc_ask3(model, messages, temperature, think=None, fmt=None,
+                  label=None, num_predict=None, num_ctx=None):
+    _sc_calls.append(model)
+    idx = len(_sc_calls) - 1
+    return _seq3[idx] if idx < len(_seq3) else "\\boxed{42}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ask = _fake_sc_ask3
+    _res3 = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+    f.SC_MIN_VOTES = _orig_min_votes
+check("sc: n<SC_MIN_VOTES の疑似全会一致では確定しない(追加サンプリング)",
+      len(_sc_calls) > f.SC_INITIAL)
+check("sc: 追加サンプリング後に正しく確定", _res3 is not None and _res3["answer"] == "42")
+
+# 抽出成功が一度もない場合: 全バッチで n=0 のまま SC_MAX に到達し、無限ループせず
+# None を返して MoA フォールバックへ委ねることを検証する（打ち切り自体は既存ロジック）。
+_sc_calls.clear()
+
+
+def _fake_sc_ask_noextract(model, messages, temperature, think=None, fmt=None,
+                           label=None, num_predict=None, num_ctx=None):
+    _sc_calls.append(model)
+    return "考え中ですが、最終的な答えを出せませんでした。"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ask = _fake_sc_ask_noextract
+    _res4 = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+    f.SC_MIN_VOTES = _orig_min_votes
+check("sc: 抽出0票が続いてもハングせず終了", len(_sc_calls) > 0)
+check("sc: 抽出0票なら None を返す(MoAへフォールバック)", _res4 is None)
+
 # ---------- task_type ガードレール ----------
 def _tt(q, declared=""):
     return f._apply_tasktype_guardrails(q, {"task_type": declared})["task_type"]
