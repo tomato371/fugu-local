@@ -2438,6 +2438,17 @@ def _arbitrate(question, task_type, samples, classes):
         print(f"   [SC] 票が拮抗 → {arb} が裁定します")
         raw = ask(arb, [{"role": "user", "content": prompt}], 0.1,
                   num_predict=model_cfg(arb, "num_predict", 8192), label="arbiter")
+        # 2026-07-22: ask() は失敗時 raw を '__ERROR__: HTTP Error 500 ...' のような
+        # 文字列で返す（line ~1079）。ここでチェックせずに extract_final_answer へ渡すと、
+        # math タスクの最終数値フォールバック（line ~2299）がエラーメッセージ中の
+        # '500'/'429'/'400' を「裁定役の最終解答」として誤採用してしまい、拮抗投票が
+        # 誤った自信満々の数値に化ける。_sc_sample（iter 4）・ask() 自身（iter 9）・
+        # _critic_judge/second_opinion（iter 15）で修正済みの同種バグがここでは未対応
+        # だったので、raw.startswith('__ERROR__') と空/空白応答を同様に弾き、次の
+        # 裁定役へフォールバックする。
+        if not raw or not raw.strip() or raw.startswith("__ERROR__"):
+            print(f"   [SC] {arb} の裁定が空/抽出不能 → 次の裁定役へ")
+            continue
         text = strip_think(raw)
         ans = extract_final_answer(text, task_type)
         if ans:

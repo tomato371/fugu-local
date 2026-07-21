@@ -744,6 +744,127 @@ check("cap: 上限超過分(5)は黙って捨てずログに出力される",
 check("cap: 上限保護時も有効な(answer, text)タプルを返す",
       _cap_result is not None and _cap_result[0] == "1")
 
+# ---------- 2026-07-22: _arbitrate が ask() の __ERROR__ センチネルを誤って
+# 数値解答として採用しないこと ----------
+# ask() は失敗時 '__ERROR__: HTTP Error 500: Internal Server Error {...}' のような
+# 文字列を返す（line ~1079）。旧 _arbitrate はこれをチェックせず strip_think →
+# extract_final_answer に渡していたため、math タスクの最終数値フォールバック
+# （line ~2299, `nums = re.findall(...)`）がエラーメッセージ中の '500'/'429' を
+# 「裁定役の最終解答」として誤採用し、拮抗投票がでっち上げの自信満々な数値に化けて
+# いた（_sc_sample=iter4, ask()自体=iter9, _critic_judge/second_opinion=iter15 で
+# 直した同種バグの兄弟ケース）。ここでは (a) solve_verifiable 経由で拮抗した全裁定役が
+# エラーになっても最終結果にエラー文字列/誤答が漏れないこと、(b) _arbitrate を直接叩いて
+# チェーンの先頭がエラーでも次の裁定役へフォールバックすること、(c) 全裁定役がエラーなら
+# _arbitrate が None を返すこと、の3点を検証する。
+
+# (a) solve_verifiable レベル: ARBITER_MODEL 無し・REASONING_MODELS=PROPOSERS=[m1,m2] の
+# 従来ケース1と同じ拮抗を作り、裁定役(m1もm2も)が毎回 __ERROR__ を返す状況。
+_arb_err_calls = []
+
+
+def _fake_ask_arb_error_only(model, messages, temperature, think=None, fmt=None,
+                              label=None, num_predict=None, num_ctx=None):
+    _arb_err_calls.append((label, model))
+    if label == "arbiter":
+        return "__ERROR__: HTTP Error 500: Internal Server Error"
+    idx = len(_arb_err_calls) - 1
+    ans = "1" if idx % 2 == 0 else "2"
+    return f"sc reasoning candidate {ans}\n\\boxed{{{ans}}}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_m1m2
+    f.ask = _fake_ask_arb_error_only
+    _res_arb_err = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+    f.ARBITER_MODEL = _orig_arbiter_model
+    f.installed_models = _orig_installed
+check("arb-err: 拮抗した全裁定役が__ERROR__を返してもanswerに'500'が誤採用されない",
+      _res_arb_err is None or _res_arb_err["answer"] != "500")
+check("arb-err: 拮抗した全裁定役が__ERROR__を返してもtextにエラー文字列が漏れない",
+      _res_arb_err is None or "__ERROR__" not in _res_arb_err["text"])
+
+# (b) _arbitrate 直接: ARBITER_MODEL(裁定役1番手)が__ERROR__、REASONING_MODELS の
+# フォールバック(2番手)が有効な \boxed 解答を返す → チェーンを進めてその有効解答を
+# 採用すること（エラーで止まって None になったり、エラー文中の数値を拾ったりしない）。
+_orig_installed_e2 = f.installed_models
+_orig_arbiter_model_e2 = f.ARBITER_MODEL
+_orig_reasoning_e2 = f.REASONING_MODELS
+_orig_props_e2 = f.PROPOSERS
+
+
+def _fake_ask_arb_chain_fallback(model, messages, temperature, think=None, fmt=None,
+                                  label=None, num_predict=None, num_ctx=None):
+    assert label == "arbiter"
+    if model == "arb_big":
+        return "__ERROR__: HTTP Error 500: Internal Server Error"
+    return "ARBITER_REASONING_FALLBACK: re-derived correctly \\boxed{7}"
+
+
+_fb_samples = [{"answer": "1", "text": "reasoning for 1", "model": "m1", "pot": False},
+               {"answer": "2", "text": "reasoning for 2", "model": "m1", "pot": False}]
+_fb_classes = [["1", 2], ["2", 2]]
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["arb_big", "m1"]
+    f.ARBITER_MODEL = "arb_big"
+    f.installed_models = lambda: ["arb_big", "m1"]
+    f.ask = _fake_ask_arb_chain_fallback
+    _e2_result = f._arbitrate("test question", "math", _fb_samples, _fb_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_e2
+    f.REASONING_MODELS = _orig_reasoning_e2
+    f.ARBITER_MODEL = _orig_arbiter_model_e2
+    f.installed_models = _orig_installed_e2
+check("arb-err: 先頭裁定役が__ERROR__ → 次の裁定役の有効な\\boxed解答へフォールバック",
+      _e2_result is not None and _e2_result[0] == "7")
+check("arb-err: フォールバック採用時の本文は次裁定役自身の推論(エラー文ではない)",
+      _e2_result is not None and "ARBITER_REASONING_FALLBACK" in _e2_result[1]
+      and "__ERROR__" not in _e2_result[1])
+
+# (c) _arbitrate 直接: チェーン全員が__ERROR__(しかも数字入り)を返す → None を返し、
+# 誤った数値タプルをでっち上げないこと。
+_orig_installed_e3 = f.installed_models
+_orig_arbiter_model_e3 = f.ARBITER_MODEL
+_orig_reasoning_e3 = f.REASONING_MODELS
+_orig_props_e3 = f.PROPOSERS
+
+
+def _fake_ask_arb_all_error(model, messages, temperature, think=None, fmt=None,
+                             label=None, num_predict=None, num_ctx=None):
+    assert label == "arbiter"
+    if model == "arb_big":
+        return "__ERROR__: HTTP Error 500: Internal Server Error"
+    return "__ERROR__: HTTP Error 429: Too Many Requests"
+
+
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["arb_big", "m1"]
+    f.ARBITER_MODEL = "arb_big"
+    f.installed_models = lambda: ["arb_big", "m1"]
+    f.ask = _fake_ask_arb_all_error
+    _e3_result = f._arbitrate("test question", "math", _fb_samples, _fb_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_e3
+    f.REASONING_MODELS = _orig_reasoning_e3
+    f.ARBITER_MODEL = _orig_arbiter_model_e3
+    f.installed_models = _orig_installed_e3
+check("arb-err: 全裁定役が__ERROR__ → _arbitrate は None を返す(数値をでっち上げない)",
+      _e3_result is None)
+
 # ---------- task_type ガードレール ----------
 def _tt(q, declared=""):
     return f._apply_tasktype_guardrails(q, {"task_type": declared})["task_type"]
