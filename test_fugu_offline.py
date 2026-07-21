@@ -1,0 +1,413 @@
+"""モデル呼び出しなしの高速回帰テスト。Ollama 不要・数秒で完走する。
+実行: python test_fugu_offline.py
+fugu_local / eval_fugu の純粋ロジック（プラン検証・JSON抽出・思考除去・言語判定・
+アグリゲータのフォールバック・採点関数）を合成入力で検証する。
+"""
+import fugu_local as f
+import eval_fugu as e
+
+_FAILS = []
+
+
+def check(name, cond):
+    print(f"[{'OK' if cond else 'NG'}] {name}")
+    if not cond:
+        _FAILS.append(name)
+
+
+# ---------- extract_json ----------
+check("json: 素のJSON", f.extract_json('{"a": 1}') == {"a": 1})
+check("json: コードフェンス", f.extract_json('x\n```json\n{"a": 1}\n```\ny') == {"a": 1})
+check("json: think混入", f.extract_json('<think>ignore {"b":9}</think>{"a": 1}') == {"a": 1})
+check("json: 地の文に埋没", f.extract_json('The plan is {"a": 1} as follows') == {"a": 1})
+check("json: 抽出不能はNone", f.extract_json("no json here") is None)
+check("json: 空はNone", f.extract_json("") is None)
+
+# ---------- strip_think ----------
+check("strip: think除去", f.strip_think("<think>x</think>answer") == "answer")
+check("strip: thinking除去", f.strip_think("<THINKING>x</THINKING>ans") == "ans")
+check("strip: 対象なしは素通し", f.strip_think("plain") == "plain")
+check("strip: None耐性", f.strip_think(None) is None)
+
+# ---------- validate_plan（新スキーマ: mode single|moa / selected_proposers 他） ----------
+f.PROPOSERS = ["qwen3:4b", "phi4-mini", "gemma4:e2b-it-qat"]
+f.AGGREGATOR = "deepseek-r1:7b"
+f.CONDUCTOR = "qwen3:4b"
+
+p = f.validate_plan({"mode": "moa",
+                     "selected_proposers": ["qwen3:4b", "存在しないモデル"],
+                     "rounds": 99, "use_image_generation": False,
+                     "search_required": True})
+check("plan: rounds を MAX_ROUNDS に丸める", p["rounds"] == f.MAX_ROUNDS)
+check("plan: 未知プロポーザーを除外", p["selected_proposers"] == ["qwen3:4b"])
+check("plan: search_required を反映", p["search_required"] is True)
+check("plan: 不正mode は moa",
+      f.validate_plan({"mode": "weird", "selected_proposers": ["qwen3:4b"]})["mode"] == "moa")
+check("plan: dict以外はフォールバック", f.validate_plan(None).get("_fallback") is True)
+check("plan: single は先頭1体のみ",
+      f.validate_plan({"mode": "single",
+                       "selected_proposers": ["phi4-mini", "qwen3:4b"]})["selected_proposers"]
+      == ["phi4-mini"])
+check("plan: 空selected は既定へフォールバック",
+      len(f.validate_plan({"mode": "moa", "selected_proposers": []})["selected_proposers"]) >= 1)
+check("plan: use_image_generation は mode を強制しない(非排他)",
+      f.validate_plan({"mode": "moa", "selected_proposers": ["qwen3:4b"],
+                       "use_image_generation": True})["mode"] == "moa")
+check("plan: 画像生成フラグを反映",
+      f.validate_plan({"use_image_generation": True,
+                       "selected_proposers": ["qwen3:4b"]})["use_image_generation"] is True)
+check("plan: image_only を反映",
+      f.validate_plan({"image_only": True, "selected_proposers": []})["image_only"] is True)
+check("plan: make_pptx を反映し image_only を無効化",
+      (lambda p: p["make_pptx"] is True and p["image_only"] is False)(
+          f.validate_plan({"make_pptx": True, "image_only": True,
+                           "selected_proposers": ["qwen3:4b"]})))
+
+# ---------- ペルソナ解決（selected_proposers のペルソナ名→実モデル） ----------
+_op_persona = f.PROPOSERS
+f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "qwen3.6:35b"]
+check("persona: 'Proposer A' → gpt-oss", f._resolve_proposer("Proposer A") == "gpt-oss:20b")
+check("persona: 緩い 'a' → gpt-oss", f._resolve_proposer("a") == "gpt-oss:20b")
+check("persona: モデル名直指定を許容", f._resolve_proposer("qwen3.6:35b") == "qwen3.6:35b")
+check("persona: 未知は None", f._resolve_proposer("Proposer Z") is None)
+check("persona: validate がペルソナ名を実モデルへ解決",
+      f.validate_plan({"mode": "moa",
+                       "selected_proposers": ["Proposer C", "Proposer D"]})["selected_proposers"]
+      == ["gemma4:26b", "qwen3.6:35b"])
+f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "phi4"]  # gemma4:26b 未導入シナリオ
+check("persona: 未導入モデルのペルソナは None", f._resolve_proposer("Proposer C") is None)
+check("persona: validate は未導入ペルソナを除外",
+      f.validate_plan({"mode": "moa",
+                       "selected_proposers": ["Proposer C", "Proposer B"]})["selected_proposers"]
+      == ["qwen3-coder:30b"])
+
+# ---------- 精度ガードレール（code/proof を single→moa へ格上げ） ----------
+f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "phi4"]
+
+
+def _single_plan():
+    return {"mode": "single", "selected_proposers": ["gpt-oss:20b"], "rounds": 1,
+            "use_image_generation": False, "search_required": False,
+            "reason": "r", "_fallback": False}
+
+
+check("guard: コード質問は moa へ格上げ",
+      f._apply_accuracy_guardrails("Pythonで実装して", _single_plan())["mode"] == "moa")
+check("guard: 証明質問は moa へ格上げ",
+      f._apply_accuracy_guardrails("背理法で証明せよ", _single_plan())["mode"] == "moa")
+check("guard: 格上げ時は複数体を割当",
+      len(f._apply_accuracy_guardrails("コードを書いて", _single_plan())["selected_proposers"]) >= 2)
+check("guard: 平易な質問は single のまま",
+      f._apply_accuracy_guardrails("日本の首都は？", _single_plan())["mode"] == "single")
+check("guard: image_only は格上げ対象外",
+      f._apply_accuracy_guardrails(
+          "コードを実装して",
+          {"mode": "single", "selected_proposers": [],
+           "image_only": True})["mode"] == "single")
+check("guard: イラスト付き(image_only=False)のコードは格上げ",
+      f._apply_accuracy_guardrails(
+          "コードを実装して",
+          {"mode": "single", "selected_proposers": ["gpt-oss:20b"],
+           "use_image_generation": True, "image_only": False})["mode"] == "moa")
+
+# ---------- スライド分解（PowerPoint 用） ----------
+_slides = f._parse_slides("## 概要\n- 要点1\n- 要点2\n\n## 詳細\n本文の段落です。\n1. 手順A\n2. 手順B")
+check("pptx: 見出しでスライド分割", len(_slides) == 2)
+check("pptx: 箇条書き記号を除去", _slides[0]["bullets"] == ["要点1", "要点2"])
+check("pptx: タイトルは見出し由来", _slides[1]["title"] == "詳細")
+check("pptx: 見出し無しは概要1枚",
+      len(f._parse_slides("ただの文章その1。\nその2。")) == 1)
+check("pptx: deck_title は短い質問を採用", f._deck_title("犬の紹介", _slides) == "犬の紹介")
+
+# ---------- 出力形態ルーティングガードレール ----------
+f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "phi4"]
+
+
+def _base_plan():
+    return {"mode": "single", "selected_proposers": ["gpt-oss:20b"], "rounds": 1,
+            "use_image_generation": False, "image_only": False, "make_pptx": False,
+            "search_required": False, "reason": "r", "_fallback": False}
+
+
+_r = f._apply_routing_guardrails("機械学習入門のスライドを作って", _base_plan())
+check("route: スライド→make_pptx+moa", _r["make_pptx"] is True and _r["mode"] == "moa")
+_r = f._apply_routing_guardrails("かわいい柴犬のイラストを描いて", _base_plan())
+check("route: イラストのみ→image_only", _r["use_image_generation"] is True and _r["image_only"] is True)
+_r = f._apply_routing_guardrails("PINN洪水モデルを説明して図も作って", _base_plan())
+check("route: 説明+図→イラスト付き(image_only=False)",
+      _r["use_image_generation"] is True and _r["image_only"] is False)
+_r = f._apply_routing_guardrails("日本の首都は？", _base_plan())
+check("route: 通常質問は据え置き",
+      _r["make_pptx"] is False and _r["use_image_generation"] is False)
+f.PROPOSERS = _op_persona
+
+# ---------- 自己一貫性投票（答え抽出・正規化・同値判定・投票） ----------
+check("sc: boxed 抽出", f.extract_boxed("thus \\boxed{42}") == "42")
+check("sc: boxed 入れ子", f.extract_boxed("\\boxed{\\frac{1}{2}}") == "\\frac{1}{2}")
+check("sc: boxed 最後を採用", f.extract_boxed("\\boxed{1} then \\boxed{2}") == "2")
+check("sc: boxed 無しは None", f.extract_boxed("no box") is None)
+
+check("sc: 正規化 全角→半角", f.normalize_answer("１２３") == "123")
+check("sc: 正規化 桁区切り除去", f.normalize_answer("12,345") == "12345")
+check("sc: 正規化 空白入り桁区切り", f.normalize_answer("11,\\! 111,\\! 111,\\! 100") == "11111111100")
+check("sc: 正規化 前置き除去", f.normalize_answer("Answer: 700") == "700")
+check("sc: 正規化 text外殻", f.normalize_answer("\\text{391}") == "391")
+
+check("sc: 抽出 boxed優先", f.extract_final_answer("答えは 5 です。\\boxed{7}") == "7")
+check("sc: 抽出 答え宣言", f.extract_final_answer("計算すると、答えは 700 円です") == "700")
+check("sc: 抽出 最後の数値", f.extract_final_answer("17 * 23 = 391") == "391")
+check("sc: 抽出 無しは None", f.extract_final_answer("わかりません") is None)
+check("sc: mcq boxed", f.extract_final_answer("\\boxed{B}", "mcq") == "B")
+check("sc: mcq 宣言", f.extract_final_answer("正解は (C) です", "mcq") == "C")
+check("sc: mcq 無しは None", f.extract_final_answer("どれも違う", "mcq") is None)
+
+check("sc: 同値 完全一致", f.answers_equivalent("42", "42"))
+check("sc: 同値 分数=小数", f.answers_equivalent("1/2", "0.5"))
+check("sc: 同値 桁区切り", f.answers_equivalent("12,345", "12345"))
+check("sc: 非同値", not f.answers_equivalent("41", "42"))
+check("sc: 空は非同値", not f.answers_equivalent("", "42"))
+
+_top, _cnt, _cls = f.vote_answers(["42", "42", "41", "0.5", "1/2", None, ""])
+check("sc: 投票 最多クラス", _top == "42" and _cnt == 2)
+check("sc: 投票 同値クラス集約", any(c[1] == 2 and f.answers_equivalent(c[0], "0.5") for c in _cls))
+check("sc: 投票 空リスト", f.vote_answers([]) == (None, 0, []))
+
+# ---------- solve_verifiable（ask をモックして適応サンプリングを検証） ----------
+_orig_ask2 = f.ask
+_orig_props2 = f.PROPOSERS
+_orig_reasoning = f.REASONING_MODELS
+_orig_cheap = f.SC_CHEAP_VOTES
+_orig_pot = f.SC_POT
+_sc_calls = []
+
+
+def _fake_sc_ask(model, messages, temperature, think=None, fmt=None,
+                 label=None, num_predict=None, num_ctx=None):
+    _sc_calls.append(model)
+    return f"reasoning...\n\\boxed{{{'42' if len(_sc_calls) % 2 else '42'}}}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ask = _fake_sc_ask
+    _res = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+check("sc: 全会一致で早期確定", _res is not None and _res["answer"] == "42")
+check("sc: 初回バッチのみで停止", len(_sc_calls) == f.SC_INITIAL)
+check("sc: モデルを交互に使う", set(_sc_calls) == {"m1", "m2"})
+
+# 票が割れるケース: 第1バッチで拮抗 → 追加サンプリング後に過半数で確定。
+# バッチ化により第1バッチ(SC_INITIAL)は m1 まとめ→m2 まとめの順。call index で答えを固定し、
+# 第1バッチを均等割り(過半数なし)にして 2 バッチ目で決着させる。
+_sc_calls.clear()
+_seq = (["\\boxed{1}"] * (f.SC_INITIAL // 2) + ["\\boxed{2}"] * (f.SC_INITIAL - f.SC_INITIAL // 2)
+        + ["\\boxed{1}"] * 100)   # 第1バッチは均等、以降は 1 が積み上がる
+
+
+def _fake_sc_ask2(model, messages, temperature, think=None, fmt=None,
+                  label=None, num_predict=None, num_ctx=None):
+    _sc_calls.append(model)
+    idx = len(_sc_calls) - 1
+    return _seq[idx] if idx < len(_seq) else "\\boxed{1}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ask = _fake_sc_ask2
+    _res2 = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+check("sc: 割れたら追加サンプリング", len(_sc_calls) > f.SC_INITIAL)
+check("sc: 追加後に過半数で確定", _res2 is not None and _res2["answer"] == "1")
+
+# ---------- task_type ガードレール ----------
+def _tt(q, declared=""):
+    return f._apply_tasktype_guardrails(q, {"task_type": declared})["task_type"]
+
+
+check("tt: AIME風は math", _tt("Find the number of ordered pairs...") == "math")
+check("tt: 日本語計算は math", _tt("1000円の3割引の支払額を求めよ") == "math")
+check("tt: 選択肢列挙は mcq", _tt("正しいものを選べ\nA) foo\nB) bar") == "mcq")
+check("tt: which of the following は mcq", _tt("Which of the following is true?") == "mcq")
+check("tt: コードは code", _tt("フィボナッチ関数を実装して") == "code")
+check("tt: 証明は math にしない", _tt("3連続整数の積が6の倍数であることを証明して求めよ") != "math")
+check("tt: Conductor申告を尊重", _tt("こんにちは", "chat") == "chat")
+check("tt: 不明シグナルは chat", _tt("よろしくね", "") == "chat")
+check("tt: validate が task_type を保持",
+      f.validate_plan({"mode": "moa", "selected_proposers": [],
+                       "task_type": "math"})["task_type"] == "math")
+check("tt: validate が不正 task_type を空へ",
+      f.validate_plan({"mode": "moa", "selected_proposers": [],
+                       "task_type": "quiz"})["task_type"] == "")
+
+# ---------- MODEL_CONFIG 解決 ----------
+check("cfg: 既知モデルの num_ctx", f.model_cfg("gpt-oss:20b", "num_ctx") == 16384)
+check("cfg: 未知モデルは default", f.model_cfg("nonexistent", "num_ctx", 8192) == 8192)
+check("cfg: think 段階指定", f.model_cfg("gpt-oss:20b", "think") == "high")
+
+# ---------- 大VRAMプロファイル ----------
+_hv_saved = (dict(f.MODEL_CONFIG), f.PARALLEL_PROPOSERS, f.SC_INITIAL, f.SC_MAX,
+             f.SC_CHEAP_VOTES, f.MODEL_NUM_CTX)
+try:
+    _cfg_snapshot = {m: dict(c) for m, c in f.MODEL_CONFIG.items()}
+    f.MODEL_CONFIG = {m: dict(c) for m, c in _cfg_snapshot.items()}
+    f.apply_high_vram_profile()
+    check("hv: 並列ON", f.PARALLEL_PROPOSERS is True)
+    check("hv: SC上限を引き上げ", f.SC_MAX >= 40)
+    check("hv: num_ctx拡大", f.model_cfg("gpt-oss:20b", "num_ctx") == 65536)
+    check("hv: 安価票を有効化", f.SC_CHEAP_VOTES >= 8)
+finally:
+    (f.MODEL_CONFIG, f.PARALLEL_PROPOSERS, f.SC_INITIAL, f.SC_MAX,
+     f.SC_CHEAP_VOTES, f.MODEL_NUM_CTX) = _hv_saved
+_orig_pt = f.PROPOSER_THINK
+try:
+    f.PROPOSER_THINK = None
+    check("cfg: think解決 グローバルNoneは設定値", f.proposer_think_for("gpt-oss:20b") == "high")
+    f.PROPOSER_THINK = False
+    check("cfg: think解決 グローバル優先", f.proposer_think_for("gpt-oss:20b") is False)
+finally:
+    f.PROPOSER_THINK = _orig_pt
+
+# ---------- use_jp_aggregator ----------
+check("jp: ひらがな", f.use_jp_aggregator("これはテストです"))
+check("jp: カタカナ", f.use_jp_aggregator("テスト"))
+check("jp: 漢字のみ(旧版の取りこぼし)", f.use_jp_aggregator("東京都の人口密度?"))
+check("jp: 英語はFalse", not f.use_jp_aggregator("What is the capital of France?"))
+check("jp: 空/None耐性", not f.use_jp_aggregator("") and not f.use_jp_aggregator(None))
+
+# ---------- aggregate のフォールバック（ask をモンキーパッチ） ----------
+_orig_ask = f.ask
+_ask_log = []
+
+
+def _fake_ask_empty(model, messages, temperature, think=None, fmt=None,
+                    label=None, num_predict=None):
+    """アグリゲータ/再統合/Criticすべて空返答 → 保険2の最終分岐(最長の提案)まで落ちる。
+    ※Critic は extract_json 失敗時 ok=True 既定なので、実際は最初の提案が返る。"""
+    _ask_log.append((label, model, think))
+    return ""
+
+
+f.ask = _fake_ask_empty
+try:
+    out = f.aggregate("Q?", [("m1", "short"), ("m2", "much longer answer")])
+finally:
+    f.ask = _orig_ask
+_agg_calls = [(m, th) for lab, m, th in _ask_log if lab == "aggregator"]
+check("agg: 全滅時も提案のどれかを返す(空にしない)", out in ("short", "much longer answer"))
+check("agg: 再統合(保険1)が試行されている", len(_agg_calls) == 2)
+check("agg: 保険1は JP_AGGREGATOR + think=False で再統合",
+      _agg_calls[1] == (f.JP_AGGREGATOR, False))
+
+_ask_log.clear()
+
+
+def _fake_ask_ok(model, messages, temperature, think=None, fmt=None,
+                 label=None, num_predict=None):
+    _ask_log.append((label, model, think))
+    return "aggregated!"
+
+
+f.ask = _fake_ask_ok
+try:
+    out = f.aggregate("Q?", [("m1", "a"), ("m2", "b")])
+finally:
+    f.ask = _orig_ask
+check("agg: 正常時は統合結果を返す", out == "aggregated!")
+check("agg: 正常時は1回だけ呼ぶ", len(_ask_log) == 1)
+
+# エラー提案しかない場合
+check("agg: 全プロポーザー失敗は__ERROR__",
+      f.aggregate("Q?", [("m1", "__ERROR__: x")]).startswith("__ERROR__"))
+
+# ---------- get_proposals の多様性（先頭はドラフト無しで新規回答） ----------
+_seen_refs = []
+
+
+def _fake_proposal(model, question, reference, issue=None, history=None):
+    _seen_refs.append(reference)
+    return model, "ans"
+
+
+_orig_gsp = f.get_single_proposal
+f.get_single_proposal = _fake_proposal
+try:
+    f.PARALLEL_PROPOSERS = False
+    f.get_proposals(["m1", "m2", "m3"], "Q?", reference="draft", issue="x")
+finally:
+    f.get_single_proposal = _orig_gsp
+check("prop: ラウンド2の先頭は新規回答(reference=None)", _seen_refs[0] is None)
+check("prop: 2体目以降はドラフト改善", _seen_refs[1] == "draft" and _seen_refs[2] == "draft")
+
+# ---------- コード実行検証 ----------
+check("code: python フェンス抽出", f.extract_code("x\n```python\nprint(1)\n```\ny") == "print(1)\n")
+check("code: タグ無しフェンスも拾う", f.extract_code("```\nx = 1\n```") == "x = 1\n")
+check("code: コード無しは None", f.extract_code("no code here") is None)
+
+ok, out = f.run_python("print('hello_runner')")
+check("code: 実行成功", ok and "hello_runner" in out)
+ok, out = f.run_python("raise ValueError('boom')")
+check("code: 例外を検知して traceback を返す", (not ok) and "boom" in out)
+ok, out = f.run_python("while True:\n    pass", timeout=2)
+check("code: 無限ループはタイムアウト", (not ok) and "TIMEOUT" in out)
+
+check("code: code_check 正常コードは None", f.code_check("```python\nprint(1)\n```") is None)
+_issue = f.code_check("```python\n1/0\n```")
+check("code: code_check 失敗はエラー要約", _issue is not None and "ZeroDivision" in _issue)
+check("code: コード無し回答は None", f.code_check("plain text answer") is None)
+
+_good_fib = ("説明します。\n```python\n"
+             "def fib(n):\n"
+             "    a, b = 1, 1\n"
+             "    for _ in range(n - 1):\n"
+             "        a, b = b, a + b\n"
+             "    return a\n\n"
+             "assert fib(10) == 55\n"
+             "```")
+_bad_fib = "```python\ndef fib(n):\n    return n\n```"
+check("eval: fib 正解コード→OK", e.grade_code_fib(_good_fib) is True)
+check("eval: fib 誤りコード→NG", e.grade_code_fib(_bad_fib) is False)
+check("eval: コード無し回答→NG", e.grade_code_fib("fib(10)は55です") is False)
+
+# ---------- eval_fugu の採点 ----------
+check("eval: has_num 境界", e.has_num("answer is 391.", "391") and not e.has_num("3910", "391"))
+check("eval: has_num 部分数字を弾く", not e.has_num("17 and 13", "7"))
+check("eval: batball 0.05のみ→OK", e.grade_batball("The ball costs $0.05.") is True)
+check("eval: batball 0.05なし→NG", e.grade_batball("The bat costs $1.05.") is False)
+
+# ---------- second_opinion のバイアス対策（PROPOSERS から除外したケース） ----------
+_orig_proposers = f.PROPOSERS
+_orig_second_opinion_model = f.SECOND_OPINION_MODEL
+_orig_disabled_flag = f._SECOND_OPINION_DISABLED
+try:
+    f.PROPOSERS = ["qwen3:4b"]  # phi4-mini を除外
+    f.SECOND_OPINION_MODEL = "phi4-mini"
+    f._SECOND_OPINION_DISABLED = False
+    ok, issue = f.second_opinion("test", "test answer")
+    check("so: PROPOSERS外のモデルは ok=True で即返す", ok is True and issue == "")
+    check("so: 無効化フラグがセットされる", f._SECOND_OPINION_DISABLED is True)
+finally:
+    f.PROPOSERS = _orig_proposers
+    f.SECOND_OPINION_MODEL = _orig_second_opinion_model
+    f._SECOND_OPINION_DISABLED = _orig_disabled_flag
+
+print()
+if _FAILS:
+    print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
+    raise SystemExit(1)
+print("ALL PASSED")
