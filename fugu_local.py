@@ -1123,13 +1123,52 @@ def extract_json(text):
             return json.loads(m.group(1))
         except Exception:
             pass
-    # 3) 最初の { ... } を貪欲に
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
+    # 3) 最初のバランスの取れた { ... } を波括弧の深さで走査して探す
+    # 2026-07-22: 旧実装は re.search(r"\{.*\}", ..., re.DOTALL) という貪欲マッチで、
+    # 最初の '{' から最後の '}' までを一括で span にしていた。本文中に地の文の
+    # 集合記法 "{1,2,3}" や末尾の "{x}"、あるいは2つ目のJSONオブジェクトなど
+    # 「余分な波括弧」が存在すると、その span 全体は JSON として不正な形になり
+    # json.loads が例外を投げて None を返していた（本来 docstring が約束する
+    # 「最初の JSON オブジェクト」を回収可能なのに握りつぶす）。
+    # これは conduct() のルーティングプランと research_search() の
+    # RESEARCH_SCHEMA 充足判定の両方を壊し、None が来た側で default_plan() への
+    # 劣化や、リサーチの誤った早期終了を引き起こしていた。
+    # 修正: 文字列中の状態（ダブルクォート内かどうか・直前のバックスラッシュに
+    # よるエスケープ）を追跡しながら、'{' を見つけるたびに深さカウントで対応する
+    # '}' を探し、最初に json.loads が成功した部分文字列を返す。
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] == "{":
+            depth = 0
+            in_string = False
+            escape = False
+            j = i
+            while j < n:
+                ch = text[j]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif ch == "\\":
+                        escape = True
+                    elif ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                    elif ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            candidate = text[i:j + 1]
+                            try:
+                                return json.loads(candidate)
+                            except Exception:
+                                break  # この候補は失敗、次の '{' から再探索
+                j += 1
+            # depth が閉じ切らなかった（切り詰められた/不正）場合もここに来る
+        i += 1
     return None
 
 # ==================================================

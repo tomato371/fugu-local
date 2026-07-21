@@ -28,6 +28,17 @@ check("json: think混入", f.extract_json('<think>ignore {"b":9}</think>{"a": 1}
 check("json: 地の文に埋没", f.extract_json('The plan is {"a": 1} as follows') == {"a": 1})
 check("json: 抽出不能はNone", f.extract_json("no json here") is None)
 check("json: 空はNone", f.extract_json("") is None)
+# 2026-07-22: 貪欲re.searchの over-capture 回帰防止（先頭オブジェクト消失バグ）
+check("json: 末尾に余分な波括弧があっても先頭を抽出",
+      f.extract_json('Sure! {"mode":"single"} note {x}') == {"mode": "single"})
+check("json: 先行する集合記法{1,2,3}に惑わされない",
+      f.extract_json('The set {1,2,3} then {"a": 1}') == {"a": 1})
+check("json: 2つ目の有効オブジェクトがあっても最初を返す",
+      f.extract_json('{"a": 1} and also {"b": 2}') == {"a": 1})
+check("json: 文字列値中の}に惑わされない(深さカウントの文字列認識)",
+      f.extract_json('x {"s": "a}b", "n": 2} y') == {"s": "a}b", "n": 2})
+check("json: 閉じない{単体はクラッシュせずNone",
+      f.extract_json("prefix { unbalanced no closing brace") is None)
 
 # ---------- strip_think ----------
 check("strip: think除去", f.strip_think("<think>x</think>answer") == "answer")
