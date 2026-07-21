@@ -2254,11 +2254,27 @@ def extract_boxed(text):
     # 一方、iteration 11 で修正した「未確定の残骸を答えとして返さない」動作は
     # そのまま維持する: 見つかった \boxed{ が一つも閉じていない場合は、
     # 従来どおり None を返す（無投票の方が誤答票より安全）。
+    # 2026-07-22 (iteration 25, iteration 11/23 の続き): 閉じてはいるが中身が
+    # 空/空白のみの \boxed{}（\boxed{} や \boxed{ }）を「無投票」と同一視して
+    # 手前へ遡り続ける。以前は closed かどうかしか見ておらず、末尾の \boxed{}
+    # が空でも即座に return content.strip() or None で None を返していたため、
+    # その手前にあった \boxed{5} のような確定済みの正しい票まで一緒に捨てて
+    # いた。extract_final_answer の math 分岐はここで None を受け取ると
+    # 文中の数値を拾う最終フォールバックへ落ちるため、単なる無投票のはずが
+    # 誤投票（gotcha #7 の自己整合性投票で最も避けたいケース）に変わって
+    # しまう。空 \boxed{} は「無投票」として読み飛ばし、閉じていて中身が
+    # 空でない最初の（末尾に近い）候補が見つかった時点でそれを採用する
+    # last-wins 方式は維持する。iteration 11 の「一つも閉じていなければ
+    # None」という安全側の挙動、および num_ctx 打ち切り絡みの gotcha #2 の
+    # 前提もそのまま変えていない。
     for idx in reversed(positions):
         closed, content = _scan(idx)
-        if closed:
-            ans = content.strip()
-            return ans or None
+        if not closed:
+            continue
+        ans = content.strip()
+        if ans:
+            return ans
+        # 閉じているが空/空白のみ → 無投票として扱い、手前を探索し続ける。
     return None
 
 

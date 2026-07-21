@@ -200,6 +200,24 @@ check("sc: boxed 後続が未閉じでも手前の確定票を救出",
 check("sc: boxed 後続が入れ子ごと未閉じでも手前の確定票を救出",
       f.extract_boxed("\\boxed{7} ... \\boxed{\\frac{1}{2") == "7")
 
+# 2026-07-22 (iteration 25, iteration 11/23 の続き): 末尾の \boxed{} が閉じては
+# いるが中身が空/空白のみの場合は「無投票」として扱い、手前にある閉じた非空の
+# 票まで遡って救出する（gotcha #2, #7 参照。詳細は extract_boxed 本体のコメント）。
+# これをしないと extract_final_answer の math 分岐が None を受けて散文中の
+# 数値を拾うフォールバックへ落ち、無投票のはずが誤投票に変わってしまう。
+check("sc: boxed 末尾が空でも手前の確定票を救出",
+      f.extract_boxed("\\boxed{5} then \\boxed{}") == "5")
+check("sc: boxed 末尾が空白のみでも手前の確定票を救出",
+      f.extract_boxed("\\boxed{42} then \\boxed{ }") == "42")
+check("sc: boxed 単独の空は None（救出対象なし）",
+      f.extract_boxed("\\boxed{}") is None)
+check("sc: boxed 単独の空白のみも None（救出対象なし）",
+      f.extract_boxed("\\boxed{ }") is None)
+check("sc: boxed 末尾が空でも last-wins は非空同士で維持",
+      f.extract_boxed("\\boxed{1} then \\boxed{2}") == "2")
+check("sc: boxed 末尾空スキップ後もextract_final_answerが散文の数値を誤採用しない",
+      f.extract_final_answer("\\boxed{5} then the loop ran 10 times \\boxed{}", "math") == "5")
+
 check("sc: 正規化 全角→半角", f.normalize_answer("１２３") == "123")
 check("sc: 正規化 桁区切り除去", f.normalize_answer("12,345") == "12345")
 check("sc: 正規化 空白入り桁区切り", f.normalize_answer("11,\\! 111,\\! 111,\\! 100") == "11111111100")
