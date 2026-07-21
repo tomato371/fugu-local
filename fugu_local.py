@@ -2323,11 +2323,26 @@ def extract_final_answer(text, task_type="math"):
             m = re.match(r"\(?\s*([A-E])\b", normalize_answer(boxed).upper())
             if m:
                 return m.group(1)
-        for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])?\s*\(?([A-EＡ-Ｅ])\)?(?![A-Za-z])",
+        # 2026-07-22: 連結詞（is/：/は）を省略可にしていたせいで、「answer A」のような
+        # 単なる言及（例:「Note that answer A was a common distractor.」）まで宣言と
+        # 誤認していた。本物の宣言は「answer is B」「答え：B」のように連結詞を伴うのが
+        # 通例なので、下の math 宣言ブランチ（L2334 付近）と同じく連結詞を必須にする。
+        for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])\s*\(?([A-EＡ-Ｅ])\)?(?![A-Za-z])",
                     r"^\s*\(?([A-E])\)?\s*(?:が正解|です)?\s*$"):
             ms = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
             if ms:
-                return ms[-1].translate(_FW_TRANS).upper()
+                letters = {m.translate(_FW_TRANS).upper() for m in ms}
+                # 2026-07-22: 連結詞を必須にしても、「the answer is B; oh wait, the
+                # answer: A」のような言い直し・訂正では複数の宣言が異なる文字を指した
+                # まま両方マッチしうる。ここで機械的に ms[-1]（最後のマッチ）を採用すると、
+                # 訂正前/ディストラクタ側の文字を確信ありの1票として投票してしまい、
+                # 自己整合性投票（gotcha #7）を汚染する。「無投票 > 誤投票」の方針
+                # （精度優先・時間は気にしない）に従い、競合する文字が混在する場合は
+                # ここで確定させず None を返して棄権する。全て同一文字で一致する場合のみ
+                # その文字を返す。
+                if len(letters) > 1:
+                    return None
+                return letters.pop()
         return None
     if boxed:
         return normalize_answer(boxed) or None

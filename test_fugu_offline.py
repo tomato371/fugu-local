@@ -275,6 +275,16 @@ check("sc: mcq boxed 散文のみは誤答せず None",
 check("sc: mcq boxed 括弧付き先頭文字", f.extract_final_answer("\\boxed{(A)}", "mcq") == "A")
 check("sc: mcq boxed text外殻付き先頭文字", f.extract_final_answer("\\boxed{\\text{D}}", "mcq") == "D")
 check("sc: mcq boxed 選択肢+本文", f.extract_final_answer("\\boxed{A) 5}", "mcq") == "A")
+check("sc: mcq 宣言 ディストラクタ言及に釣られない",
+      f.extract_final_answer(
+          "The correct answer is B. Note that answer A was a common distractor.",
+          "mcq") == "B")
+check("sc: mcq 宣言 訂正で文字が競合したら棄権",
+      f.extract_final_answer(
+          "The answer is B; oh wait, the answer: A", "mcq") is None)
+check("sc: mcq 宣言 同一文字の繰り返しは誤棄権しない",
+      f.extract_final_answer(
+          "The answer is D. Restating: the answer is D.", "mcq") == "D")
 
 check("sc: 同値 完全一致", f.answers_equivalent("42", "42"))
 check("sc: 同値 分数=小数", f.answers_equivalent("1/2", "0.5"))
