@@ -2156,7 +2156,23 @@ SC_PROMPT_POT = (
     "Wrap it in a single ```python block. No input() calls."
 )
 
-_FW_TRANS = str.maketrans("０１２３４５６７８９ＡＢＣＤＥａｂｃｄｅ", "0123456789ABCDEabcde")
+# 2026-07-22: 全角数字/A-E に加えて、CJK 寄りのプロポーザ (qwen/gemma 系) が
+# しばしば出力する Unicode 記号の等価表記もここで正規化する:
+#   U+2212 (MINUS SIGN) / U+FF0D (fullwidth hyphen-minus) -> '-'
+#   U+FF0E (fullwidth full stop)                          -> '.'
+#   U+FF0F (fullwidth solidus)                            -> '/'
+#   U+FF0C (fullwidth comma)                               -> ','
+# これらを潰さないと "−5"(U+2212) と "-5" は na.lower()==nb.lower() でも
+# Fraction() でも一致せず（Fraction は U+2212 を拒否する）、answers_equivalent
+# は math_verify 頼みになる。math_verify が失敗すると本来同じ答えが
+# vote_answers で票が2系統に割れ、誤答がプルラリティを取ったり無駄なサンプル
+# 消費・仲裁が発生する（精度優先の自己整合性投票が崩れる）。曖昧な en-dash
+# (U+2013) / em-dash (U+2014) は区間表記等と衝突しうるため、意図的にここでは
+# マッピングしない。
+_FW_TRANS = str.maketrans(
+    "０１２３４５６７８９ＡＢＣＤＥａｂｃｄｅ−－．／，",
+    "0123456789ABCDEabcde--./,",
+)
 
 
 def extract_boxed(text):
