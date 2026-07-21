@@ -901,6 +901,28 @@ check("cfg: 既知モデルの num_ctx", f.model_cfg("gpt-oss:20b", "num_ctx") =
 check("cfg: 未知モデルは default", f.model_cfg("nonexistent", "num_ctx", 8192) == 8192)
 check("cfg: think 段階指定", f.model_cfg("gpt-oss:20b", "think") == "high")
 
+# ---------- is_installed（インストール済み判定：厳密タグ一致） ----------
+# resolve_models() が DESIRED_PROPOSERS を採否判定し、_arbitrate() が ARBITER_MODEL の
+# 起用可否を判定する土台。docstring の通り、旧 startswith 実装は 'qwen3:4b' が
+# 'qwen3:4b-instruct' に誤ヒットするバグを持っていたため厳密一致へ変更され、
+# タグ無し指定のときだけ ':latest' を許容する例外が残された。この判定を誤ると
+# 未導入モデルを誤って起用/裁定役に据えたり、導入済みの正規プロポーザーを
+# 黙って除外したりして、精度優先のアンサンブル構成が静かに壊れる。
+check("inst: 厳密タグ一致で導入判定", f.is_installed("qwen3:4b", ["qwen3:4b"]) is True)
+check("inst: 旧startswithの誤検知(タグ違い)は拒否",
+      f.is_installed("qwen3:4b", ["qwen3:4b-instruct"]) is False)
+check("inst: タグ無し指定は :latest 導入を許容",
+      f.is_installed("qwen3", ["qwen3:latest"]) is True)
+check("inst: タグ無し指定はタグ無し導入も許容",
+      f.is_installed("qwen3", ["qwen3"]) is True)
+check("inst: タグ無し指定は任意のタグ付き導入には一致しない",
+      f.is_installed("qwen3", ["qwen3:4b"]) is False)
+check("inst: タグ付き指定はタグ無し導入では満たされない(非対称)",
+      f.is_installed("qwen3:latest", ["qwen3"]) is False)
+check("inst: 空リストは未導入", f.is_installed("gpt-oss:20b", []) is False)
+check("inst: 無関係な導入リストのみでは未導入",
+      f.is_installed("gpt-oss:20b", ["phi4", "gemma4:26b"]) is False)
+
 # ---------- 大VRAMプロファイル ----------
 _hv_saved = (dict(f.MODEL_CONFIG), f.PARALLEL_PROPOSERS, f.SC_INITIAL, f.SC_MAX,
              f.SC_CHEAP_VOTES, f.MODEL_NUM_CTX)
