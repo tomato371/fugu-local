@@ -1882,6 +1882,15 @@ def _critic_judge(question, answer, think):
         num_predict=(NUM_PREDICT_JUDGE_THINK if think else NUM_PREDICT_JUDGE),
         label="critic",
     )
+    # 2026-07-22: __ERROR__ センチネル（ask() の通信/モデル失敗）と、空文字や
+    # パース不能だが正常な出力とを区別する。後者は gpt-oss:20b の思考予算切れで
+    # 本文が空になる既知ケースのため ok=True 既定を維持するが、前者は critic 呼び出し
+    # そのものが失敗しているだけで「回答に問題なし」を意味しない。ここで黙って
+    # ok=True にすると verify_single() の最終審判（think=True critic）が事実上
+    # 無審査で通ってしまい、精度優先の方針に反するため ok=False にしてエスカレーション
+    # させる（呼び出し元は MoA パネルへフォールバックできる）。
+    if strip_think(raw).startswith("__ERROR__"):
+        return False, f"critic call failed: {strip_think(raw)}"[:200]
     p = extract_json(raw) or {}
     return bool(p.get("ok", True)), str(p.get("issue", ""))[:200]
 
@@ -1923,6 +1932,13 @@ def second_opinion(question, answer):
         num_predict=NUM_PREDICT_JUDGE_THINK,
         label="critic2",
     )
+    # 2026-07-22: _critic_judge と同様、__ERROR__ センチネル（second opinion モデルの
+    # 通信/モデル失敗）は「空文字/非JSONだが正常出力」（gpt-oss:20b の思考予算切れ既定）
+    # とは別物として扱う。second_opinion は自己評価バイアス対策の独立チェックであり、
+    # ここが黙って ok=True になると verify_single() でバイアス対策が機能しないまま
+    # 高速パスが通ってしまう。エラー時は ok=False にして think=True 再検算に回す。
+    if strip_think(raw).startswith("__ERROR__"):
+        return False, f"critic call failed: {strip_think(raw)}"[:200]
     p = extract_json(raw) or {}
     return bool(p.get("ok", True)), str(p.get("issue", ""))[:200]
 

@@ -887,6 +887,105 @@ finally:
     f.SECOND_OPINION_MODEL = _orig_second_opinion_model
     f._SECOND_OPINION_DISABLED = _orig_disabled_flag
 
+# ---------- _critic_judge / second_opinion: __ERROR__ センチネルは ok=False (2026-07-22) ----------
+# ask() が通信/モデル失敗で '__ERROR__:...' を返したとき、extract_json は None になり
+# 旧実装は p.get("ok", True) で黙って ok=True（審査合格）にしてしまっていた。
+# critic 呼び出し自体が失敗しているだけなのに「回答は問題なし」と誤判定するのは
+# 精度優先の方針に反するため、__ERROR__ センチネルだけを ok=False に反転させる。
+# 一方、空文字や非JSONの地の文（gpt-oss:20b の think 予算切れ等）は既存どおり
+# ok=True 既定を維持する必要があり、それも合わせて回帰確認する。
+_orig_ask = f.ask
+try:
+    f.ask = lambda *a, **k: "__ERROR__: simulated transport failure"
+    ok, issue = f._critic_judge("q", "a", think=False)
+    check("critic: __ERROR__センチネル(think=False)はok=False", ok is False and bool(issue))
+    ok, issue = f._critic_judge("q", "a", think=True)
+    check("critic: __ERROR__センチネル(think=True)もok=False", ok is False and bool(issue))
+
+    f.ask = lambda *a, **k: ""
+    ok, issue = f._critic_judge("q", "a", think=False)
+    check("critic: 空文字は既定どおりok=True(gpt-oss think予算切れ対策を維持)", ok is True)
+
+    f.ask = lambda *a, **k: "Looks fine to me, no issues here."
+    ok, issue = f._critic_judge("q", "a", think=False)
+    check("critic: 非JSONの地の文も既定どおりok=True", ok is True)
+finally:
+    f.ask = _orig_ask
+
+_orig_proposers = f.PROPOSERS
+_orig_second_opinion_model = f.SECOND_OPINION_MODEL
+_orig_disabled_flag = f._SECOND_OPINION_DISABLED
+_orig_ask = f.ask
+try:
+    # SECOND_OPINION_MODEL を PROPOSERS に含めて「有効」経路を通す。
+    f.SECOND_OPINION_MODEL = "phi4-mini"
+    f.PROPOSERS = ["phi4-mini", "qwen3:4b"]
+    f._SECOND_OPINION_DISABLED = False
+
+    f.ask = lambda *a, **k: "__ERROR__: simulated transport failure"
+    ok, issue = f.second_opinion("q", "a")
+    check("so: __ERROR__センチネルはok=False", ok is False and bool(issue))
+
+    f.ask = lambda *a, **k: ""
+    ok, issue = f.second_opinion("q", "a")
+    check("so: 空文字は既定どおりok=True", ok is True)
+
+    f.ask = lambda *a, **k: "Looks fine to me, no issues here."
+    ok, issue = f.second_opinion("q", "a")
+    check("so: 非JSONの地の文も既定どおりok=True", ok is True)
+
+    # 無効化パス(SECOND_OPINION_MODEL not in PROPOSERS)は ask を一切呼ばずに (True, "") を返す。
+    _calls = []
+    f.PROPOSERS = ["qwen3:4b"]  # phi4-mini を除外
+    f.ask = lambda *a, **k: _calls.append(1) or "__ERROR__: should not be reached"
+    ok, issue = f.second_opinion("q", "a")
+    check("so: 無効化パスはaskを呼ばずok=True", ok is True and issue == "" and not _calls)
+finally:
+    f.PROPOSERS = _orig_proposers
+    f.SECOND_OPINION_MODEL = _orig_second_opinion_model
+    f._SECOND_OPINION_DISABLED = _orig_disabled_flag
+    f.ask = _orig_ask
+
+# ---------- verify_single: think=True 最終審判の __ERROR__ は MoA へエスカレーション (2026-07-22) ----------
+# verify_single は高速チェックのどちらかが疑義を出したときだけ think=True 再検算を
+# 最終審判にする。その think=True 呼び出し自体が __ERROR__ で失敗した場合、_critic_judge の
+# 修正により ok=False になるはずで、verify_single はそれを受けて False を返し MoA パネルへの
+# 格上げを引き起こす（黙って True を返して壊れた回答を採用しない）ことを確認する。
+_orig_proposers = f.PROPOSERS
+_orig_second_opinion_model = f.SECOND_OPINION_MODEL
+_orig_disabled_flag = f._SECOND_OPINION_DISABLED
+_orig_ask = f.ask
+try:
+    # second_opinion を無効化パスに固定し、think=True 最終審判の挙動だけを見る。
+    f.PROPOSERS = ["qwen3:4b"]
+    f.SECOND_OPINION_MODEL = "phi4-mini"
+    f._SECOND_OPINION_DISABLED = False
+
+    def _fake_ask_escalate(model, messages, temperature, think=None, fmt=None,
+                            label=None, num_predict=None, num_ctx=None):
+        if think:
+            return "__ERROR__: simulated transport failure"
+        return json.dumps({"ok": False, "issue": "fast check flagged"})
+    f.ask = _fake_ask_escalate
+    ok, issue = f.verify_single("2+2?", "4")
+    check("verify_single: think=True最終審判の__ERROR__はMoAへ格上げ(ok=False)",
+          ok is False and bool(issue))
+
+    def _fake_ask_control(model, messages, temperature, think=None, fmt=None,
+                           label=None, num_predict=None, num_ctx=None):
+        if think:
+            return json.dumps({"ok": True, "issue": ""})
+        return json.dumps({"ok": False, "issue": "fast check flagged"})
+    f.ask = _fake_ask_control
+    ok, issue = f.verify_single("2+2?", "4")
+    check("verify_single: think=True最終審判が正常なJSONなら採用(control)",
+          ok is True and issue == "")
+finally:
+    f.PROPOSERS = _orig_proposers
+    f.SECOND_OPINION_MODEL = _orig_second_opinion_model
+    f._SECOND_OPINION_DISABLED = _orig_disabled_flag
+    f.ask = _orig_ask
+
 # ---------- bench_queue: 異常終了コード分類（gotcha 8 再発防止, 2026-07-21）----------
 # job 4 (math500/sc+pot) が rc=1073807364 で落ちた際、旧実装は成功/失敗/クラッシュを
 # 区別せず、以降のジョブが rc=3221226091 で連鎖即死してもキューは気づかず
