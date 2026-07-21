@@ -300,6 +300,101 @@ finally:
 check("sc: 抽出0票が続いてもハングせず終了", len(_sc_calls) > 0)
 check("sc: 抽出0票なら None を返す(MoAへフォールバック)", _res4 is None)
 
+check("sc: 拮抗なし時は _arbitrate 未使用・勝者サンプルの本文を採用(従来通り)",
+      _res is not None and _res["text"].startswith("reasoning..."))
+
+# ---------- 拮抗時の裁定（_arbitrate）----------
+# 上位2クラスが同数で並ぶと _arbitrate が呼ばれる。かつては裁定役の答えだけを採用し、
+# 本文(res['text'])は SAMPLE プールから _representative_text で再選出していたため、
+# 裁定で数値が変わったり第三の答えに覆ったりすると、本文が敗者側候補の主張のまま
+# 残る内部矛盾があった（2026-07-21 発見・修正）。ここでは _arbitrate 自身の解答
+# テキストが res['text'] として使われることを検証する。
+_orig_installed = f.installed_models
+_orig_arbiter_model = f.ARBITER_MODEL
+
+
+def _fake_installed_m1m2():
+    return ["m1", "m2"]
+
+
+# ケース1: 拮抗 → 裁定役が既存候補の一方(1)を支持。本文は裁定役自身の推論であること
+# （敗者候補(2)の本文であってはならない）。
+_arb_calls = []
+
+
+def _fake_ask_arb_pick_existing(model, messages, temperature, think=None, fmt=None,
+                                label=None, num_predict=None, num_ctx=None):
+    _arb_calls.append((label, model))
+    if label == "arbiter":
+        return ("ARBITER_REASONING: candidate B miscalculates in step 2; "
+                 "re-solving from scratch gives \\boxed{1}")
+    idx = len(_arb_calls) - 1
+    ans = "1" if idx % 2 == 0 else "2"
+    return f"sc reasoning candidate {ans}\n\\boxed{{{ans}}}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_m1m2
+    f.ask = _fake_ask_arb_pick_existing
+    _res_arb1 = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+    f.ARBITER_MODEL = _orig_arbiter_model
+    f.installed_models = _orig_installed
+check("arb: 票が同数で拮抗 → 裁定役が呼ばれる", any(lab == "arbiter" for lab, _m in _arb_calls))
+check("arb: 裁定役の答えを採用", _res_arb1 is not None and _res_arb1["answer"] == "1")
+check("arb: 本文は裁定役自身の推論(敗者候補の本文ではない)",
+      _res_arb1 is not None and "ARBITER_REASONING" in _res_arb1["text"]
+      and "sc reasoning candidate" not in _res_arb1["text"])
+
+# ケース2: 裁定役が両候補と異なる第三の答えを提示 → 本文が敗者側候補の主張になって
+# はいけない（旧ロジックのバグ: _representative_text が第三の答えと同値のサンプルを
+# 見つけられず「最長サンプル」＝どちらかの敗者の本文にフォールバックしていた）。
+_arb_calls2 = []
+
+
+def _fake_ask_arb_new_answer(model, messages, temperature, think=None, fmt=None,
+                             label=None, num_predict=None, num_ctx=None):
+    _arb_calls2.append((label, model))
+    if label == "arbiter":
+        return ("ARBITER_REASONING_NEW: both candidates share the same wrong "
+                 "assumption; the correct value is \\boxed{3}")
+    idx = len(_arb_calls2) - 1
+    ans = "1" if idx % 2 == 0 else "2"
+    return f"sc reasoning candidate {ans}\n\\boxed{{{ans}}}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_m1m2
+    f.ask = _fake_ask_arb_new_answer
+    _res_arb2 = f.solve_verifiable("test question", "math")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props2
+    f.REASONING_MODELS = _orig_reasoning
+    f.SC_CHEAP_VOTES = _orig_cheap
+    f.SC_POT = _orig_pot
+    f.ARBITER_MODEL = _orig_arbiter_model
+    f.installed_models = _orig_installed
+check("arb: 裁定役が出した第三の答えを採用", _res_arb2 is not None and _res_arb2["answer"] == "3")
+check("arb: 本文は裁定役の推論(第三の答え。敗者候補の主張ではない)",
+      _res_arb2 is not None and "ARBITER_REASONING_NEW" in _res_arb2["text"]
+      and "sc reasoning candidate" not in _res_arb2["text"])
+
 # ---------- task_type ガードレール ----------
 def _tt(q, declared=""):
     return f._apply_tasktype_guardrails(q, {"task_type": declared})["task_type"]

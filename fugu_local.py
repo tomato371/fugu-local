@@ -2238,7 +2238,8 @@ def _representative_text(samples, answer):
 
 
 def _arbitrate(question, task_type, samples, classes):
-    """票が拮抗した上位 2 クラスの代表解答を突き合わせて裁定する。裁定答（失敗は None）。
+    """票が拮抗した上位 2 クラスの代表解答を突き合わせて裁定する。
+    戻り値: (裁定answer, 裁定役自身の解答テキスト) のタプル。全裁定役が失敗/空なら None。
     裁定役の優先順: ARBITER_MODEL（導入済みなら。既定 gpt-oss:120b の最上位知能）→
     それが失敗/空/未導入なら REASONING_MODELS の先頭へ堅牢にフォールバック。
     120b は 65GB で RAM(48GB)+VRAM(8GB) を超え NVMe ページングで非常に遅い可能性があるが、
@@ -2269,9 +2270,10 @@ def _arbitrate(question, task_type, samples, classes):
         print(f"   [SC] 票が拮抗 → {arb} が裁定します")
         raw = ask(arb, [{"role": "user", "content": prompt}], 0.1,
                   num_predict=model_cfg(arb, "num_predict", 8192), label="arbiter")
-        ans = extract_final_answer(strip_think(raw), task_type)
+        text = strip_think(raw)
+        ans = extract_final_answer(text, task_type)
         if ans:
-            return ans
+            return ans, text
         print(f"   [SC] {arb} の裁定が空/抽出不能 → 次の裁定役へ")
     return None
 
@@ -2335,11 +2337,13 @@ def solve_verifiable(question, task_type="math", history=None):
     top, cnt, classes = vote_answers(answers)
     if top is None:
         return None
+    rep = None
     if len(classes) >= 2 and classes[0][1] == classes[1][1]:
-        arb_ans = _arbitrate(question, task_type, samples, classes)
-        if arb_ans:
-            top = arb_ans
-    rep = _representative_text(samples, top)
+        arb_result = _arbitrate(question, task_type, samples, classes)
+        if arb_result:
+            top, rep = arb_result
+    if rep is None:
+        rep = _representative_text(samples, top)
     print(f"   [SC] 確定: {top}  (票 {cnt}/{len(answers)}, サンプル計 {len(samples)})")
     return {"answer": top, "text": rep,
             "votes": {c[0]: c[1] for c in classes}, "n_samples": len(samples)}
