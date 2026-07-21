@@ -209,11 +209,22 @@ check("sc: 正規化 全角カンマ 桁区切り", f.normalize_answer("1，234"
 check("sc: 正規化 ASCII -5 不変", f.normalize_answer("-5") == "-5")
 check("sc: 正規化 ASCII 1/2 不変", f.normalize_answer("1/2") == "1/2")
 check("sc: 正規化 ASCII 1,234 不変", f.normalize_answer("1,234") == "1234")
+# 2026-07-22: 末尾カンマ除去（extract_final_answer の数値抽出正規表現 [\d,]* が
+# 桁区切りでない末尾カンマまで貪欲に飲み込む問題への対処、normalize_answer 側のコメント参照）
+check("sc: 正規化 末尾カンマ除去", f.normalize_answer("42,") == "42")
+check("sc: 正規化 桁区切り+末尾カンマ除去", f.normalize_answer("1234,") == "1234")
 
 check("sc: 抽出 boxed優先", f.extract_final_answer("答えは 5 です。\\boxed{7}") == "7")
 check("sc: 抽出 答え宣言", f.extract_final_answer("計算すると、答えは 700 円です") == "700")
 check("sc: 抽出 最後の数値", f.extract_final_answer("17 * 23 = 391") == "391")
 check("sc: 抽出 無しは None", f.extract_final_answer("わかりません") is None)
+# 2026-07-22: 末尾カンマを伴う抽出（宣言分岐・最後の数値フォールバックの両方）
+check("sc: 抽出 最後の数値 末尾カンマ",
+      f.extract_final_answer("so in total we get 42,", "math") == "42")
+check("sc: 抽出 答え宣言 桁区切り+末尾カンマ",
+      f.extract_final_answer("the final answer is 1,234,", "math") == "1234")
+check("sc: 抽出 最後の数値(boxedなし) 末尾カンマ",
+      f.extract_final_answer("17 * 23 = 391,", "math") == "391")
 check("sc: mcq boxed", f.extract_final_answer("\\boxed{B}", "mcq") == "B")
 check("sc: mcq 宣言", f.extract_final_answer("正解は (C) です", "mcq") == "C")
 check("sc: mcq 無しは None", f.extract_final_answer("どれも違う", "mcq") is None)
