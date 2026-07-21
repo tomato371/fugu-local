@@ -1026,19 +1026,24 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
     )
     t0 = time.time()
     out = "__ERROR__: unreachable"
+
+    def _do_call(request):
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as r:
+            body = json.loads(r.read().decode("utf-8"))
+        msg = body.get("message") or {}
+        # think 分離型モデルは thinking が別フィールドに来る場合があるので content のみ採用。
+        result = (msg.get("content") or "").strip()
+        # 思考が num_predict を食い尽くして本文ゼロで打ち切られた場合(実測: 空返答の
+        # 根本原因)は、沈黙の空文字ではなく明示的なエラーにして上位のフォールバックを
+        # 確実に発動させる。本文が一部でも出ていればそのまま使う。
+        if not result and body.get("done_reason") == "length":
+            result = ("__ERROR__: truncated by num_predict during thinking "
+                      "(no content was generated)")
+        return result
+
     for attempt in (1, 2):
         try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
-                body = json.loads(r.read().decode("utf-8"))
-            msg = body.get("message") or {}
-            # think 分離型モデルは thinking が別フィールドに来る場合があるので content のみ採用。
-            out = (msg.get("content") or "").strip()
-            # 思考が num_predict を食い尽くして本文ゼロで打ち切られた場合(実測: 空返答の
-            # 根本原因)は、沈黙の空文字ではなく明示的なエラーにして上位のフォールバックを
-            # 確実に発動させる。本文が一部でも出ていればそのまま使う。
-            if not out and body.get("done_reason") == "length":
-                out = ("__ERROR__: truncated by num_predict during thinking "
-                       "(no content was generated)")
+            out = _do_call(req)
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
@@ -1052,8 +1057,25 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                out = f"__ERROR__: think_stripped_retry"
-                continue  # すぐリトライ（sleep 不要）
+                # 重要(バグ修正): このブランチはかつて continue で外側の for に戻り、
+                # 「次のイテレーション」が実際に送信されることに依存していた。しかし
+                # attempt==1 が一過性の 500（ロード直後）で、attempt==2 で初めて
+                # 「thinking非対応」400 が出た場合、continue しても for (1, 2) は
+                # 既に尽きており、組み直したリクエストは一度も送信されずに
+                # ループを抜けて __ERROR__: think_stripped_retry がそのまま最終値に
+                # なってしまっていた（SC投票/提案が黙って1票失われる）。
+                # 修正: think を pop 済みなのでこの分岐は高々1回しか到達し得ない
+                # （無限ループの可能性なし）。よってここでその場で確定的に1回だけ
+                # 追加送信し、一過性リトライの残り予算（sleep(2)して attempt を
+                # 消費する経路）は一切消費しない。
+                try:
+                    out = _do_call(req)
+                except urllib.error.HTTPError as e2:
+                    err_body2 = e2.read().decode("utf-8", errors="replace")
+                    out = f"__ERROR__: {e2} {err_body2}"
+                except Exception as e2:
+                    out = f"__ERROR__: {e2}"
+                break  # think は pop済みでこの分岐は再発し得ないため、ここで確定終了
             out = f"__ERROR__: {e} {err_body}"
             if attempt == 1:
                 time.sleep(2)
