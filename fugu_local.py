@@ -2140,6 +2140,16 @@ def extract_boxed(text):
                 break
         out.append(c)
         i += 1
+    # 2026-07-22: while ループが depth>0 のまま text 末尾に達した場合、
+    # \boxed{ が閉じられていない（thinking モデルの num_predict 打ち切り等で
+    # 出力が途中で切れた場合の既知の失敗モード。gotcha #2 参照）。
+    # このとき out には「答え」ではなく切れた出力の残骸が入っているだけなので、
+    # それを answer として返すと solve_verifiable の多数決 (cnt*2 > n) で
+    # 分母 n を水増しし、誤答が票として数えられてしまう。
+    # 「無投票」の方が「誤った票」より安全という方針（精度優先）に従い、
+    # 閉じ括弧に到達できなかった場合は None を返す。
+    if depth > 0:
+        return None
     ans = "".join(out).strip()
     return ans or None
 

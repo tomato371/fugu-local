@@ -152,6 +152,15 @@ check("sc: boxed 抽出", f.extract_boxed("thus \\boxed{42}") == "42")
 check("sc: boxed 入れ子", f.extract_boxed("\\boxed{\\frac{1}{2}}") == "\\frac{1}{2}")
 check("sc: boxed 最後を採用", f.extract_boxed("\\boxed{1} then \\boxed{2}") == "2")
 check("sc: boxed 無しは None", f.extract_boxed("no box") is None)
+# 2026-07-22: \boxed{ が閉じられないまま出力が打ち切られた場合（thinking モデルの
+# num_predict 打ち切り等、gotcha #2 の既知の失敗モード）は、切れた残骸を答えとして
+# 返さず None（無投票）を返すことを検証する。
+check("sc: boxed 未閉じは None（打ち切り）",
+      f.extract_boxed("thus \\boxed{42 and then the response was cut off") is None)
+check("sc: boxed 未閉じ・入れ子未対応も None",
+      f.extract_boxed("\\boxed{\\frac{1}{2") is None)
+check("sc: boxed 閉じ括弧後に散文があっても正しく抽出",
+      f.extract_boxed("\\boxed{7} because it is prime") == "7")
 
 check("sc: 正規化 全角→半角", f.normalize_answer("１２３") == "123")
 check("sc: 正規化 桁区切り除去", f.normalize_answer("12,345") == "12345")
