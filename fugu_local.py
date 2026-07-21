@@ -2349,11 +2349,28 @@ def extract_final_answer(text, task_type="math"):
     ms = re.findall(r"(?:final answer|answer|答え|正解)\s*(?:is|[:：は])\s*([^\n]{1,60})",
                     text, re.IGNORECASE)
     if ms:
-        cand = normalize_answer(ms[-1])
-        if cand:
+        # 2026-07-22: iteration 26 で MCQ 宣言ブランチ（上の L2326-2345 付近）に適用した
+        # 「複数宣言が競合する場合は無投票（None）とする」修正の math 版（gotcha #7）。
+        # 以前はここで ms[-1] だけを見ていたため、「答えは24 …実は答えは12」のような
+        # 言い直し・訂正や、ディストラクタに触れる文でも最後の宣言だけを機械的に採用し、
+        # 訂正前/誤った値を確信ありの1票として self-consistency 投票（solve_verifiable）に
+        # 混入させていた。ここでは各宣言から数値部を抽出して候補リストを作り
+        # （空/抽出不能な宣言は候補に数えず単にスキップする）、answers_equivalent で
+        # 最後の候補と相互比較する。全候補が同値（例: 1/2 と 0.5、1,000 と 1000）なら
+        # 単一の票として確定させ、一つでも非同値な候補が混在すれば None を返して棄権する
+        # （無投票 > 誤投票、精度優先・時間は気にしない）。
+        cands = []
+        for raw in ms:
+            cand = normalize_answer(raw)
+            if not cand:
+                continue
             # 「700 円です」のような後置き単位・助詞を落とす: 数値で始まるなら数値部のみ
             m = re.match(r"-?\d[\d,]*(?:\.\d+)?(?:\s*/\s*\d+)?", cand)
-            return m.group(0).replace(" ", "") if m else cand
+            cands.append(m.group(0).replace(" ", "") if m else cand)
+        if cands:
+            if any(not answers_equivalent(c, cands[-1]) for c in cands[:-1]):
+                return None
+            return cands[-1]
     # 2026-07-22: 最後の数値フォールバックは RAW text に対して ASCII の "-?" だけを符号として
     # 拾っていたため、直前の符号が Unicode マイナス U+2212（−）や全角ハイフンマイナス U+FF0D
     # （－）だと拾えず、負の答えが正の値として投票されてしまう（例:「結果は −5。」→ "5"）。

@@ -286,6 +286,26 @@ check("sc: mcq 宣言 同一文字の繰り返しは誤棄権しない",
       f.extract_final_answer(
           "The answer is D. Restating: the answer is D.", "mcq") == "D")
 
+# 2026-07-22: iteration 28 — math 宣言ブランチにも iteration 26 の MCQ 修正
+# （複数宣言が競合したら無投票=None）を対称に適用した回帰確認。
+# 注: 宣言抽出の捕獲グループ ([^\n]{1,60}) は改行を跨がず貪欲マッチするため、同一行に
+# 複数の「answer is」があると最初のマッチが行末まで飲み込み2件目の宣言が独立して
+# 検出されない。複数宣言を意図的に分離検出させるため、ここでは改行で区切って書く
+# （実際の LLM 出力でも言い直し・訂正は改行/文区切りを伴うことが多い）。
+check("sc: 抽出 答え宣言 訂正で数値が競合したら棄権",
+      f.extract_final_answer(
+          "The answer is 5.\nOn second thought, the answer is 7.", "math") is None)
+_eq_restate = f.extract_final_answer(
+    "The answer is 1/2.\nEquivalently, the answer is 0.5.", "math")
+check("sc: 抽出 答え宣言 同値な言い直しは棄権しない",
+      _eq_restate is not None and f.answers_equivalent(_eq_restate, "0.5"))
+check("sc: 抽出 答え宣言 同一値の繰り返しは誤棄権しない",
+      f.extract_final_answer(
+          "The answer is 42.\nRestating: the answer is 42.", "math") == "42")
+check("sc: 抽出 答え宣言 空の宣言候補は競合と数えない",
+      f.extract_final_answer(
+          "The answer is .\nThe answer is 9.", "math") == "9")
+
 check("sc: 同値 完全一致", f.answers_equivalent("42", "42"))
 check("sc: 同値 分数=小数", f.answers_equivalent("1/2", "0.5"))
 check("sc: 同値 桁区切り", f.answers_equivalent("12,345", "12345"))
