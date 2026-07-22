@@ -3239,15 +3239,35 @@ def _save_as_docx(out: Path, question: str, answer: str, elapsed: float):
     """Word (.docx) 形式で保存。python-docx が必要。未インストール時は .md にフォールバック。"""
     try:
         import docx as _docx
+    except ImportError:
+        md_path = out.with_suffix(".md")
+        _save_as_markdown(md_path, question, answer, elapsed, "")
+        print(f"   [DOCX保存には python-docx が必要 (pip install python-docx)。代わりに保存: {md_path}]")
+        return md_path
+
+    # 2026-07-22: LLM の回答（および question）には稀にフォームフィード(\x0c)、
+    # ANSIエスケープ(\x1b)、NUL 等の制御文字が混入する。これらは XML 1.0
+    # 仕様上不正な文字であり、python-docx (lxml) の add_paragraph/add_heading
+    # に渡すと ValueError が送出される。従来は except ImportError だけを
+    # 捕捉していたため例外がそのまま伝播し、_save_answer_to_file 全体が
+    # 異常終了して回答保存に失敗していた（iteration 41 の _save_as_excel の
+    # IllegalCharacterError 修正と同じバグクラス）。python-docx に渡す前に
+    # 各文字列から XML 不正制御文字 (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F) だけを
+    # 除去することで実データ（本文）は保ったまま正常な .docx を書き出す。
+    # 万一それでも保存に失敗した場合は、既存の .md フォールバックへ安全に
+    # 降格させ、決してここで異常終了させない。
+    try:
+        _illegal_xml_re = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
         from datetime import datetime
         doc = _docx.Document()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         doc.add_heading(f"Q ({ts})", level=1)
-        doc.add_paragraph(question)
+        doc.add_paragraph(_illegal_xml_re.sub("", question))
         doc.add_heading("A", level=1)
         in_code = False
         code_lines = []
         for line in answer.splitlines():
+            line = _illegal_xml_re.sub("", line)
             if line.startswith("```"):
                 if in_code:
                     doc.add_paragraph("\n".join(code_lines), style="No Spacing")
@@ -3262,12 +3282,11 @@ def _save_as_docx(out: Path, question: str, answer: str, elapsed: float):
         doc.add_paragraph(f"所要: {elapsed}s")
         doc.save(str(out))
         return
-    except ImportError:
-        pass
-    md_path = out.with_suffix(".md")
-    _save_as_markdown(md_path, question, answer, elapsed, "")
-    print(f"   [DOCX保存には python-docx が必要 (pip install python-docx)。代わりに保存: {md_path}]")
-    return md_path
+    except Exception as e:
+        md_path = out.with_suffix(".md")
+        _save_as_markdown(md_path, question, answer, elapsed, "")
+        print(f"   [DOCX保存に失敗しました ({e!r})。代わりに保存: {md_path}]")
+        return md_path
 
 
 def _save_as_excel(out: Path, answer: str):

@@ -2801,6 +2801,134 @@ with _tempfile.TemporaryDirectory() as _xlsx_dir:
         check("_save_as_excel: フォールバック時の.csvファイルが実際に書かれる",
               _result_missing is not None and _result_missing.exists())
 
+# ---------- _save_as_docx: XML不正制御文字によるValueError耐性 (2026-07-22) ----------
+# python-docx (lxml) の add_paragraph/add_heading は XML 1.0 で禁止された制御文字
+# (0x00-0x08/0x0B/0x0C/0x0E-0x1F) を含む文字列を渡されると ValueError を送出する。
+# 従来コードは except ImportError しか捕捉しておらず、question をそのまま
+# add_paragraph に渡していた事もあり、LLM回答/questionに混入したANSIエスケープ
+# (\x1b)やNUL(\x00)等が原因で _save_answer_to_file 全体が異常終了していた
+# （iteration 41 の _save_as_excel の IllegalCharacterError 修正と同じバグクラス）。
+# ここでは python-docx の有無を検出し、サニタイズして.docx生成できること・
+# 未インストール時は既存通り.mdへフォールバックすること・ビルド/保存失敗時も
+# .mdへ安全に降格することを検証する。本物のOllama/ネットワーク呼び出しは一切行わない。
+import pathlib as _pathlib_docx
+
+try:
+    import docx as _docx_probe
+    _HAS_DOCX = True
+except ImportError:
+    _HAS_DOCX = False
+
+with _tempfile.TemporaryDirectory() as _docx_dir:
+    _docx_root = _pathlib_docx.Path(_docx_dir)
+
+    if _HAS_DOCX:
+        # 制御文字はわざと単語の間の空白の位置に置く。除去後も単語同士がくっつかず
+        # 実データ(本文)が読み取れることを確認する。
+        _illegal_question = "Hello \x1bWorld \x00Test?"
+        _illegal_answer = "Answer \x1bline one.\n\n```python\nprint(\x001)\n```\n\nFinal \x00line."
+        _out_illegal_docx = _docx_root / "illegal.docx"
+        _exc_docx = None
+        try:
+            _ret_illegal = f._save_as_docx(_out_illegal_docx, _illegal_question, _illegal_answer, 0.42)
+        except Exception as _e:
+            _exc_docx = _e
+            _ret_illegal = None
+        check("_save_as_docx: XML不正制御文字混入でも例外を送出しない(ValueError回帰)",
+              _exc_docx is None)
+        check("_save_as_docx: 制御文字混入時も.docxファイルが生成される", _out_illegal_docx.exists())
+        check("_save_as_docx: 制御文字混入でも成功時は.docxパス(None)を返す(戻り値契約維持)",
+              _ret_illegal is None)
+
+        if _exc_docx is None and _out_illegal_docx.exists():
+            _doc_illegal = _docx_probe.Document(str(_out_illegal_docx))
+            _texts_illegal = [p.text for p in _doc_illegal.paragraphs]
+            _all_text_illegal = "\n".join(_texts_illegal)
+            check("_save_as_docx: 制御文字(ESC/NUL)は本文から除去される",
+                  "\x1b" not in _all_text_illegal and "\x00" not in _all_text_illegal)
+            check("_save_as_docx: 制御文字除去後もquestion本文の単語は保持される",
+                  "Hello World Test?" in _texts_illegal)
+            check("_save_as_docx: 制御文字除去後もanswer本文の単語は保持される",
+                  "Answer line one." in _texts_illegal and "Final line." in _texts_illegal)
+            check("_save_as_docx: 制御文字除去後もコードブロック本文は保持される",
+                  "print(1)" in _texts_illegal)
+
+        # 制御文字を含まない通常回答は、コードフェンス解析・見出し構造・所要時間行が
+        # 従来通り生成されること(既存挙動不変の回帰確認)。
+        _clean_question = "Plain question"
+        _clean_answer = "Intro line\n\n```python\nprint('hi')\n```\n\nOutro line"
+        _out_clean_docx = _docx_root / "clean.docx"
+        _ret_clean = f._save_as_docx(_out_clean_docx, _clean_question, _clean_answer, 2.5)
+        check("_save_as_docx: 制御文字なしの通常回答も成功時はNoneを返す", _ret_clean is None)
+        _doc_clean = _docx_probe.Document(str(_out_clean_docx))
+        _paras_clean = list(_doc_clean.paragraphs)
+        _texts_clean = [p.text for p in _paras_clean]
+        _styles_clean = [p.style.name for p in _paras_clean]
+        check("_save_as_docx: Q見出しが先頭に生成される(既存挙動不変)",
+              len(_texts_clean) > 0 and _texts_clean[0].startswith("Q (") and _styles_clean[0] == "Heading 1")
+        check("_save_as_docx: question本文がQ見出しの直後に生成される(既存挙動不変)",
+              len(_texts_clean) > 1 and _texts_clean[1] == "Plain question")
+        check("_save_as_docx: A見出しが生成される(既存挙動不変)",
+              len(_texts_clean) > 2 and _texts_clean[2] == "A" and _styles_clean[2] == "Heading 1")
+        check("_save_as_docx: コードフェンス本文はNo Spacingスタイルの段落になる(既存挙動不変)",
+              "print('hi')" in _texts_clean and
+              _styles_clean[_texts_clean.index("print('hi')")] == "No Spacing")
+        check("_save_as_docx: 所要時間の行が末尾に生成される(既存挙動不変)",
+              _texts_clean[-1] == "所要: 2.5s")
+
+        # python-docx が未インストールの場合の分岐: sys.modules['docx'] を None に
+        # することで `import docx` に ImportError を送出させる（実インストール状態を
+        # 変更せずに未インストール環境を模擬する標準的な手法）。
+        _orig_docx_mod = sys.modules.get("docx")
+        sys.modules["docx"] = None
+        try:
+            _out_missing_docx = _docx_root / "missing.docx"
+            _ret_missing = f._save_as_docx(_out_missing_docx, "Q?", "A.", 1.0)
+            check("_save_as_docx: python-docx未インストール時は.mdへフォールバックする",
+                  _ret_missing == _out_missing_docx.with_suffix(".md"))
+            check("_save_as_docx: フォールバック時の.mdファイルが実際に書かれる",
+                  _ret_missing is not None and _ret_missing.exists())
+        finally:
+            if _orig_docx_mod is not None:
+                sys.modules["docx"] = _orig_docx_mod
+            else:
+                del sys.modules["docx"]
+
+        # ビルド/保存自体が失敗するケース(IllegalXml以外の残存エラーも含む)を
+        # docx.document.Document.save をモンキーパッチして模擬し、例外が
+        # 外へ漏れずに.mdへ降格することを確認する。
+        import docx.document as _docx_document_mod
+        _orig_save_method = _docx_document_mod.Document.save
+
+        def _boom_save(self, *_a, **_kw):
+            raise RuntimeError("simulated docx save failure")
+
+        _docx_document_mod.Document.save = _boom_save
+        try:
+            _out_fail_docx = _docx_root / "fail.docx"
+            _exc_fail = None
+            try:
+                _ret_fail = f._save_as_docx(_out_fail_docx, "Q?", "A.", 1.0)
+            except Exception as _e:
+                _exc_fail = _e
+                _ret_fail = None
+            check("_save_as_docx: 保存失敗時も例外は外へ伝播しない", _exc_fail is None)
+            check("_save_as_docx: 保存失敗時は.mdへフォールバックする",
+                  _ret_fail == _out_fail_docx.with_suffix(".md"))
+            check("_save_as_docx: 保存失敗フォールバック時の.mdファイルが実際に書かれる",
+                  _ret_fail is not None and _ret_fail.exists())
+        finally:
+            _docx_document_mod.Document.save = _orig_save_method
+    else:
+        # python-docx 未インストール環境: 既存の.mdフォールバック(拡張子/戻り値)が
+        # 従来通り機能すること。
+        _out_missing_docx = _docx_root / "missing.docx"
+        _result_missing_docx = f._save_as_docx(_out_missing_docx, "Q?", "A.", 1.0)
+        check("_save_as_docx: python-docx未インストール時は.mdへフォールバックする",
+              _result_missing_docx == _out_missing_docx.with_suffix(".md"))
+        check("_save_as_docx: フォールバック時の.mdファイルが実際に書かれる",
+              _result_missing_docx is not None and _result_missing_docx.exists())
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
