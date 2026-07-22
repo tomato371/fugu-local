@@ -1079,6 +1079,33 @@ check("tt: コードは code", _tt("フィボナッチ関数を実装して") ==
 check("tt: 証明は math にしない", _tt("3連続整数の積が6の倍数であることを証明して求めよ") != "math")
 check("tt: Conductor申告を尊重", _tt("こんにちは", "chat") == "chat")
 check("tt: 不明シグナルは chat", _tt("よろしくね", "") == "chat")
+
+# --- 誤申告レスキュー: _apply_tasktype_guardrails は solve_verifiable(自己一貫性投票、
+# gotcha #7) への入口ゲート。小型 Conductor が math/mcq 問題を誤って chat/knowledge 等に
+# 分類しても、確実なキーワードシグナルがあれば強制的に正しい task_type へ補正し、投票
+# 経路を失わないことを検証する（Conductor申告のみを尊重する既存チェックの逆側）。
+check("tt: 誤申告(chat)でも強い math シグナルで math へレスキュー",
+      _tt("Find the remainder when 7^100 is divided by 13.", "chat") == "math")
+check("tt: 誤申告(knowledge)でも選択肢列挙シグナルで mcq へレスキュー",
+      _tt("正しいものを選べ\nA) foo\nB) bar", "knowledge") == "mcq")
+
+# --- シグナル優先順位: 実装コードは if/elif mcq -> code -> math の順で判定されるため、
+# mcq シグナルが最優先、次いで code、最後に math。複数シグナルが同居する問題での
+# 優先順位を固定する。
+check("tt: code と math シグナルが同居 -> elif順で code が勝つ",
+      _tt("フィボナッチ関数を実装して。その関数の余りを求めよ。") == "code")
+check("tt: mcq と code シグナルが同居 -> mcq が最優先",
+      _tt("次のうち、コードの実装として正しいものを選べ\nA) foo\nB) bar") == "mcq")
+
+# --- 自由記述デモーションのスコープ: t == "math" のときのみ証明/説明系シグナルで
+# knowledge へ格下げされる（＝投票に回さない）。declared="mcq" など math 以外に確定した
+# 場合はこのデモーション条件に入らず、証明系ワードが含まれていても格下げされないことを
+# 確認する。
+check("tt: 申告math + 自由記述シグナル(シグナル一致なし) -> knowledge へ格下げ",
+      _tt("なぜ空は青いのか", "math") == "knowledge")
+check("tt: 申告mcq + 自由記述ワードが含まれていても mcq のまま(格下げされない)",
+      _tt("なぜ空は青いか説明して", "mcq") == "mcq")
+
 check("tt: validate が task_type を保持",
       f.validate_plan({"mode": "moa", "selected_proposers": [],
                        "task_type": "math"})["task_type"] == "math")
