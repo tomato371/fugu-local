@@ -49,7 +49,7 @@ jobs:
       - name: Install mypy + API deps
         run: pip install mypy fastapi pydantic
       - name: Mypy (typed surfaces)
-        run: mypy fugu_api.py rag_eval.py
+        run: mypy fugu_api.py rag_eval.py rag_bench.py
 
   docker:
     name: Docker build
