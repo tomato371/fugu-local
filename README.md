@@ -109,6 +109,9 @@ docker compose exec ollama ollama pull qwen3:4b
 
 # 2. Start the web UI, then open http://localhost:7860
 docker compose up fugu
+
+# ...or start the REST API instead, then open http://localhost:8000/docs
+docker compose up fugu-api
 ```
 
 To run the CLI inside the container instead:
