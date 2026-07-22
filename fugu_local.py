@@ -799,7 +799,19 @@ def _load_rag_chunks(dirs: list) -> list:
                 continue
             if fp.suffix.lower() in _BINARY_SKIP:
                 continue
-            text = read_file_text(fp)
+            # 2026-07-22 (iter42): read_file_text() 呼び出しを裸のまま置くと、破損/未対応の
+            # 単一ファイル（壊れた.xlsx、パスワード付き.xlsx、python-docxに渡した旧形式.doc、
+            # 壊れた.pptx/.pdf、不正な.htmlなど）が ImportError 以外の例外を送出した瞬間に
+            # _load_rag_chunks -> _get_rag_chunks -> rag_search -> build_context まで伝播し、
+            # 質問のたびにRAGコンテキストが丸ごと失われていた（1ファイルの破損がRAG全体を
+            # 道連れにする精度事故）。精度優先・時間は気にしない方針のもと、iter41の
+            # graceful-degradation方針（ImportError限定の握りつぶしを超えて、失敗は
+            # スキップして続行する）を踏襲し、ここで1ファイル単位に隔離する。
+            try:
+                text = read_file_text(fp)
+            except Exception as _rag_read_exc:
+                print(f"   [RAG] 読み込み失敗のためスキップ: {fp} ({type(_rag_read_exc).__name__})")
+                continue
             # 2026-07-22: 以前は text.startswith("[") で判定しており、成功時に "[Sheet: ...]"
             # (_read_excel) や "[Slide 1]" (_read_pptx) で始まる正常な抽出結果まで
             # 誤ってスキップしていた（Excel/PPTX が RAG から常時欠落する精度事故。

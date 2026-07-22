@@ -2205,6 +2205,120 @@ with _tempfile.TemporaryDirectory() as _rag_dir:
     check("RAG: 通常テキストのチャンク分割はバイト単位で従来通り",
           _rag_by_file.get("plain.txt", []) == _expected_plain_chunks)
 
+# ---------- _load_rag_chunks: 1ファイルの読み込み例外でRAG全体が落ちない (2026-07-22 / iter42) ----------
+# read_file_text(fp) を裸で呼んでいたため、破損/未対応ファイル1件がImportError以外の例外を
+# 送出すると _load_rag_chunks -> _get_rag_chunks -> rag_search -> build_context まで伝播し、
+# 質問のたびにRAGコンテキストが丸ごと失われていた。ここでは1ファイル単位に例外を隔離し、
+# 他ファイルは正常にチャンク化されることを検証する。iter41のgraceful-degradation方針を踏襲。
+
+# (1) read_file_textをmonkeypatchし、片方のファイルパスだけ例外を送出させる。
+#     実ファイルは一時ディレクトリに置き、read_file_textをすり替えるだけで
+#     Ollama/ネットワーク呼び出しは一切行わない。
+_orig_read_file_text = f.read_file_text
+with _tempfile.TemporaryDirectory() as _rag_dir2:
+    _rag_root2 = _pathlib.Path(_rag_dir2)
+    _bad_fp = _rag_root2 / "corrupt.xlsx"
+    _good_fp = _rag_root2 / "good.txt"
+    _bad_fp.write_bytes(b"not a real xlsx file, just garbage bytes")
+    _good_text = ("これは正常に読めるファイルの本文です。" * 10 + "\n") * 5
+    _good_fp.write_text(_good_text, encoding="utf-8")
+
+    def _fake_read_file_text(path):
+        if _pathlib.Path(path).name == "corrupt.xlsx":
+            raise ValueError("simulated corrupt file read failure")
+        return _orig_read_file_text(path)
+
+    try:
+        f.read_file_text = _fake_read_file_text
+        _rag_chunks2 = f._load_rag_chunks([str(_rag_root2)])
+    finally:
+        f.read_file_text = _orig_read_file_text
+
+    check("_load_rag_chunks: 1ファイルの読み込み例外で全体が例外送出しない(到達できていること自体が検証)",
+          True)
+    _rag_by_file2 = {}
+    for _fp2, _chunk2 in _rag_chunks2:
+        _rag_by_file2.setdefault(_os.path.basename(_fp2), []).append((_fp2, _chunk2))
+    check("_load_rag_chunks: 読み込み失敗したファイルのチャンクは一切含まれない",
+          "corrupt.xlsx" not in _rag_by_file2)
+    check("_load_rag_chunks: 正常ファイルのチャンクは含まれる",
+          len(_rag_by_file2.get("good.txt", [])) >= 1)
+    _expected_good_chunks2 = []
+    _start2 = 0
+    while _start2 < len(_good_text):
+        _end2 = _start2 + f.RAG_CHUNK_CHARS
+        _expected_good_chunks2.append((str(_good_fp), _good_text[_start2:_end2]))
+        _start2 += f.RAG_CHUNK_CHARS - f.RAG_CHUNK_OVERLAP
+    check("_load_rag_chunks: 正常ファイルの(パス,チャンク)タプルが正しい",
+          _rag_by_file2.get("good.txt", []) == _expected_good_chunks2)
+
+# (2) ディレクトリ内が「読み込みに失敗するファイルのみ」の場合、空リストを返し例外を送出しない。
+with _tempfile.TemporaryDirectory() as _rag_dir3:
+    _rag_root3 = _pathlib.Path(_rag_dir3)
+    (_rag_root3 / "onlybad.xlsx").write_bytes(b"garbage garbage garbage")
+
+    def _always_fail_read_file_text(path):
+        raise RuntimeError("simulated total read failure")
+
+    try:
+        f.read_file_text = _always_fail_read_file_text
+        _rag_chunks3 = f._load_rag_chunks([str(_rag_root3)])
+    finally:
+        f.read_file_text = _orig_read_file_text
+
+    check("_load_rag_chunks: 全ファイルが読み込み失敗するディレクトリでは空リストを返す",
+          _rag_chunks3 == [])
+
+# (3) 回帰: 正常に読めるファイルのみのディレクトリでは、変更前と完全に同一のチャンク出力
+#     (境界・オーバーラップ・順序含め)になること。
+with _tempfile.TemporaryDirectory() as _rag_dir4:
+    _rag_root4 = _pathlib.Path(_rag_dir4)
+    _text_a4 = ("ファイルAの本文テキストです。" * 15 + "\n") * 8
+    _text_b4 = ("File B plain ascii content line. " * 20 + "\n") * 6
+    (_rag_root4 / "a_file.txt").write_text(_text_a4, encoding="utf-8")
+    (_rag_root4 / "b_file.md").write_text(_text_b4, encoding="utf-8")
+
+    _rag_chunks4 = f._load_rag_chunks([str(_rag_root4)])
+
+    _expected_chunks4 = []
+    for _fname4, _text4 in sorted([("a_file.txt", _text_a4), ("b_file.md", _text_b4)]):
+        _fp4 = str(_rag_root4 / _fname4)
+        _start4 = 0
+        while _start4 < len(_text4):
+            _end4 = _start4 + f.RAG_CHUNK_CHARS
+            _expected_chunks4.append((_fp4, _text4[_start4:_end4]))
+            _start4 += f.RAG_CHUNK_CHARS - f.RAG_CHUNK_OVERLAP
+    check("_load_rag_chunks: 正常ファイルのみの場合はチャンク出力が変更前とバイト単位で完全一致(境界/オーバーラップ/順序)",
+          _rag_chunks4 == _expected_chunks4)
+
+# (4) 任意: 実際のリーダー例外経路の検証（monkeypatchではなく、本物の壊れた.xlsxを
+#     _read_excel に読ませて例外を発生させる）。openpyxlが利用可能な環境でのみ実施。
+try:
+    import openpyxl as _openpyxl_probe2
+    _HAS_OPENPYXL2 = True
+except Exception:
+    _HAS_OPENPYXL2 = False
+
+if _HAS_OPENPYXL2:
+    with _tempfile.TemporaryDirectory() as _rag_dir5:
+        _rag_root5 = _pathlib.Path(_rag_dir5)
+        # 本物の壊れた.xlsx（ZIP/XMLとして無効なゴミバイト列）
+        (_rag_root5 / "broken.xlsx").write_bytes(b"\x00\x01\x02not a zip or xlsx file at all\xff\xfe")
+        _good_text5 = "This is a genuinely readable plain text file for RAG.\n" * 30
+        (_rag_root5 / "readable.txt").write_text(_good_text5, encoding="utf-8")
+
+        _rag_chunks5 = f._load_rag_chunks([str(_rag_root5)])
+        _rag_by_file5 = {}
+        for _fp5, _chunk5 in _rag_chunks5:
+            _rag_by_file5.setdefault(_os.path.basename(_fp5), []).append(_chunk5)
+
+        check("_load_rag_chunks: 本物の破損.xlsx(実リーダー例外)はスキップされる",
+              "broken.xlsx" not in _rag_by_file5)
+        check("_load_rag_chunks: 破損.xlsxと同居する正常な.txtは読み込まれる",
+              len(_rag_by_file5.get("readable.txt", [])) >= 1)
+else:
+    print("   [SKIP] openpyxl未インストールのため実.xlsx破損読み込みテストをスキップ")
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
       f._tokenize("PINNについて") == {"pinn", "について"})
