@@ -1852,6 +1852,19 @@ def validate_plan(p):
     if out["make_pptx"]:
         out["image_only"] = False
 
+    # 2026-07-22: スキーマ制約付き Conductor が image_only=True かつ
+    # use_image_generation=False という矛盾した plan を出すことがある
+    # （_apply_routing_guardrails は image_only を use_image_generation=True と
+    # セットでしか立てないため、この矛盾を修復するガードレールが他に存在しない）。
+    # 放置すると (1) fugu_answer の SC投票ゲート（math/mcq で精度に直結、
+    # gotcha#7）が image_only により無効化され、(2) MoA提案パネルが
+    # IMAGE_PROMPT_PANEL=2 まで縮小され、(3) それでいて use_image_generation=False
+    # なので画像自体は一枚も生成されない、という三重の劣化が起きる。
+    # image_only は「画像を生成してテキストを省く」の意味なので、画像を
+    # 生成しないなら image_only も強制的に False にする。
+    if not out["use_image_generation"]:
+        out["image_only"] = False
+
     mode = str(p.get("mode", "moa")).lower()
     out["mode"] = "single" if mode == "single" else "moa"
 

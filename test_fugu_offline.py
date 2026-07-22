@@ -91,12 +91,26 @@ check("plan: use_image_generation は mode を強制しない(非排他)",
 check("plan: 画像生成フラグを反映",
       f.validate_plan({"use_image_generation": True,
                        "selected_proposers": ["qwen3:4b"]})["use_image_generation"] is True)
-check("plan: image_only を反映",
-      f.validate_plan({"image_only": True, "selected_proposers": []})["image_only"] is True)
+check("plan: image_only を反映(use_image_generation と整合時)",
+      f.validate_plan({"image_only": True, "use_image_generation": True,
+                       "selected_proposers": []})["image_only"] is True)
 check("plan: make_pptx を反映し image_only を無効化",
       (lambda p: p["make_pptx"] is True and p["image_only"] is False)(
           f.validate_plan({"make_pptx": True, "image_only": True,
                            "selected_proposers": ["qwen3:4b"]})))
+check("plan: use_image_generation=False なら image_only を強制的に無効化(矛盾解消)",
+      f.validate_plan({"image_only": True, "use_image_generation": False,
+                       "selected_proposers": []})["image_only"] is False)
+check("plan: 矛盾したmath plan で SC投票ゲートの3フラグが全てFalseになる",
+      (lambda p: p["image_only"] is False and p["make_pptx"] is False
+       and p["use_image_generation"] is False)(
+          f.validate_plan({"task_type": "math", "image_only": True,
+                           "use_image_generation": False,
+                           "selected_proposers": []})))
+check("plan: 矛盾解消後は selected_proposers が通常moa分岐(image panelでない)",
+      len(f.validate_plan({"task_type": "math", "image_only": True,
+                           "use_image_generation": False,
+                           "selected_proposers": []})["selected_proposers"]) >= 2)
 
 # ---------- ペルソナ解決（selected_proposers のペルソナ名→実モデル） ----------
 _op_persona = f.PROPOSERS
