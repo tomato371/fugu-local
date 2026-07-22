@@ -1,2 +1,27 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local model weights (never commit large binaries)
+*.gguf
+*.bin
+*.safetensors
+
+# Secrets / environment
+.env
+*.key
+
+# Project working data
+backups/
+iterations/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
