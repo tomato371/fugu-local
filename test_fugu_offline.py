@@ -2613,6 +2613,80 @@ finally:
     urllib.request.urlopen = _orig_urlopen_rs
     f.subprocess.run = _orig_subprocess_run_rs
 
+# ---------- _save_as_excel: XML不正制御文字によるIllegalCharacterError耐性 (2026-07-22) ----------
+# openpyxl の ws.append() は XML 1.0 で禁止された制御文字(0x00-0x08/0x0B/0x0C/0x0E-0x1F)を
+# 含むセルに対して openpyxl.utils.exceptions.IllegalCharacterError（ImportErrorではない
+# 素のException）を送出する。従来コードは except ImportError しか捕捉しておらず、
+# LLM回答に混入したフォームフィード(\x0c)/ANSIエスケープ(\x1b)/NUL(\x00)等が原因で
+# _save_answer_to_file 全体が異常終了していた。ここでは openpyxl の有無を検出し、
+# 両方の分岐（サニタイズして.xlsx生成 / 未インストール時の.csvフォールバック）を検証する。
+# 本物のOllama/ネットワーク呼び出しは一切行わない。
+import pathlib as _pathlib_xlsx
+
+try:
+    import openpyxl as _openpyxl_probe
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
+
+with _tempfile.TemporaryDirectory() as _xlsx_dir:
+    _xlsx_root = _pathlib_xlsx.Path(_xlsx_dir)
+
+    def _trim_trailing_none(_row):
+        # openpyxl の iter_rows() はシート全体の最大列数まで各行を None で
+        # パディングして返す(この関数の変更とは無関係の既存仕様)。比較用に
+        # 末尾の None パディングだけを取り除く。
+        _r = list(_row)
+        while _r and _r[-1] is None:
+            _r.pop()
+        return _r
+
+    if _HAS_OPENPYXL:
+        # 制御文字はわざと文字列の「途中」に置く。ただし \x0b/\x0c/\x1c-\x1e は
+        # Python の str.splitlines() 自体が改行境界として解釈し、answer.splitlines()
+        # の時点でセル文字列に残らず消費されてしまう(この関数の既存仕様であり、
+        # 今回の修正対象外)。そのため実際にセルへ到達し検証可能な、XML不正かつ
+        # splitlines非対象の制御文字 \x1b(ESC)/\x00(NUL) を用いる。
+        _illegal_answer = "name,age\nAli\x1bce,30\nB\x00ob,25"
+        _out_illegal = _xlsx_root / "illegal.xlsx"
+        _exc = None
+        try:
+            f._save_as_excel(_out_illegal, _illegal_answer)
+        except Exception as _e:
+            _exc = _e
+        check("_save_as_excel: XML不正制御文字混入でも例外を送出しない(IllegalCharacterError回帰)",
+              _exc is None)
+        check("_save_as_excel: 制御文字混入時も.xlsxファイルが生成される", _out_illegal.exists())
+
+        if _exc is None and _out_illegal.exists():
+            _wb_illegal = _openpyxl_probe.load_workbook(str(_out_illegal))
+            _rows_illegal = [_trim_trailing_none(row) for row in _wb_illegal.active.iter_rows(values_only=True)]
+            check("_save_as_excel: 制御文字は除去されつつ実データ(表の中身)は保持される",
+                  _rows_illegal == [["name", "age"], ["Alice", "30"], ["Bob", "25"]])
+
+        # 制御文字を含まない通常回答は、列分割(re.split(r"[,\t|]", line))が
+        # 従来とバイト単位で同一であること。
+        _clean_answer = "a,b\tc|d\nx, y , z"
+        _out_clean = _xlsx_root / "clean.xlsx"
+        f._save_as_excel(_out_clean, _clean_answer)
+        _wb_clean = _openpyxl_probe.load_workbook(str(_out_clean))
+        _rows_clean = [_trim_trailing_none(row) for row in _wb_clean.active.iter_rows(values_only=True)]
+        _expected_clean = [
+            [c.strip() for c in f.re.split(r"[,\t|]", "a,b\tc|d")],
+            [c.strip() for c in f.re.split(r"[,\t|]", "x, y , z")],
+        ]
+        check("_save_as_excel: 制御文字なしの通常回答は従来通り列分割される(既存挙動不変)",
+              _rows_clean == _expected_clean)
+    else:
+        # openpyxl 未インストール環境: 既存の.csvフォールバック(拡張子/メッセージ/戻り値)が
+        # 従来通り機能すること。
+        _out_missing = _xlsx_root / "missing.xlsx"
+        _result_missing = f._save_as_excel(_out_missing, "a,b\nc,d")
+        check("_save_as_excel: openpyxl未インストール時は.csvへフォールバックする",
+              _result_missing == _out_missing.with_suffix(".csv"))
+        check("_save_as_excel: フォールバック時の.csvファイルが実際に書かれる",
+              _result_missing is not None and _result_missing.exists())
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")

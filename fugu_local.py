@@ -3260,23 +3260,41 @@ def _save_as_docx(out: Path, question: str, answer: str, elapsed: float):
 
 def _save_as_excel(out: Path, answer: str):
     """回答中のCSVライクな表を Excel (.xlsx) として保存。openpyxl が必要。"""
+    # 2026-07-22: LLM の回答には稀にフォームフィード(\x0c)、ANSIエスケープ
+    # (\x1b)、NUL 等の制御文字が混入する。これらは XML 1.0 の仕様上
+    # 不正な文字であり、ws.append() の時点で
+    # openpyxl.utils.exceptions.IllegalCharacterError（ImportError ではない
+    # ただの Exception）が送出され、従来は except ImportError だけを
+    # 捕捉していたため例外がそのまま伝播し、_save_answer_to_file 全体が
+    # 異常終了して回答保存に失敗していた。ws.append() する前に各セル文字列
+    # から XML 不正制御文字 (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F) だけを除去
+    # することで実データ（表の中身）は保ったまま正常な .xlsx を書き出す。
+    # 万一それでも保存に失敗した場合は、既存の .csv フォールバックへ
+    # 安全に降格させ、決してここで異常終了させない。
     try:
         import openpyxl
+    except ImportError:
+        txt_path = out.with_suffix(".csv")
+        txt_path.write_text(answer, encoding="utf-8")
+        print(f"   [Excel保存には openpyxl が必要 (pip install openpyxl)。代わりに保存: {txt_path}]")
+        return txt_path
+
+    try:
+        _illegal_xml_re = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Fugu Output"
         for line in answer.splitlines():
             if line.strip():
-                cols = [c.strip() for c in re.split(r"[,\t|]", line)]
+                cols = [_illegal_xml_re.sub("", c.strip()) for c in re.split(r"[,\t|]", line)]
                 ws.append(cols)
         wb.save(str(out))
         return
-    except ImportError:
-        pass
-    txt_path = out.with_suffix(".csv")
-    txt_path.write_text(answer, encoding="utf-8")
-    print(f"   [Excel保存には openpyxl が必要 (pip install openpyxl)。代わりに保存: {txt_path}]")
-    return txt_path
+    except Exception as e:
+        txt_path = out.with_suffix(".csv")
+        txt_path.write_text(answer, encoding="utf-8")
+        print(f"   [Excel保存に失敗しました ({e!r})。代わりに保存: {txt_path}]")
+        return txt_path
 
 
 # ==================================================
