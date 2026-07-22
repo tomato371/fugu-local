@@ -2611,10 +2611,18 @@ def _arbitrate(question, task_type, samples, classes):
     listing = "\n\n".join(
         f"### Candidate {chr(ord('A') + i)} (final answer: {c})\n{t}"
         for i, (c, t) in enumerate(reps))
+    # 2026-07-22: iteration 16 でヘッダー行（"{len(reps)} candidate solutions
+    # disagree:"）は候補数に依存しない表現に直したが、本文の指示文は "Carefully
+    # check both, find the flaw in the wrong one" のまま2択決め打ちで残っていた。
+    # 3/4択タイでは候補が3-4件（reps）提示されるのに "both" / "the wrong one"（単数）
+    # と言われ、3件目以降への精査が手薄になる恐れがあった。「each candidate」
+    # 「the incorrect one(s)」という候補数非依存の表現に統一する。2択の場合も
+    # 意味は従来の "check both / find the flaw in the wrong one" と同等。
     prompt = (f"Problem:\n{question}\n\n"
               f"{len(reps)} candidate solutions disagree:\n\n{listing}\n\n"
-              "Carefully check both, find the flaw in the wrong one, and solve the problem "
-              "yourself if needed. At the very end, put ONLY the correct final answer in \\boxed{}.")
+              "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
+              "and solve the problem yourself if needed. At the very end, put ONLY the "
+              "correct final answer in \\boxed{}.")
     for arb in chain:
         print(f"   [SC] 票が拮抗 → {arb} が裁定します")
         raw = ask(arb, [{"role": "user", "content": prompt}], 0.1,

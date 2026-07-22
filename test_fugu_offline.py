@@ -1096,6 +1096,103 @@ finally:
 check("arb-err: 全裁定役が__ERROR__ → _arbitrate は None を返す(数値をでっち上げない)",
       _e3_result is None)
 
+# ---------- 2026-07-22: _arbitrate プロンプト本文の候補数非依存化(iteration 16の続き) ----------
+# iteration 16 はヘッダー行("{len(reps)} candidate solutions disagree:")を候補数に
+# 応じた表現に直したが、本文の指示文 "Carefully check both, find the flaw in the wrong
+# one" は2択決め打ちのまま残っていた。3択/4択タイでは候補が3-4件出るのに「both」
+# 「the wrong one」(単数)と言われ、3件目以降の精査が軽視されるリスクがある。ここでは
+# _arbitrate を直接叩き、(a) 2択では従来と同じ意図(両候補を精査し\boxed{}で単一の正解を
+# 出す)を保ったまま候補数非依存の文言になっていること、(b) 3択では "check both" や
+# 単数形の「the wrong one」という誤解を招く表現が出ないこと、(c) いずれもヘッダー行と
+# \boxed{} 指示は変更されておらず、有効な(answer, text)タプル/Noneの契約を保つこと、を検証する。
+_orig_installed_body2 = f.installed_models
+_orig_arbiter_model_body2 = f.ARBITER_MODEL
+_orig_reasoning_body2 = f.REASONING_MODELS
+_orig_props_body2 = f.PROPOSERS
+_body2_prompts = []
+
+
+def _fake_ask_body2(model, messages, temperature, think=None, fmt=None,
+                     label=None, num_predict=None, num_ctx=None):
+    if label == "arbiter":
+        _body2_prompts.append(messages[0]["content"])
+        return "ARBITER_REASONING_BODY2 \\boxed{1}"
+    return "\\boxed{1}"
+
+
+_body2_samples = [{"answer": "1", "text": "reasoning for 1", "model": "m1", "pot": False},
+                  {"answer": "2", "text": "reasoning for 2", "model": "m1", "pot": False}]
+_body2_classes = [["1", 2], ["2", 2]]
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = lambda: ["m1"]
+    f.ask = _fake_ask_body2
+    _body2_result = f._arbitrate("test question", "math", _body2_samples, _body2_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_body2
+    f.REASONING_MODELS = _orig_reasoning_body2
+    f.ARBITER_MODEL = _orig_arbiter_model_body2
+    f.installed_models = _orig_installed_body2
+
+_body2_prompt = _body2_prompts[0] if _body2_prompts else ""
+check("arb-body2: 2択のヘッダー行は従来通り('2 candidate solutions disagree:')",
+      "2 candidate solutions disagree:" in _body2_prompt)
+check("arb-body2: 2択でも本文は各候補の精査を指示している(same intent as 'check both')",
+      "each candidate" in _body2_prompt)
+check("arb-body2: \\boxed{} による単一最終解答の指示は維持されている",
+      "\\boxed{}" in _body2_prompt)
+check("arb-body2: 有効な(answer, text)タプルを返す",
+      _body2_result is not None and _body2_result[0] == "1")
+
+_orig_installed_body3 = f.installed_models
+_orig_arbiter_model_body3 = f.ARBITER_MODEL
+_orig_reasoning_body3 = f.REASONING_MODELS
+_orig_props_body3 = f.PROPOSERS
+_body3_prompts = []
+
+
+def _fake_ask_body3(model, messages, temperature, think=None, fmt=None,
+                     label=None, num_predict=None, num_ctx=None):
+    if label == "arbiter":
+        _body3_prompts.append(messages[0]["content"])
+        return "ARBITER_REASONING_BODY3 \\boxed{1}"
+    return "\\boxed{1}"
+
+
+_body3_samples = [{"answer": str(i), "text": f"reasoning for {i}", "model": "m1", "pot": False}
+                  for i in (1, 2, 3)]
+_body3_classes = [["1", 2], ["2", 2], ["3", 2]]
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = lambda: ["m1"]
+    f.ask = _fake_ask_body3
+    _body3_result = f._arbitrate("test question", "math", _body3_samples, _body3_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_body3
+    f.REASONING_MODELS = _orig_reasoning_body3
+    f.ARBITER_MODEL = _orig_arbiter_model_body3
+    f.installed_models = _orig_installed_body3
+
+_body3_prompt = _body3_prompts[0] if _body3_prompts else ""
+check("arb-body3: 3択のヘッダー行は候補数に応じている('3 candidate solutions disagree:')",
+      "3 candidate solutions disagree:" in _body3_prompt)
+check("arb-body3: 3択の本文に2択決め打ちの'check both'が残っていない",
+      "check both" not in _body3_prompt.lower())
+check("arb-body3: 3択の本文に単数形決め打ちの'the wrong one'が残っていない",
+      "the wrong one" not in _body3_prompt.lower())
+check("arb-body3: 3択の本文は候補数非依存の表現('each candidate'/'incorrect one(s)')になっている",
+      "each candidate" in _body3_prompt and "incorrect one" in _body3_prompt)
+check("arb-body3: \\boxed{} による単一最終解答の指示は維持されている",
+      "\\boxed{}" in _body3_prompt)
+check("arb-body3: 有効な(answer, text)タプルを返す",
+      _body3_result is not None and _body3_result[0] == "1")
+
 # ---------- task_type ガードレール ----------
 def _tt(q, declared=""):
     return f._apply_tasktype_guardrails(q, {"task_type": declared})["task_type"]
