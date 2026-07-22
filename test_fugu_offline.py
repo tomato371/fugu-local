@@ -2416,7 +2416,7 @@ with _tempfile.TemporaryDirectory() as _rag_dir4:
 # (4) 任意: 実際のリーダー例外経路の検証（monkeypatchではなく、本物の壊れた.xlsxを
 #     _read_excel に読ませて例外を発生させる）。openpyxlが利用可能な環境でのみ実施。
 try:
-    import openpyxl as _openpyxl_probe2
+    import openpyxl as _openpyxl_probe2  # noqa: F401
     _HAS_OPENPYXL2 = True
 except Exception:
     _HAS_OPENPYXL2 = False

@@ -7,7 +7,6 @@ import sys
 import queue
 import threading
 import builtins
-from pathlib import Path
 
 for _s in (sys.stdout, sys.stderr):
     if _s and hasattr(_s, "reconfigure"):
@@ -18,7 +17,6 @@ try:
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.live import Live
-    from rich.rule import Rule
 except ImportError:
     sys.exit("pip install rich  が必要です")
 

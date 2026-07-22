@@ -1,0 +1,6 @@
+# Run `pre-commit install` once, then ruff checks run automatically on every commit.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.22
+    hooks:
+      - id: ruff

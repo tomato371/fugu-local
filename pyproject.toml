@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+exclude = ["backups", "iterations"]
+
+[tool.ruff.lint]
+# High-signal rules first (real errors: syntax + pyflakes), not style noise.
+# The rule set can be widened over time (e.g. add "E", "I", "UP").
+select = ["E9", "F"]

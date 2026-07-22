@@ -2908,7 +2908,7 @@ def fugu_answer(question, plan=None, history=None):
                 issue_hint = issue  # 何が不十分かを次ラウンドの提案へ伝える
                 print(f"   ↻ 品質不足のため追加ラウンド（{issue}）")
             else:
-                print(f"   ✓ 十分な品質と判断 → 反復を打ち切り")
+                print("   ✓ 十分な品質と判断 → 反復を打ち切り")
         else:
             need_more = False
         if not need_more:
@@ -3463,7 +3463,6 @@ def build_pptx(question, answer, out_path=None):
     try:
         from pptx import Presentation
         from pptx.util import Inches, Pt
-        from pptx.dml.color import RGBColor
     except ImportError:
         md = (Path(out_path).with_suffix(".md") if out_path
               else PPTX_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}.md")

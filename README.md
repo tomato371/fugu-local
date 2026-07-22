@@ -1,5 +1,7 @@
 # Fugu-Local — Dynamic Mixture-of-Agents, 100% local on 8 GB VRAM
 
+[![CI](https://github.com/tomato371/fugu-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tomato371/fugu-local/actions/workflows/ci.yml)
+
 A local, dependency-light **Mixture-of-Agents (MoA) orchestrator** for LLMs, inspired by
 Sakana AI's *Fugu*. It runs entirely on consumer hardware (built and tuned for an
 RTX 4060 Laptop, 8 GB VRAM / 48 GB RAM / i7-13700H) using [Ollama](https://ollama.com) —
