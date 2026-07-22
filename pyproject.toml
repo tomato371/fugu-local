@@ -11,3 +11,14 @@ select = ["E9", "F"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.9"
+# We type-check the small, typed surfaces (e.g. fugu_api.py) only.
+ignore_missing_imports = true
+
+# The large legacy orchestrator (fugu_local) is untyped — don't follow into it
+# when checking the typed modules that import it.
+[[tool.mypy.overrides]]
+module = "fugu_local"
+follow_imports = "skip"
