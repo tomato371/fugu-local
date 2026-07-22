@@ -1793,6 +1793,118 @@ finally:
     urllib.request.urlopen = _orig_urlopen
     f.time.sleep = _orig_sleep
 
+# --- gotcha #1 / #2 回帰: /api/chat 固定 & options.num_ctx 常時pin ---
+# 既存の _make_fake_urlopen は payload(dict) だけを calls_log に積む設計で、既存の
+# _calls1..4 のインデックス方法(payload dict として直接参照)を変えると回帰するため
+# ここでは触らない。URL も検証したいこのセクション専用に別のフェイク urlopen を用意する
+# (calls_log の各要素は {"full_url":.., "payload":..} の dict)。
+
+
+def _make_fake_urlopen_url(steps, calls_log):
+    """_make_fake_urlopen と同じ挙動だが、送信 payload に加えて req.full_url も記録する。"""
+    state = {"i": 0}
+
+    def _fake_urlopen(req, timeout=None):
+        i = state["i"]
+        state["i"] += 1
+        if i >= len(steps):
+            raise AssertionError(f"unexpected extra urlopen call #{i + 1} (bounded-loop violation)")
+        calls_log.append({
+            "full_url": req.full_url,
+            "payload": json.loads(req.data.decode("utf-8")),
+        })
+        step = steps[i]
+        if step[0] == "error":
+            raise _http_error(step[1], step[2])
+        return _FakeHTTPResponse(json.dumps({"message": {"content": step[1]}}).encode("utf-8"))
+
+    return _fake_urlopen
+
+
+# シナリオ5: 通常成功呼び出し(think/num_predict/fmt すべて未指定・未知モデル) →
+# native /api/chat を叩き(/v1 は使わない)、options.num_ctx が既定値で必ず pin される。
+_calls5 = []
+try:
+    f.time.sleep = lambda s: None
+    urllib.request.urlopen = _make_fake_urlopen_url(
+        [("ok", "plain answer")],
+        _calls5,
+    )
+    _r5 = f.ask("m-unknown-nonthinking", [{"role": "user", "content": "hi"}], 0.7)
+    _url5 = _calls5[-1]["full_url"]
+    _opts5 = _calls5[-1]["payload"].get("options", {})
+    check("ask: 通常呼び出しは /api/chat を叩く(gotcha#1)", _url5.endswith("/api/chat"))
+    check("ask: 通常呼び出しで /v1 エンドポイントは使わない(gotcha#1)", "/v1" not in _url5)
+    check("ask: think/num_predict/fmt が全てNoneでもoptions.num_ctxは省略されない(gotcha#2)",
+          "num_ctx" in _opts5 and _opts5["num_ctx"])
+    check("ask: 未知モデルはMODEL_NUM_CTXが既定値になる",
+          _opts5["num_ctx"] == f.MODEL_NUM_CTX)
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
+# シナリオ6: MODEL_CONFIG に登録された思考モデル(gpt-oss:20b)は num_ctx=16384 が
+# model_cfg 由来で pin される(8192 のままでは思考が truncate される既知不具合の回帰防止)。
+_calls6 = []
+try:
+    f.time.sleep = lambda s: None
+    urllib.request.urlopen = _make_fake_urlopen_url(
+        [("ok", "thinking model answer")],
+        _calls6,
+    )
+    _r6 = f.ask("gpt-oss:20b", [{"role": "user", "content": "hi"}], 0.7)
+    _opts6 = _calls6[-1]["payload"].get("options", {})
+    _expected_ctx6 = f.model_cfg("gpt-oss:20b", "num_ctx", f.MODEL_NUM_CTX)
+    check("ask: gpt-oss:20b(思考モデル)はMODEL_CONFIG由来のnum_ctxになる",
+          _opts6["num_ctx"] == _expected_ctx6 == 16384)
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
+# シナリオ7: 明示的な num_ctx=... 引数はモデル既定値より優先される。
+_calls7 = []
+try:
+    f.time.sleep = lambda s: None
+    urllib.request.urlopen = _make_fake_urlopen_url(
+        [("ok", "explicit ctx answer")],
+        _calls7,
+    )
+    _r7 = f.ask("gpt-oss:20b", [{"role": "user", "content": "hi"}], 0.7, num_ctx=12345)
+    _opts7 = _calls7[-1]["payload"].get("options", {})
+    check("ask: 明示的なnum_ctx引数はモデル既定値より優先される",
+          _opts7["num_ctx"] == 12345)
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
+# シナリオ8(重要): think-strip再送パス(500→thinking非対応400→success)でも、
+# 最終的に再送されるリクエストが num_ctx pin と /api/chat エンドポイントの両方を
+# 維持していること(L1054のpayload再構築で options.num_ctx や URL が失われていないか)。
+_calls8 = []
+try:
+    f.time.sleep = lambda s: None
+    urllib.request.urlopen = _make_fake_urlopen_url(
+        [("error", 500, "internal error, model loading"),
+         ("error", 400, "this model does not support thinking"),
+         ("ok", "final answer after think strip")],
+        _calls8,
+    )
+    _r8 = f.ask("gpt-oss:20b", [{"role": "user", "content": "hi"}], 0.7, think=True)
+    _expected_ctx8 = f.model_cfg("gpt-oss:20b", "num_ctx", f.MODEL_NUM_CTX)
+    _final_call8 = _calls8[-1]
+    _final_opts8 = _final_call8["payload"].get("options", {})
+    check("ask: think-strip再送でも最終応答が失われない",
+          _r8 == "final answer after think strip")
+    check("ask: think-strip再送の最終リクエストもoptions.num_ctxを維持する(gotcha#2)",
+          "num_ctx" in _final_opts8 and _final_opts8["num_ctx"] == _expected_ctx8)
+    check("ask: think-strip再送の最終リクエストも/api/chatを維持する(gotcha#1)",
+          _final_call8["full_url"].endswith("/api/chat") and "/v1" not in _final_call8["full_url"])
+    check("ask: think-strip再送の最終リクエストはthinkキーが除去されている",
+          "think" not in _final_call8["payload"])
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
 # ---------- fugu_answer: SC結果のユーザー提示 ----------
 # fugu_answer() の自己一貫性投票(SC)結果 → ユーザー提示の接合点（行 2602-2615 付近）の回帰テスト。
 # solve_verifiable の戻り値と、本文から実際に抽出した答え(extract_final_answer/answers_equivalent
