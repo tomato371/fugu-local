@@ -352,6 +352,108 @@ finally:
     else:
         del sys.modules["math_verify"]
 
+# 2026-07-22: math_verify フォールバック分岐そのもの（fugu_local.py ~L2433-2444）の
+# 直接カバレッジ。上のテストは「フォールバックに頼らない」ことの証明であり、フォールバック
+# 分岐自体には一度も入っていない。ここでは高速パス（na.lower()一致 / Fraction一致）を
+# 意図的に迂回する入力（\frac{1}{2} vs 0.5、どちらも正規化後は非空・lower()不一致・
+# Fraction変換失敗）を使い、記録スタブで (1) parse/verify が実際に呼ばれたこと、
+# (2) gotcha #6 の parsing_timeout=None / timeout_seconds=None が渡っていること
+# （Windows で math_verify 既定タイムアウトがハンドルエラーを撒く実測不具合への回帰防止）、
+# (3) verify の戻り値がそのまま answers_equivalent の戻り値になること、
+# (4) parse/verify が例外を送出しても except で握り潰され False になり例外が外に漏れない
+# ことを検証する。
+
+
+def _make_recording_math_verify(verify_result, raise_in):
+    """呼び出しを記録する math_verify スタブモジュールを生成する。
+    raise_in: "none" | "parse" | "verify" — 該当関数が呼ばれたら例外を送出する。"""
+    calls = {"parse_args": [], "parse_kwargs": [], "verify_args": [], "verify_kwargs": []}
+
+    def _parse(expr, **kwargs):
+        calls["parse_args"].append(expr)
+        calls["parse_kwargs"].append(kwargs)
+        if raise_in == "parse":
+            raise RuntimeError("boom in parse (stub)")
+        return ("parsed", expr)
+
+    def _verify(parsed_a, parsed_b, **kwargs):
+        calls["verify_args"].append((parsed_a, parsed_b))
+        calls["verify_kwargs"].append(kwargs)
+        if raise_in == "verify":
+            raise RuntimeError("boom in verify (stub)")
+        return verify_result
+
+    mod = types.ModuleType("math_verify")
+    mod.parse = _parse
+    mod.verify = _verify
+    return mod, calls
+
+
+def _run_with_math_verify_stub(verify_result, raise_in, body):
+    """math_verify を記録スタブに差し替えて body(calls) を実行し、必ず元に戻す
+    （L341-353 と同じ swap-and-restore パターン）。"""
+    mod, calls = _make_recording_math_verify(verify_result, raise_in)
+    orig = sys.modules.get("math_verify")
+    sys.modules["math_verify"] = mod
+    try:
+        body(calls)
+    finally:
+        if orig is not None:
+            sys.modules["math_verify"] = orig
+        else:
+            del sys.modules["math_verify"]
+
+
+# 高速パスを迂回する入力ペア（正規化後も非空・lower()不一致・Fraction変換失敗）
+_MV_A, _MV_B = r"\frac{1}{2}", "0.5"
+
+
+def _t_mv_verify_true(calls):
+    result = f.answers_equivalent(_MV_A, _MV_B)
+    check("sc: math_verifyフォールバック parseが実呼出しされる", len(calls["parse_args"]) >= 2)
+    check("sc: math_verifyフォールバック verifyが実呼出しされる", len(calls["verify_args"]) == 1)
+    check("sc: math_verifyフォールバック parsing_timeout=None (gotcha#6)",
+          len(calls["parse_kwargs"]) >= 2
+          and all(kw.get("parsing_timeout", "MISSING") is None for kw in calls["parse_kwargs"]))
+    check("sc: math_verifyフォールバック timeout_seconds=None (gotcha#6)",
+          len(calls["verify_kwargs"]) == 1
+          and all(kw.get("timeout_seconds", "MISSING") is None for kw in calls["verify_kwargs"]))
+    check("sc: math_verifyフォールバック verify=Trueを伝播", result is True)
+
+
+_run_with_math_verify_stub(True, "none", _t_mv_verify_true)
+
+
+def _t_mv_verify_false(calls):
+    result = f.answers_equivalent(_MV_A, _MV_B)
+    check("sc: math_verifyフォールバック verify=Falseを伝播", result is False)
+
+
+_run_with_math_verify_stub(False, "none", _t_mv_verify_false)
+
+
+def _t_mv_parse_raises(calls):
+    result = f.answers_equivalent(_MV_A, _MV_B)
+    check("sc: math_verifyフォールバック parse例外はFalseに握り潰す（例外は漏れない）",
+          result is False)
+
+
+_run_with_math_verify_stub(None, "parse", _t_mv_parse_raises)
+
+
+def _t_mv_verify_raises(calls):
+    result = f.answers_equivalent(_MV_A, _MV_B)
+    check("sc: math_verifyフォールバック verify例外はFalseに握り潰す（例外は漏れない）",
+          result is False)
+
+
+_run_with_math_verify_stub(None, "verify", _t_mv_verify_raises)
+
+# math_verify の差し替えが確実に元へ復元されていること（スタブ混入なら False に化けるはずの
+# 高速パスが正常動作することで間接確認する）
+check("sc: math_verifyスタブ解除後も高速パスが正常動作（sys.modules復元確認）",
+      f.answers_equivalent("42", "42") and not f.answers_equivalent("41", "42"))
+
 _top, _cnt, _cls = f.vote_answers(["42", "42", "41", "0.5", "1/2", None, ""])
 check("sc: 投票 最多クラス", _top == "42" and _cnt == 2)
 check("sc: 投票 同値クラス集約", any(c[1] == 2 and f.answers_equivalent(c[0], "0.5") for c in _cls))
