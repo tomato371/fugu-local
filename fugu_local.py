@@ -1290,10 +1290,18 @@ def run_python(code, timeout=None, stdout_only=False):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(code)
+        # 2026-07-22: stdin=DEVNULL を明示。指定しないと子プロセスは親の stdin を
+        # そのまま継承し、LLM 生成コードが input() を呼ぶケース（PoT の _sc_sample や
+        # code_check の検証でよくある）でハングしてしまう — repl() では対話中の親の
+        # stdin を子に奪われる事故にもなり、挙動は TTY/pipe/closed のいずれかで非決定的。
+        # DEVNULL にしておけば input() は即座に EOFError を送出して fail-fast する。
+        # input() を要求するコードはどのみちオフラインでは正しい答えを返せないので、
+        # 正解率への影響はない（無効票 / NG のままで変わらない）— 純粋にハング・
+        # stdin 汚染・非決定性の除去。
         r = subprocess.run(
             [sys.executable, "-X", "utf8", path],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout,
+            timeout=timeout, stdin=subprocess.DEVNULL,
         )
         if stdout_only and r.returncode == 0:
             out = (r.stdout or "").strip()
@@ -1301,7 +1309,7 @@ def run_python(code, timeout=None, stdout_only=False):
             out = ((r.stdout or "") + (r.stderr or "")).strip()
         return r.returncode == 0, out[-2000:]
     except subprocess.TimeoutExpired:
-        return False, f"TIMEOUT: code did not finish within {timeout}s (infinite loop or input() wait?)"
+        return False, f"TIMEOUT: code did not finish within {timeout}s (infinite loop, not input() — stdin is DEVNULL so input() now fails fast with EOFError instead)"
     except Exception as e:
         return False, f"runner error: {e}"
     finally:

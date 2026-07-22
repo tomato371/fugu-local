@@ -1560,6 +1560,31 @@ check("code: 例外を検知して traceback を返す", (not ok) and "boom" in 
 ok, out = f.run_python("while True:\n    pass", timeout=2)
 check("code: 無限ループはタイムアウト", (not ok) and "TIMEOUT" in out)
 
+# 2026-07-22 回帰: run_python は子プロセスの stdin を DEVNULL にするので、
+# input() を呼ぶコードはタイムアウトまでハングせず即座に EOFError で失敗する
+# （親の stdin を継承していた旧挙動では repl() の対話入力を子に奪われたり、
+#   TTY/pipe/closed の違いで非決定的に振る舞ったりしていた）。
+# timeout は「タイムアウトまで待っていない」ことを示すため意図的に長め(30s)にする。
+ok_input, out_input = f.run_python("data = input()\nprint(data)", timeout=30)
+check(
+    "code: input()はDEVNULL stdinによりEOFErrorで即失敗しTIMEOUTしない",
+    (not ok_input) and ("EOFError" in out_input) and ("TIMEOUT" not in out_input),
+)
+
+# regression guard: DEVNULL stdin が通常コードの成功経路を邪魔しないこと
+ok_normal, out_normal = f.run_python("print('no_input_needed_here')")
+check(
+    "code: input()を使わない通常コードはDEVNULL化後も正常に成功",
+    ok_normal and "no_input_needed_here" in out_normal,
+)
+
+# regression guard: stdout_only=True も DEVNULL化後、成功時はstdoutのみを返す(iteration 4挙動)
+ok_normal_only, out_normal_only = f.run_python("print('clean_stdout_only')", stdout_only=True)
+check(
+    "code: stdout_only=Trueの成功経路はDEVNULL化後もstdoutのみ",
+    ok_normal_only and out_normal_only.strip() == "clean_stdout_only",
+)
+
 # stdout_only: 既定(False)は stdout+stderr 結合のまま(バイトレベルで不変)。
 # stdout_only=True かつ成功時は stdout のみ返し、stderr の警告文で末尾行が汚染されない。
 _warn_code = (
