@@ -677,6 +677,26 @@ def _read_pptx(path: Path) -> str:
     return f"[PPTX: {path.name} — python-pptx が必要: pip install python-pptx]"
 
 
+# 2026-07-22: ライブラリ未インストール通知（_read_pdf/_read_docx/_read_excel/_read_pptx が
+# 抽出失敗時に返す1行メッセージ）だけを検出する専用パターン。以前は「'[' で始まる」だけで
+# 判定しており、_read_excel の成功時出力 "[Sheet: ...]" や _read_pptx の成功時出力
+# "[Slide N]" まで RAG から除外してしまっていた（= 抽出できた Excel/PPTX が丸ごと欠落する
+# 精度事故）。通知文字列は「1行・'[' で始まり ']' で終わり・'pip install' を含む」という
+# 安定した構造を持つため、それだけで狭く判定する。
+_LIB_MISSING_NOTICE_RE = re.compile(r"^\[[^\n]*pip install[^\n]*\]$")
+
+
+def _is_lib_missing_notice(text: str) -> bool:
+    """read_file_text の抽出結果が「ライブラリ未インストール」通知そのものかを判定。
+    通知は _read_pdf/_read_docx/_read_excel/_read_pptx がフォールバック時に返す
+    1行文字列のみで、他の正常な抽出結果（Excel/PPTX の先頭が '[' の行等）とは
+    「pip install を含む単一行」という点で区別できる。"""
+    stripped = text.strip()
+    if "\n" in stripped:
+        return False
+    return bool(_LIB_MISSING_NOTICE_RE.match(stripped))
+
+
 def _read_html(path: Path) -> str:
     """HTML からタグを除去してテキストを返す（stdlib html.parser 使用）。"""
     from html.parser import HTMLParser
@@ -772,7 +792,12 @@ def _load_rag_chunks(dirs: list) -> list:
             if fp.suffix.lower() in _BINARY_SKIP:
                 continue
             text = read_file_text(fp)
-            if not text or text.startswith("["):  # ライブラリ未インストール通知はスキップ
+            # 2026-07-22: 以前は text.startswith("[") で判定しており、成功時に "[Sheet: ...]"
+            # (_read_excel) や "[Slide 1]" (_read_pptx) で始まる正常な抽出結果まで
+            # 誤ってスキップしていた（Excel/PPTX が RAG から常時欠落する精度事故。
+            # 精度優先・時間は気にしない方針に反する）。ライブラリ未インストール通知
+            # （1行・pip install を含む）だけを狭く検出してスキップする。
+            if not text or _is_lib_missing_notice(text):
                 continue
             # チャンク分割（オーバーラップ付き）
             start = 0
