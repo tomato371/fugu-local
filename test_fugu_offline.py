@@ -2563,13 +2563,11 @@ try:
         f._search_raw = _orig_search_raw_rs
         f.ask = _orig_ask_rs
 
-    # --- (H) 特性テスト(既存の仕様上の弱点の可視化。fugu_local.py は変更しない): ---
-    #     注入上限カット(L566-571)は「body に1件も入らなければ空文字のまま」で、
-    #     最初の1件が SEARCH_CONTEXT_CHARS を超えると header はつくが body が空になり、
-    #     sufficient=True と判定された唯一の具体的事実が黙って本文から消える。
-    #     これは results が空ではない(検索は成功している)のに、注入されるコンテキストには
-    #     何の事実も含まれないという矛盾した挙動であり、人間の確認が必要と考えられる。
-    #     ここでは fugu_local.py 側は一切変更せず、現状の挙動をそのまま固定化するのみ。
+    # --- (H) 2026-07-22 修正済み挙動の固定化: 先頭(唯一の)結果が SEARCH_CONTEXT_CHARS を
+    #     超えていても、body を空文字のまま break せず、先頭結果を上限まで切り詰めて必ず
+    #     注入する(精度優先。sufficient=True と判定された唯一の具体的事実を黙って
+    #     落とさない)。旧挙動(body="")はイテレーション38で特性テストとして固定されていたが、
+    #     イテレーション39で修正した。
     _hugeH = "[Huge]\n" + ("Z" * (f.SEARCH_CONTEXT_CHARS + 500)) + "\nSource: http://example.com/huge"
     _searchH_calls = []
     _askH_calls = []
@@ -2579,10 +2577,18 @@ try:
         f.ask = _rs_ask_factory([{"sufficient": True, "missing": "", "queries": []}],
                                  _askH_calls)
         _resH = f.research_search("Huge Item Query")
-        check("[特性テスト/要人間確認] research_search: 先頭項目がSEARCH_CONTEXT_CHARS超過だと"
-              "bodyが空になり結果が黙って落ちる(現状挙動をそのまま固定化・fugu_local.py未変更)",
-              ("http://example.com/huge" not in _resH) and ("Z" * 100 not in _resH)
-              and _resH.startswith("## Web Search Results (取得日:"))
+        _headerH = f"## Web Search Results (取得日: {f.time.strftime('%Y-%m-%d')})"
+        _bodyH = _resH[len(_headerH):] if _resH.startswith(_headerH) else _resH
+        check("research_search: 先頭項目がSEARCH_CONTEXT_CHARS超過でもheaderが付与される",
+              _resH.startswith(_headerH))
+        check("research_search: 先頭項目がSEARCH_CONTEXT_CHARS超過でもbodyが空にならない"
+              "(切り詰めてでも必ず注入)",
+              _bodyH.strip() != "")
+        check("research_search: 切り詰められたbodyは先頭結果のプレフィックスを含む",
+              _hugeH[:200] in _resH)
+        check("research_search: 切り詰められたbodyの全文Sourceまでは含まれない"
+              "(SEARCH_CONTEXT_CHARSで打ち切られている)",
+              "http://example.com/huge" not in _resH)
     finally:
         f._search_raw = _orig_search_raw_rs
         f.ask = _orig_ask_rs

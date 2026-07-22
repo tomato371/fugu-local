@@ -567,6 +567,14 @@ def research_search(question: str) -> str:
     body = ""
     for item in results:
         if len(body) + len(item) > SEARCH_CONTEXT_CHARS:
+            # 2026-07-22: body が空のまま（＝先頭結果1件だけで上限超過）ここで break すると
+            # body="" のまま返ってしまい、Conductor が sufficient=true と判定した検索事実が
+            # 丸ごと消えてモデルが学習データ（古い可能性）で答えてしまう精度リグレッションに
+            # なる（イテレーション38で特性テスト(H)として発見・固定されたが未修正だったバグ）。
+            # 精度優先（精度優先・時間は気にしない）のため、空のまま打ち切らず先頭結果を
+            # 上限まで切り詰めてでも必ず注入する。
+            if not body:
+                body = item[:SEARCH_CONTEXT_CHARS] + "\n\n"
             break
         body += item + "\n\n"
     header = (
