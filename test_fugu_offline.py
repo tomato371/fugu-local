@@ -2590,6 +2590,148 @@ with _tempfile.TemporaryDirectory() as _html_dir:
     check("_save_as_html: 生の(未escape)コード本文は出力に含まれない",
           "a < b && c" not in _content_e)
 
+# ---------- _save_as_markdown/_save_as_text/_save_as_html: 既存ファイルが非UTF-8でも
+# クラッシュしない (2026-07-23) ----------
+# 3関数とも既存 --out ファイルの読み戻しに encoding="utf-8" のみを渡しており
+# errors ハンドラが無かった（L3158/L3167/L3212）。このマシンのコンソールが
+# cp932 であること(既知の落とし穴 #4)に起因し、既存ファイルが cp932/Shift_JIS
+# 等の非UTF-8バイト列を含む場合に read_text が UnicodeDecodeError を送出し、
+# _save_answer_to_file 経由で保存ステップ全体が異常終了して、計算し終えた
+# 回答が失われていた。これは iteration 41-44 の _save_as_excel/_docx/_pdf
+# 修正（保存を絶対にクラッシュさせず回答を失わない）と同じバグクラス。
+# errors="replace" を既存内容の読み戻しにのみ追加し、書き込み側の
+# encoding="utf-8" とUTF-8正常系の追記/マージ挙動は不変であることを検証する。
+# ローカル一時ファイルの読み書きのみで検証し、Ollama/ネットワーク/bench呼び出しは一切ない。
+with _tempfile.TemporaryDirectory() as _sv_dir:
+    _sv_root = _html_pathlib.Path(_sv_dir)
+
+    # --- _save_as_markdown: 既存ファイルがcp932(日本語)でも例外を送出しない ---
+    _md_bad = _sv_root / "bad.md"
+    _md_bad.write_bytes("日本語の既存メモ".encode("cp932"))
+    try:
+        f._save_as_markdown(_md_bad, "q_bad_md", "新しい回答md", 1.0, "")
+        _md_bad_exc = None
+    except Exception as _exc:
+        _md_bad_exc = _exc
+    check("_save_as_markdown: 既存ファイルがcp932でも例外を送出しない",
+          _md_bad_exc is None)
+    if _md_bad_exc is None:
+        _md_bad_content = _md_bad.read_text(encoding="utf-8")
+        check("_save_as_markdown: 非UTF-8既存ファイルでも新規回答が保存される",
+              "新しい回答md" in _md_bad_content)
+        try:
+            _md_bad.read_text(encoding="utf-8")
+            _md_bad_reread_ok = True
+        except UnicodeDecodeError:
+            _md_bad_reread_ok = False
+        check("_save_as_markdown: 保存後ファイルはutf-8として問題なく再読込できる(残留未デコードバイトなし)",
+              _md_bad_reread_ok)
+
+    # --- _save_as_text: 既存ファイルが不正単独バイト列でも例外を送出しない ---
+    _txt_bad = _sv_root / "bad.txt"
+    _txt_bad.write_bytes(b"\x93\xfa\xff")
+    try:
+        f._save_as_text(_txt_bad, "q_bad_txt", "新しい回答txt", 0.5)
+        _txt_bad_exc = None
+    except Exception as _exc:
+        _txt_bad_exc = _exc
+    check("_save_as_text: 既存ファイルが不正単独バイトでも例外を送出しない",
+          _txt_bad_exc is None)
+    if _txt_bad_exc is None:
+        _txt_bad_content = _txt_bad.read_text(encoding="utf-8")
+        check("_save_as_text: 非UTF-8既存ファイルでも新規回答が保存される",
+              "新しい回答txt" in _txt_bad_content)
+        try:
+            _txt_bad.read_text(encoding="utf-8")
+            _txt_bad_reread_ok = True
+        except UnicodeDecodeError:
+            _txt_bad_reread_ok = False
+        check("_save_as_text: 保存後ファイルはutf-8として問題なく再読込できる(残留未デコードバイトなし)",
+              _txt_bad_reread_ok)
+
+    # --- _save_as_html: 既存ファイルが非UTF-8(cp932)でも例外を送出しない ---
+    _html_bad = _sv_root / "bad.html"
+    _html_bad.write_bytes("<body>日本語</body>".encode("cp932"))
+    try:
+        f._save_as_html(_html_bad, "q_bad_html", "新しい回答html", 0.7)
+        _html_bad_exc = None
+    except Exception as _exc:
+        _html_bad_exc = _exc
+    check("_save_as_html: 既存ファイルがcp932でも例外を送出しない",
+          _html_bad_exc is None)
+    if _html_bad_exc is None:
+        _html_bad_content = _html_bad.read_text(encoding="utf-8")
+        check("_save_as_html: 非UTF-8既存ファイルでも新規回答が保存される",
+              "新しい回答html" in _html_bad_content)
+        try:
+            _html_bad.read_text(encoding="utf-8")
+            _html_bad_reread_ok = True
+        except UnicodeDecodeError:
+            _html_bad_reread_ok = False
+        check("_save_as_html: 保存後ファイルはutf-8として問題なく再読込できる(残留未デコードバイトなし)",
+              _html_bad_reread_ok)
+
+    # --- 回帰: 既存ファイルが無い/有効UTF-8の場合は従来通りbyte-for-byte一致 ---
+
+    # _save_as_markdown: 有効UTF-8の既存ファイルへの追記が従来通り
+    _md_good = _sv_root / "good.md"
+    _md_existing = "# 既存メモ\n\n有効なUTF-8の既存内容 täüst 日本語。\n\n"
+    _md_good.write_text(_md_existing, encoding="utf-8")
+    f._save_as_markdown(_md_good, "q_good_md", "有効な既存回答md", 2.5, "")
+    _md_good_content = _md_good.read_text(encoding="utf-8")
+    _md_ts_m = f.re.search(r"## Q \(([^)]+)\)", _md_good_content)
+    check("_save_as_markdown: 追記後にtsが検出できる", _md_ts_m is not None)
+    if _md_ts_m:
+        _md_ts = _md_ts_m.group(1)
+        _md_expected_block = (f"## Q ({_md_ts})\n\nq_good_md\n\n"
+                              f"## A\n\n有効な既存回答md\n\n*所要: 2.5s*\n\n---\n\n")
+        check("_save_as_markdown: 有効UTF-8既存ファイルへの追記はbyte-for-byte従来通り",
+              _md_good_content == _md_existing + _md_expected_block)
+
+    # _save_as_text: 有効UTF-8の既存ファイルへの追記が従来通り
+    _txt_good = _sv_root / "good.txt"
+    _txt_existing = "有効なUTF-8の既存内容 täüst 日本語。\n\n"
+    _txt_good.write_text(_txt_existing, encoding="utf-8")
+    f._save_as_text(_txt_good, "q_good_txt", "有効な既存回答txt", 1.5)
+    _txt_good_content = _txt_good.read_text(encoding="utf-8")
+    _txt_ts_m = f.re.search(r"^\[([^\]]+)\]", _txt_good_content[len(_txt_existing):])
+    check("_save_as_text: 追記後にtsが検出できる", _txt_ts_m is not None)
+    if _txt_ts_m:
+        _txt_ts = _txt_ts_m.group(1)
+        _txt_expected_block = (f"[{_txt_ts}]\nQ: q_good_txt\n\nA:\n有効な既存回答txt\n\n"
+                               f"(所要 1.5s)\n{'='*60}\n\n")
+        check("_save_as_text: 有効UTF-8既存ファイルへの追記はbyte-for-byte従来通り",
+              _txt_good_content == _txt_existing + _txt_expected_block)
+
+    # _save_as_html: 有効UTF-8の既存ファイル(2回保存の<body>マージ)が従来通り
+    _html_good = _sv_root / "good.html"
+    f._save_as_html(_html_good, "q_good_html1", "有効な既存回答html1", 0.3)
+    _html_good_first = _html_good.read_text(encoding="utf-8")
+    f._save_as_html(_html_good, "q_good_html2", "有効な既存回答html2", 0.4)
+    _html_good_content = _html_good.read_text(encoding="utf-8")
+    _html_first_body_m = f.re.search(r"<body>\n(.*)</body>", _html_good_first, f.re.DOTALL)
+    _html_ts2_m = f.re.search(r"<h2>Q <small>\(([^)]+)\)</small></h2>\n<p>q_good_html2</p>",
+                              _html_good_content)
+    check("_save_as_html: 1回目保存のbodyが抽出できる", _html_first_body_m is not None)
+    check("_save_as_html: 2回目保存のtsが検出できる", _html_ts2_m is not None)
+    if _html_first_body_m and _html_ts2_m:
+        _html_first_body = _html_first_body_m.group(1)
+        _html_ts2 = _html_ts2_m.group(1)
+        _html_second_body = (f"<h2>Q <small>({_html_ts2})</small></h2>\n<p>q_good_html2</p>\n"
+                             f"<h2>A</h2>\n<p>有効な既存回答html2<br></p>\n"
+                             f"<hr><p><small>所要: 0.4s</small></p>\n")
+        # 実装(L3210-3218)は既存<body>...</body>間の中身をそのまま次回の
+        # existing_body として引き継ぐ。1回目保存時点の内容は
+        # "<body>\n" + body1 + "</body></html>" であり、<body>と</body>の
+        # 間は "\n" + body1 なので、2回目保存の既存部分には <body> 直後の
+        # 改行が引き継がれ "\n\n" + body1 になる（既存の仕様・quirkであり
+        # 今回の修正では変更していない）。
+        _html_expected = (f"<!DOCTYPE html>\n<html lang='ja'><head>"
+                          f"<meta charset='UTF-8'><title>Fugu Output</title></head>\n"
+                          f"<body>\n\n{_html_first_body}{_html_second_body}</body></html>")
+        check("_save_as_html: 有効UTF-8既存ファイルへの2回目保存(<body>マージ)はbyte-for-byte従来通り",
+              _html_good_content == _html_expected)
+
 # ---------- research_search: 反復リサーチループ (dedup / ラウンド上限 / 早期終了) ----------
 # research_search は「Conductor/proposer 全員に注入される権威コンテキスト」を作る
 # 精度クリティカルな経路だが、これまでオフラインテストが皆無だった。

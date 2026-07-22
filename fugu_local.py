@@ -3155,7 +3155,18 @@ def _save_as_markdown(out: Path, question: str, answer: str,
         block += (f"<details><summary>Context (search/RAG)</summary>\n\n"
                   f"{context}\n\n</details>\n\n")
     block += f"## A\n\n{answer}\n\n*所要: {elapsed}s*\n\n---\n\n"
-    existing = out.read_text(encoding="utf-8") if out.exists() else ""
+    # 2026-07-23: --out が既存ファイルを指す追記保存で、その既存ファイルが
+    # cp932/Shift_JIS 等の非UTF-8バイト列を含む場合（このマシンのコンソールが
+    # cp932 であることに起因する既知の落とし穴 #4 と同種の環境要因）、
+    # encoding="utf-8" のみの read_text は UnicodeDecodeError を送出し、
+    # _save_answer_to_file 経由で保存ステップ全体が異常終了して、せっかく
+    # 計算し終えた回答が失われてしまう。これは iteration 41-44 で
+    # _save_as_excel/_docx/_pdf に対して行った「保存を絶対にクラッシュさせず
+    # 回答を失わない」という degrade-gracefully 修正と同じバグクラスであり、
+    # errors="replace" を付けることで読めない既存バイトだけを置換文字に
+    # 落とし、正常な（UTF-8な）既存内容とこれから書く新規回答は従来通り
+    # そのまま保持する。書き込み側の encoding="utf-8" はそのまま維持。
+    existing = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
     out.write_text(existing + block, encoding="utf-8")
 
 
@@ -3164,7 +3175,11 @@ def _save_as_text(out: Path, question: str, answer: str, elapsed: float):
     from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     block = f"[{ts}]\nQ: {question}\n\nA:\n{answer}\n\n(所要 {elapsed}s)\n{'='*60}\n\n"
-    existing = out.read_text(encoding="utf-8") if out.exists() else ""
+    # 2026-07-23: _save_as_markdown と同じ理由（落とし穴 #4 のcp932環境で
+    # 既存 --out ファイルが非UTF-8バイトを含むと read_text がクラッシュし、
+    # iteration 41-44 の office savers 同様に回答保存が丸ごと失われる）で
+    # errors="replace" を追加。書き込みは encoding="utf-8" のまま不変。
+    existing = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
     out.write_text(existing + block, encoding="utf-8")
 
 
@@ -3209,7 +3224,12 @@ def _save_as_html(out: Path, question: str, answer: str, elapsed: float):
             f"<hr><p><small>所要: {elapsed}s</small></p>\n")
     existing_body = ""
     if out.exists():
-        content = out.read_text(encoding="utf-8")
+        # 2026-07-23: _save_as_markdown/_save_as_text と同じ理由（落とし穴 #4 の
+        # cp932環境で既存 --out ファイルが非UTF-8バイトを含むケース）で
+        # errors="replace" を追加。既存<body>のマージ読み戻しがクラッシュして
+        # iteration 41-44 の office savers と同じバグクラスで回答保存が失われる
+        # のを防ぐ。書き込みは encoding="utf-8" のまま不変。
+        content = out.read_text(encoding="utf-8", errors="replace")
         m = re.search(r"(<body>)(.*?)(</body>)", content, re.DOTALL)
         if m:
             existing_body = m.group(2)
