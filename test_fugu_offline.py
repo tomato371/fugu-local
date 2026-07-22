@@ -2175,6 +2175,90 @@ with _tempfile.TemporaryDirectory() as _rag_dir:
     check("RAG: 通常テキストのチャンク分割はバイト単位で従来通り",
           _rag_by_file.get("plain.txt", []) == _expected_plain_chunks)
 
+# ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
+check("_tokenize: ASCII+CJK混在を別トークンに分割",
+      f._tokenize("PINNについて") == {"pinn", "について"})
+check("_score_chunk: 空チャンクは0.0",
+      f._score_chunk({"apple"}, "") == 0.0)
+check("_score_chunk: 重複トークンありは正のスコア",
+      f._score_chunk({"apple"}, "apple pie recipe") > 0.0)
+check("_score_chunk: 重複トークンなしは0.0",
+      f._score_chunk({"apple"}, "zebra mountain train") == 0.0)
+
+# ---------- rag_search: score>0のみ抽出（2026-07-22） ----------
+# 以前は top = scored[:top_k] のうち先頭(best)が0でなければ丸ごと返しており、
+# top_k内にキーワード的に無関係(score==0)なチャンクが混ざっていても
+# そのままプロンプトへ注入されていた（rag_search ~L855-864）。
+# score>0のみへの絞り込みが「best以外は素通し」の回帰を起こしていないか、
+# また「関連チャンクを取りこぼしていない」かを、Ollama/ネットワーク一切なしで検証する。
+
+
+_orig_get_rag_chunks = f._get_rag_chunks
+try:
+    # 1) queryは1件だけにマッチ、他はスコア0。top_k=2(>=2件)でも
+    #    無関係チャンクの本文が混入しないこと。
+    _chunks_partial = [
+        ("dir/apple.txt", "This chunk talks about apple pie and recipe details."),
+        ("dir/zebra.txt", "Completely unrelated content about zebras and mountains."),
+        ("dir/cars.txt", "Another unrelated text about cars and trains."),
+    ]
+    f._get_rag_chunks = lambda dirs: _chunks_partial
+    _res_partial = f.rag_search("apple recipe", dirs=["dummy"], top_k=2)
+    check("rag_search: マッチしたチャンクのSourceが含まれる",
+          "[Source: apple.txt]" in _res_partial)
+    check("rag_search: スコア0チャンクの本文(zebra)は混入しない",
+          "zebra" not in _res_partial and "mountains" not in _res_partial)
+    check("rag_search: スコア0チャンクの本文(cars)は混入しない",
+          "cars" not in _res_partial and "trains" not in _res_partial)
+
+    # 2) 複数チャンクが全てスコア>0 -> 従来通りtop_k件まで降順・書式そのまま。
+    # 注意: _score_chunk は _tokenize(chunk) を「集合」として重複除去してから
+    # overlap/sqrt(len)+1 を計算するため、同じ語の反復回数はスコアに影響しない。
+    # トークン集合の重複数と集合サイズを変えて意図的にスコアを分ける
+    # （one: overlap2/len2≈82.8 > three: overlap1/len1=50.0 > two: overlap1/len2≈41.4）。
+    # わざと入力順とスコア降順を食い違わせ、sort が実際に効いていることを検証する。
+    _chunks_all_match = [
+        ("dir/two.txt", "apple only"),      # overlap=1({apple}), len=2 -> ~41.4
+        ("dir/three.txt", "recipe"),        # overlap=1({recipe}), len=1 -> 50.0
+        ("dir/one.txt", "apple recipe"),    # overlap=2({apple,recipe}), len=2 -> ~82.8
+    ]
+    f._get_rag_chunks = lambda dirs: _chunks_all_match
+    _res_all = f.rag_search("apple recipe", dirs=["dummy"], top_k=3)
+    _expected_all = (
+        "## Relevant Document Context (RAG)\n\n"
+        "[Source: one.txt]\napple recipe"
+        "\n\n---\n\n"
+        "[Source: three.txt]\nrecipe"
+        "\n\n---\n\n"
+        "[Source: two.txt]\napple only"
+    )
+    check("rag_search: 全チャンクscore>0ならtop_k件・降順・書式が従来通り",
+          _res_all == _expected_all)
+
+finally:
+    f._get_rag_chunks = _orig_get_rag_chunks
+
+# best(=全件)が0スコアになるクエリで再検証(明示的に独立したtry/finallyで実施)
+try:
+    f._get_rag_chunks = lambda dirs: [
+        ("dir/zebra.txt", "Completely unrelated content about zebras and mountains."),
+        ("dir/cars.txt", "Another unrelated text about cars and trains."),
+    ]
+    check("rag_search: best(=全件)がscore0なら空文字（既存契約を維持）",
+          f.rag_search("apple recipe", dirs=["dummy"], top_k=2) == "")
+finally:
+    f._get_rag_chunks = _orig_get_rag_chunks
+
+# 4) 空dirs / 空チャンクリストは従来通り空文字
+check("rag_search: dirsが空なら空文字",
+      f.rag_search("apple", dirs=[]) == "")
+try:
+    f._get_rag_chunks = lambda dirs: []
+    check("rag_search: チャンクリストが空なら空文字",
+          f.rag_search("apple", dirs=["dummy"]) == "")
+finally:
+    f._get_rag_chunks = _orig_get_rag_chunks
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")

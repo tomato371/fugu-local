@@ -858,6 +858,12 @@ def rag_search(question: str, dirs: list = None, top_k: int = None) -> str:
     top = scored[:top_k]
     if not top or top[0][2] == 0:
         return ""
+    # 2026-07-22: 上位 top_k 件の中にスコア0（クエリトークンと無重複＝キーワード的に
+    # 無関係）なチャンクが混ざっていても、以前は best さえ 0 でなければそのまま
+    # 全件をプロンプトに注入していた。関係ないチャンクは各 proposer の回答を誤誘導
+    # しうるノイズなので、精度優先（時間は気にしない）の方針に基づき score>0 の
+    # チャンクのみを残す。降順順序と top_k 上限はそのまま、集合を縮小するだけ。
+    top = [t for t in top if t[2] > 0]
     parts = []
     for path, chunk, score in top:
         parts.append(f"[Source: {Path(path).name}]\n{chunk.strip()}")
