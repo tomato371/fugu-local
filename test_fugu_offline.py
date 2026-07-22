@@ -153,6 +153,22 @@ check("pptx: タイトルは見出し由来", _slides[1]["title"] == "詳細")
 check("pptx: 見出し無しは概要1枚",
       len(f._parse_slides("ただの文章その1。\nその2。")) == 1)
 check("pptx: deck_title は短い質問を採用", f._deck_title("犬の紹介", _slides) == "犬の紹介")
+# 2026-07-22: 空白のみの質問は if question で truthy のまま素通りし、
+# strip()後に splitlines() が [] を返して [0] が IndexError になっていた回帰。
+check("pptx: deck_title 空白のみ質問+スライド無しは既定値",
+      f._deck_title("   ", []) == "プレゼンテーション")
+check("pptx: deck_title 空白のみ質問はスライドタイトルへフォールバック",
+      f._deck_title("\n\n", [{"title": "概要", "bullets": []}]) == "概要")
+check("pptx: deck_title 空白のみ質問+無題スライドは既定値",
+      f._deck_title("\t \n", [{"title": "", "bullets": []}]) == "プレゼンテーション")
+check("pptx: deck_title 複数行質問は先頭行を採用",
+      f._deck_title("\n  タイトル行\n本文\n", []) == "タイトル行")
+check("pptx: deck_title 40字超はスライドタイトルへフォールバック",
+      f._deck_title("あ" * 41, [{"title": "見出し", "bullets": []}]) == "見出し")
+check("pptx: deck_title 空文字はスライドタイトルへフォールバック",
+      f._deck_title("", [{"title": "見出し", "bullets": []}]) == "見出し")
+check("pptx: deck_title None質問は既定値",
+      f._deck_title(None, []) == "プレゼンテーション")
 
 # ---------- 出力形態ルーティングガードレール ----------
 f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "phi4"]

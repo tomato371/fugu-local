@@ -3279,7 +3279,12 @@ def _parse_slides(answer):
 
 
 def _deck_title(question, slides):
-    q = (question or "").strip().splitlines()[0] if question else ""
+    # 2026-07-22: `if question` は生文字列を真偽判定するため、空白のみの質問
+    # （例 "   " / "\n\n"）は truthy のまま素通りし、strip()後は空文字列に
+    # なって splitlines() が [] を返し、[0] で IndexError が発生していた。
+    # 一度リストにしてからガード付きで先頭要素を取り出す。
+    _q_lines = (question or "").strip().splitlines()
+    q = _q_lines[0] if _q_lines else ""
     if 0 < len(q) <= 40:
         return q
     if slides and slides[0].get("title"):
