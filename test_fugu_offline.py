@@ -2340,6 +2340,259 @@ with _tempfile.TemporaryDirectory() as _html_dir:
     check("_save_as_html: 生の(未escape)コード本文は出力に含まれない",
           "a < b && c" not in _content_e)
 
+# ---------- research_search: 反復リサーチループ (dedup / ラウンド上限 / 早期終了) ----------
+# research_search は「Conductor/proposer 全員に注入される権威コンテキスト」を作る
+# 精度クリティカルな経路だが、これまでオフラインテストが皆無だった。
+# f._search_raw と f.ask の両方をモックし、実ネットワーク/Ollama呼び出しを一切発生させずに
+# 分岐(Source URL重複排除・大小無視のクエリ重複排除・sufficient判定・空queries早期終了・
+# SEARCH_MAX_ROUNDS上限)を検証する。extract_json は本物をそのまま使う(ask()の戻り値の
+# 生文字列だけをモックする)。
+#
+# さらに、万一モックが外れて本物の _search_raw/ask 経由で実ネットワークに落ちないことを
+# 保証するため、urllib.request.urlopen と f.subprocess.run も「呼ばれたら即座に
+# AssertionError」の番人(センチネル)に差し替える(gotcha #8 の「bounded-loop違反は例外で
+# 可視化する」流儀を踏襲)。
+
+_orig_search_raw_rs = f._search_raw
+_orig_ask_rs = f.ask
+_orig_urlopen_rs = urllib.request.urlopen
+_orig_subprocess_run_rs = f.subprocess.run
+
+
+def _rs_no_network_urlopen(*a, **k):
+    raise AssertionError("research_search: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _rs_no_subprocess_run(*a, **k):
+    raise AssertionError("research_search: モック漏れで実subprocess.runが呼ばれた")
+
+
+def _rs_search_factory(mapping, calls_log, max_calls):
+    """mapping: {query: [item, ...]}。想定回数(max_calls)を超えたら例外(上限違反を可視化)。"""
+    def _fake(query, max_results=None):
+        calls_log.append(query)
+        if len(calls_log) > max_calls:
+            raise AssertionError(
+                f"research_search: 想定回数({max_calls})を超えて_search_rawが呼ばれた"
+                "(SEARCH_MAX_ROUNDS違反疑い)")
+        return list(mapping.get(query, []))
+    return _fake
+
+
+def _rs_ask_factory(responses, calls_log):
+    """responses: 十分性判定として順に返すdictのリスト。想定回数を超えたら例外。"""
+    def _fake(model, messages, temperature, think=None, fmt=None, label=None,
+              num_predict=None, num_ctx=None):
+        calls_log.append(messages)
+        idx = len(calls_log) - 1
+        if idx >= len(responses):
+            raise AssertionError(
+                "research_search: 想定回数を超えてask()が呼ばれた(早期終了/ラウンド上限違反疑い)")
+        return json.dumps(responses[idx])
+    return _fake
+
+
+try:
+    urllib.request.urlopen = _rs_no_network_urlopen
+    f.subprocess.run = _rs_no_subprocess_run
+
+    # --- (A) Source-URL重複排除 と Sourceなし項目の先頭80文字重複排除 ---
+    _itemA1 = "[T1]\nBody1 for source dedup test\nSource: http://example.com/a"
+    _itemA2 = "No-source item padding text to reach eighty chars exactly xxxxxxxxxxxxxxxxxxxxxxxxx"
+    _itemA3 = "[T3]\nBody3 brand new item\nSource: http://example.com/b"
+    _searchA_calls = []
+    _askA_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"Q_DEDUP": [_itemA1, _itemA2],
+             "Q_DEDUP_R2": [_itemA1, _itemA2, _itemA3]},  # R2で同じ2件+新規1件を返す
+            _searchA_calls, max_calls=2)
+        f.ask = _rs_ask_factory(
+            [{"sufficient": False, "missing": "x", "queries": ["Q_DEDUP_R2"]},
+             {"sufficient": True, "missing": "", "queries": []}],
+            _askA_calls)
+        _resA = f.research_search("Q_DEDUP")
+        check("research_search: Source URL重複は2巡目で再注入されない",
+              _resA.count("http://example.com/a") == 1)
+        check("research_search: Sourceなし項目は先頭80文字一致で重複排除される",
+              _resA.count("No-source item padding text to reach eighty chars exactly") == 1)
+        check("research_search: 新規Source項目はきちんと追加される",
+              "http://example.com/b" in _resA)
+        check("research_search: (A)_search_rawはR1・R2の2回のみ呼ばれる",
+              _searchA_calls == ["Q_DEDUP", "Q_DEDUP_R2"])
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (B) 実行済みクエリの大小無視の重複排除(同一クエリの再検索防止) ---
+    _itemB1 = "[B1]\nfirst round body\nSource: http://example.com/r1"
+    _itemB2 = "[B2]\nsecond round body\nSource: http://example.com/r2"
+    _searchB_calls = []
+    _askB_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"Case Test Query": [_itemB1], "New Angle Query": [_itemB2]},
+            _searchB_calls, max_calls=2)
+        f.ask = _rs_ask_factory(
+            [{"sufficient": False, "missing": "x",
+              "queries": ["CASE TEST QUERY", "New Angle Query"]},  # 1つ目は既実行クエリの大小違い
+             {"sufficient": True, "missing": "", "queries": []}],
+            _askB_calls)
+        _resB = f.research_search("Case Test Query")
+        check("research_search: 既実行クエリは大小無視で再検索されない",
+              _searchB_calls == ["Case Test Query", "New Angle Query"])
+        check("research_search: 重複クエリをスキップしつつ新規クエリの結果は反映される",
+              "http://example.com/r1" in _resB and "http://example.com/r2" in _resB)
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (C) sufficient=true で即座に早期終了(以降のラウンドの検索が発生しない) ---
+    _itemC1 = "[C1]\nsufficient stop body\nSource: http://example.com/c1"
+    _searchC_calls = []
+    _askC_calls = []
+    try:
+        f._search_raw = _rs_search_factory({"Suff Stop Query": [_itemC1]},
+                                            _searchC_calls, max_calls=1)
+        f.ask = _rs_ask_factory([{"sufficient": True, "missing": "", "queries": []}],
+                                 _askC_calls)
+        _resC = f.research_search("Suff Stop Query")
+        check("research_search: sufficient=trueで即座に早期終了(検索は1ラウンドのみ)",
+              _searchC_calls == ["Suff Stop Query"])
+        check("research_search: sufficient=trueなら判定は1回のみ呼ばれる",
+              len(_askC_calls) == 1)
+        check("research_search: 早期終了時もそのラウンドの結果は反映される",
+              "http://example.com/c1" in _resC)
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (D) 空/欠落のqueriesで早期終了(以降のラウンドの検索が発生しない) ---
+    _itemD1 = "[D1]\nempty queries stop body\nSource: http://example.com/d1"
+    _searchD_calls = []
+    _askD_calls = []
+    try:
+        f._search_raw = _rs_search_factory({"Empty Queries Query": [_itemD1]},
+                                            _searchD_calls, max_calls=1)
+        f.ask = _rs_ask_factory(
+            [{"sufficient": False, "missing": "still missing", "queries": []}],
+            _askD_calls)
+        _resD = f.research_search("Empty Queries Query")
+        check("research_search: 空queriesリストで早期終了(検索は1ラウンドのみ)",
+              _searchD_calls == ["Empty Queries Query"])
+        check("research_search: 空queries早期終了時もそのラウンドの結果は反映される",
+              "http://example.com/d1" in _resD)
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    _itemD2 = "[D2]\nmissing queries key stop body\nSource: http://example.com/d2"
+    _searchD2_calls = []
+    _askD2_calls = []
+    try:
+        f._search_raw = _rs_search_factory({"Missing Key Query": [_itemD2]},
+                                            _searchD2_calls, max_calls=1)
+        # "queries" キー自体が欠落したJSON(j.get("queries") が None になるケース)
+        f.ask = _rs_ask_factory([{"sufficient": False, "missing": "still missing"}],
+                                 _askD2_calls)
+        _resD2 = f.research_search("Missing Key Query")
+        check("research_search: queriesキー欠落でも早期終了する(検索は1ラウンドのみ)",
+              _searchD2_calls == ["Missing Key Query"])
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (E) SEARCH_MAX_ROUNDS上限: 常にsufficient=falseかつ新規クエリでも上限で打ち切り ---
+    _searchE_calls = []
+    _askE_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"Bound Round Query": ["[E1]\nr1\nSource: http://example.com/e1"],
+             "Bound Q2": ["[E2]\nr2\nSource: http://example.com/e2"],
+             "Bound Q3": ["[E3]\nr3\nSource: http://example.com/e3"]},
+            _searchE_calls, max_calls=f.SEARCH_MAX_ROUNDS)
+        f.ask = _rs_ask_factory(
+            [{"sufficient": False, "missing": "x", "queries": ["Bound Q2"]},
+             {"sufficient": False, "missing": "y", "queries": ["Bound Q3"]}],
+            _askE_calls)  # ちょうど MAX_ROUNDS-1 回分しか用意しない(最終ラウンドは判定なし)
+        _resE = f.research_search("Bound Round Query")
+        check("research_search: 新規クエリが尽きなくてもSEARCH_MAX_ROUNDSでちょうど打ち切り",
+              len(_searchE_calls) == f.SEARCH_MAX_ROUNDS == 3)
+        check("research_search: 最終ラウンドでは十分性判定(ask)を呼ばない",
+              len(_askE_calls) == f.SEARCH_MAX_ROUNDS - 1)
+        check("research_search: 上限到達までの全ラウンドの結果が反映される",
+              all(u in _resE for u in ("http://example.com/e1", "http://example.com/e2",
+                                        "http://example.com/e3")))
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (F) 全ラウンドで結果ゼロ -> 空文字を返す ---
+    _searchF_calls = []
+    _askF_calls = []
+    try:
+        f._search_raw = _rs_search_factory({}, _searchF_calls, max_calls=f.SEARCH_MAX_ROUNDS)
+        f.ask = _rs_ask_factory(
+            [{"sufficient": False, "missing": "x", "queries": ["F Round2"]},
+             {"sufficient": False, "missing": "y", "queries": ["F Round3"]}],
+            _askF_calls)
+        _resF = f.research_search("F Round1")
+        check("research_search: 全ラウンドで結果ゼロなら空文字を返す", _resF == "")
+        check("research_search: (F)検索はSEARCH_MAX_ROUNDS回実施された上での空文字",
+              len(_searchF_calls) == f.SEARCH_MAX_ROUNDS)
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (G) 結果が1件でもあれば日付入りフレッシュネスヘッダーが付与される ---
+    _searchG_calls = []
+    _askG_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"Header Query": ["[G1]\nheader body\nSource: http://example.com/g1"]},
+            _searchG_calls, max_calls=1)
+        f.ask = _rs_ask_factory([{"sufficient": True, "missing": "", "queries": []}],
+                                 _askG_calls)
+        _resG = f.research_search("Header Query")
+        _expected_date_g = f.time.strftime("%Y-%m-%d")
+        check("research_search: 結果ありなら取得日入りヘッダーが付与される",
+              _resG.startswith(f"## Web Search Results (取得日: {_expected_date_g})"))
+        check("research_search: ヘッダーに本文(検索結果)が続く",
+              "http://example.com/g1" in _resG)
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (H) 特性テスト(既存の仕様上の弱点の可視化。fugu_local.py は変更しない): ---
+    #     注入上限カット(L566-571)は「body に1件も入らなければ空文字のまま」で、
+    #     最初の1件が SEARCH_CONTEXT_CHARS を超えると header はつくが body が空になり、
+    #     sufficient=True と判定された唯一の具体的事実が黙って本文から消える。
+    #     これは results が空ではない(検索は成功している)のに、注入されるコンテキストには
+    #     何の事実も含まれないという矛盾した挙動であり、人間の確認が必要と考えられる。
+    #     ここでは fugu_local.py 側は一切変更せず、現状の挙動をそのまま固定化するのみ。
+    _hugeH = "[Huge]\n" + ("Z" * (f.SEARCH_CONTEXT_CHARS + 500)) + "\nSource: http://example.com/huge"
+    _searchH_calls = []
+    _askH_calls = []
+    try:
+        f._search_raw = _rs_search_factory({"Huge Item Query": [_hugeH]},
+                                            _searchH_calls, max_calls=1)
+        f.ask = _rs_ask_factory([{"sufficient": True, "missing": "", "queries": []}],
+                                 _askH_calls)
+        _resH = f.research_search("Huge Item Query")
+        check("[特性テスト/要人間確認] research_search: 先頭項目がSEARCH_CONTEXT_CHARS超過だと"
+              "bodyが空になり結果が黙って落ちる(現状挙動をそのまま固定化・fugu_local.py未変更)",
+              ("http://example.com/huge" not in _resH) and ("Z" * 100 not in _resH)
+              and _resH.startswith("## Web Search Results (取得日:"))
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+finally:
+    f._search_raw = _orig_search_raw_rs
+    f.ask = _orig_ask_rs
+    urllib.request.urlopen = _orig_urlopen_rs
+    f.subprocess.run = _orig_subprocess_run_rs
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
