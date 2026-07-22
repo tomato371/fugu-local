@@ -6,6 +6,10 @@
 # Web UI (fugu_web.py)
 gradio
 
+# REST API (fugu_api.py)
+fastapi
+uvicorn[standard]
+
 # Multi-format file input/output (--file / --out)
 pdfplumber      # read PDF
 fpdf2           # write PDF

@@ -7,3 +7,6 @@ exclude = ["backups", "iterations"]
 # High-signal rules first (real errors: syntax + pyflakes), not style noise.
 # The rule set can be widened over time (e.g. add "E", "I", "UP").
 select = ["E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

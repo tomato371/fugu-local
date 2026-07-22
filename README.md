@@ -117,12 +117,34 @@ To run the CLI inside the container instead:
 docker compose run --rm fugu python fugu_local.py "Is 91 a prime number?"
 ```
 
+## REST API
+
+The orchestrator is also exposed as a small FastAPI service.
+
+```bash
+# start the API (Ollama must be running with a model pulled)
+pip install fastapi "uvicorn[standard]"
+uvicorn fugu_api:app --host 0.0.0.0 --port 8000
+# interactive docs: http://localhost:8000/docs
+
+# ask a question
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Is 91 a prime number?"}'
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Is the Ollama backend reachable? |
+| `POST` | `/ask` | Answer a question via the full MoA pipeline |
+
 ## Project structure
 
 | File | Purpose |
 |---|---|
 | `fugu_local.py` | Core orchestrator + CLI (Conductor / Critic / Proposers / Aggregator) |
 | `fugu_web.py` | Gradio web front-end |
+| `fugu_api.py` | FastAPI REST API (`POST /ask`, `GET /health`) |
 | `fugu_tui.py` | Terminal UI front-end |
 | `bench_fugu.py` | Benchmark runner (accuracy) |
 | `bench_queue.py` | Batch/queue benchmarking |
