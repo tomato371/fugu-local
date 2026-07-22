@@ -92,6 +92,29 @@ python fugu_local.py --rag ./docs "Implement a PINN for this problem"
 python fugu_web.py
 ```
 
+## Run with Docker
+
+Everything runs in containers — no local Python or Ollama install needed
+(requires Docker; for GPU, the NVIDIA Container Toolkit).
+
+```bash
+# 1. Start Ollama and pull at least the lightweight router model
+docker compose up -d ollama
+docker compose exec ollama ollama pull qwen3:4b
+# (optional — the full council; large downloads)
+# docker compose exec ollama ollama pull gpt-oss:20b
+# docker compose exec ollama ollama pull qwen3-coder:30b
+
+# 2. Start the web UI, then open http://localhost:7860
+docker compose up fugu
+```
+
+To run the CLI inside the container instead:
+
+```bash
+docker compose run --rm fugu python fugu_local.py "Is 91 a prime number?"
+```
+
 ## Project structure
 
 | File | Purpose |
@@ -103,6 +126,9 @@ python fugu_web.py
 | `bench_queue.py` | Batch/queue benchmarking |
 | `eval_fugu.py` | Evaluation utilities |
 | `test_fugu_offline.py` | Offline unit tests (no model required) |
+| `Dockerfile` | Container image for the app (web UI by default) |
+| `docker-compose.yml` | One-command stack: Ollama + fugu web UI |
+| `requirements.txt` | Optional deps (web UI + file I/O); core needs none |
 
 ## License
 

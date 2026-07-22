@@ -1,0 +1,31 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    # --- GPU (optional) ---
+    # Requires the NVIDIA Container Toolkit on the host. Uncomment to use the GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  fugu:
+    build: .
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      GRADIO_SERVER_NAME: 0.0.0.0
+    ports:
+      - "7860:7860"
+    stdin_open: true
+    tty: true
+
+volumes:
+  ollama:

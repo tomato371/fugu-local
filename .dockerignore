@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+backups/
+iterations/
+*.log
+*.gguf
+*.bin
+*.safetensors
+.env

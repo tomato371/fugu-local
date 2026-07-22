@@ -1,0 +1,14 @@
+# The core orchestrator (fugu_local.py CLI) needs NO third-party packages —
+# it talks to Ollama over the standard library only.
+#
+# The packages below are OPTIONAL and enable extra features:
+
+# Web UI (fugu_web.py)
+gradio
+
+# Multi-format file input/output (--file / --out)
+pdfplumber      # read PDF
+fpdf2           # write PDF
+python-docx     # read/write Word
+openpyxl        # read/write Excel
+python-pptx     # read/write PowerPoint

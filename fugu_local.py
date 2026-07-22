@@ -46,7 +46,7 @@ for _stream in (sys.stdout, sys.stderr):
 # 設定
 # ==================================================
 
-OLLAMA_URL = "http://localhost:11434"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 # --- モデルの役割 ---
 # Conductor + Critic: qwen3:4b（軽量・高速・JSON安定。ルーティング専用、VRAM常駐最小化）
