@@ -1297,6 +1297,92 @@ check("jp: 漢字のみ(旧版の取りこぼし)", f.use_jp_aggregator("東京�
 check("jp: 英語はFalse", not f.use_jp_aggregator("What is the capital of France?"))
 check("jp: 空/None耐性", not f.use_jp_aggregator("") and not f.use_jp_aggregator(None))
 
+# ---------- pick_aggregator（統合役の選定ルーティング） ----------
+# has_code / 日本語 / それ以外 の各分岐と優先順位（コード > 日本語 > 推論型既定）を
+# module globals をセンチネル値へ差し替えて検証する。JP_AGGREGATOR_STRONG / JP_AGGREGATOR /
+# AGGREGATOR_REASONING / AGGREGATOR / CONDUCTOR / PROPOSERS はすべて try/finally で
+# 復元し、後続チェック（aggregate 経由で pick_aggregator を間接的に叩く箇所を含む）に
+# 汚染したグローバルを見せないようにする。
+# 判定の曖昧さを避けるため、日本語入力はひらがな/カタカナのみ、非日本語入力はASCIIのみを使う
+# （use_jp_aggregator の docstring が指摘する「漢字だけでは日中判別不能」問題を踏まない）。
+_JP_TEXT = "これはテストです"   # ひらがな -> use_jp_aggregator は True
+_EN_TEXT = "What is this?"    # ASCIIのみ -> use_jp_aggregator は False
+
+_pa_orig_jp_strong = f.JP_AGGREGATOR_STRONG
+_pa_orig_jp = f.JP_AGGREGATOR
+_pa_orig_agg_reasoning = f.AGGREGATOR_REASONING
+_pa_orig_agg = f.AGGREGATOR
+_pa_orig_conductor = f.CONDUCTOR
+_pa_orig_proposers = f.PROPOSERS
+try:
+    f.AGGREGATOR = "SENTINEL-AGGREGATOR-CODE"
+    f.AGGREGATOR_REASONING = "SENTINEL-AGGREGATOR-REASONING"
+    f.JP_AGGREGATOR_STRONG = "SENTINEL-JP-STRONG"
+    f.JP_AGGREGATOR = "SENTINEL-JP-BASE"
+    f.CONDUCTOR = "SENTINEL-CONDUCTOR"
+
+    # (1) has_code=True は言語に関係なく常に AGGREGATOR
+    f.PROPOSERS = []
+    check("pick_agg: has_code優先(日本語入力でもAGGREGATOR)",
+          f.pick_aggregator(_JP_TEXT, has_code=True) == f.AGGREGATOR)
+    check("pick_agg: has_code優先(英語入力でもAGGREGATOR)",
+          f.pick_aggregator(_EN_TEXT, has_code=True) == f.AGGREGATOR)
+
+    # (2) 日本語 + JP_AGGREGATOR_STRONG が導入済み(PROPOSERSに存在) -> STRONGを返す
+    f.PROPOSERS = [f.JP_AGGREGATOR_STRONG]
+    check("pick_agg: 日本語+強JPモデル導入済みはSTRONGを返す",
+          f.pick_aggregator(_JP_TEXT, has_code=False) == f.JP_AGGREGATOR_STRONG)
+
+    # (3a) 日本語 + STRONGがfalsy(未設定) + JP_AGGREGATORがPROPOSERSに存在 -> JP_AGGREGATORを返す
+    f.JP_AGGREGATOR_STRONG = None
+    f.PROPOSERS = [f.JP_AGGREGATOR]
+    check("pick_agg: 日本語+STRONG未設定はJP_AGGREGATORへ(導入済み)",
+          f.pick_aggregator(_JP_TEXT, has_code=False) == f.JP_AGGREGATOR)
+
+    # (3b) STRONGが値を持っていてもPROPOSERS未導入なら同様にJP_AGGREGATORへ落ちる
+    f.JP_AGGREGATOR_STRONG = "SENTINEL-JP-STRONG"
+    f.PROPOSERS = [f.JP_AGGREGATOR]  # STRONGはPROPOSERSに含まれない=未導入扱い
+    check("pick_agg: 強JPモデルがPROPOSERS未導入ならJP_AGGREGATORへ",
+          f.pick_aggregator(_JP_TEXT, has_code=False) == f.JP_AGGREGATOR)
+
+    # (4) 日本語 + JP_AGGREGATORはPROPOSERS未導入だがCONDUCTORと一致 -> JP_AGGREGATORを返す
+    f.JP_AGGREGATOR_STRONG = None
+    f.PROPOSERS = ["SENTINEL-OTHER-MODEL"]
+    f.CONDUCTOR = f.JP_AGGREGATOR
+    check("pick_agg: JP_AGGREGATOR未導入でもCONDUCTORと一致すれば採用",
+          f.pick_aggregator(_JP_TEXT, has_code=False) == f.JP_AGGREGATOR)
+
+    # (5) 日本語 + JP系条件を何も満たさない -> 最終フォールバックのAGGREGATOR
+    #     （現行docstring通りの意図的フォールバックであり、qwen3系のAGGREGATORも
+    #     deepseek-r1の言語混入問題を踏まない選択なので、これは特性確認であってバグ報告ではない）
+    f.CONDUCTOR = "SENTINEL-CONDUCTOR-OTHER"
+    check("pick_agg: 日本語でJP系条件すべて不成立ならAGGREGATOR(特性確認)",
+          f.pick_aggregator(_JP_TEXT, has_code=False) == f.AGGREGATOR)
+
+    # (6) 非日本語 + AGGREGATOR_REASONINGが導入済み -> AGGREGATOR_REASONINGを返す
+    f.PROPOSERS = [f.AGGREGATOR_REASONING]
+    check("pick_agg: 非日本語は導入済みのAGGREGATOR_REASONINGへ",
+          f.pick_aggregator(_EN_TEXT, has_code=False) == f.AGGREGATOR_REASONING)
+
+    # (7) 非日本語 + AGGREGATOR_REASONINGが未導入 -> AGGREGATORへフォールバック
+    f.PROPOSERS = ["SENTINEL-OTHER-MODEL"]
+    check("pick_agg: 非日本語でAGGREGATOR_REASONING未導入はAGGREGATORへ",
+          f.pick_aggregator(_EN_TEXT, has_code=False) == f.AGGREGATOR)
+
+    # (8) 相互作用: 日本語だがhas_code=True -> コードがJP系より優先されAGGREGATORを返す
+    f.JP_AGGREGATOR_STRONG = "SENTINEL-JP-STRONG"
+    f.PROPOSERS = [f.JP_AGGREGATOR_STRONG, f.JP_AGGREGATOR]  # JP条件は満たせる状態にしておく
+    f.CONDUCTOR = f.JP_AGGREGATOR
+    check("pick_agg: 日本語でもhas_code=TrueならAGGREGATOR(コード優先)",
+          f.pick_aggregator(_JP_TEXT, has_code=True) == f.AGGREGATOR)
+finally:
+    f.JP_AGGREGATOR_STRONG = _pa_orig_jp_strong
+    f.JP_AGGREGATOR = _pa_orig_jp
+    f.AGGREGATOR_REASONING = _pa_orig_agg_reasoning
+    f.AGGREGATOR = _pa_orig_agg
+    f.CONDUCTOR = _pa_orig_conductor
+    f.PROPOSERS = _pa_orig_proposers
+
 # ---------- aggregate のフォールバック（ask をモンキーパッチ） ----------
 _orig_ask = f.ask
 _ask_log = []
