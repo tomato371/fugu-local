@@ -3402,10 +3402,33 @@ def _parse_slides(answer):
     slides = []
     cur = None
     in_code = False
-    for ln in answer.splitlines():
+
+    # 2026-07-23: ```フェンスの数が奇数（＝閉じ忘れ/開き忘れで打ち切られた
+    # proposer 出力）だと、旧実装の単純なトグルでは in_code が文書の残り
+    # 全体で True に固定されたままになる。すると以降の全ての '#'/'##' 見出し
+    # が新規スライドを作れず（"if m and not in_code" のガードに阻まれ）、かつ
+    # 強調記号除去（[*_`#]+ の除去）もスキップされるため、見出しが
+    # "## 節タイトル" というリテラルな文字列のまま1枚のスライドの箇条書きに
+    # 押し込まれ、複数節あるはずのデッキが1枚に崩壊してしまう。これは
+    # フェンスの閉じ忘れ/不対応によって以降の処理状態が汚染され続ける同種の
+    # バグで、extract_boxed（iteration 11）・strip_think（iteration 16）・
+    # _save_as_html（iteration 37）で既に対処済みのバグクラスだが、
+    # _parse_slides だけは未対応だった。ここでは事前に本文中の```で始まる
+    # 行を数え、その総数が奇数＝最後の1個が対になっていない場合、その最後の
+    # 1個だけをトグル対象から除外する（フェンスとして扱わずコード開始/終了
+    # 処理をしない）。それより前の、正しく対になったコードブロックは従来
+    # 通りコードモードを維持するので、そのブロック内の '# コメント' が見出し
+    # に昇格することはない。フェンスが偶数個（＝全て正しく対応）の入力では
+    # unpaired_idx が -1 のままとなり、挙動は一切変わらない。
+    lines = answer.splitlines()
+    fence_idxs = [i for i, ln in enumerate(lines) if ln.rstrip().strip().startswith("```")]
+    unpaired_idx = fence_idxs[-1] if len(fence_idxs) % 2 == 1 else -1
+
+    for i, ln in enumerate(lines):
         s = ln.rstrip()
         if s.strip().startswith("```"):
-            in_code = not in_code
+            if i != unpaired_idx:
+                in_code = not in_code
             continue
         m = re.match(r"^\s*#{1,4}\s+(.*)$", s)
         if m and not in_code:

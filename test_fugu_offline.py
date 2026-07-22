@@ -166,6 +166,57 @@ check("pptx: 箇条書き記号を除去", _slides[0]["bullets"] == ["要点1", 
 check("pptx: タイトルは見出し由来", _slides[1]["title"] == "詳細")
 check("pptx: 見出し無しは概要1枚",
       len(f._parse_slides("ただの文章その1。\nその2。")) == 1)
+
+# 2026-07-23: 未対応(奇数個)の```フェンスが in_code を文書末尾まで固定し、
+# 以降の見出しが新規スライドを作れず literal な "## ..." 箇条書きとして
+# 1枚に押し込まれてしまう回帰の防止（extract_boxed iter11 / strip_think
+# iter16 / _save_as_html iter37 と同種のバグクラス）。
+
+# 回帰: 対になったコードブロック内の '# コメント' は見出しに昇格せず、
+# コード本文も強調記号除去されない（従来通り）。
+_bal_code = f._parse_slides(
+    "## セクション1\n```python\n# これはコメント\nx = 1\n```\n## セクション2\n本文")
+check("pptx回帰: 対になったコードフェンス内の#コメントは見出しに昇格しない",
+      len(_bal_code) == 2
+      and _bal_code[0]["title"] == "セクション1"
+      and "# これはコメント" in _bal_code[0]["bullets"]
+      and "x = 1" in _bal_code[0]["bullets"]
+      and _bal_code[1]["title"] == "セクション2")
+
+# 回帰: 対になったコードブロック2個(フェンス4本)+見出し混在は従来通り分割される。
+_bal_two = f._parse_slides(
+    "## A\n```python\n# a\n```\n## B\n```python\n# b\n```\n## C\n末尾の文")
+check("pptx回帰: 対になったコードブロック2個でも見出し分割は不変",
+      [s["title"] for s in _bal_two] == ["A", "B", "C"]
+      and "# a" in _bal_two[0]["bullets"] and "# b" in _bal_two[1]["bullets"])
+
+# 新規: 閉じ忘れの奇数フェンスの後に来る見出しは、literalな"## ..."箇条書きに
+# ならず、新規スライドの見出しとして正しく分割される。
+# (フェンス直後の本文行はあえて '#' で始めない。中断されたコードの地の文が
+#  たまたま '#' で始まれば新仕様では見出し候補になるのは意図通りだが、
+#  ここでは「フェンス後も後続の本当の見出しでちゃんと分割される」ことだけを
+#  単純な形で確認する。)
+_unterminated = f._parse_slides(
+    "## 導入\n本文1\n```python\nx = 1\ny = 2\n## 結果\n本文2\n## まとめ\n本文3")
+check("pptx新規: 閉じ忘れフェンス後の見出しは新規スライドになる",
+      [s["title"] for s in _unterminated] == ["導入", "結果", "まとめ"])
+check("pptx新規: 閉じ忘れフェンス後の見出しは#が除去されタイトルになる(literal箇条書きではない)",
+      all("#" not in s["title"] for s in _unterminated)
+      and not any(b.startswith("##") for s in _unterminated for b in s["bullets"]))
+check("pptx新規: 閉じ忘れフェンスでも本文は失われない",
+      "本文1" in _unterminated[0]["bullets"]
+      and "本文2" in _unterminated[1]["bullets"]
+      and "本文3" in _unterminated[2]["bullets"])
+
+# 新規: 混在ケース(先に対になったブロックがあり、末尾だけ閉じ忘れ)でも、
+# 先行する対になったブロックはコードモードを維持し#コメントを昇格させない。
+_mixed = f._parse_slides(
+    "## 前半\n```python\n# 対になっているコメント\n```\n## 後半\n```python\nx = 1\n## 次\n本文")
+check("pptx混在: 先行する対になったブロックは見出し昇格させない",
+      _mixed[0]["title"] == "前半" and "# 対になっているコメント" in _mixed[0]["bullets"])
+check("pptx混在: 末尾の閉じ忘れフェンス後の見出しは新規スライドになる",
+      [s["title"] for s in _mixed] == ["前半", "後半", "次"])
+
 check("pptx: deck_title は短い質問を採用", f._deck_title("犬の紹介", _slides) == "犬の紹介")
 # 2026-07-22: 空白のみの質問は if question で truthy のまま素通りし、
 # strip()後に splitlines() が [] を返して [0] が IndexError になっていた回帰。
