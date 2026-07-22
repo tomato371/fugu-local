@@ -1516,6 +1516,71 @@ finally:
 check("prop: ラウンド2の先頭は新規回答(reference=None)", _seen_refs[0] is None)
 check("prop: 2体目以降はドラフト改善", _seen_refs[1] == "draft" and _seen_refs[2] == "draft")
 
+# ---------- get_proposals: PARALLEL_PROPOSERS=True でも多様性契約が保たれる ----------
+# 2026-07-23: 並列分岐(get_single_proposalをThreadPoolExecutorで実行)でも、
+# jobs[0](=models[0])だけがreference=Noneで呼ばれる契約が崩れていないことを確認する。
+_seen_refs_parallel = {}
+
+
+def _fake_proposal_parallel(model, question, reference, issue=None, history=None):
+    _seen_refs_parallel[model] = reference
+    return model, "ans"
+
+
+_orig_gsp_par = f.get_single_proposal
+_orig_parallel_flag_1 = f.PARALLEL_PROPOSERS
+f.get_single_proposal = _fake_proposal_parallel
+try:
+    f.PARALLEL_PROPOSERS = True
+    f.get_proposals(["m1", "m2", "m3"], "Q?", reference="draft", issue="x")
+finally:
+    f.get_single_proposal = _orig_gsp_par
+    f.PARALLEL_PROPOSERS = _orig_parallel_flag_1
+check("prop(parallel): 先頭(models[0])は新規回答(reference=None)",
+      _seen_refs_parallel.get("m1") is None)
+check("prop(parallel): 2体目以降はドラフト改善",
+      _seen_refs_parallel.get("m2") == "draft" and _seen_refs_parallel.get("m3") == "draft")
+
+# ---------- get_proposals: PARALLEL_PROPOSERS=True は completion順ではなく submission順で返す ----------
+# 2026-07-23: as_completed()の完了順ではなく、futsリスト(=jobs=投入順)の順序で
+# 結果を集めることを確認する。最初に投入するm1のジョブをthreading.Eventで
+# 意図的にブロックし、最後に投入するm3が先に完了してイベントをセットするよう
+# 強制することで、完了順(m3,m2,m1相当)とsubmission順(m1,m2,m3)が確実に食い違う
+# 状況を作る。さらに、m1が実際にイベントを受信できた(timeoutしなかった)ことを
+# 確認することで、「全ジョブ投入 → その後に結果収集」という並行性
+# (apply_high_vram_profileが有効化する96GB構成でのwall-clock短縮の前提)が
+# 壊れていないことも同時に検証する。
+import threading as _threading
+
+_order_flags = {}
+_order_event = _threading.Event()
+
+
+def _fake_proposal_ordered(model, question, reference, issue=None, history=None):
+    if model == "m1":
+        # 提出順では最初のジョブだが、m3がイベントをセットするまで完了しない
+        # → 完了順ではm1が最後になる。もし「全ジョブ投入前に結果収集」に
+        # 退行していればm3のジョブがまだ投入されておらずここでtimeoutする。
+        _order_flags["m1_got_event"] = _order_event.wait(timeout=5)
+    elif model == "m3":
+        _order_event.set()
+    return model, f"ans-{model}"
+
+
+_orig_gsp_ord = f.get_single_proposal
+_orig_parallel_flag_2 = f.PARALLEL_PROPOSERS
+f.get_single_proposal = _fake_proposal_ordered
+try:
+    f.PARALLEL_PROPOSERS = True
+    _out_ordered = f.get_proposals(["m1", "m2", "m3"], "Q?")
+finally:
+    f.get_single_proposal = _orig_gsp_ord
+    f.PARALLEL_PROPOSERS = _orig_parallel_flag_2
+check("prop(parallel): 全ジョブ投入後に収集される(m1がイベントを受信できた)",
+      _order_flags.get("m1_got_event") is True)
+check("prop(parallel): 完了順(m1が最後)ではなくsubmission順(m1,m2,m3)で返る",
+      _out_ordered == [("m1", "ans-m1"), ("m2", "ans-m2"), ("m3", "ans-m3")])
+
 # ---------- コード実行検証 ----------
 check("code: python フェンス抽出", f.extract_code("x\n```python\nprint(1)\n```\ny") == "print(1)\n")
 check("code: タグ無しフェンスも拾う", f.extract_code("```\nx = 1\n```") == "x = 1\n")

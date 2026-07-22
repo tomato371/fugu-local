@@ -2124,12 +2124,21 @@ def get_proposals(models, question, reference=None, issue=None, history=None):
     jobs = [(m, (None if (reference is not None and i == 0) else reference))
             for i, m in enumerate(models)]
     if PARALLEL_PROPOSERS:
-        out = []
+        # 2026-07-23: as_completed() は完了順で future を返すため、返り値の
+        # (model, answer) 順序が実行毎に非決定的になり、aggregator の
+        # "Answer A/B/C" ラベル割当がブレて MoA 統合の再現性が失われる。加えて
+        # 多様性契約（jobs[0] は reference=None の新規回答を先頭に置く）が
+        # aggregator に見える位置として保証されなくなる。このパスは 8GB GPU
+        # の既定では休眠中（gotcha #5: OLLAMA_MAX_LOADED_MODELS=1 により逐次
+        # 実行が正しい既定）だが、apply_high_vram_profile が有効化する 96GB
+        # 実験用の高VRAM構成ではまさにここが使われるため、投入順
+        # (futs リストの順序 = jobs の順序) で結果を集めて決定的にする。
+        # 全ジョブを先に submit してから結果収集するので並列度・wall-clock は
+        # 変わらない（as_completed をやめても同時実行性は失われない）。
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
             futs = [ex.submit(get_single_proposal, m, question, ref, issue, history)
                     for m, ref in jobs]
-            for f in concurrent.futures.as_completed(futs):
-                out.append(f.result())
+            out = [fut.result() for fut in futs]
         return out
     return [get_single_proposal(m, question, ref, issue, history) for m, ref in jobs]
 
