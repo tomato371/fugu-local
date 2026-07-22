@@ -2929,6 +2929,102 @@ with _tempfile.TemporaryDirectory() as _docx_dir:
         check("_save_as_docx: フォールバック時の.mdファイルが実際に書かれる",
               _result_missing_docx is not None and _result_missing_docx.exists())
 
+# ---------- _save_as_pdf: fpdf2 ビルド/出力失敗時の .md フォールバック耐性 (2026-07-22) ----------
+# fpdf2 には 'DejaVu' という名前で事前登録された組み込み Unicode フォントは無く、
+# set_font("DejaVu") は FPDFException となり Helvetica (コアlatin-1フォント) へ
+# 縮退する。既定言語である日本語などの非ASCII文字を multi_cell に渡すと
+# FPDFUnicodeEncodingException（ImportErrorではない素のException）が送出される。
+# 従来コードは except ImportError しか捕捉しておらず、_save_as_pdf の呼び出し元
+# _save_answer_to_file 自体にもガードが無いため、回答保存ステップ全体が
+# 異常終了していた（iteration 41 の _save_as_excel の IllegalCharacterError 修正、
+# iteration 43 の _save_as_docx の制御文字 ValueError 修正と同じバグクラス）。
+# ここでは fpdf2 の有無を検出し、(1) 日本語などUnicodeを含む通常呼び出しが例外を
+# 送出せず実ファイルを生成すること、(2) ビルド/出力自体が失敗しても.mdへ安全に
+# 降格すること、(3) fpdf2未インストール時の既存.mdフォールバック(メッセージ/戻り値)
+# が変わらないことを検証する。本物のOllama/ネットワーク呼び出しは一切行わない。
+import pathlib as _pathlib_pdf
+
+try:
+    import fpdf as _fpdf_probe
+    _HAS_FPDF = True
+except ImportError:
+    _HAS_FPDF = False
+
+with _tempfile.TemporaryDirectory() as _pdf_dir:
+    _pdf_root = _pathlib_pdf.Path(_pdf_dir)
+
+    if _HAS_FPDF:
+        # 日本語(Unicode)を含む question/answer で呼んでも例外が伝播せず、
+        # 実ファイル(.pdf または .md フォールバック)が生成されること。
+        _ja_question = "日本語の質問です。テスト？"
+        _ja_answer = "日本語の回答です。\n改行を含む本文。"
+        _out_ja = _pdf_root / "ja.pdf"
+        _exc_ja = None
+        try:
+            _ret_ja = f._save_as_pdf(_out_ja, _ja_question, _ja_answer, 1.23)
+        except Exception as _e:
+            _exc_ja = _e
+            _ret_ja = None
+        check("_save_as_pdf: 日本語/Unicode本文でも例外を送出しない(FPDFUnicodeEncodingException回帰)",
+              _exc_ja is None)
+        _produced_ja = _out_ja.exists() or _out_ja.with_suffix(".md").exists()
+        check("_save_as_pdf: 日本語/Unicode本文でも実ファイル(.pdfまたは.md)が生成される",
+              _produced_ja)
+
+        # ビルド/出力自体が失敗するケース(Unicode以外の残存エラーも含む)を
+        # fpdf.FPDF.output をモンキーパッチして模擬し、例外が外へ漏れずに
+        # .md へ降格することを確認する。
+        _orig_output_method = _fpdf_probe.FPDF.output
+
+        def _boom_output(self, *_a, **_kw):
+            raise RuntimeError("simulated pdf output failure")
+
+        _fpdf_probe.FPDF.output = _boom_output
+        try:
+            _out_fail_pdf = _pdf_root / "fail.pdf"
+            _exc_fail_pdf = None
+            try:
+                _ret_fail_pdf = f._save_as_pdf(_out_fail_pdf, "Q?", "A.", 1.0)
+            except Exception as _e:
+                _exc_fail_pdf = _e
+                _ret_fail_pdf = None
+            check("_save_as_pdf: 保存失敗時も例外は外へ伝播しない", _exc_fail_pdf is None)
+            check("_save_as_pdf: 保存失敗時は.mdへフォールバックする",
+                  _ret_fail_pdf == _out_fail_pdf.with_suffix(".md"))
+            check("_save_as_pdf: 保存失敗フォールバック時の.mdファイルが実際に書かれる",
+                  _ret_fail_pdf is not None and _ret_fail_pdf.exists())
+        finally:
+            _fpdf_probe.FPDF.output = _orig_output_method
+    else:
+        # fpdf2 が本当に存在しない環境: 既存の.mdフォールバック(拡張子/戻り値)が
+        # 従来通り機能すること(iteration 41 の else分岐スタイルを踏襲)。
+        _out_missing_pdf_real = _pdf_root / "missing_real.pdf"
+        _result_missing_pdf_real = f._save_as_pdf(_out_missing_pdf_real, "Q?", "A.", 1.0)
+        check("_save_as_pdf: fpdf2未インストール環境では.mdへフォールバックする",
+              _result_missing_pdf_real == _out_missing_pdf_real.with_suffix(".md"))
+        check("_save_as_pdf: フォールバック時の.mdファイルが実際に書かれる(未インストール環境)",
+              _result_missing_pdf_real is not None and _result_missing_pdf_real.exists())
+
+    # 回帰ガード: fpdf2 が実際にインストールされている環境でも sys.modules['fpdf']
+    # を None にすることで `from fpdf import FPDF` に ImportError を送出させ
+    # （実インストール状態を変更せずに未インストール環境を模擬する標準的な手法）、
+    # 既存の ImportError フォールバック分岐(メッセージ/戻り値)が変わっていない
+    # ことを検証する。
+    _orig_fpdf_mod = sys.modules.get("fpdf")
+    sys.modules["fpdf"] = None
+    try:
+        _out_missing_pdf = _pdf_root / "missing.pdf"
+        _ret_missing_pdf = f._save_as_pdf(_out_missing_pdf, "Q?", "A.", 1.0)
+        check("_save_as_pdf: fpdf2未インストール時は.mdへフォールバックする(既存メッセージ/戻り値不変)",
+              _ret_missing_pdf == _out_missing_pdf.with_suffix(".md"))
+        check("_save_as_pdf: フォールバック時の.mdファイルが実際に書かれる",
+              _ret_missing_pdf is not None and _ret_missing_pdf.exists())
+    finally:
+        if _orig_fpdf_mod is not None:
+            sys.modules["fpdf"] = _orig_fpdf_mod
+        else:
+            del sys.modules["fpdf"]
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")

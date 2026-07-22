@@ -3207,6 +3207,27 @@ def _save_as_pdf(out: Path, question: str, answer: str, elapsed: float):
     """PDF 形式で保存。fpdf2 が必要。未インストール時は .md にフォールバック。"""
     try:
         from fpdf import FPDF
+    except ImportError:
+        md_path = out.with_suffix(".md")
+        _save_as_markdown(md_path, question, answer, elapsed, "")
+        print(f"   [PDF生成には fpdf2 が必要 (pip install fpdf2)。代わりに保存: {md_path}]")
+        return md_path
+
+    # 2026-07-22: fpdf2 には 'DejaVu' という名前で事前登録された組み込み
+    # Unicode フォントは存在しない（add_font での明示登録が必要）。
+    # set_font("DejaVu") は FPDFException を送出し、直下の except Exception
+    # で Helvetica にフォールバックするが、Helvetica はコア latin-1 フォント
+    # のため、既定言語である日本語などの非ASCII文字を multi_cell/cell に渡す
+    # と FPDFUnicodeEncodingException（ImportError ではない ただの Exception）
+    # が送出される。従来は except ImportError だけを捕捉していたため例外が
+    # そのまま伝播し、_save_as_pdf の呼び出し元 _save_answer_to_file 自体に
+    # ガードがなく、回答保存ステップ全体が異常終了して回答を失っていた
+    # （iteration 41 の _save_as_excel の IllegalCharacterError 修正、
+    # iteration 43 の _save_as_docx の制御文字 ValueError 修正と同じ
+    # バグクラス）。ここでは Unicode フォントの登録・同梱は行わず（環境依存
+    # のため別対応とする）、PDF 構築・出力段階の失敗を捕捉して既存の .md
+    # フォールバックへ安全に降格させるに留める。
+    try:
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
         pdf.add_page()
@@ -3226,13 +3247,11 @@ def _save_as_pdf(out: Path, question: str, answer: str, elapsed: float):
             pdf.ln(5)
         pdf.output(str(out))
         return
-    except ImportError:
-        pass
-    # フォールバック: .md として保存
-    md_path = out.with_suffix(".md")
-    _save_as_markdown(md_path, question, answer, elapsed, "")
-    print(f"   [PDF生成には fpdf2 が必要 (pip install fpdf2)。代わりに保存: {md_path}]")
-    return md_path
+    except Exception as e:
+        md_path = out.with_suffix(".md")
+        _save_as_markdown(md_path, question, answer, elapsed, "")
+        print(f"   [PDF保存に失敗しました ({e!r})。代わりに保存: {md_path}]")
+        return md_path
 
 
 def _save_as_docx(out: Path, question: str, answer: str, elapsed: float):
