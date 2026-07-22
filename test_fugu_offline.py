@@ -2275,6 +2275,71 @@ try:
 finally:
     f._get_rag_chunks = _orig_get_rag_chunks
 
+# ---------- _save_as_html: コードフェンスの開始/終了タグ整合性 (2026-07-22) ----------
+# 旧実装は開始/終了 ``` フェンスを両方とも "<pre><code>" にマップし、
+# "</code></pre>" を一度も出力しないため <pre><code>...<pre><code> という
+# 入れ子・未クローズの不整合HTMLになり、さらにコード本文が <br> 付きの
+# 通常行として扱われて整形が崩れていた（L3135-3140）。ローカル一時ファイル
+# への書き込み・読み戻しのみで検証し、Ollama/ネットワーク呼び出しは一切ない。
+import pathlib as _html_pathlib
+
+with _tempfile.TemporaryDirectory() as _html_dir:
+    _html_root = _html_pathlib.Path(_html_dir)
+
+    # (a) 単一のpythonフェンス付きコードブロック
+    _html_out_a = _html_root / "a.html"
+    _answer_a = "before\n```python\nx = 1\nprint(x)\n```\nafter"
+    f._save_as_html(_html_out_a, "q1", _answer_a, 1.23)
+    _content_a = _html_out_a.read_text(encoding="utf-8")
+    check("_save_as_html: <pre><code>は正確に1回出現",
+          _content_a.count("<pre><code>") == 1)
+    check("_save_as_html: </code></pre>は正確に1回出現",
+          _content_a.count("</code></pre>") == 1)
+    check("_save_as_html: コード本文はescapeされている",
+          "x = 1" in _content_a and "print(x)" in _content_a)
+    _code_body_a = _content_a.split("<pre><code>", 1)[1].split("</code></pre>", 1)[0]
+    check("_save_as_html: コード本文内に<br>が混入しない",
+          "<br>" not in _code_body_a)
+
+    # (b) プレーンテキストのみの回答: <br>維持・<pre>は出現しない
+    _html_out_b = _html_root / "b.html"
+    f._save_as_html(_html_out_b, "q2", "line1\nline2\nline3", 0.5)
+    _content_b = _html_out_b.read_text(encoding="utf-8")
+    check("_save_as_html: プレーンテキストは<br>で改行が維持される",
+          _content_b.count("<br>") == 3)
+    check("_save_as_html: プレーンテキストのみでは<pre>が出現しない",
+          "<pre>" not in _content_b)
+
+    # (c) 未終端フェンス（```が奇数個）でもバランスの取れた閉じタグになる
+    _html_out_c = _html_root / "c.html"
+    _answer_c = "intro\n```python\nx = 1\ny = 2\n"  # 閉じフェンスなし
+    f._save_as_html(_html_out_c, "q3", _answer_c, 0.1)
+    _content_c = _html_out_c.read_text(encoding="utf-8")
+    check("_save_as_html: 未終端フェンスでも<pre><code>と</code></pre>の個数が一致",
+          _content_c.count("<pre><code>") == _content_c.count("</code></pre>") == 1)
+
+    # (d) 同一パスへ2回保存 -> 単一<body>へマージされ、両方のコードブロックがバランス
+    _html_out_d = _html_root / "d.html"
+    f._save_as_html(_html_out_d, "q4a", "```\ncode block one\n```", 0.1)
+    f._save_as_html(_html_out_d, "q4b", "```\ncode block two\n```", 0.2)
+    _content_d = _html_out_d.read_text(encoding="utf-8")
+    check("_save_as_html: 2回保存しても<body>は1つにマージされる",
+          _content_d.count("<body>") == 1 and _content_d.count("</body>") == 1)
+    check("_save_as_html: 2回保存後も<pre><code>/</code></pre>の個数が一致(各2件)",
+          _content_d.count("<pre><code>") == 2 and _content_d.count("</code></pre>") == 2)
+    check("_save_as_html: 2回保存後も両方の回答本文が含まれる",
+          "code block one" in _content_d and "code block two" in _content_d)
+
+    # 回帰: コード本文中の '<' '&' がHTMLエスケープされ、生の '<b' 等が漏れない
+    _html_out_e = _html_root / "e.html"
+    _answer_e = "```\na < b && c\n```"
+    f._save_as_html(_html_out_e, "q5", _answer_e, 0.1)
+    _content_e = _html_out_e.read_text(encoding="utf-8")
+    check("_save_as_html: コード本文の'<'/'&'がescapeされている",
+          "a &lt; b &amp;&amp; c" in _content_e)
+    check("_save_as_html: 生の(未escape)コード本文は出力に含まれない",
+          "a < b && c" not in _content_e)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")

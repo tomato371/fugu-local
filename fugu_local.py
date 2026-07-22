@@ -3132,12 +3132,29 @@ def _save_as_html(out: Path, question: str, answer: str, elapsed: float):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     q_esc = _html.escape(question)
     a_lines = []
+    # 2026-07-22: 旧実装は開始・終了の ``` フェンスを両方とも "<pre><code>" に
+    # マップしており "</code></pre>" を一度も出力しないため、コードブロックを
+    # 含む回答が "<pre><code>...<pre><code>" という入れ子・未クローズの不整合
+    # HTML になっていた。さらにコード本文の行は else 節に落ちて末尾に "<br>"
+    # が付与され、整形済みのはずのコードが崩れていた。開始/終了フェンスを
+    # in_code フラグで区別し、コード本文は <br> を付けず改行 "\n" を保持した
+    # まま escape して <pre><code>...</code></pre> の中に入れる。
+    in_code = False
     for line in answer.splitlines():
         if line.startswith("```"):
-            tag = "<pre><code>" if not line[3:].strip() == "" else "<pre><code>"
-            a_lines.append("<pre><code>")
+            if in_code:
+                a_lines.append("</code></pre>")
+                in_code = False
+            else:
+                a_lines.append("<pre><code>")
+                in_code = True
+        elif in_code:
+            a_lines.append(_html.escape(line) + "\n")
         else:
             a_lines.append(_html.escape(line) + "<br>")
+    if in_code:
+        # フェンスが奇数個（閉じ忘れ）の場合でも <pre>/<code> を確実に閉じる
+        a_lines.append("</code></pre>")
     body = (f"<h2>Q <small>({ts})</small></h2>\n<p>{q_esc}</p>\n"
             f"<h2>A</h2>\n<p>{''.join(a_lines)}</p>\n"
             f"<hr><p><small>所要: {elapsed}s</small></p>\n")
