@@ -4473,6 +4473,136 @@ try:
 finally:
     f.MAX_HISTORY_CHARS = _orig_max_hist_chars
 
+# ---------- 会話履歴の永続化（load/save_history_file） ----------
+# load_history_file (L353) / save_history_file (L369) はセッションをまたいだ
+# 複数ターン会話のメモリを担う。iteration 59 の _trim_history 修正と同じ
+# 「文脈を失わない」精度クリティカルな経路だが、これまでテストが皆無だった
+# (grep しても関数本体・SESSION_SAVE・MAX_HISTORY_TURNS_SAVED のいずれも
+# test_fugu_offline.py に一度も出現しない)。
+# 重要: 以下は全呼び出しで path= に一時ファイルを明示的に渡す。デフォルト
+# 引数は Path.home() / ".fugu_history.json"（ユーザーの実際の会話履歴）を
+# 指すため、path= を省略すると本物の履歴を読み込み/破壊してしまう危険がある。
+# ここは純粋な一時ファイルI/Oのみで、Ollama/ネットワーク/subprocess呼び出しは
+# 一切ない。gotcha 該当箇所（/api/chat・num_ctx固定・think除去リトライ・
+# cp932 reconfigure・OLLAMA_MAX_LOADED_MODELS・math_verifyタイムアウト・
+# SC投票/solve_verifiable）はいずれも本セクションでは触れていない。
+_orig_session_save = f.SESSION_SAVE
+_orig_max_hist_turns_saved = f.MAX_HISTORY_TURNS_SAVED
+
+with _tempfile.TemporaryDirectory() as _hist_dir:
+    _hist_root = f.Path(_hist_dir)
+
+    # (1) ファイルが存在しない -> 空リスト
+    _hp_missing = _hist_root / "missing.json"
+    check("history: 存在しないファイルは空リストを返す",
+          f.load_history_file(path=_hp_missing) == [])
+
+    # (2) 保存->読込のラウンドトリップは等価なメッセージ列を返す
+    _hp_roundtrip = _hist_root / "roundtrip.json"
+    _hist_valid = [{"role": "user", "content": "こんにちは"},
+                   {"role": "assistant", "content": "こんにちは、ご用件は？"},
+                   {"role": "user", "content": "元気です"},
+                   {"role": "assistant", "content": "それは良かったです"}]
+    f.save_history_file(_hist_valid, path=_hp_roundtrip)
+    check("history: save->loadのラウンドトリップは等価なリストを返す",
+          f.load_history_file(path=_hp_roundtrip) == _hist_valid)
+
+    # (3) 壊れたJSON -> 空リスト(広い except で例外を送出しない)
+    _hp_corrupt = _hist_root / "corrupt.json"
+    _hp_corrupt.write_text("{not valid json!!!", encoding="utf-8")
+    check("history: 壊れたJSONファイルは空リストを返す",
+          f.load_history_file(path=_hp_corrupt) == [])
+
+    # (4) トップレベルが list ではない(dict) -> 空リスト
+    _hp_notlist = _hist_root / "notlist.json"
+    _hp_notlist.write_text(json.dumps({"role": "user", "content": "x"}),
+                            encoding="utf-8")
+    check("history: トップレベルが list以外(dict)なら空リストを返す",
+          f.load_history_file(path=_hp_notlist) == [])
+
+    # (5) 不正エントリのフィルタリング: dict以外・role欠落・content欠落を除外し、
+    #     整形済みメッセージのみを元の順序のまま返す
+    _hp_mixed = _hist_root / "mixed.json"
+    _mixed_raw = [
+        {"role": "user", "content": "1問目"},
+        "not a dict",
+        {"role": "assistant"},          # content 欠落 -> 除外
+        {"content": "role欠落"},         # role 欠落 -> 除外
+        {"role": "assistant", "content": "1答目"},
+        123,
+        None,
+        {"role": "user", "content": "2問目"},
+    ]
+    _hp_mixed.write_text(json.dumps(_mixed_raw, ensure_ascii=False), encoding="utf-8")
+    check("history: 不正エントリを除外し整形済みメッセージのみ順序維持で返す",
+          f.load_history_file(path=_hp_mixed) == [
+              {"role": "user", "content": "1問目"},
+              {"role": "assistant", "content": "1答目"},
+              {"role": "user", "content": "2問目"},
+          ])
+
+    # (6) 末尾スライスの上限(MAX_HISTORY_TURNS_SAVED*2)を load/save 双方で検証
+    try:
+        f.MAX_HISTORY_TURNS_SAVED = 2  # 上限を一時的に縮小(*2 = 4件まで保持)
+        _hist_long = [{"role": ("user" if i % 2 == 0 else "assistant"),
+                       "content": f"msg{i}"} for i in range(10)]
+        _expected_tail = _hist_long[-4:]
+
+        # load側: 上限より多いエントリを持つファイルを直接書いて確認
+        _hp_cap_load = _hist_root / "cap_load.json"
+        _hp_cap_load.write_text(json.dumps(_hist_long, ensure_ascii=False),
+                                 encoding="utf-8")
+        check("history: loadは直近 MAX_HISTORY_TURNS_SAVED*2 件のみ返す",
+              f.load_history_file(path=_hp_cap_load) == _expected_tail)
+
+        # save側: 書き込み時点で切り詰められ、ファイルの生JSONも上限内に収まる
+        _hp_cap_save = _hist_root / "cap_save.json"
+        f.save_history_file(_hist_long, path=_hp_cap_save)
+        check("history: saveは書き込み時点で MAX_HISTORY_TURNS_SAVED*2 件に切り詰める",
+              f.load_history_file(path=_hp_cap_save) == _expected_tail)
+        _raw_cap_save = json.loads(_hp_cap_save.read_text(encoding="utf-8"))
+        check("history: 切り詰め後にファイルへ書かれる生JSONも上限件数のみ",
+              len(_raw_cap_save) == 4)
+    finally:
+        f.MAX_HISTORY_TURNS_SAVED = _orig_max_hist_turns_saved
+
+    # (7) SESSION_SAVE=False は save を no-op にする(ファイル未作成/既存ファイル不変)
+    try:
+        f.SESSION_SAVE = False
+        _hp_nosave = _hist_root / "nosave.json"
+        f.save_history_file([{"role": "user", "content": "saved?"}], path=_hp_nosave)
+        check("history: SESSION_SAVE=Falseなら新規ファイルを作成しない",
+              not _hp_nosave.exists())
+
+        _hp_nosave_existing = _hist_root / "nosave_existing.json"
+        _existing_content = json.dumps([{"role": "user", "content": "keep"}],
+                                        ensure_ascii=False)
+        _hp_nosave_existing.write_text(_existing_content, encoding="utf-8")
+        f.save_history_file([{"role": "user", "content": "should not overwrite"}],
+                             path=_hp_nosave_existing)
+        check("history: SESSION_SAVE=Falseなら既存ファイルも変更しない",
+              _hp_nosave_existing.read_text(encoding="utf-8") == _existing_content)
+    finally:
+        f.SESSION_SAVE = _orig_session_save
+
+    # (8) 非ASCII(日本語)コンテンツがラウンドトリップで無傷(ensure_ascii=False)
+    _hp_ja = _hist_root / "ja.json"
+    _hist_ja = [{"role": "user",
+                 "content": "日本語の質問です。特殊文字：あいうえお、漢字も含む"},
+                {"role": "assistant", "content": "はい、日本語で回答します。"}]
+    f.save_history_file(_hist_ja, path=_hp_ja)
+    check("history: 日本語コンテンツはラウンドトリップで無傷",
+          f.load_history_file(path=_hp_ja) == _hist_ja)
+    _raw_ja_text = _hp_ja.read_text(encoding="utf-8")
+    check("history: 保存ファイルの生テキストに日本語がそのまま含まれる(\\uXXXXエスケープでない)",
+          "日本語の質問です" in _raw_ja_text)
+
+# 念のため: 本セクションはグローバル状態を try/finally で復元済みであることを確認
+check("history: SESSION_SAVE はテスト後に既定値へ復元されている",
+      f.SESSION_SAVE == _orig_session_save)
+check("history: MAX_HISTORY_TURNS_SAVED はテスト後に既定値へ復元されている",
+      f.MAX_HISTORY_TURNS_SAVED == _orig_max_hist_turns_saved)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
