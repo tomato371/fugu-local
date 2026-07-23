@@ -4444,6 +4444,111 @@ with _tempfile.TemporaryDirectory() as _rpx_dir:
 check("_read_pptx: テスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
       ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
 
+# ----- _read_pptx: 表シェイプ/グループシェイプの抽出 (2026-07-24 / iter87) -----
+# 背景: python-pptxの表シェイプ(GraphicFrame)とグループシェイプ(GroupShape)には
+# `.text` 属性そのものが存在しない。そのため上のiter82テストが固定した従来の
+# _read_pptx実装 `[sh.text for sh in slide.shapes if hasattr(sh, "text") ...]` は
+# 表・グループ内の文字列を静かに全て読み飛ばしていた。実データのPPTXでは表が
+# 情報の大半を占めることが多く、これがRAG/--fileコンテキストへ一切届かない
+# 精度事故だった(iter83の_read_pdf/iter84の_read_excelと同系統の「呼び出し元が
+# 静かに失っていたコンテンツを救済する」修正)。ここでは(1)非結合2x2表、
+# (2)ネストしたグループを含むグループシェイプ、(3)テキストボックス+表の混在
+# スライドの3フィクスチャを実際にpython-pptxで生成し、_read_pptxが表セルを
+# タブ結合/行を改行結合で拾い、グループ内テキストも再帰的に拾い、既存の
+# プレーンテキストボックス経路(iter82)と併存しても重複しないことを検証する。
+try:
+    import pptx as _pptx_probe_tbl
+    _HAS_PPTX_TBL = True
+except ImportError:
+    _HAS_PPTX_TBL = False
+
+with _tempfile.TemporaryDirectory() as _rpt_dir:
+    _rpt_root = _pathlib.Path(_rpt_dir)
+
+    if _HAS_PPTX_TBL:
+        from pptx.util import Inches as _Inches_tbl
+
+        # (1) 非結合2x2表単独のスライド
+        _rpt_path1 = _rpt_root / "table.pptx"
+        _rpt_prs1 = _pptx_probe_tbl.Presentation()
+        _rpt_blank1 = _rpt_prs1.slide_layouts[6]
+        _rpt_slide1 = _rpt_prs1.slides.add_slide(_rpt_blank1)
+        _rpt_gf1 = _rpt_slide1.shapes.add_table(
+            2, 2, _Inches_tbl(1), _Inches_tbl(1), _Inches_tbl(4), _Inches_tbl(2))
+        _rpt_tbl1 = _rpt_gf1.table
+        _rpt_tbl1.cell(0, 0).text = "A1"
+        _rpt_tbl1.cell(0, 1).text = "B1"
+        _rpt_tbl1.cell(1, 0).text = "A2"
+        _rpt_tbl1.cell(1, 1).text = "B2"
+        _rpt_prs1.save(str(_rpt_path1))
+
+        _rpt_out1 = f._read_pptx(_rpt_path1)
+        _rpt_expected1 = "[Slide 1]\n" + "\n".join(["A1\tB1", "A2\tB2"])
+        check("_read_pptx: 2x2表(非結合)の全セルがタブ結合/行が改行結合でbyte-for-byte一致",
+              _rpt_out1 == _rpt_expected1)
+
+        # (2) グループシェイプ(テキストボックス)+ネストしたグループのスライド
+        _rpt_path2 = _rpt_root / "group.pptx"
+        _rpt_prs2 = _pptx_probe_tbl.Presentation()
+        _rpt_blank2 = _rpt_prs2.slide_layouts[6]
+        _rpt_slide2 = _rpt_prs2.slides.add_slide(_rpt_blank2)
+        _rpt_grp2 = _rpt_slide2.shapes.add_group_shape()
+        _rpt_tb2 = _rpt_grp2.shapes.add_textbox(
+            _Inches_tbl(1), _Inches_tbl(1), _Inches_tbl(2), _Inches_tbl(1))
+        _rpt_tb2.text_frame.text = "Grouped Text"
+        _rpt_nested2 = _rpt_grp2.shapes.add_group_shape()
+        _rpt_tb2n = _rpt_nested2.shapes.add_textbox(
+            _Inches_tbl(1), _Inches_tbl(2), _Inches_tbl(2), _Inches_tbl(1))
+        _rpt_tb2n.text_frame.text = "Nested Group Text"
+        _rpt_prs2.save(str(_rpt_path2))
+
+        _rpt_out2 = f._read_pptx(_rpt_path2)
+        check("_read_pptx: グループシェイプ直下のテキストが抽出される(旧コードでは脱落)",
+              "Grouped Text" in _rpt_out2)
+        check("_read_pptx: ネストしたグループ内のテキストも再帰的に抽出される",
+              "Nested Group Text" in _rpt_out2)
+        check("_read_pptx: グループ抽出結果は'[Slide 1]'マーカー配下に収まる",
+              _rpt_out2 == "[Slide 1]\n" + "\n".join(["Grouped Text", "Nested Group Text"]))
+
+        # (3) テキストボックス+表が同一スライドに混在(シェイプ追加順=出力順)
+        _rpt_path3 = _rpt_root / "mixed.pptx"
+        _rpt_prs3 = _pptx_probe_tbl.Presentation()
+        _rpt_blank3 = _rpt_prs3.slide_layouts[6]
+        _rpt_slide3 = _rpt_prs3.slides.add_slide(_rpt_blank3)
+        _rpt_tb3 = _rpt_slide3.shapes.add_textbox(
+            _Inches_tbl(1), _Inches_tbl(1), _Inches_tbl(4), _Inches_tbl(1))
+        _rpt_tb3.text_frame.text = "Mixed Slide Text"
+        _rpt_gf3 = _rpt_slide3.shapes.add_table(
+            2, 2, _Inches_tbl(1), _Inches_tbl(2), _Inches_tbl(4), _Inches_tbl(2))
+        _rpt_tbl3 = _rpt_gf3.table
+        _rpt_tbl3.cell(0, 0).text = "C1"
+        _rpt_tbl3.cell(0, 1).text = "D1"
+        _rpt_tbl3.cell(1, 0).text = "C2"
+        _rpt_tbl3.cell(1, 1).text = "D2"
+        _rpt_prs3.save(str(_rpt_path3))
+
+        _rpt_out3 = f._read_pptx(_rpt_path3)
+        _rpt_expected3 = "[Slide 1]\n" + "\n".join(
+            ["Mixed Slide Text", "C1\tD1", "C2\tD2"])
+        check("_read_pptx: テキストボックス+表混在スライドは両方をシェイプ追加順で"
+              "byte-for-byte抽出(重複無し)",
+              _rpt_out3 == _rpt_expected3)
+        check("_read_pptx: 混在スライドでテキストボックス文字列が重複挿入されない",
+              _rpt_out3.count("Mixed Slide Text") == 1)
+
+        check("_is_lib_missing_notice: 表抽出成功時の出力全体はFalse(iter37の過剰フィルタ回帰ガード)",
+              not f._is_lib_missing_notice(_rpt_out1))
+        check("_is_lib_missing_notice: グループ抽出成功時の出力全体はFalse(iter37の過剰フィルタ回帰ガード)",
+              not f._is_lib_missing_notice(_rpt_out2))
+    else:
+        # python-pptxが無いとタスク制約(本物のpython-pptxで実.pptxを生成すること)を
+        # 満たすテスト用フィクスチャを作れないため、上のiter82ブロックと同じ理由・
+        # 同じスタイルでスキップする(このホストでは通常通らない分岐)。
+        print("   [SKIP] python-pptx未インストールのため_read_pptx表/グループ抽出テストをスキップ")
+
+check("_read_pptx: 表/グループテスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
+      ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
+
 # ----- _read_docx -----
 try:
     import docx as _docx_probe_rd

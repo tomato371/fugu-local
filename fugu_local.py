@@ -766,6 +766,38 @@ def _read_excel(path: Path) -> str:
     return f"[Excel: {path.name} — openpyxl or pandas が必要: pip install openpyxl]"
 
 
+def _pptx_shape_texts(sh) -> list:
+    """PPTXの1シェイプから抽出できるテキスト断片を出現順のリストで返す。
+    2026-07-24 (iter87): python-pptxの表シェイプ(GraphicFrame)とグループシェイプ
+    (GroupShape)には `.text` 属性そのものが存在しない（hasattr(sh, "text") が False
+    になる）。そのため_read_pptxの従来コード
+    `[sh.text for sh in slide.shapes if hasattr(sh, "text") and sh.text.strip()]`
+    は表・グループ内の文字列を一切拾えず静かに読み飛ばしていた。実データのPPTXでは
+    表が情報の大半を占めることが多く、その内容がRAG/--fileコンテキストへ一切届かず
+    モデルが古い学習知識で答えてしまう精度事故（精度優先・時間は気にしないの方針に
+    反する）。iter82は_read_pptxの成功時抽出にテストカバレッジを整えたが対象は平文
+    テキストボックスのみで、表/グループ内容は当時未検証・未対応のまま残っていた。
+    iter83(_read_pdf)/iter84(_read_excel)の「呼び出し元が静かに失っていたコンテンツを
+    救済する」系統の修正の直系。表は他のシェイプ種別には無い属性のため
+    getattr(sh, "has_table", False)で存在確認してからsh.tableを読み、行は
+    _read_docxの表取り扱い(L708-710)と同じ規約でセルをタブ結合・行を改行結合する。
+    グループはGroupShapeが`.text`を持たず`.shapes`だけを持つことをhasattr()で
+    ダックタイピング判定し、ネストしたグループにも再帰する。他シェイプ種別に無い
+    属性を無条件で呼ぶと例外になるため、必ずgetattr/hasattrで存在確認してから読む。"""
+    out = []
+    if hasattr(sh, "text") and sh.text.strip():
+        out.append(sh.text)
+    elif getattr(sh, "has_table", False):
+        for row in sh.table.rows:
+            row_text = "\t".join(cell.text for cell in row.cells)
+            if row_text.strip():
+                out.append(row_text)
+    elif hasattr(sh, "shapes"):
+        for sub in sh.shapes:
+            out.extend(_pptx_shape_texts(sub))
+    return out
+
+
 def _read_pptx(path: Path) -> str:
     """PowerPoint (.pptx) からテキストを抽出。"""
     try:
@@ -773,7 +805,9 @@ def _read_pptx(path: Path) -> str:
         prs = Presentation(str(path))
         parts = []
         for i, slide in enumerate(prs.slides, 1):
-            texts = [sh.text for sh in slide.shapes if hasattr(sh, "text") and sh.text.strip()]
+            texts = []
+            for sh in slide.shapes:
+                texts.extend(_pptx_shape_texts(sh))
             if texts:
                 parts.append(f"[Slide {i}]\n" + "\n".join(texts))
         return "\n\n".join(parts)
