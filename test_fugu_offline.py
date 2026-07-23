@@ -4083,6 +4083,243 @@ with _tempfile.TemporaryDirectory() as _ri_dir:
     check("_read_ipynb: cells内の非dictエントリはskipされ後続の正当なセルは抽出される",
           _ri_out_f == "# Title")
 
+# ---------- _read_excel/_read_pptx/_read_docx: 成功時の構造化抽出カバレッジ (2026-07-23 / iter82) ----------
+# iteration 71 は stdlib のみで書かれた _read_html/_read_ipynb の「成功時」抽出を直接
+# 検証したが、ライブラリ依存の _read_docx/_read_excel/_read_pptx はこれまで失敗/劣化
+# 経路（iter42: 破損.xlsxがRAGから静かにスキップされる、iter53: read_file_textの
+# ディスパッチ例外を握りつぶす）しかテストされておらず、「正しく抽出できた場合」の
+# シート/スライド/段落マーカー・表の行・順序・空行スキップは一切検証されていなかった。
+# これらの抽出結果はRAG(_load_rag_chunks)や--fileを経由してproposer/aggregatorの
+# プロンプトへそのまま混入するため、抽出のサイレントな退行（シート脱落・行の
+# 入れ替わり・内容切り詰め）を検出するテストがこれまで存在しなかった。
+# ここでは各ライブラリ自身でtempdirへ実ファイルを書き出し(openpyxl.Workbook().save()/
+# python-docx Document().save()/python-pptx Presentation().save())、
+# f._read_excel/_read_pptx/_read_docx を直接呼んで成功時の出力を検証する。
+# Excel/PPTXについては、iter37が修正した「出力が'['で始まるだけでライブラリ未
+# インストール通知と誤判定し、RAGから丸ごと欠落させていた」過剰フィルタの回帰を
+# _is_lib_missing_notice で併せて確認する(3661行目のRAG経由の回帰テストと対をなす、
+# リーダー自体に対する直接の回帰ガード)。
+# ライブラリ未インストール環境でもスイートが全体PASSするよう、各ライブラリの
+# import可否をtry/exceptで検出し、成功時抽出テストはそのif分岐でのみ実行する
+# (iteration 41/43/68のスタイルを踏襲)。ライブラリが実際に利用可能な環境でも
+# 「未インストール」フォールバック行自体のカバレッジを取りこぼさないよう、
+# sys.modulesを一時的に書き換えてImportErrorを模擬する経路も併せて検証する
+# (iteration 43/44で確立済みの手法: sys.modules[name]=Noneでその名前のimport文に
+# ImportErrorを送出させる)。テスト用の実ファイルはローカル一時ディレクトリのみに
+# 書き込み、Ollama/ネットワーク/subprocess呼び出しは一切行わない。
+# 表明的注記: 3ライブラリすべてで、実際に生成・読み戻した結果は仕様通り
+# （マーカー順序維持・タブ結合・Noneの空文字化・完全空行/空白シェイプ/空白段落の
+# スキップ）であり、抽出処理自体に新たな欠陥は見つからなかった(surface-don't-fix:
+# 欠陥が見つかった場合のみ特性テストとしてピン留めしフラグする方針/iter48/71踏襲)。
+
+# ----- _read_excel -----
+try:
+    import openpyxl as _openpyxl_probe_rd
+    _HAS_OPENPYXL_RD = True
+except ImportError:
+    _HAS_OPENPYXL_RD = False
+
+with _tempfile.TemporaryDirectory() as _rxl_dir:
+    _rxl_root = _pathlib.Path(_rxl_dir)
+    _rxl_path = _rxl_root / "book.xlsx"
+
+    if _HAS_OPENPYXL_RD:
+        _rxl_wb = _openpyxl_probe_rd.Workbook()
+        _rxl_ws1 = _rxl_wb.active
+        _rxl_ws1.title = "Sheet1"
+        _rxl_ws1.append(["name", "age"])
+        _rxl_ws1.append(["Alice", 30])
+        _rxl_ws1.append([None, None])   # 完全に空の行 -> 出力から省略される
+        _rxl_ws1.append(["Bob", None])  # Noneセルを含むが行自体は非空 -> 保持される
+        _rxl_ws2 = _rxl_wb.create_sheet("Sheet2")
+        _rxl_ws2.append(["x", "y"])
+        _rxl_ws2.append([1, 2])
+        _rxl_wb.save(str(_rxl_path))
+
+        _rxl_out = f._read_excel(_rxl_path)
+        # openpyxlのread_only=Trueワークブックはワークシートとの間に参照循環を持ち、
+        # 単純な参照カウントだけでは_read_excel関数を抜けても即座に解放されず、
+        # 内部のzipファイルハンドルがWindows上でロックされたままになりうる
+        # (openpyxl公式にwb.close()を推奨する既知の挙動)。fugu_local.py側は
+        # 変更できないため、テスト側でgc.collect()を呼び循環GCを強制発火させ、
+        # 一時ディレクトリのクリーンアップ時に"プロセスはファイルにアクセスできません"
+        # (WinError 32)が起きないようにする(テスト専用の後始末、抽出ロジックとは無関係)。
+        import gc as _gc_rd
+        _gc_rd.collect()
+        _rxl_expected = "\n".join([
+            "[Sheet: Sheet1]",
+            "name\tage",
+            "Alice\t30",
+            "Bob\t",
+            "[Sheet: Sheet2]",
+            "x\ty",
+            "1\t2",
+        ])
+        check("_read_excel: 複数シートの抽出結果がマーカー順序/タブ結合/空行スキップ/"
+              "Noneの空文字化を含めbyte-for-byte一致",
+              _rxl_out == _rxl_expected)
+        check("_read_excel: '[Sheet: Sheet1]'が'[Sheet: Sheet2]'より前に出現する(ワークブック順)",
+              _rxl_out.index("[Sheet: Sheet1]") < _rxl_out.index("[Sheet: Sheet2]"))
+        check("_is_lib_missing_notice: _read_excel成功時の出力全体はFalse(iter37の過剰フィルタ回帰ガード)",
+              not f._is_lib_missing_notice(_rxl_out))
+
+        # sys.modules差し替えでopenpyxl/pandas双方が未インストールの状態を模擬し、
+        # 実行環境に関わらず「ライブラリ未インストール」通知フォールバック行の
+        # カバレッジを確保する。_read_excelはopenpyxl -> pandasの順にフォールバック
+        # するため、通知文字列に到達させるには両方をImportError化する必要がある。
+        _orig_openpyxl_mod_rd = sys.modules.get("openpyxl")
+        _orig_pandas_mod_rd = sys.modules.get("pandas")
+        sys.modules["openpyxl"] = None
+        sys.modules["pandas"] = None
+        try:
+            _rxl_notice = f._read_excel(_rxl_path)
+        finally:
+            if _orig_openpyxl_mod_rd is not None:
+                sys.modules["openpyxl"] = _orig_openpyxl_mod_rd
+            else:
+                del sys.modules["openpyxl"]
+            if _orig_pandas_mod_rd is not None:
+                sys.modules["pandas"] = _orig_pandas_mod_rd
+            else:
+                del sys.modules["pandas"]
+        check("_read_excel: openpyxl/pandas双方未インストール模擬時は'pip install'通知文字列を返す",
+              f._is_lib_missing_notice(_rxl_notice))
+        check("_read_excel: 未インストール通知にファイル名が含まれる",
+              _rxl_path.name in _rxl_notice)
+    else:
+        # openpyxlが無いとタスク制約(本物のopenpyxl.Workbook().save()で実.xlsxを
+        # 生成すること)を満たすテスト用フィクスチャを作れない。このホストでは
+        # openpyxlが常にインストール済みのため通常は通らない分岐だが、万一欠けている
+        # 環境でもスイート全体を落とさないためのガードとしてスキップする
+        # (3850行目の既存の実.xlsx破損読み込みテストと同じ理由・同じスタイル)。
+        print("   [SKIP] openpyxl未インストールのため_read_excel成功時抽出テストをスキップ")
+
+check("_read_excel: テスト後にsys.modulesの'openpyxl'エントリが元通り解決可能(復元確認)",
+      ("openpyxl" not in sys.modules) or (sys.modules["openpyxl"] is not None))
+
+# ----- _read_pptx -----
+try:
+    import pptx as _pptx_probe_rd
+    _HAS_PPTX_RD = True
+except ImportError:
+    _HAS_PPTX_RD = False
+
+with _tempfile.TemporaryDirectory() as _rpx_dir:
+    _rpx_root = _pathlib.Path(_rpx_dir)
+    _rpx_path = _rpx_root / "deck.pptx"
+
+    if _HAS_PPTX_RD:
+        from pptx.util import Inches as _Inches_rd
+
+        _rpx_prs = _pptx_probe_rd.Presentation()
+        _rpx_blank = _rpx_prs.slide_layouts[6]
+        _rpx_slide1 = _rpx_prs.slides.add_slide(_rpx_blank)
+        _rpx_tb1 = _rpx_slide1.shapes.add_textbox(
+            _Inches_rd(1), _Inches_rd(1), _Inches_rd(4), _Inches_rd(1))
+        _rpx_tb1.text_frame.text = "Slide One Text"
+        _rpx_slide2 = _rpx_prs.slides.add_slide(_rpx_blank)
+        _rpx_tb2 = _rpx_slide2.shapes.add_textbox(
+            _Inches_rd(1), _Inches_rd(1), _Inches_rd(4), _Inches_rd(1))
+        _rpx_tb2.text_frame.text = "Slide Two Text"
+        _rpx_tb2b = _rpx_slide2.shapes.add_textbox(
+            _Inches_rd(1), _Inches_rd(2), _Inches_rd(4), _Inches_rd(1))
+        _rpx_tb2b.text_frame.text = "   "  # 空白のみのシェイプ -> スキップされる
+        _rpx_prs.save(str(_rpx_path))
+
+        _rpx_out = f._read_pptx(_rpx_path)
+        _rpx_expected = "\n\n".join([
+            "[Slide 1]\nSlide One Text",
+            "[Slide 2]\nSlide Two Text",
+        ])
+        check("_read_pptx: 2スライド分の抽出結果がスライド順マーカー/本文/空白シェイプ"
+              "スキップを含めbyte-for-byte一致",
+              _rpx_out == _rpx_expected)
+        check("_read_pptx: 空白のみのテキストボックスは出力に含まれない",
+              "   " not in _rpx_out)
+        check("_is_lib_missing_notice: _read_pptx成功時の出力全体はFalse(iter37の過剰フィルタ回帰ガード)",
+              not f._is_lib_missing_notice(_rpx_out))
+
+        _orig_pptx_mod_rd = sys.modules.get("pptx")
+        sys.modules["pptx"] = None
+        try:
+            _rpx_notice = f._read_pptx(_rpx_path)
+        finally:
+            if _orig_pptx_mod_rd is not None:
+                sys.modules["pptx"] = _orig_pptx_mod_rd
+            else:
+                del sys.modules["pptx"]
+        check("_read_pptx: python-pptx未インストール模擬時は'pip install'通知文字列を返す",
+              f._is_lib_missing_notice(_rpx_notice) and _rpx_path.name in _rpx_notice)
+    else:
+        # from pptx import Presentation はpathへ触れる前にImportErrorを送出するため、
+        # 実ファイルを用意できなくても通知文字列フォールバック自体は安全に検証できる。
+        _rpx_notice_real = f._read_pptx(_rpx_path)
+        check("_read_pptx: python-pptx未インストール環境では通知文字列を返す",
+              f._is_lib_missing_notice(_rpx_notice_real) and _rpx_path.name in _rpx_notice_real)
+
+check("_read_pptx: テスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
+      ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
+
+# ----- _read_docx -----
+try:
+    import docx as _docx_probe_rd
+    _HAS_DOCX_RD = True
+except ImportError:
+    _HAS_DOCX_RD = False
+
+with _tempfile.TemporaryDirectory() as _rdx_dir:
+    _rdx_root = _pathlib.Path(_rdx_dir)
+    _rdx_path = _rdx_root / "doc.docx"
+
+    if _HAS_DOCX_RD:
+        _rdx_doc = _docx_probe_rd.Document()
+        _rdx_doc.add_paragraph("First paragraph.")
+        _rdx_doc.add_paragraph("")  # 空白段落 -> "if para.text.strip()" でスキップされる
+        _rdx_doc.add_paragraph("Second paragraph.")
+        _rdx_table = _rdx_doc.add_table(rows=2, cols=2)  # マージセル無しの単純な表
+        _rdx_table.cell(0, 0).text = "H1"
+        _rdx_table.cell(0, 1).text = "H2"
+        _rdx_table.cell(1, 0).text = "R1C1"
+        _rdx_table.cell(1, 1).text = "R1C2"
+        _rdx_doc.save(str(_rdx_path))
+
+        _rdx_out = f._read_docx(_rdx_path)
+        _rdx_expected = "\n".join([
+            "First paragraph.",
+            "Second paragraph.",
+            "H1\tH2",
+            "R1C1\tR1C2",
+        ])
+        check("_read_docx: 段落2件(空白段落はスキップ)+表2行の抽出結果が"
+              "byte-for-byte一致(段落->表の順序含む)",
+              _rdx_out == _rdx_expected)
+        check("_read_docx: 空白段落が出力中に空行として残らない",
+              "" not in _rdx_out.split("\n"))
+
+        _orig_docx_mod_rd = sys.modules.get("docx")
+        sys.modules["docx"] = None
+        try:
+            _rdx_notice = f._read_docx(_rdx_path)
+        finally:
+            if _orig_docx_mod_rd is not None:
+                sys.modules["docx"] = _orig_docx_mod_rd
+            else:
+                del sys.modules["docx"]
+        _rdx_expected_notice = f"[DOCX: {_rdx_path.name} — python-docx が必要: pip install python-docx]"
+        check("_read_docx: python-docx未インストール模擬時は'pip install'通知文字列を返す",
+              _rdx_notice == _rdx_expected_notice)
+        check("_is_lib_missing_notice: _read_docxの未インストール通知はTrue(併せて確認)",
+              f._is_lib_missing_notice(_rdx_notice))
+    else:
+        # docx.Document(...)へ到達する前にImportErrorが送出されるため、
+        # 実ファイルを用意できなくても通知文字列フォールバック自体は安全に検証できる。
+        _rdx_notice_real = f._read_docx(_rdx_path)
+        check("_read_docx: python-docx未インストール環境では通知文字列を返す",
+              _rdx_notice_real == f"[DOCX: {_rdx_path.name} — python-docx が必要: pip install python-docx]")
+
+check("_read_docx: テスト後にsys.modulesの'docx'エントリが元通り解決可能(復元確認)",
+      ("docx" not in sys.modules) or (sys.modules["docx"] is not None))
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
       f._tokenize("PINNについて") == {"pinn", "について"})
