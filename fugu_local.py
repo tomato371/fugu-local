@@ -359,7 +359,19 @@ def load_history_file(path: Path = None) -> list:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, list):
             # 最新 MAX_HISTORY_TURNS_SAVED 往復分のみ保持
-            msgs = [m for m in data if isinstance(m, dict) and "role" in m and "content" in m]
+            # 2026-07-23: iteration 66 で指摘され未修正だったバグを修正。
+            # キーの有無だけでなく値の型も str であることを検証する。
+            # {"role": "user", "content": null}（あるいは content が数値/list/dict）
+            # のような壊れたセッションファイルのエントリはキーの存在チェックだけでは
+            # 通過してしまい、_HISTORY に混入した後、次ターンで _trim_history()
+            # (L949 付近) が sum(len(m["content"]) for m in history) を実行した際に
+            # len(None) / len(123) で TypeError を送出しターンごとクラッシュする。
+            # ここで文字列以外の値を持つエントリを弾き、「壊れたファイルは空/縮退
+            # リストへ degrade する」という本関数の既存契約を値レベルまで拡張する。
+            msgs = [m for m in data
+                    if isinstance(m, dict)
+                    and isinstance(m.get("role"), str)
+                    and isinstance(m.get("content"), str)]
             return msgs[-(MAX_HISTORY_TURNS_SAVED * 2):]
     except Exception:
         pass

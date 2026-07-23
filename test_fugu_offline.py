@@ -4541,6 +4541,52 @@ with _tempfile.TemporaryDirectory() as _hist_dir:
               {"role": "user", "content": "2問目"},
           ])
 
+    # (5b) 2026-07-23: iteration 66 で指摘・未修正だった値型バグの回帰テスト。
+    #      role/content の「キーの有無」だけでなく「値が str かどうか」も
+    #      検証しなければならない。content が None/int/list/dict、あるいは
+    #      role が str でないエントリを混入させ、いずれも除外され
+    #      文字列値の整形済みメッセージのみが元の順序で残ることを確認する。
+    _hp_badval = _hist_root / "badval.json"
+    _badval_raw = [
+        {"role": "user", "content": "1問目"},
+        {"role": "user", "content": None},       # content が None -> 除外
+        {"role": "user", "content": 123},        # content が int -> 除外
+        {"role": "user", "content": ["x"]},      # content が list -> 除外
+        {"role": "user", "content": {"x": 1}},   # content が dict -> 除外
+        {"role": "assistant", "content": "1答目"},
+        {"role": 123, "content": "x"},           # role が int(非str) -> 除外
+        {"role": "user", "content": "2問目"},
+    ]
+    _hp_badval.write_text(json.dumps(_badval_raw, ensure_ascii=False), encoding="utf-8")
+    _loaded_badval = f.load_history_file(path=_hp_badval)
+    check("history: contentが非str(None/int/list/dict)のエントリを除外する",
+          _loaded_badval == [
+              {"role": "user", "content": "1問目"},
+              {"role": "assistant", "content": "1答目"},
+              {"role": "user", "content": "2問目"},
+          ])
+    check("history: roleが非str(int)のエントリを除外する",
+          all(isinstance(m["role"], str) for m in _loaded_badval))
+
+    # (5c) エンドツーエンドのクラッシュ経路防止確認: content:null を含む壊れた
+    #      ファイルを load_history_file で読み込んだ結果を _trim_history に
+    #      そのまま渡しても、以前クラッシュしていた
+    #      `sum(len(m["content"]) for m in history)` の TypeError(len(None))
+    #      経路が発生しないこと(=事前に非strエントリが除外されていること)を確認する。
+    _hp_crash = _hist_root / "crash.json"
+    _hp_crash.write_text(
+        json.dumps([{"role": "user", "content": "生き残る"},
+                    {"role": "user", "content": None}], ensure_ascii=False),
+        encoding="utf-8")
+    _loaded_crash = f.load_history_file(path=_hp_crash)
+    _trim_crash_exc = None
+    try:
+        f._trim_history(_loaded_crash)
+    except Exception as _e:
+        _trim_crash_exc = _e
+    check("history: content:nullを含む壊れたファイルをload後、_trim_historyが例外を送出しない",
+          _trim_crash_exc is None)
+
     # (6) 末尾スライスの上限(MAX_HISTORY_TURNS_SAVED*2)を load/save 双方で検証
     try:
         f.MAX_HISTORY_TURNS_SAVED = 2  # 上限を一時的に縮小(*2 = 4件まで保持)
