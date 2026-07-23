@@ -4609,6 +4609,95 @@ with _tempfile.TemporaryDirectory() as _rdx_dir:
 check("_read_docx: テスト後にsys.modulesの'docx'エントリが元通り解決可能(復元確認)",
       ("docx" not in sys.modules) or (sys.modules["docx"] is not None))
 
+# ---------- _read_docx: 水平マージセル(gridSpan)の重複排除 (2026-07-24 / iter91) ----------
+# python-docxのrow.cellsは表のグリッド座標の数だけ_Cellを返すが、水平方向(gridSpan)に
+# マージされたセルは全ての被マージ座標で同一の<w:tc>要素を共有するため、c.textは
+# マージされたテキストを座標数だけ重複して返す(例: 2列にまたがるヘッダーは
+# 'Header\tHeader')。iter82のテストは「マージセル無しの単純な表」しかカバーしておらず、
+# この重複抽出の穴は未検証だった。本テストはiter87(_read_pptxの表/グループ抽出)の
+# 直系である_read_docx側の同種の抽出漏れ/重複修正を検証する。
+with _tempfile.TemporaryDirectory() as _rdxm_dir:
+    _rdxm_root = _pathlib.Path(_rdxm_dir)
+    _rdxm_path = _rdxm_root / "merged.docx"
+
+    if _HAS_DOCX_RD:
+        _rdxm_doc = _docx_probe_rd.Document()
+        _rdxm_table = _rdxm_doc.add_table(rows=2, cols=2)
+        # 1行目: 0列目と1列目を水平マージして1つのヘッダーセルにする
+        _rdxm_merged_cell = _rdxm_table.cell(0, 0).merge(_rdxm_table.cell(0, 1))
+        _rdxm_merged_cell.text = "Header"
+        # 2行目: マージ無しの通常セル(従来通りの挙動が保たれることの対照群)
+        _rdxm_table.cell(1, 0).text = "R1C1"
+        _rdxm_table.cell(1, 1).text = "R1C2"
+        _rdxm_doc.save(str(_rdxm_path))
+
+        _rdxm_out = f._read_docx(_rdxm_path)
+        _rdxm_expected = "\n".join([
+            "Header",
+            "R1C1\tR1C2",
+        ])
+        check("_read_docx: 水平マージされたヘッダーセルは行につき1回だけ抽出される"
+              "('Header\\tHeader'のように重複しない)",
+              _rdxm_out == _rdxm_expected)
+        check("_read_docx: マージ行に続く非マージ行(R1C1/R1C2)はタブ結合のまま影響を受けない",
+              _rdxm_out.split("\n")[1] == "R1C1\tR1C2")
+    else:
+        # python-docx未インストール環境ではマージ表フィクスチャ自体を構築できないため、
+        # 通知文字列フォールバックの確認は既存の"_read_docx未インストール"テストに委譲する。
+        pass
+
+# _read_docx: gridSpanの重複排除で参照する getattr(c, "_tc", None) が None を返す場合
+# (将来のpython-docx実装変化などで内部属性 _tc 自体が取得できなくなるケースの模擬)でも
+# 例外を送出せず、重複排除を行わない従来通りの挙動へ安全にフォールバックすることを検証する。
+# python-docxが未インストールの環境でも成立するよう、docx.Document自体をダックタイピングの
+# 偽オブジェクトに差し替えて検証する(python-docxの実クラス/内部実装には一切触れない)。
+_rdxtc_fake_mod = types.ModuleType("docx")
+
+
+class _RdxTcFakeCell:
+    """_tc属性を意図的に持たないセルの模擬(python-docxの_Cellではない)。"""
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _RdxTcFakeRow:
+    def __init__(self, cells):
+        self.cells = cells
+
+
+class _RdxTcFakeTable:
+    def __init__(self, rows):
+        self.rows = rows
+
+
+class _RdxTcFakeDoc:
+    def __init__(self):
+        self.paragraphs = []
+        # 同一テキスト"A"を持つ2セル: _tcが無いため重複排除されず、
+        # 従来通り"A\tA"として出力されるはず。
+        self.tables = [_RdxTcFakeTable([_RdxTcFakeRow([_RdxTcFakeCell("A"), _RdxTcFakeCell("A")])])]
+
+
+_rdxtc_fake_mod.Document = lambda _path: _RdxTcFakeDoc()
+
+_orig_docx_mod_tc = sys.modules.get("docx")
+sys.modules["docx"] = _rdxtc_fake_mod
+try:
+    _rdxtc_out = f._read_docx(_pathlib.Path("dummy_for_tc_fallback_test.docx"))
+finally:
+    if _orig_docx_mod_tc is not None:
+        sys.modules["docx"] = _orig_docx_mod_tc
+    else:
+        del sys.modules["docx"]
+
+check("_read_docx: getattr(c,'_tc',None)がNoneの場合は例外を送出せず"
+      "重複排除なしの従来通りの挙動にフォールバックする(id依存しない安全側動作)",
+      _rdxtc_out == "A\tA")
+
+check("_read_docx: テスト後にsys.modulesの'docx'エントリが元通り解決可能(_tcフォールバック検証後の復元確認)",
+      ("docx" not in sys.modules) or (sys.modules["docx"] is not None))
+
 # ---------- _read_pdf: ImportError以外の実行時例外でもpypdf/PyPDF2へフォールスルー (2026-07-23 / iter83) ----------
 # _read_pdf は pdfplumber -> pypdf -> PyPDF2 の順で試行するが、各ブロックは従来
 # except ImportError のみで、下位ライブラリへのフォールスルーは「上位ライブラリが

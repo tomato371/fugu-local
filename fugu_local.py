@@ -723,7 +723,34 @@ def _read_docx(path: Path) -> str:
                 parts.append(para.text)
         for tbl in doc.tables:
             for row in tbl.rows:
-                parts.append("\t".join(c.text for c in row.cells))
+                # 2026-07-24 (iter91): python-docxのrow.cellsは表のグリッド座標の数だけ
+                # _Cellを返すが、水平方向(gridSpan)にマージされたセルは全ての被マージ
+                # 座標で同一の<w:tc>要素を共有する。そのためc.textはマージされた
+                # テキストを座標の数だけ重複して返し、例えば2列にまたがるヘッダーセルは
+                # 'Header\tHeader'のように重複抽出されてしまう(単純なタブ結合のみだった
+                # 従来コードにはこの重複排除が無かった)。ここでは行内で既出の<w:tc>を
+                # id(getattr(c, '_tc', None))で追跡し、同一セルの2回目以降の出現を
+                # スキップすることで、マージされたセルのテキストを行につき1回だけ
+                # 出力する。_tcが取得できない場合(将来のpython-docx実装変化等)は
+                # 安全側に倒し重複排除を行わず従来通りの挙動にフォールバックする。
+                # なお本修正は行内(水平/gridSpan)の重複排除のみに限定しており、
+                # 垂直マージ(行をまたぐvMerge)の重複排除やネストした表の再帰抽出は
+                # 意図的にスコープ外としている(将来のフォローアップ課題)。
+                # 同種の「python-docx/python-pptxの属性欠落・仕様により文字列を
+                # 取りこぼす/重複する」系統の修正としてiter87(_read_pptxの表/グループ
+                # 抽出)の直系であり、iter82では非マージの単純な表しかテストされて
+                # いなかった穴を埋めるもの。
+                seen_tc_ids = set()
+                cells_text = []
+                for c in row.cells:
+                    tc = getattr(c, "_tc", None)
+                    if tc is not None:
+                        tc_id = id(tc)
+                        if tc_id in seen_tc_ids:
+                            continue
+                        seen_tc_ids.add(tc_id)
+                    cells_text.append(c.text)
+                parts.append("\t".join(cells_text))
         return "\n".join(parts)
     except ImportError:
         pass
