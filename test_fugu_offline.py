@@ -5276,6 +5276,204 @@ check("history: SESSION_SAVE はテスト後に既定値へ復元されている
 check("history: MAX_HISTORY_TURNS_SAVED はテスト後に既定値へ復元されている",
       f.MAX_HISTORY_TURNS_SAVED == _orig_max_hist_turns_saved)
 
+# ---------- resolve_models: PROPOSERS/AGGREGATOR/CONDUCTOR プール構成 ----------
+# resolve_models() (fugu_local.py L1084) は SC投票パネル(solve_verifiableが
+# `[m for m in REASONING_MODELS if m in PROPOSERS]` で組む)と _arbitrate のアービター
+# チェーン(PROPOSERSから構成)の土台になるが、これまで直接のテストが皆無だった。
+# installed_models()(ネットワーク越しに /api/tags を叩く)と pull()(実際に
+# `ollama pull` を subprocess.run で起動する)の両方を必ずモックする。さらに
+# モック漏れを即座に可視化するため、f.subprocess.run と urllib.request.urlopen も
+# 「呼ばれたら即AssertionError」の番人に差し替える(iteration 38/39 と同じ流儀)。
+# 各ケースの期待(pool, agg, cond) はソースを手でトレースして導出したもの(推測ではない)。
+# 静的レビューでは欠陥は見つからなかったため、ここは既存挙動の特性固定化(characterization)
+# であり、意外な挙動があってもここでは修正せず iteration 48/66/71 の
+# surface-don't-fix 方針を踏襲して明示するに留める。
+
+_orig_rm_desired_proposers = f.DESIRED_PROPOSERS
+_orig_rm_desired_aggregator = f.DESIRED_AGGREGATOR
+_orig_rm_desired_conductor = f.DESIRED_CONDUCTOR
+_orig_rm_fallback_model = f.FALLBACK_MODEL
+_orig_rm_installed_models = f.installed_models
+_orig_rm_pull = f.pull
+_orig_rm_subprocess_run = f.subprocess.run
+_orig_rm_urlopen = urllib.request.urlopen
+
+
+def _rm_no_subprocess_run(*a, **k):
+    raise AssertionError("resolve_models: モック漏れで実subprocess.run(ollama pull起動)が呼ばれた")
+
+
+def _rm_no_urlopen(*a, **k):
+    raise AssertionError("resolve_models: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _rm_installed_factory(fixed_list):
+    """installed_models() は resolve_models() 内で複数回呼ばれるため、
+    呼び出し回数に関わらず常に同じリストを返す固定スタブにする。"""
+    def _fake():
+        return list(fixed_list)
+    return _fake
+
+
+def _rm_pull_factory(succeed_set, calls_log):
+    """pull() の代役。実subprocessは一切呼ばない。呼び出されたモデル名を記録し、
+    succeed_set に含まれていれば成功(True)、それ以外は失敗(False)を返す。"""
+    def _fake(model):
+        calls_log.append(model)
+        return model in succeed_set
+    return _fake
+
+
+try:
+    f.subprocess.run = _rm_no_subprocess_run
+    urllib.request.urlopen = _rm_no_urlopen
+
+    # --- (1) 全DESIRED_PROPOSERSが導入済み -> pool==DESIRED_PROPOSERS、pullは一度も呼ばれない ---
+    f.DESIRED_PROPOSERS = ["fake-p1:1b", "fake-p2:1b", "fake-p3:1b"]
+    f.DESIRED_AGGREGATOR = "fake-p2:1b"   # 既にpool内 -> agg用のpullは発生しない
+    f.DESIRED_CONDUCTOR = "fake-p1:1b"    # 既にpool内 -> cond用のpullは発生しない
+    f.FALLBACK_MODEL = "fake-fallback:1b"
+    _calls1 = []
+    try:
+        f.installed_models = _rm_installed_factory(
+            ["fake-p1:1b", "fake-p2:1b", "fake-p3:1b"])
+        f.pull = _rm_pull_factory(set(), _calls1)  # 何が来ても失敗扱い(呼ばれない想定)
+        _pool1, _agg1, _cond1 = f.resolve_models()
+        check("resolve_models(1): 全proposer導入済みならpoolはDESIRED_PROPOSERSと一致",
+              _pool1 == ["fake-p1:1b", "fake-p2:1b", "fake-p3:1b"])
+        check("resolve_models(1): aggはpool内既存モデル(fake-p2)のまま",
+              _agg1 == "fake-p2:1b")
+        check("resolve_models(1): condはpool内既存モデル(fake-p1)のまま",
+              _cond1 == "fake-p1:1b")
+        check("resolve_models(1): pull()は一度も呼ばれない", _calls1 == [])
+    finally:
+        f.installed_models = _orig_rm_installed_models
+        f.pull = _orig_rm_pull
+
+    # --- (2) proposerが1つ未導入だがpull成功 -> poolに追加される ---
+    f.DESIRED_PROPOSERS = ["fake-p1:1b", "fake-p2:1b", "fake-p3:1b"]
+    f.DESIRED_AGGREGATOR = "fake-p1:1b"   # 既にpool内
+    f.DESIRED_CONDUCTOR = "fake-p3:1b"    # 既にpool内
+    _calls2 = []
+    try:
+        f.installed_models = _rm_installed_factory(["fake-p1:1b", "fake-p3:1b"])  # p2欠落
+        f.pull = _rm_pull_factory({"fake-p2:1b"}, _calls2)
+        _pool2, _agg2, _cond2 = f.resolve_models()
+        check("resolve_models(2): pull成功したproposerはpoolに追加される(順序も維持)",
+              _pool2 == ["fake-p1:1b", "fake-p2:1b", "fake-p3:1b"])
+        check("resolve_models(2): pullは欠落していたp2に対してのみ呼ばれる",
+              _calls2 == ["fake-p2:1b"])
+        check("resolve_models(2): agg/condはpool内既存モデルのまま(追加pull無し)",
+              (_agg2, _cond2) == ("fake-p1:1b", "fake-p3:1b"))
+    finally:
+        f.installed_models = _orig_rm_installed_models
+        f.pull = _orig_rm_pull
+
+    # --- (3) proposerが1つ未導入かつpull失敗 -> poolから除外され、他は無傷 ---
+    _calls3 = []
+    try:
+        f.installed_models = _rm_installed_factory(["fake-p1:1b", "fake-p3:1b"])  # p2欠落
+        f.pull = _rm_pull_factory(set(), _calls3)  # p2のpullを失敗させる
+        _pool3, _agg3, _cond3 = f.resolve_models()
+        check("resolve_models(3): pull失敗したproposerはpoolから除外される",
+              _pool3 == ["fake-p1:1b", "fake-p3:1b"])
+        check("resolve_models(3): 他のproposer(p1,p3)は無傷のまま2件だけ残る",
+              "fake-p1:1b" in _pool3 and "fake-p3:1b" in _pool3 and len(_pool3) == 2)
+        check("resolve_models(3): pullは欠落p2に対してのみ呼ばれる(1回)",
+              _calls3 == ["fake-p2:1b"])
+    finally:
+        f.installed_models = _orig_rm_installed_models
+        f.pull = _orig_rm_pull
+
+    # --- (4) aggregatorが未導入かつpool外、pull失敗 -> agg=pool[0]で代用 ---
+    f.DESIRED_PROPOSERS = ["fake-p1:1b", "fake-p2:1b"]
+    f.DESIRED_AGGREGATOR = "fake-agg:1b"   # 未導入かつpool外
+    f.DESIRED_CONDUCTOR = "fake-p2:1b"     # 既にpool内(cond側の分岐に影響させない)
+    _calls4 = []
+    try:
+        f.installed_models = _rm_installed_factory(["fake-p1:1b", "fake-p2:1b"])
+        f.pull = _rm_pull_factory(set(), _calls4)  # aggregatorのpullを失敗させる
+        _pool4, _agg4, _cond4 = f.resolve_models()
+        check("resolve_models(4): proposer側は無傷", _pool4 == ["fake-p1:1b", "fake-p2:1b"])
+        check("resolve_models(4): aggregatorのpull失敗時はpool[0]で代用される",
+              _agg4 == "fake-p1:1b")
+        check("resolve_models(4): condはpool内既存モデルのまま", _cond4 == "fake-p2:1b")
+        check("resolve_models(4): pullはaggregatorに対してのみ呼ばれる(1回)",
+              _calls4 == ["fake-agg:1b"])
+    finally:
+        f.installed_models = _orig_rm_installed_models
+        f.pull = _orig_rm_pull
+
+    # --- (5) conductorがaggregatorと重複(cond == agg) -> conductor用のpullは発生しない ---
+    #     ("cond in pool" 分岐は上の(1)〜(4)でcond=既存proposerとして既に踏んでいるため、
+    #      ここでは判定式のもう一方の分岐 cond == agg を明示的に踏む)
+    f.DESIRED_PROPOSERS = ["fake-p1:1b", "fake-p2:1b"]
+    f.DESIRED_AGGREGATOR = "fake-shared:1b"  # 未導入かつpool外 -> pullが必要
+    f.DESIRED_CONDUCTOR = "fake-shared:1b"   # aggと同一モデル
+    _calls5 = []
+    try:
+        f.installed_models = _rm_installed_factory(["fake-p1:1b", "fake-p2:1b"])
+        f.pull = _rm_pull_factory({"fake-shared:1b"}, _calls5)  # aggregatorのpullは成功させる
+        _pool5, _agg5, _cond5 = f.resolve_models()
+        check("resolve_models(5): pull成功したaggregatorはpoolには追加されない(仕様通り)",
+              _pool5 == ["fake-p1:1b", "fake-p2:1b"])
+        check("resolve_models(5): aggはpull成功した共有モデルになる", _agg5 == "fake-shared:1b")
+        check("resolve_models(5): cond==aggの場合はcondもその値に一致する",
+              _cond5 == "fake-shared:1b")
+        check("resolve_models(5): pullはaggregator用に1回だけ呼ばれる(conductor用の追加pullは無い)",
+              _calls5 == ["fake-shared:1b"])
+    finally:
+        f.installed_models = _orig_rm_installed_models
+        f.pull = _orig_rm_pull
+
+    # --- (6) 全滅(installed_models==[]・proposer/agg/condの全pull失敗)後、
+    #     FALLBACK_MODELのpullのみ成功 -> pool==[FALLBACK_MODEL]、agg/condも後埋めされる ---
+    f.DESIRED_PROPOSERS = ["fake-p1:1b", "fake-p2:1b"]
+    f.DESIRED_AGGREGATOR = "fake-agg:1b"
+    f.DESIRED_CONDUCTOR = "fake-cond:1b"
+    f.FALLBACK_MODEL = "fake-fallback:1b"
+    _calls6 = []
+    try:
+        f.installed_models = _rm_installed_factory([])  # 何も導入されていない
+        f.pull = _rm_pull_factory({"fake-fallback:1b"}, _calls6)  # FALLBACKのみ成功
+        _pool6, _agg6, _cond6 = f.resolve_models()
+        check("resolve_models(6): 全滅時はFALLBACK_MODEL単体のpoolになる",
+              _pool6 == ["fake-fallback:1b"])
+        check("resolve_models(6): aggもFALLBACK_MODELへ後埋めされる", _agg6 == "fake-fallback:1b")
+        check("resolve_models(6): condもFALLBACK_MODELへ後埋めされる", _cond6 == "fake-fallback:1b")
+        check("resolve_models(6): pullはp1,p2,agg,cond,FALLBACKの順で全て試行される",
+              _calls6 == ["fake-p1:1b", "fake-p2:1b", "fake-agg:1b", "fake-cond:1b",
+                          "fake-fallback:1b"])
+    finally:
+        f.installed_models = _orig_rm_installed_models
+        f.pull = _orig_rm_pull
+finally:
+    f.DESIRED_PROPOSERS = _orig_rm_desired_proposers
+    f.DESIRED_AGGREGATOR = _orig_rm_desired_aggregator
+    f.DESIRED_CONDUCTOR = _orig_rm_desired_conductor
+    f.FALLBACK_MODEL = _orig_rm_fallback_model
+    f.installed_models = _orig_rm_installed_models
+    f.pull = _orig_rm_pull
+    f.subprocess.run = _orig_rm_subprocess_run
+    urllib.request.urlopen = _orig_rm_urlopen
+
+check("resolve_models: テスト後にDESIRED_PROPOSERSが元の状態へ復元されている",
+      f.DESIRED_PROPOSERS == _orig_rm_desired_proposers)
+check("resolve_models: テスト後にDESIRED_AGGREGATORが元の状態へ復元されている",
+      f.DESIRED_AGGREGATOR == _orig_rm_desired_aggregator)
+check("resolve_models: テスト後にDESIRED_CONDUCTORが元の状態へ復元されている",
+      f.DESIRED_CONDUCTOR == _orig_rm_desired_conductor)
+check("resolve_models: テスト後にFALLBACK_MODELが元の状態へ復元されている",
+      f.FALLBACK_MODEL == _orig_rm_fallback_model)
+check("resolve_models: テスト後にinstalled_modelsが元の状態へ復元されている",
+      f.installed_models == _orig_rm_installed_models)
+check("resolve_models: テスト後にpullが元の状態へ復元されている",
+      f.pull == _orig_rm_pull)
+check("resolve_models: テスト後にsubprocess.runが元の状態へ復元されている",
+      f.subprocess.run == _orig_rm_subprocess_run)
+check("resolve_models: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_rm_urlopen)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
