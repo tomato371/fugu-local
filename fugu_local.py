@@ -3858,6 +3858,20 @@ def _save_answer_to_file(question: str, answer: str, elapsed: float,
     その他   → Markdown で保存
     """
     out = Path(path)
+    # 2026-07-23: --out に存在しないサブディレクトリ（例: reports/answer.md）
+    # を指定すると、.md/.txt/.py 等は out.write_text が、.docx/.xlsx 等は
+    # 各 lib.save が FileNotFoundError を送出し、ask_fugu 側は無捕捉のため
+    # MoA/SC投票まで完了した高コストな計算済み回答がトレースバックと共に
+    # 丸ごと失われていた。さらに office 系フォールバック（.docx/.xlsx 失敗時
+    # の .md/.csv 代替書き込み）も同じ存在しないディレクトリに書こうとして
+    # 二重に失敗し、出力が完全に消える。build_pptx は既に自前で
+    # out_path.parent.mkdir を呼んでいる（L3729、フォールバック分岐にも
+    # 別途 mkdir あり）が、他の拡張子には無かった。iteration 41-47・68
+    # （_save_as_excel の IllegalCharacterError、_save_as_docx の
+    # ValueError、_save_as_pdf の FPDFUnicodeEncodingException 等、保存段で
+    # 計算済み回答を失わないための一連の修正）と同じバグクラスであるため、
+    # 全 suffix 分岐・その場フォールバック双方をこの一箇所で保護する。
+    out.parent.mkdir(parents=True, exist_ok=True)
     suffix = out.suffix.lower()
     actual = out  # 実際に書かれたファイル（フォールバック時に変わる可能性あり）
 

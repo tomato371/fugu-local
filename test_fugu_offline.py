@@ -5878,6 +5878,102 @@ check("resolve_models: テスト後にsubprocess.runが元の状態へ復元さ�
 check("resolve_models: テスト後にurllib.request.urlopenが元の状態へ復元されている",
       urllib.request.urlopen == _orig_rm_urlopen)
 
+# ---------- _save_answer_to_file: --out の親ディレクトリが存在しない場合でも
+# 計算済み回答を失わない (2026-07-23修正) ----------
+# build_pptx は既に自前で out_path.parent.mkdir を呼んでいる(L3729、python-pptx
+# 不在時のフォールバック分岐にも別途mkdirあり)が、他のsuffix分岐(.md/.txt/.py等)は
+# out.write_text / 各lib.save を親ディレクトリの存在チェック無しに直接呼んでおり、
+# --out に存在しないサブディレクトリ(例: reports/answer.md)を指定すると
+# FileNotFoundError が ask_fugu 側(L3185-3187)無捕捉のまま伝播し、MoA/SC投票まで
+# 完了した高コストな計算済み回答がトレースバックと共に失われていた。さらに
+# office系フォールバック(.docx/.xlsx失敗時の.md/.csv代替書き込み)も同じ存在しない
+# ディレクトリに書こうとして二重に失敗し、出力が完全に消える。これは
+# iteration 41-47・68(_save_as_excelのIllegalCharacterError・_save_as_docxの
+# ValueError・_save_as_pdfのFPDFUnicodeEncodingException等、保存段で計算済み
+# 回答を失わないための一連の修正)と同じバグクラス。_save_answer_to_file の
+# out = Path(path) 直後に out.parent.mkdir(parents=True, exist_ok=True) を1箇所
+# 追加し、全suffix分岐とその場フォールバックをまとめて保護する(個別saverへの
+# mkdir散乱はしない)。ローカル一時ディレクトリのみで検証し、
+# Ollama/ネットワーク/bench呼び出しは一切発生しない。
+import tempfile as _pd_tempfile
+import pathlib as _pd_pathlib
+
+with _pd_tempfile.TemporaryDirectory() as _pd_dir:
+    _pd_root = _pd_pathlib.Path(_pd_dir)
+
+    # (1) .md を存在しない1階層サブディレクトリへ
+    #     -> ディレクトリが作られ、例外なくanswerが書き込まれる
+    _pd_md = _pd_root / "missing_subdir" / "answer.md"
+    _pd_md_exc = None
+    try:
+        f._save_answer_to_file("q_pd_md", "回答pd_md", 1.0, str(_pd_md))
+    except Exception as _exc:
+        _pd_md_exc = _exc
+    check("_save_answer_to_file: 存在しないサブディレクトリへの.md保存は例外を送出しない",
+          _pd_md_exc is None)
+    check("_save_answer_to_file: 存在しないサブディレクトリが作成される(.md)",
+          _pd_md.parent.is_dir())
+    if _pd_md_exc is None:
+        check("_save_answer_to_file: .mdファイルが作成され回答を含む",
+              _pd_md.is_file() and "回答pd_md" in _pd_md.read_text(encoding="utf-8"))
+
+    # (2) コード拡張子(.py)を存在しないサブディレクトリへ
+    #     -> ディレクトリが作られ、抽出されたコードが書き込まれる
+    _pd_py = _pd_root / "missing_subdir_code" / "answer.py"
+    _pd_py_answer = "説明文\n```python\nprint('hello')\n```\n"
+    _pd_py_exc = None
+    try:
+        f._save_answer_to_file("q_pd_py", _pd_py_answer, 0.5, str(_pd_py))
+    except Exception as _exc:
+        _pd_py_exc = _exc
+    check("_save_answer_to_file: 存在しないサブディレクトリへの.py保存は例外を送出しない",
+          _pd_py_exc is None)
+    if _pd_py_exc is None:
+        _pd_py_content = _pd_py.read_text(encoding="utf-8")
+        check("_save_answer_to_file: .pyファイルが作成され抽出コードを含む",
+              "print('hello')" in _pd_py_content)
+
+    # (3) .txt / .html を2階層以上ネストした存在しないサブディレクトリへ
+    _pd_txt = _pd_root / "a" / "b" / "c" / "answer.txt"
+    _pd_txt_exc = None
+    try:
+        f._save_answer_to_file("q_pd_txt", "回答pd_txt", 0.3, str(_pd_txt))
+    except Exception as _exc:
+        _pd_txt_exc = _exc
+    check("_save_answer_to_file: 2階層以上ネストした存在しないサブディレクトリへの.txt保存は例外なし",
+          _pd_txt_exc is None)
+    if _pd_txt_exc is None:
+        check("_save_answer_to_file: ネスト.txtファイルが作成され回答を含む",
+              _pd_txt.is_file() and "回答pd_txt" in _pd_txt.read_text(encoding="utf-8"))
+
+    _pd_html = _pd_root / "x" / "y" / "z" / "answer.html"
+    _pd_html_exc = None
+    try:
+        f._save_answer_to_file("q_pd_html", "回答pd_html", 0.4, str(_pd_html))
+    except Exception as _exc:
+        _pd_html_exc = _exc
+    check("_save_answer_to_file: 2階層以上ネストした存在しないサブディレクトリへの.html保存は例外なし",
+          _pd_html_exc is None)
+    if _pd_html_exc is None:
+        check("_save_answer_to_file: ネスト.htmlファイルが作成され回答を含む",
+              _pd_html.is_file() and "回答pd_html" in _pd_html.read_text(encoding="utf-8"))
+
+    # (4) 回帰: 既に存在するディレクトリ(tempdirルート直下)への保存は
+    #     byte-for-byte従来通り(.mdの既存内容への追記マージが不変であることを確認)
+    _pd_regress = _pd_root / "regress.md"
+    _pd_existing = "# 既存メモ\n\n既存内容 täüst 日本語。\n\n"
+    _pd_regress.write_text(_pd_existing, encoding="utf-8")
+    f._save_answer_to_file("q_pd_regress", "回答pd_regress", 2.0, str(_pd_regress))
+    _pd_regress_content = _pd_regress.read_text(encoding="utf-8")
+    _pd_ts_m = f.re.search(r"## Q \(([^)]+)\)", _pd_regress_content)
+    check("_save_answer_to_file: 既存ディレクトリへの追記後にtsが検出できる", _pd_ts_m is not None)
+    if _pd_ts_m:
+        _pd_ts = _pd_ts_m.group(1)
+        _pd_expected_block = (f"## Q ({_pd_ts})\n\nq_pd_regress\n\n"
+                              f"## A\n\n回答pd_regress\n\n*所要: 2.0s*\n\n---\n\n")
+        check("_save_answer_to_file: 既存ディレクトリへの.md追記はbyte-for-byte従来通り",
+              _pd_regress_content == _pd_existing + _pd_expected_block)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
