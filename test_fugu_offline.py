@@ -5120,6 +5120,105 @@ check("_search_raw: テスト後に_resolve_ddgs_classが元の状態へ復元�
 check("_search_raw: テスト後に_ddg_instantが元の状態へ復元されている",
       f._ddg_instant == _orig_ddg_instant_sr)
 
+# ---------- _ddg_instant: Abstract/RelatedTopics スニペットの長さ上限 (2026-07-24修正) ----------
+# _ddg_full は (r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS] で各スニペットを必ず
+# 切り詰めるが、_ddg_instant (ddgs/duckduckgo_search 未インストール時のフォールバック。
+# 上の 2026-07-23 セクションの通り維持対象の経路) は Abstract / RelatedTopics の Text を
+# 無制限に追加していた。DuckDuckGo の Abstract は数KBに及ぶことがあり、research_search の
+# 本文組み立てループで先頭アイテムが SEARCH_CONTEXT_CHARS を超えると
+# `if not body: body = item[:SEARCH_CONTEXT_CHARS]` で break するため、巨大Abstract 1件が
+# 他の収集済み事実を全て握り潰す事故につながる。ここでは urllib.request.urlopen のみを
+# モックし、実ネットワーク呼び出しは一切発生させずに検証する。
+
+_orig_urlopen_di = urllib.request.urlopen
+
+
+def _fake_urlopen_di_payload(payload):
+    def _fake(req, timeout=None):
+        return _FakeHTTPResponse(json.dumps(payload).encode("utf-8"))
+    return _fake
+
+
+def _fake_urlopen_di_raises(exc):
+    def _fake(req, timeout=None):
+        raise exc
+    return _fake
+
+
+try:
+    # --- (1) Abstractが上限を大幅に超える -> 本文のみ切り詰め、タイトル接頭辞と
+    #     Source行(AbstractURL)はそのまま ---
+    _long_abstract = "A" * (f.WEB_SEARCH_SNIPPET_CHARS * 3)
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": _long_abstract,
+        "AbstractTitle": "巨大要約",
+        "AbstractURL": "https://example.com/abstract",
+        "RelatedTopics": [],
+    })
+    _di1 = f._ddg_instant("巨大Abstractクエリ", max_results=10)
+    check("_ddg_instant: 巨大Abstractの本文はWEB_SEARCH_SNIPPET_CHARSに切り詰められ、"
+          "タイトル接頭辞とSource行はそのまま",
+          len(_di1) == 1 and _di1[0] == (
+              f"[巨大要約]\n{_long_abstract[:f.WEB_SEARCH_SNIPPET_CHARS]}\n"
+              f"Source: https://example.com/abstract"))
+    check("_ddg_instant: 切り詰め後の本文長は正確にWEB_SEARCH_SNIPPET_CHARS",
+          _di1[0].split("\n")[1] == "A" * f.WEB_SEARCH_SNIPPET_CHARS)
+
+    # --- (2) RelatedTopicsのTextが上限超過 -> 切り詰められる(Source行は付与しない=既存の形状) ---
+    _long_text = "B" * (f.WEB_SEARCH_SNIPPET_CHARS * 2)
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [{"Text": _long_text, "FirstURL": "https://example.com/rt"}],
+    })
+    _di2 = f._ddg_instant("巨大RelatedTopicsクエリ", max_results=10)
+    check("_ddg_instant: 巨大RelatedTopics Textも上限に切り詰められる",
+          _di2 == ["B" * f.WEB_SEARCH_SNIPPET_CHARS])
+
+    # --- (3) 短いAbstract/Text(上限未満)はbyte-for-byteでそのまま(回帰なし) ---
+    _short_abstract = "短い要約テキスト"
+    _short_text = "短い関連トピック"
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": _short_abstract,
+        "AbstractTitle": "短い要約",
+        "AbstractURL": "https://example.com/short",
+        "RelatedTopics": [{"Text": _short_text}],
+    })
+    _di3 = f._ddg_instant("短いクエリ", max_results=10)
+    check("_ddg_instant: 短いAbstractはSource行も含め従来通り無変更(既存挙動)",
+          _di3[0] == f"[短い要約]\n{_short_abstract}\nSource: https://example.com/short")
+    check("_ddg_instant: 短いRelatedTopics Textも従来通り無変更(既存挙動)",
+          _di3[1] == _short_text)
+
+    # --- (4) max_resultsが従来通り尊重される(ループ早期break + 最終スライス、既存挙動) ---
+    _many_topics = [{"Text": f"トピック{i}"} for i in range(20)]
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": _many_topics,
+    })
+    _di4 = f._ddg_instant("多数RelatedTopicsクエリ", max_results=3)
+    check("_ddg_instant: max_resultsで結果数が従来通り上限に収まる(既存挙動)",
+          len(_di4) == 3)
+
+    # --- (5) AbstractもRelatedTopicsも無い -> [](既存挙動) ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [],
+    })
+    _di5 = f._ddg_instant("空クエリ", max_results=5)
+    check("_ddg_instant: AbstractもRelatedTopicsも無い場合は[]を返す(既存挙動)",
+          _di5 == [])
+
+    # --- (6) urlopen例外(JSON取得失敗相当) -> [](既存挙動) ---
+    urllib.request.urlopen = _fake_urlopen_di_raises(RuntimeError("ネットワーク断(模擬)"))
+    _di6 = f._ddg_instant("例外クエリ", max_results=5)
+    check("_ddg_instant: urlopen例外時は[]を返す(既存挙動)",
+          _di6 == [])
+finally:
+    urllib.request.urlopen = _orig_urlopen_di
+
+check("_ddg_instant: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_urlopen_di)
+
 # ---------- research_search: 反復リサーチループ (dedup / ラウンド上限 / 早期終了) ----------
 # research_search は「Conductor/proposer 全員に注入される権威コンテキスト」を作る
 # 精度クリティカルな経路だが、これまでオフラインテストが皆無だった。

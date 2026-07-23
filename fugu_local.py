@@ -485,12 +485,21 @@ def _ddg_instant(query: str, max_results: int) -> list:
     except Exception:
         return []
     results = []
+    # 2026-07-24: _ddg_full は (r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS] で
+    # 各スニペットを必ず切り詰めているが、この Instant Answer フォールバックは
+    # Abstract / RelatedTopics の Text を無制限に追加していた。DuckDuckGo の
+    # Abstract は数KBに及ぶことがあり、research_search の body 組み立てループは
+    # 先頭アイテムが SEARCH_CONTEXT_CHARS を超えると
+    # `if not body: body = item[:SEARCH_CONTEXT_CHARS]` で break するため、巨大な
+    # Abstract 1件が他の収集済み事実を全て握り潰してしまう。_ddg_full と同じ上限を
+    # 適用して対称にする（Source 行は切り詰めない）。
     if data.get("Abstract"):
-        results.append(f"[{data.get('AbstractTitle', '')}]\n{data['Abstract']}\n"
+        abstract = data["Abstract"][:WEB_SEARCH_SNIPPET_CHARS]
+        results.append(f"[{data.get('AbstractTitle', '')}]\n{abstract}\n"
                        f"Source: {data.get('AbstractURL', '')}")
     for t in data.get("RelatedTopics", []):
         if isinstance(t, dict) and t.get("Text"):
-            results.append(t["Text"])
+            results.append(t["Text"][:WEB_SEARCH_SNIPPET_CHARS])
         if len(results) >= max_results:
             break
     return results[:max_results]

@@ -1,0 +1,40 @@
+_ddg_instant: cap Abstract/RelatedTopics snippets to WEB_SEARCH_SNIPPET_CHARS
+
+The primary DDGS-backed search path truncates every result body via
+(r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS], but the Instant Answer
+fallback _ddg_instant (reached when ddgs/duckduckgo_search is not
+importable, per the iteration-75/2026-07-23 fallback split kept in
+_search_raw) appended data["Abstract"] and each RelatedTopics "Text" with
+no length cap. A multi-KB DuckDuckGo Abstract then dominates
+research_search's body-assembly loop: the first item exceeds
+SEARCH_CONTEXT_CHARS, hits `if not body: body = item[:SEARCH_CONTEXT_CHARS]`,
+and every other collected fact is dropped from the injected context.
+
+Fix: slice data["Abstract"] and each RelatedTopics item's "Text" with
+[:WEB_SEARCH_SNIPPET_CHARS] (existing module constant, no new constant, no
+hardcoded 400). The Abstract item's "[AbstractTitle]" prefix and full
+"Source: {AbstractURL}" line are left untouched, matching how the primary
+path truncates body but not href. RelatedTopics items remain plain text
+with no Source line. max_results loop-break/final-slice and the
+try/except returning [] on urlopen/JSON failure are unchanged. Added a
+dated 2026-07-24 Japanese comment at the change site explaining the
+asymmetry and the crowd-out impact on research_search's context budget.
+
+Added offline tests (urllib.request.urlopen mocked via the existing
+_FakeHTTPResponse pattern, restored in try/finally): oversized
+Abstract/Text truncated to exactly WEB_SEARCH_SNIPPET_CHARS with Source
+line intact, short Abstract/Text unchanged byte-for-byte, max_results
+honored, empty Abstract+RelatedTopics returns [], and urlopen exception
+returns []. No real network/Ollama/subprocess/bench calls anywhere.
+
+Scope: only _ddg_instant touched in the module; the DDGS-backed path,
+_resolve_ddgs_class, _search_raw, web_search, research_search, and
+build_context are untouched. No gotcha-protected code touched (/api/chat,
+num_ctx pinning, ask() think-strip retry, cp932 stdout/stderr reconfigure,
+OLLAMA_MAX_LOADED_MODELS, math_verify timeout kwargs, SC-voting /
+solve_verifiable / _arbitrate / extract_* path all untouched).
+
+Offline test suite: ALL PASSED (all pre-existing checks still green, 9
+new _ddg_instant checks pass).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
