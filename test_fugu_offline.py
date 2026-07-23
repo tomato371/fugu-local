@@ -4267,6 +4267,100 @@ with _tempfile.TemporaryDirectory() as _ri_dir:
     check("_read_ipynb: cells内の非dictエントリはskipされ後続の正当なセルは抽出される",
           _ri_out_f == "# Title")
 
+# ---------- _decode_text_bytes / read_file_text・_read_html cp932フォールバック (2026-07-24) ----------
+# このマシンのコンソールが cp932(Shift-JIS) である既知の落とし穴 #4 と同根の環境要因で、
+# ローカルに保存された非UTF-8(Shift-JIS/cp932)の .txt/.csv/.html 等が普通に存在する。
+# 従来 read_file_text の汎用テキスト分岐と _read_html は encoding="utf-8",
+# errors="replace" を無条件に使っており、cp932ファイルを読むと日本語部分が「全て」
+# U+FFFDに化けて精度critical な RAG/--file コンテキストへそのまま注入されていた。
+# iter47(_save_as_markdown/_save_as_text/_save_as_htmlの読み戻し)・iter70(会話履歴JSON
+# 読み込み)のerrors="replace"適用はfugu自身がUTF-8で書いたファイルの読み戻し用の保険で
+# あり、他所由来ファイルの元エンコーディングは救済しない。本iterationはutf-8 厳密 ->
+# cp932 厳密 -> utf-8 errors="replace" のデコードラダー(_decode_text_bytes)を追加し、
+# 他所由来ファイルの元エンコーディングを損失なく復元する。ここでは
+# _decode_text_bytes単体・read_file_text経由・_read_html経由の3レイヤーで検証する。
+# Ollama/ネットワーク呼び出しは一切不要（すべてtempfile上のオフラインI/O）。
+
+# (1) _decode_text_bytes単体: utf-8成功 / utf-8失敗+cp932成功 / 両方失敗の3分岐
+_dtb_ascii_bytes = "plain ascii text, no surprises.".encode("utf-8")
+check("_decode_text_bytes: 純粋ASCIIはutf-8厳密デコードでそのまま返る",
+      f._decode_text_bytes(_dtb_ascii_bytes) == "plain ascii text, no surprises.")
+
+_dtb_jp_text = "日本語のテスト文章です。utf-8で保存。"
+check("_decode_text_bytes: utf-8厳密デコード成功時は日本語もそのまま復元される",
+      f._decode_text_bytes(_dtb_jp_text.encode("utf-8")) == _dtb_jp_text)
+
+_dtb_cp932_text = "これはcp932(Shift-JIS)で保存された日本語テキストです。株式会社。"
+_dtb_cp932_bytes = _dtb_cp932_text.encode("cp932")
+_dtb_cp932_decoded = f._decode_text_bytes(_dtb_cp932_bytes)
+check("_decode_text_bytes: utf-8失敗・cp932厳密デコード成功時はcp932デコード結果を返す",
+      _dtb_cp932_decoded == _dtb_cp932_text)
+check("_decode_text_bytes: cp932復元結果にU+FFFD(文字化け)が含まれない",
+      "�" not in _dtb_cp932_decoded)
+
+_dtb_undecodable = b"\x80\x81\xfe\xff"  # utf-8としてもcp932としても不正なバイト列
+_dtb_expected_fallback = _dtb_undecodable.decode("utf-8", errors="replace")
+check("_decode_text_bytes: utf-8/cp932とも失敗した場合は例外を送出せずutf-8+replaceにフォールバック",
+      f._decode_text_bytes(_dtb_undecodable) == _dtb_expected_fallback)
+check("_decode_text_bytes: 完全劣化フォールバック結果にはU+FFFDが含まれる(想定通りの置換・退行なし)",
+      "�" in f._decode_text_bytes(_dtb_undecodable))
+
+# (2) read_file_text経由: cp932保存の.txt/.csvが正しい日本語として復元される(従来は全滅)
+with _tempfile.TemporaryDirectory() as _dtb_dir:
+    _dtb_root = _pathlib.Path(_dtb_dir)
+
+    _dtb_txt_jp = "議事録: 本日の会議では新製品の売上について議論した。担当者は田中さんです。"
+    (_dtb_root / "sjis.txt").write_bytes(_dtb_txt_jp.encode("cp932"))
+    _dtb_txt_out = f.read_file_text(_dtb_root / "sjis.txt")
+    check("read_file_text: cp932保存の.txtが正しい日本語として復元される(U+FFFD化けなし)",
+          _dtb_txt_out == _dtb_txt_jp and "�" not in _dtb_txt_out)
+
+    _dtb_csv_jp = "名前,部署,売上\n田中太郎,営業部,1200000\n鈴木花子,開発部,980000\n"
+    (_dtb_root / "sjis.csv").write_bytes(_dtb_csv_jp.encode("cp932"))
+    _dtb_csv_out = f.read_file_text(_dtb_root / "sjis.csv")
+    check("read_file_text: cp932保存の.csvが正しい日本語として復元される(U+FFFD化けなし)",
+          _dtb_csv_out == _dtb_csv_jp and "�" not in _dtb_csv_out)
+
+    # 回帰: 通常のUTF-8 .txtは従来(utf-8厳密読み)とバイト単位で完全一致
+    _dtb_utf8_txt = "通常のUTF-8保存テキストです。\n2行目。\n"
+    (_dtb_root / "utf8.txt").write_text(_dtb_utf8_txt, encoding="utf-8")
+    check("read_file_text: 通常のUTF-8 .txtは従来の読み込み結果とバイト単位で完全一致(回帰)",
+          f.read_file_text(_dtb_root / "utf8.txt") == _dtb_utf8_txt)
+
+    # 回帰: 純粋ASCIIファイルは無変化
+    _dtb_ascii_txt = "pure ascii content, nothing exotic.\nsecond line.\n"
+    (_dtb_root / "ascii.txt").write_text(_dtb_ascii_txt, encoding="utf-8")
+    check("read_file_text: 純粋ASCIIファイルは無変化(回帰)",
+          f.read_file_text(_dtb_root / "ascii.txt") == _dtb_ascii_txt)
+
+    # 劣化耐性: read_bytes自体が失敗する(存在しないファイル)場合も従来通り""を返し
+    # 例外を送出しない(read_file_textのgraceful-degradation契約は不変)
+    check("read_file_text: 存在しないファイルはread_bytes失敗を握りつぶし\"\"を返す(劣化耐性)",
+          f.read_file_text(_dtb_root / "does_not_exist.txt") == "")
+
+# (3) _read_html経由: cp932保存の.htmlがタグ除去済みの正しい日本語として復元される
+with _tempfile.TemporaryDirectory() as _dtb_html_dir:
+    _dtb_html_root = _pathlib.Path(_dtb_html_dir)
+
+    _dtb_html_src = (
+        "<html><body><h1>お知らせ</h1>"
+        "<p>本日は晴天なり。会社の業績は好調です。</p></body></html>"
+    )
+    (_dtb_html_root / "sjis.html").write_bytes(_dtb_html_src.encode("cp932"))
+    _dtb_html_out = f._read_html(_dtb_html_root / "sjis.html")
+    check("_read_html: cp932保存の.htmlが正しい日本語として復元される(タグ除去済み)",
+          "お知らせ" in _dtb_html_out and "本日は晴天なり。会社の業績は好調です。" in _dtb_html_out)
+    check("_read_html: cp932復元結果にタグが残らない(山括弧なし)",
+          "<" not in _dtb_html_out and ">" not in _dtb_html_out)
+    check("_read_html: cp932復元結果にU+FFFD(文字化け)が含まれない",
+          "�" not in _dtb_html_out)
+
+    # 回帰: 通常のUTF-8 .htmlは従来の読み込み結果(utf-8厳密読み)と完全一致
+    _dtb_html_utf8_src = "<html><body><p>Hello UTF-8 world. こんにちは。</p></body></html>"
+    (_dtb_html_root / "utf8.html").write_text(_dtb_html_utf8_src, encoding="utf-8")
+    check("_read_html: 通常のUTF-8 .htmlは'Hello UTF-8 world. こんにちは。'を正しく抽出する(回帰)",
+          f._read_html(_dtb_html_root / "utf8.html") == "Hello UTF-8 world. こんにちは。")
+
 # ---------- _read_excel/_read_pptx/_read_docx: 成功時の構造化抽出カバレッジ (2026-07-23 / iter82) ----------
 # iteration 71 は stdlib のみで書かれた _read_html/_read_ipynb の「成功時」抽出を直接
 # 検証したが、ライブラリ依存の _read_docx/_read_excel/_read_pptx はこれまで失敗/劣化

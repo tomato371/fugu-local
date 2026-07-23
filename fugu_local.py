@@ -959,6 +959,45 @@ def _is_lib_missing_notice(text: str) -> bool:
     return bool(_LIB_MISSING_NOTICE_RE.match(stripped))
 
 
+def _decode_text_bytes(data: bytes) -> str:
+    """入力ファイルのバイト列を str にデコードする（utf-8 -> cp932 -> replace の順）。
+
+    2026-07-24: 既知の落とし穴 #4（このマシンのコンソールが cp932/Shift-JIS で
+    あること）と同根の環境要因で、ローカルに保存された非UTF-8（Shift-JIS/cp932）の
+    .txt/.csv/.html 等がこのマシンには普通に存在する。従来 read_file_text の
+    汎用テキスト分岐と _read_html は encoding="utf-8", errors="replace" を
+    無条件に使っていたため、cp932 ファイルを読むと日本語部分が「全て」
+    U+FFFD（置換文字）に化け、その文字化けがそのまま精度critical な
+    RAG/--file コンテキストへ注入されていた（精度優先・時間は気にしないの
+    方針に反する重大な劣化）。iteration 47（_save_as_markdown/_save_as_text/
+    _save_as_html の読み戻し）・iteration 70（会話履歴JSON読み込み）で導入した
+    errors="replace" は「fugu自身がUTF-8で書いたファイルの読み戻し」用の保険で
+    あり、他所由来ファイルの元エンコーディングを救済するものではない。
+    ここでは stdlib のみで完結する最小限のデコードラダーを用意し、
+    (1) utf-8 厳密デコードを試す（クリーンなUTF-8ファイルは従来と完全に
+    バイト同一の結果になる。utf-8-sig ではなく素の utf-8 を使うため BOM の
+    扱いも従来の read_text(encoding="utf-8") と同一）、(2) 失敗したら cp932
+    厳密デコードを試す（成功すれば日本語を含む cp932 ファイルを正しく復元
+    できる）、(3) それも失敗したら最終手段として utf-8 + errors="replace"
+    （＝これまでの挙動そのもの、退行なし）にフォールバックする。
+
+    呼び出し元は path.read_text(encoding=...) ではなく path.read_bytes() で
+    取得した生バイト列を渡す設計のため、read_text() が標準で行う普遍改行
+    変換（newline=None: ファイル上の "\r\n" や単独の "\r" を "\n" に変換）を
+    ここで明示的に再現する。これを省くと、Windows上で write_text() が
+    書き出す "\r\n" 改行がデコード後もそのまま残ってしまい、read_text()を
+    使っていた従来の出力とバイト単位で一致しなくなる（回帰）。
+    この関数は例外を送出しない。"""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("cp932")
+        except UnicodeDecodeError:
+            text = data.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _read_html(path: Path) -> str:
     """HTML からタグを除去してテキストを返す（stdlib html.parser 使用）。"""
     from html.parser import HTMLParser
@@ -978,7 +1017,14 @@ def _read_html(path: Path) -> str:
             if not self._skip and data.strip():
                 self.parts.append(data.strip())
 
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    # 2026-07-24: 落とし穴 #4 (cp932コンソール) と同根の環境要因で、ローカルの
+    # .html/.htm がShift-JIS(cp932)保存されていることがある。旧来の
+    # encoding="utf-8", errors="replace" 一本槍だと日本語本文が全滅してU+FFFD
+    # 化けがそのままRAG/--fileコンテキストに載っていた。_decode_text_bytes()
+    # のutf-8→cp932→replaceラダーで復元する（iter47/iter70のerrors="replace"
+    # 適用箇所とは目的が異なる: あちらはfugu自身がUTF-8で書いたファイルの
+    # 読み戻し用の保険で、こちらは他所由来ファイルの元エンコーディングの救済）。
+    raw = _decode_text_bytes(path.read_bytes())
     p = _Strip()
     p.feed(raw)
     return "\n".join(p.parts)
@@ -1069,7 +1115,16 @@ def read_file_text(path: Path) -> str:
         return ""
     # その他: テキストとして読む（コード・設定ファイル・Markdown など）
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        # 2026-07-24: 落とし穴 #4 (cp932コンソール) と同根の環境要因で、この
+        # 汎用テキスト分岐が読む .txt/.md/.csv/.py/.json 等がローカルで
+        # Shift-JIS(cp932)保存されていることがある。旧来の
+        # encoding="utf-8", errors="replace" 一本槍では日本語が全滅し、
+        # 精度critical なRAG/--fileコンテキストに文字化けがそのまま注入
+        # されていた。_decode_text_bytes() のutf-8→cp932→replaceラダーで
+        # 復元する（iter47/iter70のerrors="replace"適用箇所とは目的が異なる:
+        # あちらはfugu自身がUTF-8で書いたファイルの読み戻し用の保険で、
+        # こちらは他所由来ファイルの元エンコーディングの救済）。
+        return _decode_text_bytes(path.read_bytes())
     except Exception:
         return ""
 
