@@ -766,18 +766,33 @@ def read_file_text(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in _BINARY_SKIP:
         return ""
-    if suffix == ".pdf":
-        return _read_pdf(path)
-    if suffix in {".docx", ".doc"}:
-        return _read_docx(path)
-    if suffix in {".xlsx", ".xls"}:
-        return _read_excel(path)
-    if suffix in {".pptx", ".ppt"}:
-        return _read_pptx(path)
-    if suffix in {".html", ".htm"}:
-        return _read_html(path)
-    if suffix == ".ipynb":
-        return _read_ipynb(path)
+    # 2026-07-23 (iter53): _read_pdf/_read_docx/_read_excel/_read_pptx/_read_html は
+    # それぞれ import 文と実際のパース処理を同じ try/except ImportError で包んでいるため、
+    # ライブラリ自体は入っているがファイルが壊れている/パスワード付き/旧形式バイナリ等の
+    # 場合（zipfile.BadZipFile, PDFSyntaxError 等の ImportError 以外の例外）はここまで
+    # 素通しで伝播していた。iter42 は _load_rag_chunks 側（RAG経由の呼び出し）だけを
+    # 個別に保護したが、main() の --file 呼び出し（`read_file_text(fp).strip()`）は
+    # 無防備なままで、壊れたOffice/PDFファイルを渡すとCLI全体がクラッシュしていた
+    # （本関数のdocstringが約束する「空文字を返す」というgraceful degradation契約に
+    # 反する）。全リーダー関数の書き換えを試みたiter51は行き詰まったため、ここでは
+    # ディスパッチ関数側だけを薄く保護し、失敗時は空文字にフォールバックしつつ
+    # 警告を可視化する（黙って握りつぶさない）。
+    try:
+        if suffix == ".pdf":
+            return _read_pdf(path)
+        if suffix in {".docx", ".doc"}:
+            return _read_docx(path)
+        if suffix in {".xlsx", ".xls"}:
+            return _read_excel(path)
+        if suffix in {".pptx", ".ppt"}:
+            return _read_pptx(path)
+        if suffix in {".html", ".htm"}:
+            return _read_html(path)
+        if suffix == ".ipynb":
+            return _read_ipynb(path)
+    except Exception as exc:
+        print(f"[read_file_text] 読み込み失敗のためスキップ: {path} ({type(exc).__name__})")
+        return ""
     # その他: テキストとして読む（コード・設定ファイル・Markdown など）
     try:
         return path.read_text(encoding="utf-8", errors="replace")

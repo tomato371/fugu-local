@@ -2706,6 +2706,88 @@ if _HAS_OPENPYXL2:
 else:
     print("   [SKIP] openpyxl未インストールのため実.xlsx破損読み込みテストをスキップ")
 
+# ---------- read_file_text: ディスパッチ例外を握りつぶして""を返す (2026-07-23 / iter53) ----------
+# _read_pdf/_read_docx/_read_excel/_read_pptx/_read_html は import 文と実パース処理を
+# 同じ try/except ImportError で包んでいるため、ライブラリ自体は入っているがファイルが
+# 壊れている場合の非ImportError例外（zipfile.BadZipFile, PDFSyntaxError等）が
+# read_file_text の外まで素通しで伝播していた。main()の--file呼び出し
+# （`read_file_text(fp).strip()`）は_load_rag_chunksと違って無防備だったため、
+# 壊れたOffice/PDFファイルを渡すとCLI全体がクラッシュしていた（iter42はRAG経路のみ保護、
+# 全リーダー書き換えを試みたiter51は行き詰まった）。ここではread_file_text自身が
+# 例外を握りつぶして""を返すことを、個々のリーダーをmonkeypatchして直接検証する
+# （実ライブラリ・実ファイル・Ollama呼び出しは一切不要）。
+import zipfile as _zipfile
+
+_orig_read_pdf2 = f._read_pdf
+_orig_read_excel2 = f._read_excel
+
+
+def _rft_raise_value_error(path):
+    raise ValueError("simulated corrupt PDF parse failure")
+
+
+def _rft_raise_bad_zip(path):
+    raise _zipfile.BadZipFile("simulated corrupt xlsx (not a zip file)")
+
+
+try:
+    f._read_pdf = _rft_raise_value_error
+    with contextlib.redirect_stdout(io.StringIO()) as _rft_out1:
+        _rft_result1 = f.read_file_text(_pathlib.Path("dummy_corrupt.pdf"))
+finally:
+    f._read_pdf = _orig_read_pdf2
+
+check("read_file_text: _read_pdfが非ImportError例外(ValueError)を送出しても伝播せず\"\"を返す",
+      _rft_result1 == "")
+check("read_file_text: PDF読み込み失敗時に警告(ファイル名+例外型)を表示する",
+      "dummy_corrupt.pdf" in _rft_out1.getvalue() and "ValueError" in _rft_out1.getvalue())
+
+try:
+    f._read_excel = _rft_raise_bad_zip
+    with contextlib.redirect_stdout(io.StringIO()) as _rft_out2:
+        _rft_result2 = f.read_file_text(_pathlib.Path("dummy_corrupt.xlsx"))
+finally:
+    f._read_excel = _orig_read_excel2
+
+check("read_file_text: _read_excelがBadZipFileを送出しても伝播せず\"\"を返す(ディスパッチ全体の保護を確認)",
+      _rft_result2 == "")
+check("read_file_text: Excel読み込み失敗時に警告(ファイル名+例外型)を表示する",
+      "dummy_corrupt.xlsx" in _rft_out2.getvalue() and "BadZipFile" in _rft_out2.getvalue())
+
+# 回帰: 正常なテキストファイル/_BINARY_SKIP拡張子は従来通りの挙動を維持
+with _tempfile.TemporaryDirectory() as _rft_dir:
+    _rft_root = _pathlib.Path(_rft_dir)
+    _rft_txt_content = "これは通常のテキストファイルです。\nsecond line.\n"
+    (_rft_root / "plain.txt").write_text(_rft_txt_content, encoding="utf-8")
+    (_rft_root / "note.md").write_text(_rft_txt_content, encoding="utf-8")
+    check("read_file_text: 通常の.txtファイルはバイト単位で内容が一致(回帰)",
+          f.read_file_text(_rft_root / "plain.txt") == _rft_txt_content)
+    check("read_file_text: 通常の.mdファイルはバイト単位で内容が一致(回帰)",
+          f.read_file_text(_rft_root / "note.md") == _rft_txt_content)
+
+    (_rft_root / "image.png").write_bytes(b"\x89PNG\r\n\x1a\nnot a real png")
+    check("read_file_text: _BINARY_SKIP拡張子(.png)は従来通り\"\"を返す(回帰)",
+          f.read_file_text(_rft_root / "image.png") == "")
+
+# ライブラリ未インストール通知文字列（例外ではなくリーダーが正常returnした場合）は
+# ""に変換されず、そのままバイト単位で素通しされること（_is_lib_missing_notice判定は
+# 呼び出し側=_load_rag_chunksの仕事であり、read_file_text自体は加工しない）。
+_rft_notice_text = "[Excel: dummy.xlsx — openpyxl or pandas が必要: pip install openpyxl]"
+
+
+def _rft_return_notice(path):
+    return _rft_notice_text
+
+
+try:
+    f._read_excel = _rft_return_notice
+    _rft_result3 = f.read_file_text(_pathlib.Path("dummy_notice.xlsx"))
+finally:
+    f._read_excel = _orig_read_excel2
+
+check("read_file_text: リーダーがpip install通知文字列を正常returnした場合はそのまま素通し(\"\"化されない)",
+      _rft_result3 == _rft_notice_text)
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
       f._tokenize("PINNについて") == {"pinn", "について"})
