@@ -1775,6 +1775,44 @@ check(
     == "int main(){return 0;}\n",
 )
 
+# 2026-07-23 回帰: フェンス無しフォールバックが l.startswith("#") で '#' 始まりの
+# 行を無条件に全削除していたため、--out file.<ext> で保存される素の(フェンス無し)
+# コードに含まれる #include/#define/#pragma、シェバン行、Rust属性が「見出し」
+# 扱いされて誤って削除されていたバグの修正確認 (iteration 7/18/28/29 が対処した
+# フェンス選択側の兄弟分岐)。CommonMark の ATX heading (^#{1,6}(?:\s|$)) にのみ
+# 一致する行を除去するよう修正した。
+check(
+    "code_out: フェンス無しのC #includeは見出し扱いされず保持される",
+    "#include <stdio.h>"
+    in f._extract_code_for_output(
+        "#include <stdio.h>\nint main(void){return 0;}", ".c"
+    ),
+)
+check(
+    "code_out: フェンス無しの#define/#pragma/シェバン/Rust属性はすべて保持される",
+    f._extract_code_for_output(
+        "#!/usr/bin/env python\n"
+        "#define X 1\n"
+        "#pragma once\n"
+        "#[derive(Debug)]\n"
+        "code_line()",
+        ".py",
+    )
+    == "#!/usr/bin/env python\n#define X 1\n#pragma once\n#[derive(Debug)]\ncode_line()",
+)
+check(
+    "code_out: 7個以上の連続'#'はATX見出しとして無効なため保持される",
+    "####### note"
+    in f._extract_code_for_output("####### note\ncode_line()", ".py"),
+)
+check(
+    "code_out: フェンス無しでも真のATX見出し(# Title/## Section)は従来通り除去される",
+    f._extract_code_for_output(
+        "# Title\ncode_a()\n## Section\ncode_b()", ".py"
+    )
+    == "code_a()\ncode_b()",
+)
+
 # 2026-07-22: iteration 28 の extract_code 修正 (info string は最初の空白区切り
 # トークンのみを言語タグとする) を _extract_code_for_output にも追随適用した
 # 回帰・新規テスト。装飾付き info string (```python title="sol.py" や

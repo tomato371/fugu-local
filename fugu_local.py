@@ -3165,7 +3165,23 @@ def _extract_code_for_output(answer: str, suffix: str) -> str:
         if lang not in _NON_CODE_TAGS:
             return body
     # フェンスなし: マークダウン見出し行を除いた本文を返す
-    lines = [l for l in answer.splitlines() if not l.startswith("#")]
+    # 2026-07-23: 旧実装は l.startswith("#") で '#' から始まる行を無条件に
+    # 全削除しており、docstring が意図する「マークダウン見出し(ATX heading)の
+    # 除去」の範囲を大きく超えていた。この関数はコード拡張子ファイルへの
+    # 保存(--out file.<ext>)にも使われるため、フェンス無しの生コードに含まれる
+    # C の #include/#define/#pragma、シェバン行 #!/usr/bin/env python、
+    # Rust の属性 #[derive(Debug)] まで「見出し」として問答無用に削除され、
+    # コンパイル不能な壊れたファイルが書き出されていた（iteration 7/18/28/29 が
+    # 繰り返し修正してきたのはこの上のフェンス選択側で、この素通しの兄弟分岐は
+    # 今回まで手つかずだった）。CommonMark の ATX heading 仕様では、見出しは
+    # 行頭の '#' が1〜6個続いた直後が空白または行末である行に限られる
+    # （'#include' のように '#' の直後に空白なしで文字が続く行は見出しではない）。
+    # そこで削除対象を正規表現 ^#{1,6}(?:\s|$) に限定し、真の見出し行
+    # (# Title, ## Section 等)だけを除去して、上記のような '#' 始まりの
+    # 非見出しコード行は保持する。列0アンカー(インデント行を見出し扱いしない)は
+    # 従来通り維持する。
+    _ATX_HEADING_RE = re.compile(r"^#{1,6}(?:\s|$)")
+    lines = [l for l in answer.splitlines() if not _ATX_HEADING_RE.match(l)]
     return "\n".join(lines).strip()
 
 
