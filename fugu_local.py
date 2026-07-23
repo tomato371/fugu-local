@@ -2574,11 +2574,17 @@ def aggregate(question, proposals):
     # (model, strip_think(answer)) のまま保持し、タグ付きビューは別変数
     # （annotated）に持たせて、アグリゲータへの block 文字列構築にのみ使う。
     annotated = good
+    # 【2026-07-24】保険2（下記）が「コードが実際に FAILED したと判明している提案」を
+    # 避けられるよう、このアノテーションループで既に呼んでいる code_check() の結果を
+    # good のインデックスに紐づけて保持する。code_check/run_python を再実行はしない。
+    failed_idxs = set()
     if CODE_EXECUTION:
         annotated = []
-        for m, ans in good:
+        for i, (m, ans) in enumerate(good):
             if extract_code(ans):
                 issue = code_check(ans)
+                if issue is not None:
+                    failed_idxs.add(i)
                 tag = ("[Execution check: PASSED]" if issue is None
                        else f"[Execution check: FAILED]\n{issue}")
                 ans = f"{ans}\n\n{tag}"
@@ -2619,11 +2625,24 @@ def aggregate(question, proposals):
     # 3体分の正しい提案が手元にあるのに空回答で失点するのが最悪ケースなので、それを塞ぐ。
     if _bad(out):
         print("   ⚠ 統合に失敗 → 提案から直接選択します")
-        for _m, a in good:
+        # 【2026-07-24 修正】critique() は LLM によるレビューのみでコードを実行しない。
+        # そのため以前はここで good を単純に先頭から走査しており、CODE_EXECUTION の
+        # アノテーションループで「実行して FAILED と判明済み」の提案でも critique() が
+        # ok と判定すればそのまま最終回答として返してしまい得た
+        # （AGGREGATOR_SYS ルール6「FAILED のコードを最終回答の根拠にしない」に反する）。
+        # iteration 9 で good はクリーンな (model, strip_think(answer)) のまま保持する
+        # ようにしたが、それだけでは保険2の選択ロジック自体は直せていなかった。
+        # ここでは failed_idxs（上の実行済み証拠、再実行はしない）を使って、まず
+        # 「コードが FAILED していない」提案（コード無し提案も含む）に候補を絞り、
+        # 全提案が FAILED だった場合のみ元の全候補（good, 元の順序）にフォールバックする。
+        candidates = [(m, a) for i, (m, a) in enumerate(good) if i not in failed_idxs]
+        if not candidates:
+            candidates = good
+        for _m, a in candidates:
             ok, _issue = critique(question, a)
             if ok:
                 return a
-        return max(good, key=lambda x: len(x[1]))[1]
+        return max(candidates, key=lambda x: len(x[1]))[1]
 
     return out
 

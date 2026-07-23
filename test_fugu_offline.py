@@ -2058,6 +2058,56 @@ finally:
     f.critique = _orig_critique
     f.CODE_EXECUTION = _orig_code_execution
 
+# ---------- agg: 保険2は実行済みで FAILED と判明済みのコード提案を避ける (2026-07-24) ----------
+# insurance-2 の critique() 承認スキャン/最長フォールバックとも、上の CODE_EXECUTION
+# アノテーションループが既に計算した code_check() の結果（≒ [Execution check: ...] タグの
+# 元ネタ）を使い、コードが FAILED と判明済みの提案を「他に正常/コード無しの候補がある限り」
+# 避けるべき、という回帰テスト。AGGREGATOR_SYS ルール6「FAILED のコードを最終回答の根拠に
+# しない」に対応。iteration 9 (good はクリーンな (model, strip_think(answer)) のまま保持) の
+# 不変条件はここでも維持する ― 返り値に [Execution check: ...] タグや生トレースバックが
+# 混じらないことも合わせて確認する。
+_failing_code_ans = "This code fails:\n\n```python\n1/0\n```"
+
+_orig_code_execution2 = f.CODE_EXECUTION
+_orig_critique2 = f.critique
+f.CODE_EXECUTION = True
+
+try:
+    # --- 失敗コード案 + プローズ案、critique は全案 ok → FAILED でない方(プローズ)を選ぶ ---
+    f.ask = _fake_ask_always_empty
+    f.critique = lambda question, answer: (True, "")
+    out_fail_first = f.aggregate("Q?", [("m1", _failing_code_ans), ("m2", _prose_ans)])
+    check("agg: 保険2はFAILED済みコード案でなく正常な案を返す(critique採用)",
+          out_fail_first == _prose_ans)
+    check("agg: 保険2(FAILED回避)は1/0を含む案を返さない",
+          "1/0" not in out_fail_first)
+    check("agg: 保険2(FAILED回避/critique採用)は[Execution check:]タグを漏らさない",
+          "[Execution check:" not in out_fail_first)
+
+    # --- 全提案のコードが FAILED → 空にせず全候補(good)から最長フォールバック ---
+    _failing_code_ans_long = _failing_code_ans + ("y" * 200)
+    f.critique = lambda question, answer: (False, "no good")
+    out_all_failed = f.aggregate(
+        "Q?", [("m1", _failing_code_ans), ("m2", _failing_code_ans_long)]
+    )
+    check("agg: 全案FAILEDでも例外にならず提案を返す",
+          out_all_failed in (_failing_code_ans, _failing_code_ans_long))
+    check("agg: 全案FAILED時は最長案(good全体からのフォールバック)を返す",
+          out_all_failed == _failing_code_ans_long)
+    check("agg: 全案FAILED時も[Execution check:]タグを漏らさない",
+          "[Execution check:" not in out_all_failed)
+
+    # --- CODE_EXECUTION=False なら failed_idxs は作られず、従来通り good の先頭順で選ぶ ---
+    f.CODE_EXECUTION = False
+    f.critique = lambda question, answer: (True, "")
+    out_no_exec = f.aggregate("Q?", [("m1", _failing_code_ans), ("m2", _prose_ans)])
+    check("agg: CODE_EXECUTION=Falseなら保険2は従来通りgoodの先頭案を返す",
+          out_no_exec == _failing_code_ans)
+finally:
+    f.ask = _orig_ask
+    f.critique = _orig_critique2
+    f.CODE_EXECUTION = _orig_code_execution2
+
 # ---------- agg: 正常時、アグリゲータへの user プロンプトにはタグが残っていること ----------
 # (AGGREGATOR_SYS ルール6はこのタグを判断材料にするため、アグリゲータ自身が見る
 #  プロンプトからタグを消してはいけない。good を汚さない修正がここを壊していないことの回帰確認)
