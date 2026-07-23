@@ -1501,6 +1501,270 @@ check("arb-body3: \\boxed{} による単一最終解答の指示は維持され�
 check("arb-body3: 有効な(answer, text)タプルを返す",
       _body3_result is not None and _body3_result[0] == "1")
 
+# ==================================================
+# ---------- solve_verifiable: SC_POT(PoT票混入)統合テスト (2026-07-23) ----------
+# ==================================================
+# gotcha #7: solve_verifiable は精度最優先の自己一貫性投票パス。SC_POT は本番既定値が
+# True (fugu_local.py L2352) で、real な math ベンチでは常に PoT 票が混入する。しかし
+# 上のブロック(L800〜)の solve_verifiable テストは全て SC_POT=False / SC_CHEAP_VOTES=0
+# を強制しており(一つは L829 相当で len(_sc_calls)==SC_INITIAL を厳密一致で断言し、
+# これは SC_POT=False でのみ成立する)、add_batch の PoT 分岐
+# (`if SC_POT and task_type == 'math': add(models[0], pot=True)`)・PoT サンプルの
+# 投票への計上・main_cot_count() が PoT/安価票を意図的に SC_MAX 上限計算から除外する
+# 挙動は、これまで統合レベルで一切検証されていなかった。
+#
+# ここでは f.ask ではなく f._sc_sample そのものを丸ごとモックする。_sc_sample は
+# add() 内でモジュール名前空間経由で解決されるため（`add` は solve_verifiable の
+# ネスト関数で、bare name `_sc_sample` を毎回モジュールグローバルから引く）、
+# f._sc_sample を差し替えれば add_batch の実ループ・cheap_ok ゲート・
+# main_cot_count() の除外判定・投票集計・SC_MIN_VOTES 下限・終了判定は本物のまま
+# 実行される。extract_code/run_python のサブプロセス生成には一切触れない
+# （PoT の _sc_sample 内部自体は iteration 4/52/61 で既にモック ask 経由で検証済み）。
+#
+# 既存の solve_verifiable テスト（L829 の SC_POT=False 前提の
+# len(_sc_calls)==SC_INITIAL 断言を含む）は一切変更しない。ここは追加ブロックのみ。
+
+_orig_scpot_sc_sample = f._sc_sample
+_orig_scpot_pot = f.SC_POT
+_orig_scpot_cheap_votes = f.SC_CHEAP_VOTES
+_orig_scpot_cheap_model = f.SC_CHEAP_MODEL
+_orig_scpot_props = f.PROPOSERS
+_orig_scpot_reasoning = f.REASONING_MODELS
+_orig_scpot_installed = f.installed_models
+_orig_scpot_initial = f.SC_INITIAL
+_orig_scpot_step = f.SC_STEP
+_orig_scpot_max = f.SC_MAX
+_orig_scpot_min_votes = f.SC_MIN_VOTES
+
+
+def _make_fake_sc_sample(answer_map, calls_log):
+    """(model, pot) をキーに、あらかじめ用意した答えのリストを呼び出し順に払い出す
+    f._sc_sample の代替品。リストを使い切ったら最後の値を繰り返す。
+    calls_log には実際に呼ばれた (model, pot) を呼び出し順そのまま記録する
+    （ask/run_python は一切呼ばない）。"""
+    _idx = {}
+
+    def _fake(model, question, task_type, pot=False, history=None):
+        key = (model, pot)
+        calls_log.append(key)
+        i = _idx.get(key, 0)
+        _idx[key] = i + 1
+        lst = answer_map.get(key, [None])
+        ans = lst[i] if i < len(lst) else lst[-1]
+        kind = "pot" if pot else "cot"
+        return ans, f"[{kind}:{model}:{i}] answer={ans}"
+
+    return _fake
+
+
+# ---- (A) math + SC_POT=True: PoTサンプルはadd_batch毎に1件、models[0]のみで実行され、
+#      その答えは投票(n/cnt/votes)にちゃんと参加する。全会一致で即確定する単純ケース ----
+_scpot_a_calls = []
+_scpot_a_map = {
+    ("m1", False): ["42", "42"],
+    ("m2", False): ["42", "42"],
+    ("m1", True): ["42"],
+}
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = True
+    f.SC_INITIAL = 4
+    f._sc_sample = _make_fake_sc_sample(_scpot_a_map, _scpot_a_calls)
+    _res_scpot_a = f.solve_verifiable("test question", "math")
+finally:
+    f._sc_sample = _orig_scpot_sc_sample
+    f.PROPOSERS = _orig_scpot_props
+    f.REASONING_MODELS = _orig_scpot_reasoning
+    f.SC_CHEAP_VOTES = _orig_scpot_cheap_votes
+    f.SC_POT = _orig_scpot_pot
+    f.SC_INITIAL = _orig_scpot_initial
+
+_scpot_a_pot_calls = [c for c in _scpot_a_calls if c[1]]
+check("sc-pot: math+SC_POT=TrueでPoTサンプルがadd_batch毎に1件だけ追加される",
+      len(_scpot_a_pot_calls) == 1)
+check("sc-pot: PoTサンプルはmodels[0](m1)でのみ実行される",
+      _scpot_a_pot_calls == [("m1", True)])
+check("sc-pot: CoT+PoT計5サンプル全会一致で確定(n_samplesにPoT分も含む)",
+      _res_scpot_a is not None and _res_scpot_a["answer"] == "42"
+      and _res_scpot_a["n_samples"] == 5)
+check("sc-pot: PoTサンプルの答えがvotes/cntに計上されている(5票すべて'42')",
+      _res_scpot_a is not None and _res_scpot_a["votes"] == {"42": 5})
+
+# ---- (B) mcq + SC_POT=True: add_batchの `and task_type == 'math'` ガードにより
+#      PoTサンプルは一切追加されない ----
+_scpot_b_calls = []
+_scpot_b_map = {
+    ("m1", False): ["A", "A"],
+    ("m2", False): ["A", "A"],
+}
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = True
+    f.SC_INITIAL = 4
+    f._sc_sample = _make_fake_sc_sample(_scpot_b_map, _scpot_b_calls)
+    _res_scpot_b = f.solve_verifiable("test question", "mcq")
+finally:
+    f._sc_sample = _orig_scpot_sc_sample
+    f.PROPOSERS = _orig_scpot_props
+    f.REASONING_MODELS = _orig_scpot_reasoning
+    f.SC_CHEAP_VOTES = _orig_scpot_cheap_votes
+    f.SC_POT = _orig_scpot_pot
+    f.SC_INITIAL = _orig_scpot_initial
+
+check("sc-pot: task_type='mcq'ではSC_POT=TrueでもPoTサンプルは追加されない(samples中にpot=Trueが無い)",
+      not any(pot for _m, pot in _scpot_b_calls))
+check("sc-pot: mcqはSC_INITIAL(4件のCoTのみ)で全会一致確定する",
+      _res_scpot_b is not None and _res_scpot_b["answer"] == "A"
+      and _res_scpot_b["n_samples"] == 4 and len(_scpot_b_calls) == 4)
+
+# ---- (C) math + SC_POT=True: 1バッチ目のCoTだけなら2-2で決着しないが、PoT票が
+#      一方に加わることで過半数(3/5)に押し上げ、そのPoT票自体が確定に寄与すること
+#      を示す(全会一致ではない、n<全票のケース) ----
+_scpot_c_calls = []
+_scpot_c_map = {
+    ("m1", False): ["1", "1"],
+    ("m2", False): ["2", "2"],
+    ("m1", True): ["1"],
+}
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = True
+    f.SC_INITIAL = 4
+    f._sc_sample = _make_fake_sc_sample(_scpot_c_map, _scpot_c_calls)
+    _res_scpot_c = f.solve_verifiable("test question", "math")
+finally:
+    f._sc_sample = _orig_scpot_sc_sample
+    f.PROPOSERS = _orig_scpot_props
+    f.REASONING_MODELS = _orig_scpot_reasoning
+    f.SC_CHEAP_VOTES = _orig_scpot_cheap_votes
+    f.SC_POT = _orig_scpot_pot
+    f.SC_INITIAL = _orig_scpot_initial
+
+check("sc-pot: CoTのみなら2-2で拮抗するところ、PoT票が'1'側に加わり3-2の過半数で確定",
+      _res_scpot_c is not None and _res_scpot_c["answer"] == "1"
+      and _res_scpot_c["n_samples"] == 5)
+check("sc-pot: 過半数側の勝者票(3)にPoT票が含まれる(CoT'1'は2票のみ、PoTの+1で3票)",
+      _res_scpot_c is not None and _res_scpot_c["votes"] == {"1": 3, "2": 2})
+
+# ---- (D) math + SC_POT=True: PoTはmain_cot_count()（=SC_MAXの上限判定）から
+#      意図的に除外される。SC_MAXを「PoTを含めた総サンプル数」で見た場合と
+#      「PoT除外の主力CoT数」で見た場合とで、ループが継続するかどうかが分岐する
+#      値(SC_MAX=5)を選び、実際には除外仕様どおり2バッチ目まで継続する
+#      （もしPoTがカウントされていたら1バッチ目=総数5で即打ち切られてしまうはず）
+#      ことを検証する。かつ無限ループにならないこと。 ----
+_scpot_d_calls = []
+_scpot_d_map = {
+    ("m1", False): ["1", "1", "1", "1"],
+    ("m2", False): ["2", "2", "2", "2"],
+    ("m1", True): ["3", "1"],
+}
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = True
+    f.SC_INITIAL = 4
+    f.SC_STEP = 4
+    f.SC_MAX = 5
+    f._sc_sample = _make_fake_sc_sample(_scpot_d_map, _scpot_d_calls)
+    _res_scpot_d = f.solve_verifiable("test question", "math")
+finally:
+    f._sc_sample = _orig_scpot_sc_sample
+    f.PROPOSERS = _orig_scpot_props
+    f.REASONING_MODELS = _orig_scpot_reasoning
+    f.SC_CHEAP_VOTES = _orig_scpot_cheap_votes
+    f.SC_POT = _orig_scpot_pot
+    f.SC_INITIAL = _orig_scpot_initial
+    f.SC_STEP = _orig_scpot_step
+    f.SC_MAX = _orig_scpot_max
+
+_scpot_d_pot_calls = [c for c in _scpot_d_calls if c[1]]
+_scpot_d_main_calls = [c for c in _scpot_d_calls if not c[1]]
+check("sc-pot: main_cot_count()除外によりadd_batchが2回走る"
+      "(PoTを含めた総数だとSC_MAX=5に1バッチ目で到達し1回で打ち切られるはずだが、"
+      "実際は主力CoT数だけで判定するため2バッチ目まで継続する)",
+      len(_scpot_d_pot_calls) == 2 and len(_scpot_d_calls) == 10)
+check("sc-pot: PoTはadd_batch毎(2回)に1件だけ、常にmodels[0]で実行される",
+      _scpot_d_pot_calls == [("m1", True), ("m1", True)])
+check("sc-pot: 主力CoTサンプル数がSC_MAX(5)以上に達した時点で打ち切られる(有限回で終了)",
+      len(_scpot_d_main_calls) == 8 and len(_scpot_d_main_calls) >= 5)
+check("sc-pot: PoT票を含む総サンプル数(10)は主力CoT数(8)より多い"
+      "(SC_MAXの判定が総数ではなく主力CoT数であることの直接証拠)",
+      _res_scpot_d is not None and _res_scpot_d["n_samples"] == 10)
+check("sc-pot: PoT票も含めた最終投票結果は真実(votesにPoTの寄与が正しく反映)",
+      _res_scpot_d is not None and _res_scpot_d["answer"] == "1"
+      and _res_scpot_d["votes"] == {"1": 5, "2": 4, "3": 1})
+
+# ---- (E, optional) 安価票(SC_CHEAP_VOTES>0)ケース: installed_modelsをモックして
+#      cheap_ok=Trueにし、初回バッチ直後に安価票がSC_CHEAP_VOTES件だけ一度だけ追加され、
+#      投票には参加するがmain_cot_count()（SC_MAXの上限判定）からは除外されること。
+#      SC_MAXをmain-onlyとtotal-with-cheapの間に置き、除外の有無で分岐する形で検証する
+#      （もし安価票がカウントされていたら安価票追加直後=総数6でSC_MAX=5に到達し
+#      即打ち切られるはずだが、実際は主力CoT数(4)だけで判定するため2バッチ目まで
+#      継続する）----
+_scpot_e_calls = []
+_scpot_e_map = {
+    ("m1", False): ["1", "1", "1", "1"],
+    ("m2", False): ["2", "2", "4", "4"],
+    ("cheapM", False): ["3", "3"],
+}
+_orig_scpot_e_installed = f.installed_models
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_POT = False
+    f.SC_CHEAP_MODEL = "cheapM"
+    f.SC_CHEAP_VOTES = 2
+    f.installed_models = lambda: ["m1", "m2", "cheapM"]
+    f.SC_INITIAL = 4
+    f.SC_STEP = 4
+    f.SC_MAX = 5
+    f._sc_sample = _make_fake_sc_sample(_scpot_e_map, _scpot_e_calls)
+    _res_scpot_e = f.solve_verifiable("test question", "math")
+finally:
+    f._sc_sample = _orig_scpot_sc_sample
+    f.PROPOSERS = _orig_scpot_props
+    f.REASONING_MODELS = _orig_scpot_reasoning
+    f.SC_POT = _orig_scpot_pot
+    f.SC_CHEAP_MODEL = _orig_scpot_cheap_model
+    f.SC_CHEAP_VOTES = _orig_scpot_cheap_votes
+    f.installed_models = _orig_scpot_e_installed
+    f.SC_INITIAL = _orig_scpot_initial
+    f.SC_STEP = _orig_scpot_step
+    f.SC_MAX = _orig_scpot_max
+
+_scpot_e_cheap_calls = [c for c in _scpot_e_calls if c[0] == "cheapM"]
+check("sc-cheap: 安価票はSC_CHEAP_VOTES(2)件だけ、初回バッチ直後に一度だけ追加される"
+      "(先頭4件がCoT、続く2件が安価票)",
+      _scpot_e_calls[:4] == [("m1", False), ("m1", False), ("m2", False), ("m2", False)]
+      and _scpot_e_calls[4:6] == [("cheapM", False), ("cheapM", False)]
+      and len(_scpot_e_cheap_calls) == 2)
+check("sc-cheap: main_cot_count()除外により安価票追加後も打ち切られず2バッチ目まで継続する"
+      "(総数基準ならSC_MAX=5に安価票追加直後の総数6で到達し打ち切られるはずだが、"
+      "実際は主力CoT数だけで判定するため継続する)",
+      len(_scpot_e_calls) == 10)
+check("sc-cheap: 安価票は投票結果(votes/n_samples)に正しく計上される",
+      _res_scpot_e is not None and _res_scpot_e["n_samples"] == 10
+      and _res_scpot_e["votes"].get("3") == 2)
+
+check("sc-pot/cheap: テスト後にf._sc_sampleが元へ復元されている",
+      f._sc_sample == _orig_scpot_sc_sample)
+check("sc-pot/cheap: テスト後にSC_POT/SC_CHEAP_VOTES/SC_CHEAP_MODELが元へ復元されている",
+      f.SC_POT == _orig_scpot_pot and f.SC_CHEAP_VOTES == _orig_scpot_cheap_votes
+      and f.SC_CHEAP_MODEL == _orig_scpot_cheap_model)
+check("sc-pot/cheap: テスト後にPROPOSERS/REASONING_MODELS/installed_modelsが元へ復元されている",
+      f.PROPOSERS == _orig_scpot_props and f.REASONING_MODELS == _orig_scpot_reasoning
+      and f.installed_models == _orig_scpot_installed)
+check("sc-pot/cheap: テスト後にSC_INITIAL/SC_STEP/SC_MAX/SC_MIN_VOTESが元へ復元されている",
+      f.SC_INITIAL == _orig_scpot_initial and f.SC_STEP == _orig_scpot_step
+      and f.SC_MAX == _orig_scpot_max and f.SC_MIN_VOTES == _orig_scpot_min_votes)
+
 # ---------- task_type ガードレール ----------
 def _tt(q, declared=""):
     return f._apply_tasktype_guardrails(q, {"task_type": declared})["task_type"]
