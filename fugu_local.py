@@ -738,14 +738,33 @@ def _read_excel(path: Path) -> str:
     try:
         import openpyxl
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-        parts = []
-        for ws in wb.worksheets:
-            parts.append(f"[Sheet: {ws.title}]")
-            for row in ws.iter_rows(values_only=True):
-                row_str = "\t".join("" if v is None else str(v) for v in row)
-                if row_str.strip():
-                    parts.append(row_str)
-        return "\n".join(parts)
+        # 2026-07-24: read_only=True のワークブックは内部で循環参照を持ち、単純な
+        # 参照カウントだけでは解放されない（iter82のテストがこれを踏み、後始末で
+        # gc.collect() を挟まないと WinError 32 でtempディレクトリの削除に失敗した
+        # のが直接の証拠）。close() を呼ばないまま関数を抜けるとzipのファイル
+        # ハンドルがGCまで開いたままになり、Windowsでは同じファイルの後続の
+        # 読み書き/移動をブロックし、_load_rag_chunksが多数の.xlsxを読む場面では
+        # ハンドルリークにもなる。抽出（parts構築）が終わった後にfinallyでclose()
+        # し、close()自体が失敗しても既に取れているテキストは握りつぶさず返す。
+        # 本体の except ImportError / except Exception によるiter84の
+        # フォールスルー動作（.xls等でopenpyxlが読めない場合にpandasへ進む挙動）は
+        # 変更しない。
+        try:
+            parts = []
+            for ws in wb.worksheets:
+                parts.append(f"[Sheet: {ws.title}]")
+                for row in ws.iter_rows(values_only=True):
+                    row_str = "\t".join("" if v is None else str(v) for v in row)
+                    if row_str.strip():
+                        parts.append(row_str)
+            result = "\n".join(parts)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                # close失敗で成功した抽出結果をフォールバック扱いにしない
+                pass
+        return result
     except ImportError:
         pass
     except Exception as exc:
@@ -754,11 +773,21 @@ def _read_excel(path: Path) -> str:
     try:
         import pandas as pd
         xl = pd.ExcelFile(str(path))
-        parts = []
-        for sheet in xl.sheet_names:
-            df = xl.parse(sheet)
-            parts.append(f"[Sheet: {sheet}]\n{df.to_csv(index=False)}")
-        return "\n\n".join(parts)
+        # 2026-07-24: pd.ExcelFile も内部でzipハンドルを開いたままにするため、
+        # 上のopenpyxl分岐と同じ理由（iter82のgc.collect()回避策/iter84の
+        # フォールスルー方針）でclose()を明示する。
+        try:
+            parts = []
+            for sheet in xl.sheet_names:
+                df = xl.parse(sheet)
+                parts.append(f"[Sheet: {sheet}]\n{df.to_csv(index=False)}")
+            result = "\n\n".join(parts)
+        finally:
+            try:
+                xl.close()
+            except Exception:
+                pass
+        return result
     except ImportError:
         pass
     except Exception as exc:

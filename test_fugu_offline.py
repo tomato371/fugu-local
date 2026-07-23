@@ -4951,6 +4951,278 @@ if _RXL2_HAS_OPENPYXL:
 else:
     print("   [SKIP] openpyxl未インストールのため_read_excel成功パス回帰テスト(iter84)をスキップ")
 
+# ---------- _read_excel: 読み取り後にワークブック/ExcelFileをclose()する (2026-07-24 / iter88) ----------
+# openpyxlブロック(load_workbook(read_only=True, data_only=True))とpandasブロック
+# (pd.ExcelFile)はどちらも抽出後にハンドルを解放していなかった。read_only=True の
+# ワークブックはワークシートとの間に参照循環を持つため単純な参照カウントだけでは
+# 解放されず、iter82のテストはこれを直接踏んで、tempディレクトリのクリーンアップ時に
+# gc.collect()を挟まないとWinError 32(他のプロセスがファイルを使用中)で失敗する
+# ことを確認していた(=本番コードが実際にハンドルをリークしている直接証拠)。
+# pandas.ExcelFileも内部でzipハンドルを開いたままにする。close()を呼ばないと
+# Windowsでは同じファイルの後続の読み書き/移動をブロックし、_load_rag_chunksが
+# 多数の.xlsxを読む場面ではハンドルリークにもなる。iter84はこの関数に
+# 「ImportError以外の実行時例外でも下位ライブラリへフォールスルーする」修正を
+# 入れた直系の姉妹修正であり、ここではその副作用(finally節の追加)がフォール
+# スルー・警告文言・成功時テキストのいずれも変えていないことを併せて検証する。
+# 実ライブラリのimport可否に関わらず決定的に検証するため、sys.modulesへの
+# フェイクモジュール注入(iter43/44/82/83/84で確立済みの_rpdf_swap_modules)と、
+# 実openpyxlが使える環境でのみ実施する成功パス/ハンドル解放の直接検証を併用する。
+try:
+    import openpyxl as _rxl3_real_openpyxl
+    _RXL3_HAS_OPENPYXL = True
+except ImportError:
+    _RXL3_HAS_OPENPYXL = False
+
+import pathlib as _rxl3_pathlib
+import tempfile as _rxl3_tempfile
+import os as _rxl3_os
+
+
+class _Rxl3CloseCountingProxy:
+    """実オブジェクト(openpyxl Workbook / pandas ExcelFile)をラップし、close()の
+    呼び出し回数を記録するプロキシ。close以外の属性アクセスは__getattr__経由で
+    全て実オブジェクトへ委譲するため、抽出処理そのものへの影響はない
+    (close()呼び出し回数の検証専用、iter88)。"""
+
+    def __init__(self, real_obj):
+        self._rxl3_real = real_obj
+        self.close_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._rxl3_real, name)
+
+    def close(self):
+        self.close_calls += 1
+        return self._rxl3_real.close()
+
+
+def _rxl3_make_pandas_module_tracked(mod_name, sheets, tracker):
+    """iter84の_rxl2_make_pandas_moduleにclose()呼び出し回数の記録を追加したもの
+    (trackerは{"count": int}の辞書。呼び出し側で呼び出し後の値を検証する)。"""
+    mod = types.ModuleType(mod_name)
+
+    class _Rxl3FakeDataFrame:
+        def __init__(self, csv_text):
+            self._csv_text = csv_text
+
+        def to_csv(self, index=False):
+            return self._csv_text
+
+    class _Rxl3FakeExcelFile:
+        def __init__(self, path):
+            self.sheet_names = list(sheets.keys())
+
+        def parse(self, sheet):
+            return _Rxl3FakeDataFrame(sheets[sheet])
+
+        def close(self):
+            tracker["count"] += 1
+
+    mod.ExcelFile = _Rxl3FakeExcelFile
+    return mod
+
+
+# (A) openpyxl分岐: wb.close()が正確に1回呼ばれ、抽出テキストは不変であること
+#     (受け入れ基準: openpyxl branch close-count テスト)。
+if _RXL3_HAS_OPENPYXL:
+    with _rxl3_tempfile.TemporaryDirectory() as _rxl3_dir_a:
+        _rxl3_path_a = _rxl3_pathlib.Path(_rxl3_dir_a) / "close_check.xlsx"
+        _rxl3_wb_a = _rxl3_real_openpyxl.Workbook()
+        _rxl3_ws_a = _rxl3_wb_a.active
+        _rxl3_ws_a.title = "Sheet1"
+        _rxl3_ws_a.append(["name", "age"])
+        _rxl3_ws_a.append(["Alice", 30])
+        _rxl3_wb_a.save(str(_rxl3_path_a))
+
+        _rxl3_captured_a = []
+
+        def _rxl3_fake_load_workbook_a(*args, **kwargs):
+            real_wb = _rxl3_real_openpyxl.load_workbook(*args, **kwargs)
+            proxy = _Rxl3CloseCountingProxy(real_wb)
+            _rxl3_captured_a.append(proxy)
+            return proxy
+
+        _rxl3_fake_openpyxl_mod_a = types.ModuleType("openpyxl")
+        _rxl3_fake_openpyxl_mod_a.load_workbook = _rxl3_fake_load_workbook_a
+
+        _rxl3_out_a = _rpdf_swap_modules(
+            {"openpyxl": _rxl3_fake_openpyxl_mod_a},
+            lambda: f._read_excel(_rxl3_path_a),
+        )
+        _rxl3_expected_a = "\n".join([
+            "[Sheet: Sheet1]",
+            "name\tage",
+            "Alice\t30",
+        ])
+        check("_read_excel: openpyxl分岐でwb.close()が正確に1回呼ばれる(iter88)",
+              len(_rxl3_captured_a) == 1 and _rxl3_captured_a[0].close_calls == 1)
+        check("_read_excel: close()追加後もopenpyxl分岐の抽出テキストは従来通り(iter88)",
+              _rxl3_out_a == _rxl3_expected_a)
+else:
+    print("   [SKIP] openpyxl未インストールのためwb.close()呼び出し検証(iter88)をスキップ")
+
+# (B) pandas分岐: xl.close()が正確に1回呼ばれ、抽出テキストは正しいこと
+#     (openpyxlは利用不可に見せかけてpandas分岐を強制する。受け入れ基準:
+#     pandas branch close-count テスト)。
+_rxl3_pandas_tracker_b = {"count": 0}
+_rxl3_fake_pandas_mod_b = _rxl3_make_pandas_module_tracked(
+    "pandas", {"Sheet1": "x,y\n1,2\n"}, _rxl3_pandas_tracker_b)
+
+with _rxl3_tempfile.TemporaryDirectory() as _rxl3_dir_b:
+    _rxl3_path_b = _rxl3_pathlib.Path(_rxl3_dir_b) / "pandas_close_check.xlsx"
+    # pandas分岐はフェイクモジュール経由で呼ぶだけで実際にバイト列を解釈しないため
+    # 中身は問われないが、ファイル自体は実在させる(iter84の手法を踏襲)。
+    _rxl3_path_b.write_bytes(b"dummy xlsx bytes for pandas-branch close() test, not parsed for real")
+
+    _rxl3_out_b = _rpdf_swap_modules(
+        {"openpyxl": None, "pandas": _rxl3_fake_pandas_mod_b},
+        lambda: f._read_excel(_rxl3_path_b),
+    )
+    check("_read_excel: pandas分岐でxl.close()が正確に1回呼ばれる(openpyxl不在, iter88)",
+          _rxl3_pandas_tracker_b["count"] == 1)
+    check("_read_excel: close()追加後もpandas分岐の抽出テキストは従来通り(iter88)",
+          _rxl3_out_b == "[Sheet: Sheet1]\nx,y\n1,2\n")
+
+# (C) 成功パスの回帰確認: 実openpyxlで複数シート/空行スキップ/None空文字化を含む
+#     出力がbyte-for-byte従来通りであること、かつ_is_lib_missing_notice()がFalseに
+#     なること(受け入れ基準: success-path regression テスト)。
+if _RXL3_HAS_OPENPYXL:
+    with _rxl3_tempfile.TemporaryDirectory() as _rxl3_dir_c:
+        _rxl3_path_c = _rxl3_pathlib.Path(_rxl3_dir_c) / "regression.xlsx"
+        _rxl3_wb_c = _rxl3_real_openpyxl.Workbook()
+        _rxl3_ws1_c = _rxl3_wb_c.active
+        _rxl3_ws1_c.title = "Sheet1"
+        _rxl3_ws1_c.append(["name", "age"])
+        _rxl3_ws1_c.append(["Alice", 30])
+        _rxl3_ws1_c.append([None, None])   # 完全に空の行 -> 出力から省略される
+        _rxl3_ws1_c.append(["Bob", None])  # Noneセルを含むが行自体は非空 -> 保持される
+        _rxl3_ws2_c = _rxl3_wb_c.create_sheet("Sheet2")
+        _rxl3_ws2_c.append(["x", "y"])
+        _rxl3_ws2_c.append([1, 2])
+        _rxl3_wb_c.save(str(_rxl3_path_c))
+
+        _rxl3_out_c = f._read_excel(_rxl3_path_c)
+        _rxl3_expected_c = "\n".join([
+            "[Sheet: Sheet1]",
+            "name\tage",
+            "Alice\t30",
+            "Bob\t",
+            "[Sheet: Sheet2]",
+            "x\ty",
+            "1\t2",
+        ])
+        check("_read_excel: close()追加後もbyte-for-byte従来通りの抽出結果"
+              "(複数シート/空行スキップ/None空文字化, iter88)",
+              _rxl3_out_c == _rxl3_expected_c)
+        check("_is_lib_missing_notice: close()追加後の成功時出力はFalse(iter37の過剰フィルタ回帰ガード, iter88)",
+              not f._is_lib_missing_notice(_rxl3_out_c))
+else:
+    print("   [SKIP] openpyxl未インストールのため成功パス回帰検証(iter88)をスキップ")
+
+# (D) ハンドル解放: _read_excel()から戻った直後、gc.collect()無しでも読み取った
+#     .xlsxを即座にunlinkできること(受け入れ基準: handle-release テスト)。
+#     Windows上でのみ意味のある検証のため、os.nameで判定してWindows以外では
+#     スキップし、(A)/(B)のclose()呼び出し回数アサーションで代替する
+#     (POSIXではread_onlyハンドルが残っていてもunlink自体は成功してしまうため、
+#     unlinkの成否だけではハンドル解放の証明にならない)。
+if _RXL3_HAS_OPENPYXL:
+    with _rxl3_tempfile.TemporaryDirectory() as _rxl3_dir_d:
+        _rxl3_path_d = _rxl3_pathlib.Path(_rxl3_dir_d) / "handle_release.xlsx"
+        _rxl3_wb_d = _rxl3_real_openpyxl.Workbook()
+        _rxl3_ws_d = _rxl3_wb_d.active
+        _rxl3_ws_d.title = "S"
+        _rxl3_ws_d.append(["k", "v"])
+        _rxl3_wb_d.save(str(_rxl3_path_d))
+
+        _rxl3_out_d = f._read_excel(_rxl3_path_d)
+        check("_read_excel: ハンドル解放検証用フィクスチャの抽出結果も正しい(iter88)",
+              _rxl3_out_d == "[Sheet: S]\nk\tv")
+
+        if _rxl3_os.name == "nt":
+            # 意図的にgc.collect()を呼ばない: close()単独でWindows上のファイル
+            # ハンドルが即座に解放されることそのものを検証する対象のテスト
+            # (iter82が必要としていたgc.collect()回避策がclose()追加により
+            # 不要になったことの直接確認、iter88)。
+            try:
+                _rxl3_path_d.unlink()
+                _rxl3_unlink_ok = True
+            except OSError:
+                _rxl3_unlink_ok = False
+                # unlinkに失敗した場合、このwithブロックを抜ける際のTemporaryDirectory
+                # クリーンアップがWinError 32で丸ごとクラッシュしてスイート全体を
+                # 落とさないよう、iter82と同じ後始末を保険として行う(check()自体は
+                # 既にFalseとして記録済みなので、この後始末は結果に影響しない)。
+                import gc as _rxl3_gc_d
+                _rxl3_gc_d.collect()
+            check("_read_excel: Windows上でgc.collect()無しでも読み取り直後に"
+                  "ファイルをunlinkできる(wb.close()によるハンドル即時解放, iter88)",
+                  _rxl3_unlink_ok)
+        else:
+            print("   [SKIP] POSIX環境のためgc.collect()無しunlink検証(iter88)をスキップ"
+                  "(close()呼び出し確認で代替)")
+else:
+    print("   [SKIP] openpyxl未インストールのためハンドル解放検証(iter88)をスキップ")
+
+# (E) 抽出処理中(worksheets反復中)に例外が起きるケース: ワークブックは開けたが
+#     parts構築中に失敗した場合でも、wb.close()は呼ばれ、かつiter84同様pandas側へ
+#     フォールスルーしてテキストを失わないこと(受け入れ基準: mid-iteration failure
+#     テスト)。openpyxl/pandasどちらも完全にフェイクなので実ライブラリの有無に
+#     関わらず決定的に検証できる。
+_rxl3_captured_e = []
+
+
+class _Rxl3FakeWsRaising:
+    title = "Sheet1"
+
+    def iter_rows(self, values_only=True):
+        raise RuntimeError("simulated mid-extraction failure after workbook opened (iter88)")
+
+
+class _Rxl3FakeWbRaising:
+    def __init__(self):
+        self.worksheets = [_Rxl3FakeWsRaising()]
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+
+
+def _rxl3_fake_load_workbook_e(*args, **kwargs):
+    wb = _Rxl3FakeWbRaising()
+    _rxl3_captured_e.append(wb)
+    return wb
+
+
+_rxl3_fake_openpyxl_mod_e = types.ModuleType("openpyxl")
+_rxl3_fake_openpyxl_mod_e.load_workbook = _rxl3_fake_load_workbook_e
+
+_rxl3_fake_pandas_mod_e = _rxl3_make_pandas_module_tracked(
+    "pandas", {"Fallback": "a,b\n1,2\n"}, {"count": 0})
+
+with _rxl3_tempfile.TemporaryDirectory() as _rxl3_dir_e:
+    _rxl3_path_e = _rxl3_pathlib.Path(_rxl3_dir_e) / "mid_fail.xlsx"
+    _rxl3_path_e.write_bytes(b"dummy content, not parsed for real (fully mocked)")
+
+    _rxl3_cap_e = io.StringIO()
+    with contextlib.redirect_stdout(_rxl3_cap_e):
+        _rxl3_out_e = _rpdf_swap_modules(
+            {"openpyxl": _rxl3_fake_openpyxl_mod_e, "pandas": _rxl3_fake_pandas_mod_e},
+            lambda: f._read_excel(_rxl3_path_e),
+        )
+    check("_read_excel: 抽出処理中(worksheets反復中)の例外でもwb.close()は1回呼ばれる(iter88)",
+          len(_rxl3_captured_e) == 1 and _rxl3_captured_e[0].close_calls == 1)
+    check("_read_excel: 抽出処理中の例外でもiter84同様pandas側へフォールスルーしテキストを失わない(iter88)",
+          _rxl3_out_e == "[Sheet: Fallback]\na,b\n1,2\n")
+    check("_read_excel: 抽出処理中の例外の警告にファイル名と例外型名が出力される(iter88)",
+          _rxl3_path_e.name in _rxl3_cap_e.getvalue() and "RuntimeError" in _rxl3_cap_e.getvalue())
+    check("_read_excel: 抽出処理中例外の警告メッセージはcp932でエンコード可能(gotcha#4, iter88)",
+          _rpdf_is_cp932_safe(_rxl3_cap_e.getvalue()))
+
+check("_read_excel: テスト後にsys.modulesの'openpyxl'エントリが元通り解決可能(復元確認、iter88)",
+      ("openpyxl" not in sys.modules) or (sys.modules["openpyxl"] is not None))
+check("_read_excel: テスト後にsys.modulesの'pandas'エントリが元通り解決可能(復元確認、iter88)",
+      ("pandas" not in sys.modules) or (sys.modules["pandas"] is not None))
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
       f._tokenize("PINNについて") == {"pinn", "について"})
