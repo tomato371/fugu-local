@@ -7652,6 +7652,93 @@ check("history: SESSION_SAVE はテスト後に既定値へ復元されている
 check("history: MAX_HISTORY_TURNS_SAVED はテスト後に既定値へ復元されている",
       f.MAX_HISTORY_TURNS_SAVED == _orig_max_hist_turns_saved)
 
+# ---------- ask_fugu 経路3(イラスト付き回答): 画像生成失敗時に __ERROR__ センチネルが
+# 最終回答/保存ファイルへ漏出しないことを検証 ----------
+# 2026-07-24: handle_image_generation は失敗時に内部センチネル '__ERROR__: ...' を
+# 返す(L1945/1947/1955)。旧実装はこれを素通しで
+# final = text_answer + '\n\n---\n## 生成画像\n' + img と連結していたため、final は
+# text_answer から始まり "final.startswith('__ERROR__')" では常に False になる
+# (=正常応答として扱われる)。結果としてコンソール表示・notify_slack・
+# _HISTORY への追記可否判定・_save_answer_to_file 呼び出し可否判定は正しく
+# 「成功」経路を通る一方、final 文字列の中に生の '__ERROR__: ...' センチネルが
+# そのまま残り、画面表示/Slack通知/--out 保存ファイルへ内部マーカーが漏出して
+# いた。aggregate()(iteration 9)、_critic_judge/second_opinion(iteration 15)、
+# _arbitrate(iteration 20)で対処した「内部センチネル/タグをユーザ向け出力に
+# 漏らさない」バグと同種。修正は route3 内で img が '__ERROR__' で始まる場合に
+# プレフィックスを剥がした人間可読な失敗ノートへ置き換えるのみで、テキスト
+# 本文自体を失敗扱いにはしない(text_answer は従来通り保存・保存・通知される)。
+# iteration 73 で確立した「_HISTORY にはクリーンな text_answer のみを積む」
+# 分離も変更しない。setup/conduct/fugu_answer/handle_image_generation/
+# notify_slack/save_history_file/_save_answer_to_file をすべてモックしており、
+# 実際の Ollama・ネットワーク・画像バックエンド・サブプロセス呼び出しは
+# 一切発生しない。
+_orig_af2_hist = list(f._HISTORY)
+_orig_af2_setup = f.setup
+_orig_af2_conduct = f.conduct
+_orig_af2_fugu_answer = f.fugu_answer
+_orig_af2_handle_image = f.handle_image_generation
+_orig_af2_notify = f.notify_slack
+_orig_af2_save_hist = f.save_history_file
+_orig_af2_save_file = f._save_answer_to_file
+
+try:
+    f.setup = lambda: True
+    f.notify_slack = lambda *a, **k: None
+    f.save_history_file = lambda *a, **k: None
+    _save_file_calls = []
+    f._save_answer_to_file = lambda *a, **k: _save_file_calls.append((a, k))
+
+    # --- (4) イラスト付き回答経路で画像生成が失敗: センチネルが漏出しない ---
+    f._HISTORY = []
+    _clean_body_imgfail = "これはクリーンな本文です。画像生成は失敗します。"
+    _img_sentinel = "__ERROR__: 画像生成に失敗しました（バックエンドが画像を返しませんでした）。"
+    f.conduct = lambda question, history=None, office_attached=False: (
+        _af_base_plan(use_image_generation=True, image_only=False), {})
+    f.fugu_answer = lambda question, plan=None, history=None: _clean_body_imgfail
+    f.handle_image_generation = lambda user_request, **k: _img_sentinel
+
+    _ret_imgfail = f.ask_fugu("イラスト付きで説明して(画像失敗)", baseline=False,
+                              out_file="C:/fake/out_imgfail.md")
+
+    check("ask_fugu/image失敗: 戻り値に内部センチネル'__ERROR__'が漏出しない",
+          "__ERROR__" not in _ret_imgfail)
+    check("ask_fugu/image失敗: 戻り値にクリーンな本文が保持されている",
+          _clean_body_imgfail in _ret_imgfail)
+    check("ask_fugu/image失敗: 戻り値の'## 生成画像'配下に人間可読な失敗ノートがある",
+          "## 生成画像" in _ret_imgfail and "画像生成に失敗しました" in _ret_imgfail)
+    check("ask_fugu/image失敗: _HISTORY[-1]はクリーンなtext_answerと一致(センチネル/ノート混入なし)",
+          f._HISTORY[-1]["content"] == _clean_body_imgfail)
+    check("ask_fugu/image失敗: _HISTORY[-1]に'__ERROR__'/'生成画像'ノートが混入しない",
+          "__ERROR__" not in f._HISTORY[-1]["content"]
+          and "生成画像" not in f._HISTORY[-1]["content"])
+    check("ask_fugu/image失敗: テキスト本文は失敗扱いされず_save_answer_to_fileが呼ばれる",
+          len(_save_file_calls) == 1)
+
+    # --- (5) 回帰: 画像生成成功時は従来通りセンチネル処理を経由しない(iteration73ケース2と同型) ---
+    f._HISTORY = []
+    _clean_body_imgok = "これはクリーンな本文です。画像生成は成功します。"
+    f.fugu_answer = lambda question, plan=None, history=None: _clean_body_imgok
+    f.handle_image_generation = lambda user_request, **k: "![img](fake.png)"
+
+    _ret_imgok = f.ask_fugu("イラスト付きで説明して(画像成功)", baseline=False)
+
+    check("ask_fugu/image成功(回帰): 戻り値に'## 生成画像'配下の成功マークアップがバイト一致で含まれる",
+          "## 生成画像\n![img](fake.png)" in _ret_imgok)
+    check("ask_fugu/image成功(回帰): 戻り値に'__ERROR__'が含まれない",
+          "__ERROR__" not in _ret_imgok)
+finally:
+    f._HISTORY = _orig_af2_hist
+    f.setup = _orig_af2_setup
+    f.conduct = _orig_af2_conduct
+    f.fugu_answer = _orig_af2_fugu_answer
+    f.handle_image_generation = _orig_af2_handle_image
+    f.notify_slack = _orig_af2_notify
+    f.save_history_file = _orig_af2_save_hist
+    f._save_answer_to_file = _orig_af2_save_file
+
+check("ask_fugu/image失敗テスト: テスト後に_HISTORYが元の状態へ復元されている",
+      f._HISTORY == _orig_af2_hist)
+
 # ---------- resolve_models: PROPOSERS/AGGREGATOR/CONDUCTOR プール構成 ----------
 # resolve_models() (fugu_local.py L1084) は SC投票パネル(solve_verifiableが
 # `[m for m in REASONING_MODELS if m in PROPOSERS]` で組む)と _arbitrate のアービター

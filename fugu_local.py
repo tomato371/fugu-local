@@ -3467,6 +3467,21 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
         print("\n[Fugu] 回答内容からイラストを生成します...")
         base = f"{question}\n\n[回答の要点]\n{text_answer[:800]}"
         img = handle_image_generation(base, panel=panel)
+        # 2026-07-24: handle_image_generation が失敗時に返す内部センチネル
+        # '__ERROR__: ...' をそのまま final に連結すると、final は
+        # text_answer から始まるため直後の全ての `final.startswith("__ERROR__")`
+        # 判定（コンソール表示・notify_slack・履歴保存・_save_answer_to_file）を
+        # すり抜けてしまい、内部向けマーカーがユーザ向け回答・Slack通知・保存
+        # ファイルにそのまま漏出していた。aggregate()（iteration 9）、
+        # _critic_judge/second_opinion（iteration 15）、_arbitrate（iteration 20）
+        # で対処した「内部センチネル/タグをユーザ向け出力に漏らさない」バグと
+        # 同種。ここでは img がセンチネルなら人間可読な失敗ノートに置き換える
+        # （プレフィックスを剥がすだけで、テキスト本文自体は失敗として扱わない）。
+        # iteration 73 で確立した「_HISTORY にはクリーンな text_answer のみを
+        # 積む」分離は変更しない（下の履歴追記は従来通り text_answer のまま）。
+        if img.startswith("__ERROR__"):
+            note = img[len("__ERROR__"):].lstrip(":").strip()
+            img = f"(画像生成に失敗しました: {note})" if note else "(画像生成に失敗しました)"
         final = text_answer + "\n\n---\n## 生成画像\n" + img
 
     elapsed = round(time.time() - t0, 1)
