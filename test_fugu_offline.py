@@ -3603,6 +3603,190 @@ check("fugu_answer: SCがNoneならMoA(get_proposals/aggregate)へフォール�
 check("fugu_answer: フォールバック時は実際にget_proposals/aggregateが呼ばれる",
       len(_get_proposals_calls_c) >= 1 and len(_aggregate_calls_c) >= 1)
 
+# ---------- fugu_answer MoAループ: 次ラウンドの reference は aggregate 出力の think を
+# 持ち越さない (2026-07-24) ----------
+# fugu_local.py ~L3052-3062: 従来は `reference = final`（aggregate の生出力）をそのまま
+# 次ラウンドの get_proposals へ渡していた。aggregate/ask_fugu の他の受け渡し箇所（aggregate
+# L2321、ask_fugu L3196、_sc_sample/_arbitrate）はすべて strip_think 済みの値を使っている
+# のに、この1箇所だけ think を残したまま次ラウンドの get_single_proposal に
+# 'A draft answer from the panel:\n{reference}' として渡していた。これは(1) 内部思考を
+# 「ドラフト回答」としてプロポーザーに誤呈示し改善を誤誘導し、(2) 8192/16384に固定された
+# num_ctx（gotcha #2）を think ブロックが圧迫し本来のドラフト/質問が切り詰められかねない
+# （精度優先=gotcha #7）という2つの問題を持つ。修正: aggregate 直後に1回だけ
+# fin=strip_think(final) を計算し、reference にはその fin を使う。戻り値の final 自体は
+# 変更しない（ask_fugu 側で最終的に strip_think される）。
+_orig_code_check_ref = f.code_check
+_orig_critique_ref = f.critique
+_orig_ask_ref = f.ask
+_orig_verify_single_ref = f.verify_single
+_orig_allow_recursion_ref = f.ALLOW_RECURSION
+_orig_adaptive_escalation_ref = f.ADAPTIVE_ESCALATION
+
+_ROUND1_THINK_REF = "<think>これは内部思考であり最終回答ではない、長々とした考察が続く</think>"
+_ROUND1_BODY_REF = "ラウンド1の統合結果の本文です。"
+_ROUND1_FINAL_REF = _ROUND1_THINK_REF + "\n" + _ROUND1_BODY_REF
+_ROUND2_THINK_REF = "<think>ラウンド2の内部思考</think>"
+_ROUND2_BODY_REF = "ラウンド2の最終統合結果です。"
+_ROUND2_FINAL_REF = _ROUND2_THINK_REF + "\n" + _ROUND2_BODY_REF
+
+_get_proposals_calls_ref = []
+_aggregate_call_n_ref = [0]
+
+
+def _fake_get_proposals_ref(models, question, reference=None, issue=None, history=None):
+    _get_proposals_calls_ref.append({"reference": reference, "issue": issue})
+    return [(m, "dummy proposal") for m in models]
+
+
+def _fake_aggregate_ref(question, proposals):
+    _aggregate_call_n_ref[0] += 1
+    return _ROUND1_FINAL_REF if _aggregate_call_n_ref[0] == 1 else _ROUND2_FINAL_REF
+
+
+try:
+    f.get_proposals = _fake_get_proposals_ref
+    f.aggregate = _fake_aggregate_ref
+    f.code_check = lambda answer: None  # コード実行検証は本テストの対象外
+    # r>=planned後にcritique(本物のask呼び出し)へ到達させないための最短経路
+    f.ALLOW_RECURSION = False
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_ref = f.fugu_answer(
+            "テスト質問(reference持ち越し検証用)?",
+            plan=_validated_plan(None, mode="moa", rounds=2))
+finally:
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+    f.code_check = _orig_code_check_ref
+    f.ALLOW_RECURSION = _orig_allow_recursion_ref
+
+check("fugu_answer MoA reference: 2ラウンド強制でget_proposalsが2回呼ばれる",
+      len(_get_proposals_calls_ref) == 2)
+check("fugu_answer MoA reference: round2のreferenceは<think>タグを含まない",
+      "<think>" not in (_get_proposals_calls_ref[1]["reference"] or ""))
+check("fugu_answer MoA reference: round2のreferenceは内部思考の本文を含まない",
+      "内部思考であり最終回答ではない" not in (_get_proposals_calls_ref[1]["reference"] or ""))
+check("fugu_answer MoA reference: round2のreferenceはround1の本文を含む",
+      _ROUND1_BODY_REF in (_get_proposals_calls_ref[1]["reference"] or ""))
+check("fugu_answer MoA reference: round2のreferenceはstrip_think(round1 final)と厳密一致",
+      _get_proposals_calls_ref[1]["reference"] == f.strip_think(_ROUND1_FINAL_REF))
+check("fugu_answer MoA reference(回帰): 戻り値は最終ラウンドの生出力のまま"
+      "(returnはask_fugu側でstrip_thinkされる前提で変更していない)",
+      _ans_ref == _ROUND2_FINAL_REF)
+check("fugu_answer MoA reference(回帰): 戻り値には<think>タグが残っている",
+      "<think>" in _ans_ref)
+check("fugu_answer MoA reference: テスト後にf.get_proposalsが元に復元されている",
+      f.get_proposals == _orig_get_proposals)
+check("fugu_answer MoA reference: テスト後にf.aggregateが元に復元されている",
+      f.aggregate == _orig_aggregate)
+
+# ---------- fugu_answer MoAループ: コード修復ラウンドでも reference はコードフェンスを
+# 保持したまま think だけ除去される (2026-07-24 / 回帰) ----------
+# strip_think は <think>/<thinking> のみを除去し、```python コードフェンスには触れない。
+# code_check がラウンド1の回答にエラーを見つけて追加ラウンドを要求するケースでも、
+# ラウンド2への reference にコードフェンスがそのまま残ることを確認する
+# （code-repair ループが失敗コードを見失わないことの確認）。
+_ROUND1_THINK_CODE = "<think>コードを検討中の内部思考</think>"
+_ROUND1_CODE_FENCE = "```python\nprint(1/0)\n```"
+_ROUND1_FINAL_CODE = (_ROUND1_THINK_CODE + "\n"
+                      + "ゼロ除算を試すコードです。\n" + _ROUND1_CODE_FENCE)
+_ROUND2_FINAL_CODE = "<think>修正を検討</think>\n修正済みの回答（コード除去済み）。"
+_CODE_ISSUE_TEXT = "code execution FAILED:\nZeroDivisionError: division by zero"
+
+_get_proposals_calls_code = []
+_code_check_calls_code = []
+
+
+def _fake_get_proposals_code(models, question, reference=None, issue=None, history=None):
+    _get_proposals_calls_code.append({"reference": reference, "issue": issue})
+    return [(m, "dummy proposal") for m in models]
+
+
+def _fake_aggregate_code(question, proposals):
+    return _ROUND1_FINAL_CODE if len(_get_proposals_calls_code) <= 1 else _ROUND2_FINAL_CODE
+
+
+def _fake_code_check_code(answer):
+    _code_check_calls_code.append(answer)
+    if len(_code_check_calls_code) == 1:
+        return _CODE_ISSUE_TEXT
+    return None
+
+
+try:
+    f.get_proposals = _fake_get_proposals_code
+    f.aggregate = _fake_aggregate_code
+    f.code_check = _fake_code_check_code
+    f.critique = lambda question, answer: (True, None)  # 到達しても即終了、本物のaskは呼ばない
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_code = f.fugu_answer(
+            "コードを書いて(修復ラウンド検証用)?",
+            plan=_validated_plan(None, mode="moa", rounds=1))
+finally:
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+    f.code_check = _orig_code_check_ref
+    f.critique = _orig_critique_ref
+
+check("fugu_answer コード修復(回帰): code_checkの指摘でget_proposalsが2回呼ばれる",
+      len(_get_proposals_calls_code) == 2)
+check("fugu_answer コード修復(回帰): round2のissueはcode_checkの指摘そのもの",
+      _get_proposals_calls_code[1]["issue"] == _CODE_ISSUE_TEXT)
+check("fugu_answer コード修復(回帰): round2のreferenceはコードフェンスを保持している",
+      "```python" in (_get_proposals_calls_code[1]["reference"] or "")
+      and "print(1/0)" in (_get_proposals_calls_code[1]["reference"] or ""))
+check("fugu_answer コード修復(回帰): round2のreferenceから<think>タグは除去されている",
+      "<think>" not in (_get_proposals_calls_code[1]["reference"] or ""))
+check("fugu_answer コード修復(回帰): round2のreferenceはstrip_think(round1 final)と厳密一致",
+      _get_proposals_calls_code[1]["reference"] == f.strip_think(_ROUND1_FINAL_CODE))
+
+# ---------- fugu_answer 単体→MoA エスカレーション: seed_answer は今回の変更の影響を
+# 受けない (2026-07-24 / 回帰) ----------
+# seed_answer は単体モードの ask() 直後に既に strip_think 済み(fugu_local.py L3006)。
+# 今回の変更は「aggregate() の出力を次ラウンドの reference にする箇所」のみが対象で、
+# エスカレーション直後の最初の reference(=seed_answer)には触れていない。
+_SEED_ANSWER_ESC = "単体モードの回答本文（think除去済み）"
+_get_proposals_calls_esc = []
+
+
+def _fake_get_proposals_esc(models, question, reference=None, issue=None, history=None):
+    _get_proposals_calls_esc.append({"reference": reference, "issue": issue})
+    return [(m, "dummy proposal") for m in models]
+
+
+def _fake_aggregate_esc(question, proposals):
+    return "<think>集約時の内部思考</think>\nエスカレーション後の統合結果。"
+
+
+try:
+    f.ADAPTIVE_ESCALATION = True
+    f.ALLOW_RECURSION = False  # 1ラウンドで打ち切り、本物のcritique/askへ到達させない
+    f.ask = lambda *a, **kw: _SEED_ANSWER_ESC  # think タグ無し = strip_think後も不変
+    f.verify_single = lambda question, answer: (False, "単体回答に疑義あり(テスト用)")
+    f.get_proposals = _fake_get_proposals_esc
+    f.aggregate = _fake_aggregate_esc
+    _esc_plan = _validated_plan(None, mode="single", rounds=1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        f.fugu_answer("テスト質問(エスカレーション用)?", plan=_esc_plan, history=[])
+finally:
+    f.ask = _orig_ask_ref
+    f.verify_single = _orig_verify_single_ref
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+    f.ADAPTIVE_ESCALATION = _orig_adaptive_escalation_ref
+    f.ALLOW_RECURSION = _orig_allow_recursion_ref
+
+check("fugu_answer エスカレーション(回帰): 単体回答失敗でMoAへ切替りget_proposalsが呼ばれる",
+      len(_get_proposals_calls_esc) >= 1)
+check("fugu_answer エスカレーション(回帰): 最初のroundのreferenceは単体回答そのまま(変更なし)",
+      _get_proposals_calls_esc[0]["reference"] == _SEED_ANSWER_ESC)
+check("fugu_answer エスカレーション(回帰): 最初のroundのissueはverify_singleの指摘そのまま",
+      _get_proposals_calls_esc[0]["issue"] == "単体回答に疑義あり(テスト用)")
+check("fugu_answer エスカレーション: テスト後にf.askが元に復元されている", f.ask == _orig_ask_ref)
+check("fugu_answer エスカレーション: テスト後にf.verify_singleが元に復元されている",
+      f.verify_single == _orig_verify_single_ref)
+check("fugu_answer エスカレーション: テスト後にf.ALLOW_RECURSIONが元に復元されている",
+      f.ALLOW_RECURSION == _orig_allow_recursion_ref)
+
 # ---------- fugu_answer 単体モード: think 解決に proposer_think_for を使う (2026-07-23) ----------
 # 2026-07-23 fix の適用対象その2（get_single_proposal と全く同じ欠落パターン）: 単体モードの
 # ask 呼び出しも think=PROPOSER_THINK の生グローバルを直渡ししており、隣の

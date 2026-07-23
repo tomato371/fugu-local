@@ -3050,12 +3050,21 @@ def fugu_answer(question, plan=None, history=None):
             for m, a in proposals:
                 print(f"[{m}]\n{strip_think(a)}\n")
         final = aggregate(question, proposals)
-        reference = final  # 次ラウンドは今回の統合結果を土台に改善
+        # 2026-07-24: reference には think を持ち越さない。aggregate の生出力を
+        # そのまま次ラウンドの reference にすると、get_single_proposal が
+        # 'A draft answer from the panel:\n{reference}' として <think>...</think>
+        # の内部思考をプロポーザーへ「ドラフト回答」として提示してしまい改善を誤誘導
+        # する上、8192/16384 に固定した num_ctx（gotcha #2）を think ブロックが圧迫し
+        # 本来の質問文/ドラフトが切り詰められかねない（精度優先＝gotcha #7 に反する）。
+        # aggregate の結果は L2321、ask_fugu の最終出力は L3196 で同様に strip_think
+        # 済みにしている慣例に合わせ、ここでも strip_think 済みの fin を reference に
+        # 使う。返り値の final 自体は生のまま返す（ask_fugu 側で最終的に strip_think）。
+        fin = strip_think(final)
+        reference = fin  # 次ラウンドは今回の統合結果(think除去済み)を土台に改善
         issue_hint = None  # 指摘は消費済み。以降のチェックが新しい指摘を設定する
         r += 1
 
         # コード回答は実行検証で誤りが機械的に見つかるため、修正ラウンドの上限を広げる
-        fin = strip_think(final)
         limit = (MAX_ROUNDS_CODE if (CODE_EXECUTION and extract_code(fin))
                  else MAX_ROUNDS)
         if r >= limit:
