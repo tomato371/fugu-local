@@ -4657,6 +4657,119 @@ with _tempfile.TemporaryDirectory() as _rpt_dir:
 check("_read_pptx: 表/グループテスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
       ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
 
+# ----- _read_pptx: スピーカーノート抽出 (2026-07-24 / iter98) -----
+# 背景: _read_pptxは従来slide.shapesしか走査せず、slide.notes_slideには一切触れて
+# いなかった。ノートには箇条書き本文が要約している詳細な説明が書かれていることが
+# 多く、これがRAG/--fileコンテキストへ届かないとモデルが古い学習知識で答えてしまう
+# 精度事故になる(iter87の表/グループ救済と同系統の「静かに落としているコンテンツを
+# 拾う」修正)。ここでは(1)ノート付きスライド、(2)ノート無しスライド(iter82/87の
+# 既存フィクスチャがbyte-for-byte不変であることの再確認)、(3)空白のみのノート、
+# (4)ノート読み取りが例外を投げる壊れたケース、の4パターンを検証する。
+try:
+    import pptx as _pptx_probe_notes
+    _HAS_PPTX_NOTES = True
+except ImportError:
+    _HAS_PPTX_NOTES = False
+
+with _tempfile.TemporaryDirectory() as _rpn_dir:
+    _rpn_root = _pathlib.Path(_rpn_dir)
+
+    if _HAS_PPTX_NOTES:
+        from pptx.util import Inches as _Inches_notes
+
+        # (1)+(3) 1枚目はノートあり、2枚目は空白のみノート(→ノートブロック無し)、
+        # 3枚目はノート無し(has_notes_slideがFalseのまま)のマルチスライド構成。
+        _rpn_path = _rpn_root / "notes.pptx"
+        _rpn_prs = _pptx_probe_notes.Presentation()
+        _rpn_blank = _rpn_prs.slide_layouts[6]
+
+        _rpn_slide1 = _rpn_prs.slides.add_slide(_rpn_blank)
+        _rpn_tb1 = _rpn_slide1.shapes.add_textbox(
+            _Inches_notes(1), _Inches_notes(1), _Inches_notes(4), _Inches_notes(1))
+        _rpn_tb1.text_frame.text = "Slide One Body"
+        _rpn_slide1.notes_slide.notes_text_frame.text = "Detailed narration for slide one."
+
+        _rpn_slide2 = _rpn_prs.slides.add_slide(_rpn_blank)
+        _rpn_tb2 = _rpn_slide2.shapes.add_textbox(
+            _Inches_notes(1), _Inches_notes(1), _Inches_notes(4), _Inches_notes(1))
+        _rpn_tb2.text_frame.text = "Slide Two Body"
+        _rpn_slide2.notes_slide.notes_text_frame.text = "   "  # 空白のみ -> ノートブロック無し
+
+        _rpn_slide3 = _rpn_prs.slides.add_slide(_rpn_blank)
+        _rpn_tb3 = _rpn_slide3.shapes.add_textbox(
+            _Inches_notes(1), _Inches_notes(1), _Inches_notes(4), _Inches_notes(1))
+        _rpn_tb3.text_frame.text = "Slide Three Body"
+        # slide3は notes_slide に一切触れない(has_notes_slideはFalseのまま)。
+
+        _rpn_prs.save(str(_rpn_path))
+
+        _rpn_out = f._read_pptx(_rpn_path)
+        _rpn_expected = "\n\n".join([
+            "[Slide 1]\nSlide One Body",
+            "[Slide 1 Notes]\nDetailed narration for slide one.",
+            "[Slide 2]\nSlide Two Body",
+            "[Slide 3]\nSlide Three Body",
+        ])
+        check("_read_pptx: ノート付きスライドは'[Slide N Notes]'ブロックが本文の直後・"
+              "正しいスライド番号でbyte-for-byte一致",
+              _rpn_out == _rpn_expected)
+        check("_read_pptx: 空白のみのノートは'[Slide 2 Notes]'マーカーを一切出力しない",
+              "[Slide 2 Notes]" not in _rpn_out)
+        check("_read_pptx: ノート未使用スライドは'[Slide 3 Notes]'マーカーを一切出力しない",
+              "[Slide 3 Notes]" not in _rpn_out)
+        check("_is_lib_missing_notice: ノート込み出力全体はFalse(iter37の過剰フィルタ回帰ガード)",
+              not f._is_lib_missing_notice(_rpn_out))
+
+        # (2) ノートに一切触れていないiter82の平文フィクスチャ相当の構成が、
+        # 本変更後もbyte-for-byte不変であることを再確認する(有害な回帰ガード)。
+        _rpn_path_plain = _rpn_root / "plain_no_notes.pptx"
+        _rpn_prs_plain = _pptx_probe_notes.Presentation()
+        _rpn_blank_plain = _rpn_prs_plain.slide_layouts[6]
+        _rpn_slide_plain = _rpn_prs_plain.slides.add_slide(_rpn_blank_plain)
+        _rpn_tb_plain = _rpn_slide_plain.shapes.add_textbox(
+            _Inches_notes(1), _Inches_notes(1), _Inches_notes(4), _Inches_notes(1))
+        _rpn_tb_plain.text_frame.text = "Plain Slide Text"
+        _rpn_prs_plain.save(str(_rpn_path_plain))
+
+        _rpn_out_plain = f._read_pptx(_rpn_path_plain)
+        check("_read_pptx: ノート無しフィクスチャの出力は'[Slide 1]\\nPlain Slide Text'と"
+              "byte-for-byte一致(iter82互換の回帰ガード)",
+              _rpn_out_plain == "[Slide 1]\nPlain Slide Text")
+        check("_read_pptx: ノート無しフィクスチャに'Notes'マーカーは一切現れない",
+              "Notes]" not in _rpn_out_plain)
+
+        # (4) notes_text_frameへのアクセスが例外を投げる「壊れたノートスライド」を
+        # unittest.mock.patch.objectでNotesSlide.notes_text_frameプロパティに対して
+        # 一時的にシミュレートし、ノートだけがスキップされてスライド本文
+        # (Slide One Body)は失われず、かつ_read_pptx自体は例外を送出しないことを
+        # 検証する(iter72のskip-bad-part-keep-the-rest方針)。
+        import unittest.mock as _mock_notes
+        import pptx.slide as _pptx_slide_mod
+
+        def _rpn_boom(self):
+            raise RuntimeError("simulated malformed notes slide")
+
+        with _mock_notes.patch.object(
+                _pptx_slide_mod.NotesSlide, "notes_text_frame",
+                property(_rpn_boom)):
+            _rpn_out_broken = f._read_pptx(_rpn_path)
+
+        check("_read_pptx: notes_text_frameが例外を投げても_read_pptxはクラッシュしない"
+              "(壊れたノートはスキップされるだけ)",
+              "Slide One Body" in _rpn_out_broken and "Slide Two Body" in _rpn_out_broken
+              and "Slide Three Body" in _rpn_out_broken)
+        check("_read_pptx: 壊れたノートアクセス時は該当スライドの'[Slide N Notes]'ブロックが"
+              "一切出力されない",
+              "Notes]" not in _rpn_out_broken)
+    else:
+        # python-pptxが無いとタスク制約(本物のpython-pptxで実.pptxを生成すること)を
+        # 満たすテスト用フィクスチャを作れないため、上のiter82/87ブロックと同じ理由・
+        # 同じスタイルでスキップする(このホストでは通常通らない分岐)。
+        print("   [SKIP] python-pptx未インストールのため_read_pptxノート抽出テストをスキップ")
+
+check("_read_pptx: ノートテスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
+      ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
+
 # ----- _read_docx -----
 try:
     import docx as _docx_probe_rd

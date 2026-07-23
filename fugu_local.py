@@ -933,6 +933,28 @@ def _read_pptx(path: Path) -> str:
                 texts.extend(_pptx_shape_texts(sh))
             if texts:
                 parts.append(f"[Slide {i}]\n" + "\n".join(texts))
+            # 2026-07-24 (iter98): スピーカーノートはslide.shapesの走査対象外なので、
+            # 上のループでは一切拾えない。ノートには箇条書き本文が要約している詳細な
+            # 説明が書かれていることが多く、これがRAG/--fileコンテキストへ届かないと
+            # プロポーザーが古い学習知識で答えてしまう精度事故になる（iter87で救済した
+            # 表/グループ抽出と同系統の「静かに落としているコンテンツを拾う」修正で、
+            # 精度優先・時間は気にしないの方針に基づく）。ただしslide.notes_slideは
+            # 触れた時点で（存在しなければ）python-pptxが空のノートスライドをその場で
+            # 生成してしまう副作用がある（NotesSlide.notes_slideのdocstring通り）ため、
+            # 必ずslide.has_notes_slideで存在確認してからのみslide.notes_slideへ触れる。
+            # 壊れた/読めないノート1件のせいでそのスライドの本文抽出まで失わないよう
+            # （iter72のskip-bad-part-keep-the-rest方針、iter42/53の段階的劣化と同様）、
+            # ノート読み取りだけを個別のtry/exceptで保護する。bareではなくException限定
+            # なのでKeyboardInterrupt/SystemExitはここで握りつぶさず伝播する。
+            try:
+                if slide.has_notes_slide:
+                    notes_tf = slide.notes_slide.notes_text_frame
+                    if notes_tf is not None:
+                        notes_text = notes_tf.text.strip()
+                        if notes_text:
+                            parts.append(f"[Slide {i} Notes]\n{notes_text}")
+            except Exception:
+                pass
         return "\n\n".join(parts)
     except ImportError:
         pass
