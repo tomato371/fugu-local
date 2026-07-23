@@ -1940,6 +1940,78 @@ finally:
 check("sc-err: 通常応答は__ERROR__ガードに過検知されず'42'を採票",
       _ans_ok_scerr == "42" and _text_ok_scerr == "計算しました。\\boxed{42}")
 
+# ---------- _representative_text: SC勝者クラスの代表テキスト選出 (2026-07-23) ----------
+# solve_verifiable の最終return直前(line ~2788)でres['text']を決める、自己一貫性投票
+# 経路(gotcha#7)で最後まで直接テストされていなかったヘルパー。選出順序は
+# 「CoT(pot=False)優先 → 無ければ最初に一致したPoTサンプル → それも無ければ全サンプル中
+# 最長」。一致判定は文字列==ではなくanswers_equivalent経由（表記違いの同値も拾う）。
+# iteration 2 のchangelogで「代表テキストが敗者候補の主張になりうる」懸念が挙がって
+# いた箇所（_arbitrateのrep選出とは別に、_representative_text自身の契約）を直接ロックする。
+def _rt_sample(answer, text, pot=False, model="m1"):
+    return {"answer": answer, "text": text, "pot": pot, "model": model}
+
+
+# (1) CoT優先: リスト上で先に出てくるPoT一致サンプルより、後から出てくるCoT一致サンプルの
+#     テキストを返す（"pot でない"優先はリストの並び順に依存しないことを証明する）。
+_rt1 = [
+    _rt_sample("42", "POT_TEXT_EARLIER", pot=True),
+    _rt_sample("42", "COT_TEXT_LATER", pot=False),
+]
+check("rt: CoT優先(先行PoT一致より後続CoT一致を採用、順序非依存)",
+      f._representative_text(_rt1, "42") == "COT_TEXT_LATER")
+
+# (2) PoTフォールバック: CoT一致が一つも無い場合は最初に一致したPoTサンプルのテキストを返す
+_rt2 = [
+    _rt_sample("7", "POT_TEXT_NOMATCH", pot=True),      # 不一致(勝者は42)
+    _rt_sample("42", "POT_TEXT_FIRST_MATCH", pot=True),
+    _rt_sample("42", "POT_TEXT_SECOND_MATCH", pot=True),
+]
+check("rt: CoT一致無し→最初に一致したPoTサンプルのテキストを返す",
+      f._representative_text(_rt2, "42") == "POT_TEXT_FIRST_MATCH")
+
+# (3) 同値判定: 勝者'0.5'に対しサンプルの答えが'1/2'(Fractionによる高速パス、math_verifyは
+#     不要)でも一致とみなし、文字列==ではなくanswers_equivalent経由でマッチしていることを示す
+_rt3 = [_rt_sample("1/2", "FRACTION_MATCH_TEXT", pot=False)]
+check("rt: 同値判定(1/2 と 0.5、Fraction高速パス)でマッチしテキストを返す",
+      f._representative_text(_rt3, "0.5") == "FRACTION_MATCH_TEXT")
+
+# (4) 敗者除外: 勝者と一致するサンプルのテキストが返り、別の敗者候補のテキストは
+#     決して返らない(iteration 2 changelogの「敗者候補の主張になりうる」懸念の直接ガード)
+_rt4 = [
+    _rt_sample("7", "LOSER_TEXT", pot=False),
+    _rt_sample("42", "WINNER_TEXT", pot=False),
+]
+_rt4_result = f._representative_text(_rt4, "42")
+check("rt: 勝者一致サンプルのテキストを返す(敗者除外 1/2)", _rt4_result == "WINNER_TEXT")
+check("rt: 敗者候補のテキストは返らない(敗者除外 2/2)", _rt4_result != "LOSER_TEXT")
+
+# (5) 無一致フォールバック: どのサンプルも勝者と同値でない場合は全サンプル中最長の
+#     テキストを返す(max-by-len分岐)。空リストは""を返す。
+_rt5 = [
+    _rt_sample("7", "short", pot=False),
+    _rt_sample("9", "much much longer non-matching text", pot=False),
+]
+check("rt: 無一致→全サンプル中最長のテキストにフォールバック",
+      f._representative_text(_rt5, "999") == "much much longer non-matching text")
+check("rt: 空サンプルリストは空文字列を返す", f._representative_text([], "42") == "")
+
+# (6) answer=Noneのサンプルは一致判定の対象から除外される(最長でも誤って採用されない)。
+#     ただし全体が無一致で最長フォールバックに落ちた場合は、その候補にもなりうる
+#     (max-by-len分岐はanswerの有無を見ないため)。
+_rt6a = [
+    _rt_sample(None, "NONE_ANSWER_BUT_LONGEST_TEXT_AAAAAAAAAAAAAAAA", pot=False),
+    _rt_sample("42", "SHORT_MATCH_TEXT", pot=False),
+]
+check("rt: answer=Noneのサンプルは一致判定から除外(最長でも採用されない)",
+      f._representative_text(_rt6a, "42") == "SHORT_MATCH_TEXT")
+
+_rt6b = [
+    _rt_sample(None, "NONE_ANSWER_LONGEST_FALLBACK_TEXT_AAAAAAAAAAAAAA", pot=False),
+    _rt_sample("7", "short_nomatch", pot=False),
+]
+check("rt: 無一致時に限り、answer=Noneのサンプルも最長フォールバックの対象になりうる",
+      f._representative_text(_rt6b, "999") == "NONE_ANSWER_LONGEST_FALLBACK_TEXT_AAAAAAAAAAAAAA")
+
 check("code: code_check 正常コードは None", f.code_check("```python\nprint(1)\n```") is None)
 _issue = f.code_check("```python\n1/0\n```")
 check("code: code_check 失敗はエラー要約", _issue is not None and "ZeroDivision" in _issue)
