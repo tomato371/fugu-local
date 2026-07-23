@@ -356,7 +356,18 @@ def load_history_file(path: Path = None) -> list:
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # 2026-07-23: このマシンのコンソールが cp932 である既知の落とし穴 #4 と
+        # 同種の環境要因で、セッションファイルが Shift-JIS エディタでの開き直し
+        # や部分的な破損により非UTF-8バイト列を含むことがある。その場合
+        # encoding="utf-8" のみの read_text は UnicodeDecodeError を送出し、
+        # 直下の except Exception: pass に捕まって [] を返す＝JSON構造自体は
+        # 健全でも会話履歴全体を無条件に失う。iteration 47 で
+        # _save_as_markdown/_save_as_text/_save_as_html の読み戻しに適用した
+        # errors="replace" パターンをここにも適用し、読めないバイトだけを
+        # 置換文字 (U+FFFD) に落として JSON をパース可能にし、読み取れる
+        # エントリを保持する（精度優先: 履歴を丸ごと捨てない）。書き込み側の
+        # save_history_file の encoding="utf-8" は変更しない。
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         if isinstance(data, list):
             # 最新 MAX_HISTORY_TURNS_SAVED 往復分のみ保持
             # 2026-07-23: iteration 66 で指摘され未修正だったバグを修正。

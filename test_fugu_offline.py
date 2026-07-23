@@ -4836,6 +4836,48 @@ with _tempfile.TemporaryDirectory() as _hist_dir:
     check("history: 保存ファイルの生テキストに日本語がそのまま含まれる(\\uXXXXエスケープでない)",
           "日本語の質問です" in _raw_ja_text)
 
+    # (9) 2026-07-23: load_history_file の読み込みに errors="replace" を追加した
+    #     修正の回帰テスト(このタスク本体)。落とし穴 #4(このマシンのコンソールが
+    #     cp932)と同種の環境要因で、セッションファイルが Shift-JIS エディタでの
+    #     開き直し等により非UTF-8バイト列を部分的に含むことがある。JSON構造自体は
+    #     健全 (dictのlist、role/contentともstr) でも、修正前の
+    #     path.read_text(encoding="utf-8") はバイト列全体のデコードに失敗して
+    #     UnicodeDecodeError を送出し、広い except Exception: pass に捕まって
+    #     空リスト [] を返していた＝読み取れる他のエントリまで含め会話履歴を
+    #     丸ごと喪失していた。iteration 47 で _save_as_markdown/_save_as_text/
+    #     _save_as_html の読み戻しに適用した errors="replace" パターンと同じ
+    #     一引数の変更で、読めないバイトだけを置換文字(U+FFFD)に落として
+    #     JSONパースを成功させ、破損エントリの前後の文字列も無傷の兄弟エントリも
+    #     回収できることを確認する。
+    _hp_cp932 = _hist_root / "cp932_corrupt.json"
+    _hist_cp932_raw = [
+        {"role": "user", "content": "壊れる前@@BADBYTES@@壊れる後"},
+        {"role": "assistant", "content": "無傷であるはずの兄弟エントリ：日本語も含む"},
+    ]
+    # 構造は正当なJSONとして組み立ててからUTF-8バイト列化し、マーカー部分だけを
+    # UTF-8として不正なバイト列(0xFF, 0xFE は単独では常に不正)へ差し替える。
+    # JSON区切り文字(引用符・波括弧・カンマ)自体はASCIIのまま保つため、
+    # errors="replace" 適用後のテキストは引き続き妥当なJSONとしてパースできる。
+    _hist_cp932_bytes = (
+        json.dumps(_hist_cp932_raw, ensure_ascii=False).encode("utf-8")
+        .replace(b"@@BADBYTES@@", b"\xff\xfe\xff\xfe")
+    )
+    _hp_cp932.write_bytes(_hist_cp932_bytes)
+
+    _loaded_cp932 = f.load_history_file(path=_hp_cp932)
+    check("history: 非UTF-8バイトを含む(構造は健全な)セッションファイルでも"
+          "空リストにならず読み込める(修正前はUnicodeDecodeErrorで[]だった)",
+          len(_loaded_cp932) == 2)
+    check("history: 復元されたエントリのrole/contentは常にstr型",
+          all(isinstance(m.get("role"), str) and isinstance(m.get("content"), str)
+              for m in _loaded_cp932))
+    check("history: 壊れたバイトはU+FFFDに置換されつつ前後の文字列は保持される",
+          "壊れる前" in _loaded_cp932[0]["content"]
+          and "壊れる後" in _loaded_cp932[0]["content"]
+          and "�" in _loaded_cp932[0]["content"])
+    check("history: 破損していない兄弟エントリはバイト単位で無傷のまま読み込まれる",
+          _loaded_cp932[1]["content"] == "無傷であるはずの兄弟エントリ：日本語も含む")
+
 # 念のため: 本セクションはグローバル状態を try/finally で復元済みであることを確認
 check("history: SESSION_SAVE はテスト後に既定値へ復元されている",
       f.SESSION_SAVE == _orig_session_save)
