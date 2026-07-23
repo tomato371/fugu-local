@@ -759,8 +759,28 @@ def _read_ipynb(path: Path) -> str:
         nb = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         parts = []
         for cell in nb.get("cells", []):
+            # 2026-07-23 (iter72): nbformat仕様上 'source' はstrまたはlist[str]だが、
+            # 壊れた/書きかけのnotebookでは source: null や、list内に非str要素
+            # （例: 42）が混入することがある。旧実装は"".join(cell.get("source", []))を
+            # 無条件に呼んでおり、これがTypeError/AttributeErrorを送出すると本関数の
+            # 外側try/exceptで捕捉され、「1セルの壊れたsourceでnotebook全体の生JSON
+            # 全文がそのままRAG/--fileコンテキストへ丸ごと注入される」という劣化を
+            # 招いていた（iteration 71がtest-onlyで発見し、特性検証テストとして
+            # ピン留めした上で将来のiterationでの修正候補と明示的にフラグしていたもの）。
+            # ここではセル単位で壊れたsourceだけを安全にスキップし、良好な他セルの
+            # 構造化抽出（精度優先：整形済みcontext > 生JSON）を守る。cell自体が
+            # dictでない場合も同様にスキップする。これはiteration 42/53と同じ
+            # 「1件の破損で全体を道連れにしない」graceful degradationパターン。
+            if not isinstance(cell, dict):
+                continue
             ct = cell.get("cell_type", "")
-            src = "".join(cell.get("source", []))
+            raw_src = cell.get("source", [])
+            if isinstance(raw_src, str):
+                src = raw_src
+            elif isinstance(raw_src, list):
+                src = "".join(s for s in raw_src if isinstance(s, str))
+            else:
+                src = ""
             if not src.strip():
                 continue
             if ct == "code":

@@ -3626,27 +3626,63 @@ with _tempfile.TemporaryDirectory() as _ri_dir:
     check("_read_ipynb: 非JSONファイルは例外を送出せずraw textを返す",
           _ri_out_b == _ri_bad_text)
 
-    # (c) 特性検証(characterization, 現状挙動の記録): JSONとしては妥当だが
-    #     cellの'source'がjoin可能なlist[str]ではない「壊れているがパース可能」なnotebook。
-    #     "".join()がTypeErrorを送出し、これは_read_ipynbの外側try/exceptで捕捉されるため、
-    #     問題のセルだけでなくnotebook全体がスキップされずに"生JSON全文"がそのまま
-    #     RAG/--fileコンテキストへ丸ごと注入される。1セルの壊れたsourceでnotebook全体の
-    #     構造化抽出が失われ、フォーマット化されていない生JSONがcontextに混入するのは
-    #     品質上の懸念点だが、本タスクはtest-onlyのため修正はせず現状挙動として記録する
-    #     （fugu_local.pyは変更しない。将来のiterationでの修正候補として明示的にフラグする）。
+    # (c) 修正後挙動(iter72): JSONとしては妥当だが cellの'source'がjoin可能な
+    #     list[str]ではない「壊れているがパース可能」なnotebook。かつては"".join()が
+    #     TypeErrorを送出し、_read_ipynbの外側try/exceptで捕捉されて問題のセルだけで
+    #     なくnotebook全体が生JSON全文としてRAG/--fileコンテキストへ丸ごと注入されて
+    #     いた（iteration 71がtest-onlyで発見し特性検証テストとしてピン留め、将来の
+    #     iterationでの修正候補と明示的にフラグしていたもの）。iter72で該当セルのみを
+    #     安全にスキップするよう修正したため、ここでは修正後の正しい挙動を検証する。
     _ri_nb_c = {"cells": [{"cell_type": "code", "source": None}]}
     _ri_c = _ri_root / "c.ipynb"
     _ri_raw_c = json.dumps(_ri_nb_c)
     _ri_c.write_text(_ri_raw_c, encoding="utf-8")
-    check("_read_ipynb[特性検証]: source=Noneのセルはjoin失敗->outer exceptでnotebook全体が生JSONにフォールバック",
-          f._read_ipynb(_ri_c) == _ri_raw_c)
+    _ri_out_c = f._read_ipynb(_ri_c)
+    check("_read_ipynb: source=Noneのセルはskipされ空文字を返す(生JSONダンプではない)",
+          _ri_out_c == "" and _ri_out_c != _ri_raw_c)
 
     _ri_nb_d = {"cells": [{"cell_type": "code", "source": ["ok\n", 42]}]}
     _ri_d = _ri_root / "d.ipynb"
     _ri_raw_d = json.dumps(_ri_nb_d)
     _ri_d.write_text(_ri_raw_d, encoding="utf-8")
-    check("_read_ipynb[特性検証]: source内に非文字列混入のセルも同様にnotebook全体が生JSONにフォールバック",
-          f._read_ipynb(_ri_d) == _ri_raw_d)
+    _ri_out_d = f._read_ipynb(_ri_d)
+    check("_read_ipynb: source内に非文字列混入のセルは文字列要素のみjoinされ非str要素は無視される",
+          _ri_out_d == "```python\nok\n\n```")
+    check("_read_ipynb: 非文字列混入セルの結果は生JSONダンプではない",
+          _ri_out_d != _ri_raw_d and "cell_type" not in _ri_out_d and "source" not in _ri_out_d)
+
+    # (e) 良好なセルと壊れたセル(source=None)が混在する場合: 壊れたセルのみskipされ、
+    #     良好なセルの構造化抽出は維持される（1セルの破損でnotebook全体が道連れにならない）。
+    _ri_nb_e = {
+        "cells": [
+            {"cell_type": "code", "source": ["import os\n", "print(1)"]},
+            {"cell_type": "code", "source": None},
+        ]
+    }
+    _ri_e = _ri_root / "e.ipynb"
+    _ri_raw_e = json.dumps(_ri_nb_e)
+    _ri_e.write_text(_ri_raw_e, encoding="utf-8")
+    _ri_out_e = f._read_ipynb(_ri_e)
+    check("_read_ipynb: 良好なセル+壊れたセル混在時は良好なセルのみ構造化抽出される",
+          _ri_out_e == "```python\nimport os\nprint(1)\n```")
+    check("_read_ipynb: 良好+壊れたセル混在時も生JSONマーカーが出力に含まれない",
+          "cell_type" not in _ri_out_e and "source" not in _ri_out_e)
+
+    # (f) cellsリスト内に非dictの要素が混じっている場合: そのエントリだけskipし、
+    #     以降の正当なセルは正常に構造化抽出される(cell.get(...)でAttributeErrorを
+    #     起こして生JSONダンプへ道連れにならない)。
+    _ri_nb_f = {
+        "cells": [
+            "junk",
+            {"cell_type": "markdown", "source": ["# Title"]},
+        ]
+    }
+    _ri_f = _ri_root / "f.ipynb"
+    _ri_raw_f = json.dumps(_ri_nb_f)
+    _ri_f.write_text(_ri_raw_f, encoding="utf-8")
+    _ri_out_f = f._read_ipynb(_ri_f)
+    check("_read_ipynb: cells内の非dictエントリはskipされ後続の正当なセルは抽出される",
+          _ri_out_f == "# Title")
 
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
