@@ -3533,6 +3533,121 @@ finally:
 check("read_file_text: リーダーがpip install通知文字列を正常returnした場合はそのまま素通し(\"\"化されない)",
       _rft_result3 == _rft_notice_text)
 
+# ---------- _read_html / _read_ipynb: 直接カバレッジ (2026-07-23 / iter71) ----------
+# _read_html/_read_ipynb はstdlibのみ(html.parser/json)で書かれた汎用ファイルリーダーで、
+# RAG(_load_rag_chunks -> rag_search -> build_context)や --file 経由でproposerの
+# プロンプトに直接混入する（= 精度優先の回答経路に効くコンテキスト源）。これまでは
+# iter53のread_file_textディスパッチ例外テストがコメント中で言及するのみで、
+# HTML/Notebookパース処理そのものを直接呼び出す検証が一切なかった。
+# ここでは f._read_html(path) / f._read_ipynb(path) を一時ファイルに対して直接呼び、
+# f.ask/urlopen/subprocessは一切mockしない（本物のパースロジックのみを検証）。
+with _tempfile.TemporaryDirectory() as _rh_dir:
+    _rh_root = _pathlib.Path(_rh_dir)
+
+    # (a) 通常のタグ除去: 可視テキストが残る
+    _rh_a = _rh_root / "a.html"
+    _rh_a.write_text(
+        "<html><body><div><h1>Title</h1><p>Paragraph one.</p>"
+        "<p>Paragraph two.</p></div></body></html>",
+        encoding="utf-8")
+    _rh_out_a = f._read_html(_rh_a)
+    check("_read_html: 見出し/段落の可視テキストが残る",
+          "Title" in _rh_out_a and "Paragraph one." in _rh_out_a
+          and "Paragraph two." in _rh_out_a)
+    check("_read_html: タグ自体は出力に残らない(山括弧なし)",
+          "<" not in _rh_out_a and ">" not in _rh_out_a)
+
+    # (b) <script>/<style>の中身は除外される
+    _rh_b = _rh_root / "b.html"
+    _rh_b.write_text(
+        "<html><head><style>body{color:red}</style></head><body>"
+        "<script>alert('hi'); var secret = 42;</script>"
+        "<p>Visible text here</p></body></html>",
+        encoding="utf-8")
+    _rh_out_b = f._read_html(_rh_b)
+    check("_read_html: <script>本文は出力に含まれない",
+          "alert" not in _rh_out_b and "secret" not in _rh_out_b)
+    check("_read_html: <style>本文は出力に含まれない",
+          "color" not in _rh_out_b and "red" not in _rh_out_b)
+    check("_read_html: <script>/<style>と同居する通常テキストは残る",
+          "Visible text here" in _rh_out_b)
+
+    # (c) HTML文字参照(&amp; &lt; &gt;)がデコードされる(HTMLParserのconvert_charrefs既定)
+    _rh_c = _rh_root / "c.html"
+    _rh_c.write_text(
+        "<p>Fish &amp; Chips &lt;tasty&gt;</p>", encoding="utf-8")
+    _rh_out_c = f._read_html(_rh_c)
+    check("_read_html: &amp;が'&'にデコードされる",
+          "Fish & Chips" in _rh_out_c)
+    check("_read_html: &lt;/&gt;が'<'/'>'にデコードされる",
+          "<tasty>" in _rh_out_c)
+    check("_read_html: デコード後もエンティティの生表記は残らない",
+          "&amp;" not in _rh_out_c and "&lt;" not in _rh_out_c)
+
+    # (d) テキストを持たない文書(空白のみ)は空文字を返す
+    _rh_d = _rh_root / "d.html"
+    _rh_d.write_text(
+        "<html><body>   <div>\n\n   </div>\t</body></html>", encoding="utf-8")
+    check("_read_html: テキストなし文書は空文字を返す",
+          f._read_html(_rh_d) == "")
+
+with _tempfile.TemporaryDirectory() as _ri_dir:
+    _ri_root = _pathlib.Path(_ri_dir)
+
+    # (a) 整形されたNotebook: コードセルは```python フェンス、markdownセルは平文、
+    #     空白のみ/空文字セルはスキップ、単一文字列source(リストでなくとも正当なnbformat)も扱える
+    _ri_nb_a = {
+        "cells": [
+            {"cell_type": "code", "source": ["import os\n", "print(os.getcwd())"]},
+            {"cell_type": "markdown", "source": ["# Title\n", "some text"]},
+            {"cell_type": "code", "source": ["   \n", "  "]},  # 空白のみ -> skip
+            {"cell_type": "markdown", "source": ""},  # 空文字 -> skip
+            {"cell_type": "code", "source": "x = 1\nprint(x)"},  # 単一文字列source
+        ]
+    }
+    _ri_a = _ri_root / "a.ipynb"
+    _ri_a.write_text(json.dumps(_ri_nb_a), encoding="utf-8")
+    _ri_out_a = f._read_ipynb(_ri_a)
+    _ri_expected_a = (
+        "```python\nimport os\nprint(os.getcwd())\n```"
+        "\n\n# Title\nsome text"
+        "\n\n```python\nx = 1\nprint(x)\n```"
+    )
+    check("_read_ipynb: コード/markdownセルの整形・空白セルのスキップ・単一文字列sourceが期待通り",
+          _ri_out_a == _ri_expected_a)
+    check("_read_ipynb: 空白のみセルの痕跡(空フェンス等)が出力に残らない",
+          "```python\n\n```" not in _ri_out_a and "```python\n   \n```" not in _ri_out_a)
+
+    # (b) 壊れた(非JSON)notebookはexcept分岐でraw読み込みにフォールバックし、例外を送出しない
+    _ri_b = _ri_root / "b.ipynb"
+    _ri_bad_text = "this is { not : valid json at all"
+    _ri_b.write_text(_ri_bad_text, encoding="utf-8")
+    _ri_out_b = f._read_ipynb(_ri_b)
+    check("_read_ipynb: 非JSONファイルは例外を送出せずraw textを返す",
+          _ri_out_b == _ri_bad_text)
+
+    # (c) 特性検証(characterization, 現状挙動の記録): JSONとしては妥当だが
+    #     cellの'source'がjoin可能なlist[str]ではない「壊れているがパース可能」なnotebook。
+    #     "".join()がTypeErrorを送出し、これは_read_ipynbの外側try/exceptで捕捉されるため、
+    #     問題のセルだけでなくnotebook全体がスキップされずに"生JSON全文"がそのまま
+    #     RAG/--fileコンテキストへ丸ごと注入される。1セルの壊れたsourceでnotebook全体の
+    #     構造化抽出が失われ、フォーマット化されていない生JSONがcontextに混入するのは
+    #     品質上の懸念点だが、本タスクはtest-onlyのため修正はせず現状挙動として記録する
+    #     （fugu_local.pyは変更しない。将来のiterationでの修正候補として明示的にフラグする）。
+    _ri_nb_c = {"cells": [{"cell_type": "code", "source": None}]}
+    _ri_c = _ri_root / "c.ipynb"
+    _ri_raw_c = json.dumps(_ri_nb_c)
+    _ri_c.write_text(_ri_raw_c, encoding="utf-8")
+    check("_read_ipynb[特性検証]: source=Noneのセルはjoin失敗->outer exceptでnotebook全体が生JSONにフォールバック",
+          f._read_ipynb(_ri_c) == _ri_raw_c)
+
+    _ri_nb_d = {"cells": [{"cell_type": "code", "source": ["ok\n", 42]}]}
+    _ri_d = _ri_root / "d.ipynb"
+    _ri_raw_d = json.dumps(_ri_nb_d)
+    _ri_d.write_text(_ri_raw_d, encoding="utf-8")
+    check("_read_ipynb[特性検証]: source内に非文字列混入のセルも同様にnotebook全体が生JSONにフォールバック",
+          f._read_ipynb(_ri_d) == _ri_raw_d)
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
       f._tokenize("PINNについて") == {"pinn", "について"})
