@@ -217,6 +217,35 @@ check("pptx混在: 先行する対になったブロックは見出し昇格さ�
 check("pptx混在: 末尾の閉じ忘れフェンス後の見出しは新規スライドになる",
       [s["title"] for s in _mixed] == ["前半", "後半", "次"])
 
+# 2026-07-23: 旧実装 re.sub(r"[*_`#]+", "", t) が * _ ` # を無差別に全削除して
+# いた過剰マッチの回帰防止（詳細は fugu_local.py 内の該当コメント参照）。
+# 数式の演算子/指数、識別子中のアンダースコア、インラインコード中の識別子が
+# 破壊されず、対のバッククォートのみが除去されることを確認する。
+_slides_math = f._parse_slides("## 式\n- E = m*c_0**2")
+check("slides: 数式の演算子/指数はそのまま残る(mc02に化けない)",
+      any("m*c_0**2" in b for b in _slides_math[0]["bullets"]))
+
+_slides_code_id = f._parse_slides("- 呼び出しは `do_thing()` です")
+check("slides: インラインコード識別子はアンダースコア込みで残る(dothingにならない)",
+      any("do_thing()" in b for b in _slides_code_id[0]["bullets"]))
+check("slides: 対になったバッククォート自体は除去される",
+      all("`" not in b for b in _slides_code_id[0]["bullets"]))
+
+_slides_uscore = f._parse_slides("- 係数は a_1 + a_2")
+check("slides: 地の文中のアンダースコア識別子はそのまま残る(a_1/a_2がa1/a2にならない)",
+      any("a_1" in b and "a_2" in b for b in _slides_uscore[0]["bullets"]))
+
+check("slides: 見出し中のアンダースコアはそのまま残る(a_bがabにならない)",
+      "a_b" in f._parse_slides("## a_b の説明")[0]["title"])
+
+# 安全な方向(曖昧なら削除しない)の確認: 対になっていない単独のバッククォートや
+# アスタリスクは装飾か演算子/識別子か判別できないため、削除せずそのまま残す。
+_slides_stray = f._parse_slides("- value: `x と **重要**")
+check("slides: 対になっていない単独バッククォートは残す(安全側)",
+      any("`x" in b for b in _slides_stray[0]["bullets"]))
+check("slides: 太字装飾の**もそのまま残る(削除より保持を優先)",
+      any("**重要**" in b for b in _slides_stray[0]["bullets"]))
+
 check("pptx: deck_title は短い質問を採用", f._deck_title("犬の紹介", _slides) == "犬の紹介")
 # 2026-07-22: 空白のみの質問は if question で truthy のまま素通りし、
 # strip()後に splitlines() が [] を返して [0] が IndexError になっていた回帰。
