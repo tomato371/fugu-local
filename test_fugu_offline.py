@@ -2113,6 +2113,102 @@ finally:
 check("sc-err: 通常応答は__ERROR__ガードに過検知されず'42'を採票",
       _ans_ok_scerr == "42" and _text_ok_scerr == "計算しました。\\boxed{42}")
 
+# ---------- _sc_sample: PoT分岐の4つの棄却ガードは無投票を返す (2026-07-23) ----------
+# _sc_sample の PoT 分岐 (line ~2587-2598) には「怪しい PoT サンプルを黙って捨て、
+# SC投票を汚染しない」ための4つの早期returnガードがある:
+#   (a) extract_code(text) が None（```python フェンス無し）
+#   (b) run_python の ok が False（実行時エラー=トレースバック）
+#   (c) 実行はできたが stdout が空
+#   (d) stdout 最終行が80文字を超える（自由記述の暴走を数値解答として誤採用しない）
+# いずれも (None, text) を返し無投票となる契約（「無投票 > 誤投票」の精度優先方針、
+# gotcha#7）。iteration 4 は PoT の happy path のみ、iteration 52 は __ERROR__ センチ
+# ネルのみを検証しており（52自身のコメントが認める通り）、この4ガードはこれまで無防備
+# だった。ここでは f.ask のみをモックして _sc_sample を直接呼ぶ（モデル/ネットワーク
+# 呼び出しは一切発生しない）。(b)(c)(d) は run_python に本物の軽量・決定的なローカル
+# subprocess（1/0 や print(...) 程度）を実際に実行させる — iteration 4/46/52 と同じ流儀。
+_orig_ask_potguard = f.ask
+
+# (a) コードフェンス無し: extract_code が None を返し、run_python は起動されない
+#     （到達すれば forbidden 関数が AssertionError を送出し、即座に検知できる）。
+_pot_nocode_touched = []
+
+
+def _run_python_forbidden_potguard_a(*a, **kw):
+    _pot_nocode_touched.append("run_python")
+    raise AssertionError("コードフェンス無しなのにrun_pythonへ到達してはならない(subprocess起動)")
+
+
+_orig_run_python_potguard_a = f.run_python
+try:
+    f.run_python = _run_python_forbidden_potguard_a
+    f.ask = lambda *a, **k: "説明だけの回答です。コードブロックはありません。答えはたぶん42。"
+    _ans_nocode, _text_nocode = f._sc_sample("m1", "1+1=?", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potguard
+    f.run_python = _orig_run_python_potguard_a
+check("sc-pot: (a)コードフェンス無し→extract_code=Noneでanswer=None(無投票)",
+      _ans_nocode is None)
+check("sc-pot: (a)コードフェンス無し→run_pythonへ到達しない(subprocess不起動)",
+      not _pot_nocode_touched)
+
+# (b) 実行時エラー(ZeroDivisionError): run_python の ok=False → answer=None。
+#     注意: ok=False 分岐の _sc_sample は「text + run_python出力」を連結せず、素の
+#     text（LLMが書いたコード込みの生テキスト）をそのまま返す契約（連結は成功時のみ）。
+#     よって「tracebackの数字が誤ってanswerに混入しない」ことは _sc_sample の戻り値
+#     answer が None であること自体で保証される。ここではまず run_python を直接呼び、
+#     1/0 の実行が本当に失敗し(ok=False)、その出力(traceback)に数字が実在すること
+#     （テスト前提の健全性確認＝ガードが無ければ数字が採用され得た状況であること）を
+#     確認したうえで、_sc_sample がそれを answer=None として無投票に倒すことを検証する。
+_ok_sanity_execfail, _out_sanity_execfail = f.run_python("1 / 0", stdout_only=True)
+check("sc-pot: (b)前提確認: 1/0の実行は失敗し(ok=False)traceback出力に数字が実在する",
+      (not _ok_sanity_execfail) and any(ch.isdigit() for ch in _out_sanity_execfail))
+try:
+    f.ask = lambda *a, **k: "計算コードです。\n```python\n1 / 0\n```\n"
+    _ans_execfail, _text_execfail = f._sc_sample("m1", "1/0 は何？", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potguard
+check("sc-pot: (b)実行失敗(ZeroDivisionError, ok=False)はtraceback中の数字を誤採用せずanswer=None",
+      _ans_execfail is None)
+
+# (c) 実行は成功するが stdout が空: ok=True だが out=="" → answer=None
+try:
+    f.ask = lambda *a, **k: "何も出力しないコードです。\n```python\nx = 1 + 1\n```\n"
+    _ans_emptyout, _text_emptyout = f._sc_sample("m1", "1+1=?", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potguard
+check("sc-pot: (c)stdoutが空(print無し)はanswer=None(無投票)",
+      _ans_emptyout is None)
+
+# (d) stdout 最終行が80文字を超える: 自由記述の暴走を「解答」として誤採用しない
+_long_line = "9" * 90
+try:
+    f.ask = lambda *a, **k: "長い出力のコードです。\n```python\nprint('" + _long_line + "')\n```\n"
+    _ans_toolong, _text_toolong = f._sc_sample("m1", "何か計算して", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potguard
+check("sc-pot: (d)前提確認: 生成した最終行は80文字を超える",
+      len(_long_line) > 80)
+check("sc-pot: (d)stdout最終行が80文字超はanswer=None(無投票、暴走出力を誤採用しない)",
+      _ans_toolong is None)
+
+# regression: 短い答えを最終行に印字 + 無関係なstderr警告、という正常系は上記4ガード
+# 追加後も従来通り採票される（過検知が無いことの確認）。stdout_only=Trueによるstderr
+# 除去自体は2026-07-21の別テスト（line ~2028）で既に確認済みだが、ここでは本セクション
+# 自身のモック配線内でも happy path が壊れていないことを直接ロックする。
+try:
+    f.ask = lambda *a, **k: (
+        "考え方の説明です。\n```python\n"
+        "import sys\n"
+        "print('DeprecationWarning: ignore me', file=sys.stderr)\n"
+        "print(99)\n"
+        "```\n"
+    )
+    _ans_happy_potguard, _text_happy_potguard = f._sc_sample("m1", "regression", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potguard
+check("sc-pot: regression: 短い答え+無関係なstderr警告は従来通り採票される(4ガード追加後も過検知なし)",
+      _ans_happy_potguard == f.normalize_answer("99"))
+
 # ---------- _representative_text: SC勝者クラスの代表テキスト選出 (2026-07-23) ----------
 # solve_verifiable の最終return直前(line ~2788)でres['text']を決める、自己一貫性投票
 # 経路(gotcha#7)で最後まで直接テストされていなかったヘルパー。選出順序は
