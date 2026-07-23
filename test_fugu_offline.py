@@ -4479,6 +4479,189 @@ check("_read_pdf: テスト後にsys.modulesの'pypdf'エントリが元通り�
 check("_read_pdf: テスト後にsys.modulesの'PyPDF2'エントリが元通り解決可能(復元確認)",
       ("PyPDF2" not in sys.modules) or (sys.modules["PyPDF2"] is not None))
 
+# ---------- _read_excel: ImportError以外の実行時例外でもpandas/xlrdへフォールスルー (2026-07-24 / iter84) ----------
+# _read_excel は openpyxl -> pandas/xlrd の順で試行するが、各ブロックは従来
+# except ImportError のみで、下位ライブラリへのフォールスルーは「上位ライブラリが
+# 未インストール」の場合にしか起きなかった。openpyxl は legacy な .xls
+# （バイナリ形式）を一切読めず、openpyxl.load_workbook() は
+# openpyxl.utils.exceptions.InvalidFileException という実行時例外
+# （ImportError ではない）を送出する。read_file_text（L869付近）は .xlsx と .xls
+# の両方をこの _read_excel へディスパッチするため、.xls は公式にサポートされる
+# 入力形式でありながら、pandas+xlrd がインストール済みで読めるはずでもフォール
+# スルーが起きず例外がそのまま外へ伝播し、read_file_text（iter53）/
+# _load_rag_chunks（iter42）の呼び出し側ガードがそれを握りつぶしてスプレッド
+# シート丸ごとがRAG/--fileコンテキストから静かに失われていた（精度優先の方針に
+# 反する）。破損/openpyxl未対応の.xlsxがpandas側で再試行されない点も同じ隙間に
+# 起因する。これは iter83 が _read_pdf に対して行った修正（下位ライブラリへ
+# フォールスルーしてテキストを救済する）の直系の姉妹修正であり、iter41-44 の
+# graceful degradation 方針の延長でもある。
+# ここではopenpyxl/pandasという実ライブラリを一切必要とせず、sys.modules に
+# フェイクモジュールを注入することで(iter43/44/82/83と同じ手法)、インストール
+# 状態に関わらず決定的に検証する。多モジュールのswap-restoreはiter83で確立済みの
+# _rpdf_swap_modules/_rpdf_is_cp932_safeをそのまま再利用する。変更した
+# sys.modulesエントリ・キャプチャしたstdoutはすべてtry/finallyで確実に復元する。
+import pathlib as _rxl2_pathlib
+import tempfile as _rxl2_tempfile
+
+
+class _Rxl2FakeInvalidFileException(Exception):
+    """openpyxl.utils.exceptions.InvalidFileException を模した実行時例外
+    (.xls等openpyxlが読めない形式で実際に送出される例外の代替。実際の例外クラスを
+    使わずテスト側で定義することで、openpyxl未インストール環境でも決定的に
+    テストできる)。"""
+    pass
+
+
+def _rxl2_make_openpyxl_raising_module(mod_name, exc):
+    """openpyxl.load_workbook(...)呼び出し時に指定した例外を送出するフェイク
+    モジュール(importには成功するが実行時に失敗するケースを模擬)。"""
+    mod = types.ModuleType(mod_name)
+
+    def _raising_load_workbook(*args, **kwargs):
+        raise exc
+
+    mod.load_workbook = _raising_load_workbook
+    return mod
+
+
+def _rxl2_make_pandas_module(mod_name, sheets, excelfile_raises=None):
+    """pandas.ExcelFile(path).sheet_names / .parse(sheet).to_csv(index=False) と
+    同一インタフェースのフェイクモジュールを作る(実Excelパースは一切行わない)。
+    sheets: {シート名: csvテキスト} の辞書。excelfile_raisesを指定すると
+    ExcelFile(...)コンストラクタ自体がその例外を送出する(pandas/xlrd層も実行時に
+    失敗するケース、すなわち全層失敗ケースを模擬)。"""
+    mod = types.ModuleType(mod_name)
+
+    class _FakeDataFrame:
+        def __init__(self, csv_text):
+            self._csv_text = csv_text
+
+        def to_csv(self, index=False):
+            return self._csv_text
+
+    class _FakeExcelFile:
+        def __init__(self, path):
+            if excelfile_raises is not None:
+                raise excelfile_raises
+            self.sheet_names = list(sheets.keys())
+
+        def parse(self, sheet):
+            return _FakeDataFrame(sheets[sheet])
+
+    mod.ExcelFile = _FakeExcelFile
+    return mod
+
+
+with _rxl2_tempfile.TemporaryDirectory() as _rxl2_dir:
+    _rxl2_path = _rxl2_pathlib.Path(_rxl2_dir) / "legacy.xls"
+    # pandasブロックは pd.ExcelFile(str(path)) をフェイクモジュール経由で呼ぶだけで
+    # 実際にバイト列を解釈しないため、中身は問われないがファイル自体は実在させる。
+    _rxl2_path.write_bytes(b"\xd0\xcf\x11\xe0 dummy legacy .xls binary content, not real")
+
+    # (1) openpyxlはimport可能だがload_workbook()が実行時にInvalidFileException相当を
+    #     送出(.xls等openpyxlが読めない形式を想定)、pandasはimport可能かつ正常に
+    #     テキストを返す -> フォールスルーが働き、pandas由来のテキストが失われずに
+    #     返ってくること(受け入れ基準: fall-through/recovery テスト)。
+    _rxl2_exc1 = _Rxl2FakeInvalidFileException(
+        "simulated openpyxl InvalidFileException (legacy .xls / unsupported format)")
+    _fake_openpyxl_raising1 = _rxl2_make_openpyxl_raising_module("openpyxl", _rxl2_exc1)
+    _fake_pandas_ok1 = _rxl2_make_pandas_module("pandas", {"Sheet1": "name,age\nAlice,30\n"})
+
+    _rxl2_cap1 = io.StringIO()
+    with contextlib.redirect_stdout(_rxl2_cap1):
+        _rxl2_result1 = _rpdf_swap_modules(
+            {"openpyxl": _fake_openpyxl_raising1, "pandas": _fake_pandas_ok1},
+            lambda: f._read_excel(_rxl2_path),
+        )
+    _rxl2_expected1 = "[Sheet: Sheet1]\nname,age\nAlice,30\n"
+    check("_read_excel: openpyxlが実行時InvalidFileException相当を送出してもpandasへ"
+          "フォールスルーしテキストを失わない(.xls想定)",
+          _rxl2_result1 == _rxl2_expected1)
+    check("_read_excel: openpyxl実行時失敗の警告にファイル名(path.name)が出力される",
+          _rxl2_path.name in _rxl2_cap1.getvalue())
+    check("_read_excel: openpyxl実行時失敗の警告に例外型名が出力される",
+          "_Rxl2FakeInvalidFileException" in _rxl2_cap1.getvalue())
+    check("_read_excel: 実行時失敗の警告メッセージはcp932でエンコード可能"
+          "(絵文字等の非cp932文字を含まない、gotcha#4)",
+          _rpdf_is_cp932_safe(_rxl2_cap1.getvalue()))
+
+    # (2) openpyxl/pandas両方が実行時失敗 -> 既存の
+    #     '[Excel: {name} ... pip install openpyxl]' 通知文字列をそのまま返すこと、
+    #     かつ _is_lib_missing_notice がTrueと判定すること(RAGスキップ対象のまま、
+    #     受け入れ基準: all tiers fail テスト)。例外が_read_excelの外へ伝播しない
+    #     こと自体も、ここでcheck()が例外送出なく完了する形で確認される。
+    _rxl2_exc2a = _Rxl2FakeInvalidFileException("simulated openpyxl failure (all-tiers-fail case)")
+    _fake_openpyxl_raising2 = _rxl2_make_openpyxl_raising_module("openpyxl", _rxl2_exc2a)
+    _fake_pandas_raising2 = _rxl2_make_pandas_module(
+        "pandas", {}, excelfile_raises=ValueError("simulated pandas/xlrd failure (all-tiers-fail case)"))
+
+    _rxl2_cap2 = io.StringIO()
+    with contextlib.redirect_stdout(_rxl2_cap2):
+        _rxl2_result2 = _rpdf_swap_modules(
+            {"openpyxl": _fake_openpyxl_raising2, "pandas": _fake_pandas_raising2},
+            lambda: f._read_excel(_rxl2_path),
+        )
+    _rxl2_expected_notice = f"[Excel: {_rxl2_path.name} — openpyxl or pandas が必要: pip install openpyxl]"
+    check("_read_excel: openpyxl/pandas両方が実行時失敗なら既存の通知文字列をbyte-for-byteで返す",
+          _rxl2_result2 == _rxl2_expected_notice)
+    check("_is_lib_missing_notice: 両方実行時失敗時の通知文字列はTrueと判定される(RAGスキップ対象のまま)",
+          f._is_lib_missing_notice(_rxl2_result2))
+    check("_read_excel: 両方実行時失敗時、openpyxlとpandas双方の実行時失敗警告が出力される",
+          "_Rxl2FakeInvalidFileException" in _rxl2_cap2.getvalue() and "ValueError" in _rxl2_cap2.getvalue())
+
+    # (3) 回帰: openpyxlが未インストール(ImportError)でも、pandasが正常にテキストを
+    #     返せば従来通りpandasの結果が返ること(フォールスルー自体は既存挙動、
+    #     受け入れ基準: openpyxl-absent regression テスト)。
+    _fake_pandas_ok3 = _rxl2_make_pandas_module("pandas", {"Data": "x,y\n1,2\n"})
+    _rxl2_result3 = _rpdf_swap_modules(
+        {"openpyxl": None, "pandas": _fake_pandas_ok3},
+        lambda: f._read_excel(_rxl2_path),
+    )
+    check("_read_excel(回帰): openpyxl未インストール(ImportError)でもpandasへフォールスルーする"
+          "(既存挙動維持)",
+          _rxl2_result3 == "[Sheet: Data]\nx,y\n1,2\n")
+
+check("_read_excel: テスト後にsys.modulesの'openpyxl'エントリが元通り解決可能(復元確認、iter84)",
+      ("openpyxl" not in sys.modules) or (sys.modules["openpyxl"] is not None))
+check("_read_excel: テスト後にsys.modulesの'pandas'エントリが元通り解決可能(復元確認、iter84)",
+      ("pandas" not in sys.modules) or (sys.modules["pandas"] is not None))
+
+# ---------- _read_excel: 変更後も成功パス(openpyxl実ワークブック)の出力が不変であることの確認 (iter84) ----------
+# 上記の except Exception 追加はopenpyxlブロックの成功パス(try本体のreturn文)には
+# 一切触れていないが、実際のopenpyxlの実行結果でも回帰していないことを直接確認する
+# (受け入れ基準: success-path regression テスト。iter82のフィクスチャ手法を踏襲し、
+# gc.collect()によるWindowsファイルハンドルロック回避も同様に行う)。
+try:
+    import openpyxl as _rxl2_openpyxl_probe
+    _RXL2_HAS_OPENPYXL = True
+except ImportError:
+    _RXL2_HAS_OPENPYXL = False
+
+if _RXL2_HAS_OPENPYXL:
+    with _rxl2_tempfile.TemporaryDirectory() as _rxl2_ok_dir:
+        _rxl2_ok_path = _rxl2_pathlib.Path(_rxl2_ok_dir) / "book_after_fix.xlsx"
+        _rxl2_ok_wb = _rxl2_openpyxl_probe.Workbook()
+        _rxl2_ok_ws = _rxl2_ok_wb.active
+        _rxl2_ok_ws.title = "Data"
+        _rxl2_ok_ws.append(["col1", "col2"])
+        _rxl2_ok_ws.append(["v1", 1])
+        _rxl2_ok_wb.save(str(_rxl2_ok_path))
+
+        _rxl2_ok_out = f._read_excel(_rxl2_ok_path)
+        # iter82と同じ理由(read_only=Trueワークブックの参照循環によるWindowsでの
+        # 遅延ファイルハンドル解放)でgc.collect()を挟む(テスト専用の後始末)。
+        import gc as _rxl2_gc
+        _rxl2_gc.collect()
+        _rxl2_ok_expected = "\n".join([
+            "[Sheet: Data]",
+            "col1\tcol2",
+            "v1\t1",
+        ])
+        check("_read_excel: 変更後もopenpyxl成功パスの出力はbyte-for-byte従来通り(iter84回帰ガード)",
+              _rxl2_ok_out == _rxl2_ok_expected)
+else:
+    print("   [SKIP] openpyxl未インストールのため_read_excel成功パス回帰テスト(iter84)をスキップ")
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
       f._tokenize("PINNについて") == {"pinn", "について"})

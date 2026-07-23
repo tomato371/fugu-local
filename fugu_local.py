@@ -706,7 +706,26 @@ def _read_docx(path: Path) -> str:
 
 
 def _read_excel(path: Path) -> str:
-    """Excel (.xlsx/.xls) を CSV ライクなテキストに変換。"""
+    """Excel (.xlsx/.xls) を CSV ライクなテキストに変換。openpyxl -> pandas/xlrd の順で試行。
+    2026-07-24 (iter84): read_file_text は .xlsx と .xls の両方をこの関数へディスパッチ
+    するが、従来は各ブロックが except ImportError のみで、下位ライブラリへの
+    フォールスルーは「上位ライブラリが未インストール」の場合にしか起きなかった。
+    openpyxl は legacy な .xls（バイナリ形式）を一切読めず、
+    openpyxl.load_workbook() は openpyxl.utils.exceptions.InvalidFileException という
+    実行時例外（ImportError ではない）を送出する。そのため .xls は
+    read_file_text で公式にディスパッチされる入力形式であるにもかかわらず、
+    pandas+xlrd がインストール済みで読めるはずでも、フォールスルーが起きず例外が
+    そのまま外へ伝播し、read_file_text（iter53）/ _load_rag_chunks（iter42）の
+    呼び出し側ガードがそれを握りつぶしてスプレッドシート丸ごとがRAG/--file
+    コンテキストから静かに失われていた（精度優先の方針に反する）。同じ隙間は
+    破損/openpyxl未対応の .xlsx が pandas 側で再試行されないことにも当てはまる。
+    これは iter83 が _read_pdf に対して行った修正（下位ライブラリへフォールスルーして
+    テキストを救済する）の直系の姉妹修正であり、iter41-44 の graceful degradation
+    方針の延長でもある。ImportError に加えて except Exception（bare except には
+    しない。KeyboardInterrupt/SystemExit は握りつぶさず伝播させる）でも次候補へ
+    フォールスルーさせ、ライブラリが import 自体には成功したのに失敗した場合は
+    cp932セーフな警告（ファイル名+例外型のみ、絵文字等は使わない）で可視化する。"""
+    # openpyxl (高速・.xlsx専用。.xlsは読めずInvalidFileExceptionを送出する)
     try:
         import openpyxl
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
@@ -720,6 +739,9 @@ def _read_excel(path: Path) -> str:
         return "\n".join(parts)
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_excel] openpyxl抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
+    # pandas/xlrd (.xls を含む幅広い形式を読める)
     try:
         import pandas as pd
         xl = pd.ExcelFile(str(path))
@@ -730,6 +752,8 @@ def _read_excel(path: Path) -> str:
         return "\n\n".join(parts)
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_excel] pandas抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
     return f"[Excel: {path.name} — openpyxl or pandas が必要: pip install openpyxl]"
 
 
