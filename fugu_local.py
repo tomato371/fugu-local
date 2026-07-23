@@ -2485,8 +2485,25 @@ def normalize_answer(ans):
     # ここで落とす。内部（末尾以外）のカンマは rstrip の性質上そのまま保持される。
     s = s.rstrip("。．.,").strip()
     s = re.sub(r"\s+", " ", s)
-    m = re.fullmatch(r"\\(?:text|mathrm)\{(.*)\}", s)
-    if m:
+    # 2026-07-23: \text/\mathrm 以外にも \textbf/\mathbf/\boldsymbol などの
+    # 「見た目だけ」を変える体裁マクロで最終回答を装飾するプロポーザーがいる。
+    # mcq では \boxed{\textbf{B}} を extract_final_answer の先頭選択肢文字
+    # 正規表現が読めず None（無投票）になり、math では \boxed{\mathbf{42}} が
+    # 文字列 "\mathbf{42}" のまま投票されて answers_equivalent の
+    # na.lower()/Fraction 系ファストパスに乗らず、素の "42" 票と別の投票クラスに
+    # 分裂してしまう（自己整合性投票 gotcha #7 での票落ち・票割れ）。これらは
+    # 値を変えない純粋な体裁指定なので剥がしても精度は落とさず、むしろ本来1つ
+    # であるべき票をまとめられる（精度優先・時間は気にしない）。\frac/\sqrt/
+    # \operatorname 等の値を変えうるマクロは対象外のまま維持する。\mathbf{\text{D}}
+    # のような入れ子に対応するため、固定回数の上限（暴走防止）付きループで剥がす。
+    _wrap_re = re.compile(
+        r"\\(?:text|mathrm|textbf|textit|texttt|textsf|textnormal|"
+        r"mathbf|mathit|mathsf|mathtt|boldsymbol|bm)\{(.*)\}"
+    )
+    for _ in range(4):
+        m = _wrap_re.fullmatch(s)
+        if not m:
+            break
         s = m.group(1).strip()
     return s
 

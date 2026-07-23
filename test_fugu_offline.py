@@ -495,6 +495,16 @@ check("sc: 正規化 桁区切り除去", f.normalize_answer("12,345") == "12345
 check("sc: 正規化 空白入り桁区切り", f.normalize_answer("11,\\! 111,\\! 111,\\! 100") == "11111111100")
 check("sc: 正規化 前置き除去", f.normalize_answer("Answer: 700") == "700")
 check("sc: 正規化 text外殻", f.normalize_answer("\\text{391}") == "391")
+# 2026-07-23: \text/\mathrm 以外の体裁マクロ（\textbf/\mathbf/\boldsymbol 等）も
+# 値を変えないので剥がす。mcq で \boxed{\textbf{B}} が票落ちしたり、math で
+# \boxed{\mathbf{42}} が素の "42" 票と別クラスに分裂したりするのを防ぐ
+# （normalize_answer 側のコメント参照、自己整合性投票 gotcha #7）。
+check("sc: 正規化 textbf外殻", f.normalize_answer("\\textbf{B}") == "B")
+check("sc: 正規化 mathbf外殻", f.normalize_answer("\\mathbf{42}") == "42")
+check("sc: 正規化 boldsymbol外殻", f.normalize_answer("\\boldsymbol{x}") == "x")
+check("sc: 正規化 入れ子体裁マクロ", f.normalize_answer("\\mathbf{\\text{D}}") == "D")
+# 値を変えうる意味論的マクロ（\frac 等）は対象外のまま維持することの回帰確認
+check("sc: 正規化 frac不変（意味論的マクロは非対象）", f.normalize_answer("\\frac{1}{2}") == "\\frac{1}{2}")
 # 2026-07-22: _FW_TRANS 拡張分（Unicode MINUS SIGN / 全角句点・読点・スラッシュ）の
 # 正規化。CJK 寄りのプロポーザ (qwen/gemma 系) がこれらを出力し、正規化しないと
 # vote_answers で本来同値な答えが2系統の票に割れてしまう（詳細は _FW_TRANS 定義部の
@@ -555,6 +565,13 @@ check("sc: 抽出 最後の数値(boxed/宣言なし) 桁区切り1234567",
       f.extract_final_answer("in total we counted up to 1,234,567", "math") == "1234567")
 check("sc: 抽出 最後の数値(boxed/宣言なし) 桁区切り12345",
       f.extract_final_answer("in total we counted up to 12,345", "math") == "12345")
+# 2026-07-23: \boxed{\mathbf{42}} を mathbf 外殻ごと剥がさないと文字列 "\mathbf{42}" の
+# ままとなり、answers_equivalent の na.lower()/Fraction 系ファストパスに乗らず素の
+# "42" 票と別の投票クラスに分裂していた（自己整合性投票 gotcha #7 の票割れ回帰確認）。
+_mathbf_boxed = f.extract_final_answer("\\boxed{\\mathbf{42}}", "math")
+check("sc: 抽出 boxed mathbf外殻（票割れ回帰）", _mathbf_boxed == "42")
+check("sc: 同値 boxed mathbf外殻が素の42と合流（票割れ回帰）",
+      f.answers_equivalent(_mathbf_boxed, "42"))
 check("sc: mcq boxed", f.extract_final_answer("\\boxed{B}", "mcq") == "B")
 check("sc: mcq 宣言", f.extract_final_answer("正解は (C) です", "mcq") == "C")
 check("sc: mcq 無しは None", f.extract_final_answer("どれも違う", "mcq") is None)
@@ -564,6 +581,10 @@ check("sc: mcq boxed 散文のみは誤答せず None",
       f.extract_final_answer("\\boxed{None of the above}", "mcq") is None)
 check("sc: mcq boxed 括弧付き先頭文字", f.extract_final_answer("\\boxed{(A)}", "mcq") == "A")
 check("sc: mcq boxed text外殻付き先頭文字", f.extract_final_answer("\\boxed{\\text{D}}", "mcq") == "D")
+# 2026-07-23: \boxed{\textbf{B}} は textbf を剥がさないと先頭選択肢文字の正規表現が
+# "\TEXTBF{B}" を見てマッチせず None（票落ち）になっていた回帰確認。
+check("sc: mcq boxed textbf外殻付き先頭文字（票落ち回帰）",
+      f.extract_final_answer("\\boxed{\\textbf{B}}", "mcq") == "B")
 check("sc: mcq boxed 選択肢+本文", f.extract_final_answer("\\boxed{A) 5}", "mcq") == "A")
 check("sc: mcq 宣言 ディストラクタ言及に釣られない",
       f.extract_final_answer(
