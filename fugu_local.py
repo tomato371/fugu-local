@@ -3148,6 +3148,33 @@ def _extract_code_for_output(answer: str, suffix: str) -> str:
         ".sh": ["bash", "sh", "shell"],
         ".sql": ["sql"],
         ".r": ["r"],
+        # 2026-07-23: _CODE_EXTENSIONS (L3100, --out がコードとして書き出す25拡張子)
+        # と lang_map の同期漏れ。上の13エントリしか無く、残り12拡張子
+        # (.jsx .tsx .mjs .h .hpp .kt .swift .php .bat .ps1 .m .jl) は
+        # langs が空集合になるため tier-1 (対象言語タグ一致) が絶対に発火せず、
+        # 複数フェンスの回答で非対象言語のブロック(例: 使い方説明の```bash)が
+        # 先行すると tier-3 (非コードタグ以外の最初のブロック) でそれが誤って
+        # 採用され、意図した言語のブロックより先に書き出されていた
+        # (iteration 7/18/28/29/56 が繰り返し修正してきたのと同じ
+        # ブロック誤選択バグクラスだが、このタグ集合の穴自体は今回まで未対応で、
+        # 既存の code_out: テストは全て .py/.c という対応済み拡張子だけを使って
+        # いたため検出されずにいた)。tier-1 は「優先されるブロックを選ぶだけ」
+        # で受理判定を誤って拡げても非対象ブロックを誤採用する副作用は無いため、
+        # .h (C/C++/Objective-C 共用ヘッダ) と .m (MATLAB/Objective-C/Octave) の
+        # ように言語が一意に決まらない拡張子は、単一言語を憶測するのではなく
+        # 妥当なタグを広めに全部含める。
+        ".jsx": ["jsx", "javascript", "js"],
+        ".tsx": ["tsx", "typescript", "ts"],
+        ".mjs": ["javascript", "js", "mjs"],
+        ".h": ["c", "cpp", "c++", "objc", "objective-c", "objectivec"],
+        ".hpp": ["cpp", "c++", "hpp"],
+        ".kt": ["kotlin", "kt"],
+        ".swift": ["swift"],
+        ".php": ["php"],
+        ".bat": ["bat", "batch", "cmd"],
+        ".ps1": ["powershell", "ps1", "pwsh"],
+        ".m": ["matlab", "objc", "objective-c", "objectivec", "octave"],
+        ".jl": ["julia"],
     }
     # 非コードとみなす既知のドキュメント系タグ（保守的なスキップリスト）
     _NON_CODE_TAGS = {

@@ -1838,6 +1838,141 @@ check(
     ) == "print(3)\n",
 )
 
+# 2026-07-23: _CODE_EXTENSIONS (25拡張子) と _extract_code_for_output 内 lang_map
+# (13拡張子のみ) の同期漏れ修正の回帰・新規テスト。lang_map に無い残り12拡張子
+# (.jsx .tsx .mjs .h .hpp .kt .swift .php .bat .ps1 .m .jl) は langs が空集合に
+# なり tier-1 (対象言語タグ一致) が絶対に発火せず、非対象言語のブロック
+# (例: 使い方説明の```bash)が先行すると tier-3 でそれを誤って採用してしまう
+# (iteration 7/18/28/29/56 と同じブロック誤選択バグクラス)。実例として挙げられた
+# 「```bash の npm install の後に本命の```jsx」で、修正前は 'npm install\n' が
+# 返っていたことを確認しつつ、12拡張子それぞれの代表ケースで tier-1 が正しく
+# 発火することを検証する。
+check(
+    "code_out: 先行するbashブロックの後のjsxブロックを正しく抽出(修正前はnpm installを誤抽出)",
+    "export default"
+    in f._extract_code_for_output(
+        "```bash\nnpm install\n```\n"
+        "```jsx\nexport default function App(){return null}\n```",
+        ".jsx",
+    )
+    and "npm install"
+    not in f._extract_code_for_output(
+        "```bash\nnpm install\n```\n"
+        "```jsx\nexport default function App(){return null}\n```",
+        ".jsx",
+    ),
+)
+check(
+    "code_out: 先行するbashブロックの後のtsx(tsxタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\nnpm install\n```\n```tsx\nconst x: number = 1;\n```", ".tsx"
+    ) == "const x: number = 1;\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のtsx(typescriptタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\nnpm install\n```\n```typescript\nconst y: number = 2;\n```", ".tsx"
+    ) == "const y: number = 2;\n",
+)
+check(
+    "code_out: 先行するshブロックの後のmjs(javascriptタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```sh\nnode -v\n```\n```javascript\nexport const z = 1;\n```", ".mjs"
+    ) == "export const z = 1;\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のh(cタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\ngcc --version\n```\n```c\nint add(int a, int b){return a+b;}\n```",
+        ".h",
+    ) == "int add(int a, int b){return a+b;}\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のhpp(cppタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\ncmake .\n```\n```cpp\nint add(int a,int b){return a+b;}\n```",
+        ".hpp",
+    ) == "int add(int a,int b){return a+b;}\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のphp(phpタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\ncomposer install\n```\n```php\necho 1;\n```", ".php"
+    ) == "echo 1;\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のkt(kotlinタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\ngradle build\n```\n```kotlin\nfun main() {}\n```", ".kt"
+    ) == "fun main() {}\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のswift(swiftタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\nswift build\n```\n```swift\nprint(\"hi\")\n```", ".swift"
+    ) == "print(\"hi\")\n",
+)
+check(
+    "code_out: 先行するshブロックの後のps1(powershellタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```sh\necho setup\n```\n```powershell\nGet-Process\n```", ".ps1"
+    ) == "Get-Process\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のbat(batタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\necho setup\n```\n```bat\n@echo off\n```", ".bat"
+    ) == "@echo off\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のjl(juliaタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\njulia --version\n```\n```julia\nprintln(\"hi\")\n```", ".jl"
+    ) == "println(\"hi\")\n",
+)
+check(
+    "code_out: 先行するbashブロックの後のm(matlabタグ)ブロックを正しく抽出",
+    f._extract_code_for_output(
+        "```bash\necho setup\n```\n```matlab\ndisp('hi')\n```", ".m"
+    ) == "disp('hi')\n",
+)
+
+# 回帰: 新規マッピング拡張子でも単一ブロック/bareフェンス/フェンス無しATXフォール
+# バックは従来のtier-2/tier-3/フェンス無し挙動のまま変わらないことを確認する。
+check(
+    "code_out: phpの単一ブロック(回帰・従来通り)",
+    f._extract_code_for_output("```php\necho 1;\n```", ".php") == "echo 1;\n",
+)
+check(
+    "code_out: jsx向けでもbareフェンス(タグ無し)はtier-2で従来通り抽出",
+    f._extract_code_for_output("```\nconst a = 1;\n```", ".jsx") == "const a = 1;\n",
+)
+check(
+    "code_out: swift向けでもフェンス無しはATX見出し除去フォールバックに従来通り落ちる",
+    f._extract_code_for_output(
+        "# Title\nlet a = 1\n## Section\nlet b = 2", ".swift"
+    ) == "let a = 1\nlet b = 2",
+)
+
+# End-to-end: _save_as_code (--out <newly-mapped-suffix> の実書き込み経路) でも
+# tier-1 が発火し、先行するbashブロックではなく対象言語ブロックが書き出される
+# ことを一時ファイルへの実書き込みで確認する。Ollama/ネットワーク呼び出しは無い。
+import tempfile as _cfo_tempfile
+import pathlib as _cfo_pathlib
+with _cfo_tempfile.TemporaryDirectory() as _cfo_dir:
+    _cfo_root = _cfo_pathlib.Path(_cfo_dir)
+    _cfo_out = _cfo_root / "app.tsx"
+    f._save_as_code(
+        _cfo_out,
+        "```bash\nnpm install\n```\n```typescript\nexport const x: number = 1;\n```",
+    )
+    _cfo_content = _cfo_out.read_text(encoding="utf-8")
+    check(
+        "code_out/_save_as_code: .tsxへの実書き込みは先行bashではなく対象言語ブロックになる",
+        _cfo_content == "export const x: number = 1;\n\n"
+        and "npm install" not in _cfo_content,
+    )
+
 ok, out = f.run_python("print('hello_runner')")
 check("code: 実行成功", ok and "hello_runner" in out)
 ok, out = f.run_python("raise ValueError('boom')")
