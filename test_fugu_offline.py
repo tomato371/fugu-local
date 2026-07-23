@@ -4698,6 +4698,116 @@ check("_read_docx: getattr(c,'_tc',None)がNoneの場合は例外を送出せず
 check("_read_docx: テスト後にsys.modulesの'docx'エントリが元通り解決可能(_tcフォールバック検証後の復元確認)",
       ("docx" not in sys.modules) or (sys.modules["docx"] is not None))
 
+# ---------- _read_docx: 本文の読み取り順序を保持する(段落<->表の交互出現) (2026-07-24 / iter93) ----------
+# 従来の_read_docxはdoc.paragraphsを全件処理してからdoc.tablesを全件処理する2パス
+# 構成だった。導入文 -> データ表 -> 結論文、のように本文中に表が挟まる文書では、
+# 実際の読み順(導入文・表・結論文)ではなく「導入文・結論文」の後に「表」が
+# まとめて出力される形に入れ替わり、表とそれを説明する地の文が同じRAGチャンク/
+# --file文脈に絶対に同居できなくなる精度事故だった。iter82(非マージ表テスト)は
+# 表が段落の後ろに追加されるフィクスチャしか使っておらず、iter91(水平マージ
+# 重複排除)もこの順序入れ替わり自体には触れていなかった。ここではdoc.element.body
+# を直接歩くPython実装が実際に本文出現順で段落・表を交互抽出することと、
+# iter82/iter91の非交互フィクスチャ(表が段落群の後ろにあるだけ)が退行しないことの
+# 両方を検証する。
+with _tempfile.TemporaryDirectory() as _rdxo_dir:
+    _rdxo_root = _pathlib.Path(_rdxo_dir)
+    _rdxo_path = _rdxo_root / "order.docx"
+
+    if _HAS_DOCX_RD:
+        _rdxo_doc = _docx_probe_rd.Document()
+        _rdxo_doc.add_paragraph("Intro")
+        _rdxo_doc.add_paragraph("")     # 空白段落 -> 表の直前でもスキップされる
+        _rdxo_t1 = _rdxo_doc.add_table(rows=2, cols=2)
+        _rdxo_t1.cell(0, 0).text = "A1"
+        _rdxo_t1.cell(0, 1).text = "B1"
+        _rdxo_t1.cell(1, 0).text = "A2"
+        _rdxo_t1.cell(1, 1).text = "B2"
+        _rdxo_doc.add_paragraph("   ")  # 空白のみの段落 -> 表の直後でもスキップされる
+        _rdxo_t2 = _rdxo_doc.add_table(rows=1, cols=2)  # 本文中の2つ目の表
+        _rdxo_t2.cell(0, 0).text = "C1"
+        _rdxo_t2.cell(0, 1).text = "C2"
+        _rdxo_doc.add_paragraph("Conclusion")
+        _rdxo_doc.save(str(_rdxo_path))
+
+        _rdxo_out = f._read_docx(_rdxo_path)
+        _rdxo_expected = "\n".join([
+            "Intro",
+            "A1\tB1",
+            "A2\tB2",
+            "C1\tC2",
+            "Conclusion",
+        ])
+        check("_read_docx (iter93): Intro->表1(2行)->表2(1行)->Conclusionが本文出現順の"
+              "まま交互にbyte-for-byte一致で抽出される",
+              _rdxo_out == _rdxo_expected)
+        check("_read_docx (iter93): コアアサーション— 表(A1)は両方の段落の'間'に出現する"
+              "(前後にまとめられない、旧2パス実装では失敗するはずの検証)",
+              _rdxo_out.index("Intro") < _rdxo_out.index("A1\tB1") < _rdxo_out.index("Conclusion"))
+        check("_read_docx (iter93): 表の直前/直後の空白のみ段落は交互抽出中もスキップされる",
+              "" not in _rdxo_out.split("\n"))
+        _rdxo_old_two_pass_order = "\n".join([
+            "Intro", "Conclusion", "A1\tB1", "A2\tB2", "C1\tC2",
+        ])
+        check("_read_docx (iter93): 修正前の段落→表2パス構成が生成していたはずの順序"
+              "(退行ガード。旧実装ならこのcheckはFalseになる)",
+              _rdxo_out != _rdxo_old_two_pass_order)
+
+        # iter82/iter91のフィクスチャは表を段落群の後ろに追加するだけで本文順序が
+        # 交互にならないため、この順序修正では出力が変化しないはずの回帰確認。
+        # (実体は_rdx_out/_rdxm_out として上でbyte-for-byte一致を既に検証済みで、
+        # ここでは同じ2フィクスチャがiter93の変更後も再現することを明示的に確認する)
+        check("_read_docx (iter93回帰): iter82の非マージ表フィクスチャ(表が段落群の後ろ)"
+              "は順序修正後も従来通りbyte-for-byte一致のまま",
+              _rdx_out == "\n".join(["First paragraph.", "Second paragraph.", "H1\tH2", "R1C1\tR1C2"]))
+        check("_read_docx (iter93回帰): iter91の水平マージ表フィクスチャ(表のみ、段落無し)"
+              "は順序修正後も従来通りbyte-for-byte一致のまま(マージ行につき1回)",
+              _rdxm_out == "\n".join(["Header", "R1C1\tR1C2"]))
+    else:
+        print("   [SKIP] python-docx未インストールのため_read_docx本文順序テストをスキップ")
+
+# ---------- _read_docx: セル内にネストした表は再帰しない(トップレベルのみ) (2026-07-24 / iter93) ----------
+# doc.paragraphs/doc.tablesと同じく、本文直下(<w:body>の直接の子)のみを歩くため、
+# 表セル内にネストした段落・表は今回も意図的にスコープ外のまま(iter91が明示した
+# 方針の継続)。ネストした表を含むセルでも例外を送出せず、ネスト表の内容が
+# 二重出力されたり本文の他の位置に漏れ出したりしないことを確認する。
+with _tempfile.TemporaryDirectory() as _rdxn_dir:
+    _rdxn_root = _pathlib.Path(_rdxn_dir)
+    _rdxn_path = _rdxn_root / "nested.docx"
+
+    if _HAS_DOCX_RD:
+        _rdxn_doc = _docx_probe_rd.Document()
+        _rdxn_doc.add_paragraph("Before")
+        _rdxn_outer = _rdxn_doc.add_table(rows=1, cols=1)
+        _rdxn_cell = _rdxn_outer.cell(0, 0)
+        _rdxn_cell.text = "OuterCell"
+        _rdxn_inner = _rdxn_cell.add_table(rows=1, cols=1)  # セル内にネストした表
+        _rdxn_inner.cell(0, 0).text = "InnerCell"
+        _rdxn_doc.add_paragraph("After")
+        _rdxn_doc.save(str(_rdxn_path))
+
+        _rdxn_exc = None
+        try:
+            _rdxn_out = f._read_docx(_rdxn_path)
+        except Exception as _rdxn_e:
+            _rdxn_exc = _rdxn_e
+        check("_read_docx (iter93): セル内にネストした表があっても例外を送出しない",
+              _rdxn_exc is None)
+        if _rdxn_exc is None:
+            check("_read_docx (iter93): ネストした表の内容('InnerCell')はトップレベルスコープ外"
+                  "のため出力に現れない(doc.tables/doc.paragraphsと同じ既存スコープを維持)",
+                  "InnerCell" not in _rdxn_out)
+            check("_read_docx (iter93): ネスト表を含むセル自身('OuterCell')は二重出力されない",
+                  _rdxn_out.count("OuterCell") == 1)
+            _rdxn_lines = _rdxn_out.split("\n")
+            check("_read_docx (iter93): ネスト表を含む文書でも本文順(Before->表行->After)が保たれる",
+                  _rdxn_lines[0] == "Before" and _rdxn_lines[-1] == "After"
+                  and any("OuterCell" in _ln for _ln in _rdxn_lines[1:-1]))
+    else:
+        print("   [SKIP] python-docx未インストールのため_read_docxネスト表テストをスキップ")
+
+check("_read_docx: iter93テスト後にsys.modulesの'docx'エントリが元通り解決可能(復元確認)",
+      ("docx" not in sys.modules) or (sys.modules["docx"] is not None))
+
 # ---------- _read_pdf: ImportError以外の実行時例外でもpypdf/PyPDF2へフォールスルー (2026-07-23 / iter83) ----------
 # _read_pdf は pdfplumber -> pypdf -> PyPDF2 の順で試行するが、各ブロックは従来
 # except ImportError のみで、下位ライブラリへのフォールスルーは「上位ライブラリが

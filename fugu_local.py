@@ -716,30 +716,29 @@ def _read_docx(path: Path) -> str:
     """Word (.docx) からテキストを抽出。"""
     try:
         import docx
-        doc = docx.Document(str(path))
-        parts = []
-        for para in doc.paragraphs:
-            if para.text.strip():
-                parts.append(para.text)
-        for tbl in doc.tables:
+
+        def _table_rows_text(tbl):
+            # 2026-07-24 (iter91): python-docxのrow.cellsは表のグリッド座標の数だけ
+            # _Cellを返すが、水平方向(gridSpan)にマージされたセルは全ての被マージ
+            # 座標で同一の<w:tc>要素を共有する。そのためc.textはマージされた
+            # テキストを座標の数だけ重複して返し、例えば2列にまたがるヘッダーセルは
+            # 'Header\tHeader'のように重複抽出されてしまう(単純なタブ結合のみだった
+            # 従来コードにはこの重複排除が無かった)。ここでは行内で既出の<w:tc>を
+            # id(getattr(c, '_tc', None))で追跡し、同一セルの2回目以降の出現を
+            # スキップすることで、マージされたセルのテキストを行につき1回だけ
+            # 出力する。_tcが取得できない場合(将来のpython-docx実装変化等)は
+            # 安全側に倒し重複排除を行わず従来通りの挙動にフォールバックする。
+            # なお本修正は行内(水平/gridSpan)の重複排除のみに限定しており、
+            # 垂直マージ(行をまたぐvMerge)の重複排除やネストした表の再帰抽出は
+            # 意図的にスコープ外としている(将来のフォローアップ課題)。
+            # 同種の「python-docx/python-pptxの属性欠落・仕様により文字列を
+            # 取りこぼす/重複する」系統の修正としてiter87(_read_pptxの表/グループ
+            # 抽出)の直系であり、iter82では非マージの単純な表しかテストされて
+            # いなかった穴を埋めるもの。iter93(下記)でも本ロジックはbyte-for-byte
+            # 温存しており、順序修正後の本文経路/従来フォールバック経路の両方から
+            # 同一関数として呼ばれる。
+            rows_text = []
             for row in tbl.rows:
-                # 2026-07-24 (iter91): python-docxのrow.cellsは表のグリッド座標の数だけ
-                # _Cellを返すが、水平方向(gridSpan)にマージされたセルは全ての被マージ
-                # 座標で同一の<w:tc>要素を共有する。そのためc.textはマージされた
-                # テキストを座標の数だけ重複して返し、例えば2列にまたがるヘッダーセルは
-                # 'Header\tHeader'のように重複抽出されてしまう(単純なタブ結合のみだった
-                # 従来コードにはこの重複排除が無かった)。ここでは行内で既出の<w:tc>を
-                # id(getattr(c, '_tc', None))で追跡し、同一セルの2回目以降の出現を
-                # スキップすることで、マージされたセルのテキストを行につき1回だけ
-                # 出力する。_tcが取得できない場合(将来のpython-docx実装変化等)は
-                # 安全側に倒し重複排除を行わず従来通りの挙動にフォールバックする。
-                # なお本修正は行内(水平/gridSpan)の重複排除のみに限定しており、
-                # 垂直マージ(行をまたぐvMerge)の重複排除やネストした表の再帰抽出は
-                # 意図的にスコープ外としている(将来のフォローアップ課題)。
-                # 同種の「python-docx/python-pptxの属性欠落・仕様により文字列を
-                # 取りこぼす/重複する」系統の修正としてiter87(_read_pptxの表/グループ
-                # 抽出)の直系であり、iter82では非マージの単純な表しかテストされて
-                # いなかった穴を埋めるもの。
                 seen_tc_ids = set()
                 cells_text = []
                 for c in row.cells:
@@ -750,7 +749,59 @@ def _read_docx(path: Path) -> str:
                             continue
                         seen_tc_ids.add(tc_id)
                     cells_text.append(c.text)
-                parts.append("\t".join(cells_text))
+                rows_text.append("\t".join(cells_text))
+            return rows_text
+
+        doc = docx.Document(str(path))
+        parts = []
+
+        # 2026-07-24 (iter93): 従来はdoc.paragraphsを全件処理してからdoc.tablesを
+        # 全件処理する2パス構成だった。本文中の任意の位置(例:導入文 -> データ表 ->
+        # 結論文)に表が挟まる文書では、これが「導入文・結論文」に続けて「表」が
+        # 文末にまとめて出力される形になり、本文の論理的な読み順を破壊していた。
+        # 表とそれを説明する地の文が同じチャンクに絶対に同居できなくなるため、
+        # RAG検索(_load_rag_chunks)にも--file全文コンテキストにも直接の精度劣化
+        # (精度優先・時間は気にしない、の方針に反する)として効いてくる。
+        # python-docxのdoc.paragraphs/doc.tablesは本文中の出現順序を保持しないため
+        # (どちらも本文内の該当要素だけを別々に集めたビュー)、ここでは
+        # doc.element.body（本文の直下の子要素、<w:p>と<w:tbl>が出現順に並ぶ）を
+        # 直接歩き、python-docx公式に知られる CT_P/CT_Tbl の isinstance判定で
+        # 種別を振り分けて、出現順のまま段落・表を交互に出力する。これは
+        # iter87(_read_pptxの表/グループ抽出)・iter91(本関数の水平マージ重複排除)と
+        # 同系統の「ライブラリの属性/仕様の落とし穴で本文が欠落・変形する」問題の
+        # 修正であり、iter82が固定した「非マージの単純な表」テストや上記iter91の
+        # マージ表テストは、どちらも表を段落の後ろに追加するフィクスチャのため
+        # 本文順序が変わらず影響を受けない。doc.paragraphs/doc.tables同様、本関数は
+        # 表セル内にネストした段落・表までは再帰しない(トップレベルのみ、iter91が
+        # 明示的にスコープ外とした挙動を継続)。
+        try:
+            from docx.oxml.table import CT_Tbl
+            from docx.oxml.text.paragraph import CT_P
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+
+            for child in doc.element.body.iterchildren():
+                if isinstance(child, CT_P):
+                    para = Paragraph(child, doc)
+                    if para.text.strip():
+                        parts.append(para.text)
+                elif isinstance(child, CT_Tbl):
+                    tbl = Table(child, doc)
+                    parts.extend(_table_rows_text(tbl))
+        except Exception as exc:
+            # python-docxの内部実装(CT_P/CT_Tbl/doc.element.body等)が将来の版で
+            # 変わり本文順の走査自体が失敗しても、read_file_text/_load_rag_chunksが
+            # 期待するgraceful degradation契約(iter42/53)を守るため、クラッシュ
+            # させず段落->表の従来の2パス挙動へ安全側にフォールバックする。
+            print(f"[_read_docx] 本文順序抽出に失敗したため段落->表の従来順にフォールバック: "
+                  f"{path.name} ({type(exc).__name__})")
+            parts = []
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    parts.append(para.text)
+            for tbl in doc.tables:
+                parts.extend(_table_rows_text(tbl))
+
         return "\n".join(parts)
     except ImportError:
         pass
