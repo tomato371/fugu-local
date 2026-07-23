@@ -4320,6 +4320,165 @@ with _tempfile.TemporaryDirectory() as _rdx_dir:
 check("_read_docx: テスト後にsys.modulesの'docx'エントリが元通り解決可能(復元確認)",
       ("docx" not in sys.modules) or (sys.modules["docx"] is not None))
 
+# ---------- _read_pdf: ImportError以外の実行時例外でもpypdf/PyPDF2へフォールスルー (2026-07-23 / iter83) ----------
+# _read_pdf は pdfplumber -> pypdf -> PyPDF2 の順で試行するが、各ブロックは従来
+# except ImportError のみで、下位ライブラリへのフォールスルーは「上位ライブラリが
+# 未インストール」の場合にしか起きなかった。pdfplumber等が実際にはインストール
+# 済みでも、暗号化/破損/パーサ固有のエッジケースで実行時に例外を送出するPDFに
+# 対しては例外がそのまま _read_pdf の外へ伝播し、read_file_text(iter53)の
+# 呼び出し側ガードがそれを握りつぶして""を返してしまい、pypdf/PyPDF2 なら
+# 救えたはずのテキストがPDF丸ごとRAG/--fileコンテキストから失われていた
+# （精度優先の方針に反する）。全リーダー関数の書き換えを試みたiter51は行き詰まった
+# スタック案件だが、これは「呼び出し側でクラッシュさせない」話ではなく「下位
+# ライブラリへフォールスルーしてテキストを救済する」話であり別角度の問題
+# （iter41-44のgraceful degradation方針の延長）。
+# ここではpdfplumber/pypdf/PyPDF2という実ライブラリを一切必要とせず、sys.modules
+# にフェイクモジュールを注入することで(iter43/44/82と同じ手法)、インストール状態に
+# 関わらず決定的に検証する。変更したsys.modulesエントリ・キャプチャしたstdoutは
+# すべてtry/finallyで確実に復元する。
+import pathlib as _rpdf_pathlib
+import tempfile as _rpdf_tempfile
+
+
+def _rpdf_make_reader_module(mod_name, page_texts):
+    """pypdf/PyPDF2 と同一インタフェース(PdfReader(f).pages[i].extract_text())の
+    フェイクモジュールを作る(実PDFパースは一切行わない、常に成功する版)。"""
+    mod = types.ModuleType(mod_name)
+
+    class _FakePage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakePdfReader:
+        def __init__(self, fileobj):
+            self.pages = [_FakePage(t) for t in page_texts]
+
+    mod.PdfReader = _FakePdfReader
+    return mod
+
+
+def _rpdf_make_raising_reader_module(mod_name, exc):
+    """PdfReader構築時に指定した例外を送出するフェイクモジュール
+    (importには成功するが実行時に失敗するケースを模擬)。"""
+    mod = types.ModuleType(mod_name)
+
+    class _FakePdfReader:
+        def __init__(self, fileobj):
+            raise exc
+
+    mod.PdfReader = _FakePdfReader
+    return mod
+
+
+def _rpdf_swap_modules(entries, body):
+    """entries: {module_name: fake_module_or_None} をsys.modulesへ差し替えてbody()を
+    実行し、必ず元の状態(存在した/しなかった)へ復元する
+    (iter43/44/82のswap-restoreパターンを複数モジュール分まとめて適用)。
+    値がNoneのエントリはsys.modules[name]=Noneとなり、その名前のimport文に
+    ImportErrorを送出させる(iter43/44で確立済みの標準手法)。"""
+    originals = {}
+    for name, fake in entries.items():
+        originals[name] = sys.modules.get(name)
+        sys.modules[name] = fake
+    try:
+        return body()
+    finally:
+        for name, orig in originals.items():
+            if orig is not None:
+                sys.modules[name] = orig
+            else:
+                del sys.modules[name]
+
+
+def _rpdf_is_cp932_safe(s):
+    """gotcha#4: Windowsコンソール(cp932)でエンコード不能な文字(絵文字等)を
+    含んでいないかを確認する。"""
+    try:
+        s.encode("cp932")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+with _rpdf_tempfile.TemporaryDirectory() as _rpdf_dir:
+    _rpdf_path = _rpdf_pathlib.Path(_rpdf_dir) / "doc.pdf"
+    # pypdf/PyPDF2ブロックは open(path, "rb") で実際にファイルを開くため
+    # (中身はフェイクPdfReaderが解釈するので問われない)、ファイル自体は実在させる。
+    _rpdf_path.write_bytes(b"%PDF-1.4 dummy content, not a real PDF")
+
+    # (1) pdfplumberはimport可能だが.open()が実行時にRuntimeErrorを送出、
+    #     pypdfはimport可能かつ正常にテキストを返す
+    #     -> フォールスルーが働き、pypdfのテキストが失われずに返ってくること。
+    def _rpdf_pdfplumber_open_raises(path):
+        raise RuntimeError("simulated pdfplumber runtime failure (corrupt/encrypted PDF)")
+
+    _fake_pdfplumber_raising = types.ModuleType("pdfplumber")
+    _fake_pdfplumber_raising.open = _rpdf_pdfplumber_open_raises
+    _fake_pypdf_ok = _rpdf_make_reader_module("pypdf", ["pypdf extracted text page1"])
+
+    _rpdf_cap1 = io.StringIO()
+    with contextlib.redirect_stdout(_rpdf_cap1):
+        _rpdf_result1 = _rpdf_swap_modules(
+            {"pdfplumber": _fake_pdfplumber_raising, "pypdf": _fake_pypdf_ok},
+            lambda: f._read_pdf(_rpdf_path),
+        )
+    check("_read_pdf: pdfplumberが実行時RuntimeErrorを送出してもpypdfへフォールスルーしテキストを失わない",
+          _rpdf_result1 == "pypdf extracted text page1")
+    check("_read_pdf: pdfplumber実行時失敗の警告にファイル名(path.name)が出力される",
+          _rpdf_path.name in _rpdf_cap1.getvalue())
+    check("_read_pdf: pdfplumber実行時失敗の警告に例外型名(RuntimeError)が出力される",
+          "RuntimeError" in _rpdf_cap1.getvalue())
+    check("_read_pdf: 実行時失敗の警告メッセージはcp932でエンコード可能(絵文字等の非cp932文字を含まない、gotcha#4)",
+          _rpdf_is_cp932_safe(_rpdf_cap1.getvalue()))
+
+    # (2) 回帰: pdfplumberが未インストール(ImportError)でも、pypdfが正常にテキストを
+    #     返せば従来通りpypdfの結果が返ること(フォールスルー自体は既存挙動)。
+    _fake_pypdf_ok2 = _rpdf_make_reader_module("pypdf", ["pypdf text (pdfplumber absent)"])
+    _rpdf_result2 = _rpdf_swap_modules(
+        {"pdfplumber": None, "pypdf": _fake_pypdf_ok2},
+        lambda: f._read_pdf(_rpdf_path),
+    )
+    check("_read_pdf(回帰): pdfplumber未インストール(ImportError)でもpypdfへフォールスルーする(既存挙動維持)",
+          _rpdf_result2 == "pypdf text (pdfplumber absent)")
+
+    # (3) 3層すべて失敗(ImportErrorと実行時例外が混在) -> 既存の
+    #     '[PDF: {name} ... pip install pdfplumber]' 通知文字列をそのまま返すこと、
+    #     かつ _is_lib_missing_notice がTrueと判定すること(RAGスキップ対象のまま)。
+    def _rpdf_pdfplumber_open_raises3(path):
+        raise RuntimeError("simulated pdfplumber failure (all-tiers-fail case)")
+
+    _fake_pdfplumber_raising3 = types.ModuleType("pdfplumber")
+    _fake_pdfplumber_raising3.open = _rpdf_pdfplumber_open_raises3
+    _fake_pypdf2_raising = _rpdf_make_raising_reader_module(
+        "PyPDF2", ValueError("simulated PyPDF2 failure (all-tiers-fail case)"))
+
+    _rpdf_cap3 = io.StringIO()
+    with contextlib.redirect_stdout(_rpdf_cap3):
+        _rpdf_result3 = _rpdf_swap_modules(
+            {"pdfplumber": _fake_pdfplumber_raising3, "pypdf": None, "PyPDF2": _fake_pypdf2_raising},
+            lambda: f._read_pdf(_rpdf_path),
+        )
+    _rpdf_expected_notice = (
+        f"[PDF: {_rpdf_path.name} — テキスト抽出には pdfplumber or pypdf が必要: pip install pdfplumber]"
+    )
+    check("_read_pdf: 3層すべて失敗(ImportError+実行時例外混在)なら既存の通知文字列をbyte-for-byteで返す",
+          _rpdf_result3 == _rpdf_expected_notice)
+    check("_is_lib_missing_notice: 3層すべて失敗時の通知文字列はTrueと判定される(RAGスキップ対象のまま)",
+          f._is_lib_missing_notice(_rpdf_result3))
+    check("_read_pdf: 3層すべて失敗時、pdfplumber(RuntimeError)とPyPDF2(ValueError)双方の"
+          "実行時失敗警告が出力される",
+          "RuntimeError" in _rpdf_cap3.getvalue() and "ValueError" in _rpdf_cap3.getvalue())
+
+check("_read_pdf: テスト後にsys.modulesの'pdfplumber'エントリが元通り解決可能(復元確認)",
+      ("pdfplumber" not in sys.modules) or (sys.modules["pdfplumber"] is not None))
+check("_read_pdf: テスト後にsys.modulesの'pypdf'エントリが元通り解決可能(復元確認)",
+      ("pypdf" not in sys.modules) or (sys.modules["pypdf"] is not None))
+check("_read_pdf: テスト後にsys.modulesの'PyPDF2'エントリが元通り解決可能(復元確認)",
+      ("PyPDF2" not in sys.modules) or (sys.modules["PyPDF2"] is not None))
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 check("_tokenize: ASCII+CJK混在を別トークンに分割",
       f._tokenize("PINNについて") == {"pinn", "について"})

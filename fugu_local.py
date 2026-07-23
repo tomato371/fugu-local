@@ -639,7 +639,21 @@ def research_search(question: str) -> str:
 # ==================================================
 
 def _read_pdf(path: Path) -> str:
-    """PDF からテキストを抽出。pdfplumber → pypdf → PyPDF2 の順で試行。"""
+    """PDF からテキストを抽出。pdfplumber → pypdf → PyPDF2 の順で試行。
+    2026-07-23: 各ブロックは従来 except ImportError のみで、下位ライブラリへの
+    フォールスルーは「上位ライブラリが未インストール」の場合にしか起きなかった。
+    pdfplumber 等が実際にはインストール済みでも、暗号化/破損/パーサ固有のエッジケースで
+    実行時に例外を送出するPDFに対しては例外がそのまま _read_pdf の外へ伝播し、
+    read_file_text（iter53）の呼び出し側ガードがそれを握りつぶして ""
+    を返してしまい、pypdf/PyPDF2 なら救えたはずのテキストがPDF丸ごとRAG/--file
+    コンテキストから失われていた（精度優先の方針に反する）。全リーダー関数の
+    書き換えを試みた iter51 は行き詰まったスタック案件だが、これは「呼び出し側で
+    クラッシュさせない」話ではなく「下位ライブラリへフォールスルーしてテキストを
+    救済する」話であり別角度の問題。iter41-44 の graceful degradation の方針に合わせ、
+    ImportError に加えて except Exception（bare except にはしない。
+    KeyboardInterrupt/SystemExit は握りつぶさず伝播させる）でも次候補へ
+    フォールスルーさせ、ライブラリが import 自体には成功したのに失敗した場合は
+    cp932セーフな警告（ファイル名+例外型のみ、絵文字等は使わない）で可視化する。"""
     # pdfplumber (最高品質)
     try:
         import pdfplumber
@@ -648,6 +662,8 @@ def _read_pdf(path: Path) -> str:
         return "\n\n".join(pages)
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_pdf] pdfplumber抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
     # pypdf (軽量・新しい)
     try:
         import pypdf
@@ -656,6 +672,8 @@ def _read_pdf(path: Path) -> str:
             return "\n\n".join(p.extract_text() or "" for p in r.pages)
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_pdf] pypdf抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
     # PyPDF2 (旧名称)
     try:
         import PyPDF2
@@ -664,6 +682,8 @@ def _read_pdf(path: Path) -> str:
             return "\n\n".join(p.extract_text() or "" for p in r.pages)
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_pdf] PyPDF2抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
     return f"[PDF: {path.name} — テキスト抽出には pdfplumber or pypdf が必要: pip install pdfplumber]"
 
 
