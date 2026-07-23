@@ -3652,53 +3652,80 @@ def build_pptx(question, answer, out_path=None):
             if path:
                 imgs[idx] = str(path)
 
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)   # 16:9
-    prs.slide_height = Inches(7.5)
-    blank = prs.slide_layouts[6]
+    # 2026-07-23: デッキ構築〜保存の間、LLM 回答由来の制御文字
+    # (NUL 0x00, ESC 0x1B 等) が add_textbox 経由で run.text に渡ると
+    # python-pptx/lxml が ValueError ('All strings must be XML compatible:
+    # no NULL bytes or control characters') を送出する。従来は
+    # except ImportError しか捕捉しておらず、この ValueError がそのまま
+    # _save_answer_to_file、さらには ask_fugu の make_pptx 経路まで伝播し、
+    # 計算済み（math/mcq では SC投票済みの）回答ごと失われていた。
+    # iteration 41 (_save_as_excel の IllegalCharacterError)・43
+    # (_save_as_docx の ValueError)・44 (_save_as_pdf の
+    # FPDFUnicodeEncodingException) と同じバグクラスの修正として、
+    # add_textbox の choke point（タイトルスライド・コンテンツスライドの
+    # 見出し・箇条書き全てがここを通る）で XML 不正制御文字のみを除去し
+    # （実データは維持）、かつデッキ構築〜保存全体を broad except で囲んで
+    # 失敗時は既存の .md フォールバックへ安全に降格させる。画像生成
+    # (plan_pptx_images/generate_image/add_image) は既に自前で失敗を
+    # 許容しており（backend 不在時は None を返す／embed エラーは
+    # add_image が catch する）、このガードはデッキ構築・保存のみを対象と
+    # し、画像生成の挙動（backend 不在時も画像無しでデッキが構築される）
+    # は変更しない。
+    _illegal_xml_re = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+    try:
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)   # 16:9
+        prs.slide_height = Inches(7.5)
+        blank = prs.slide_layouts[6]
 
-    def add_textbox(slide, text, left, top, width, height, size, bold=False):
-        tb = slide.shapes.add_textbox(left, top, width, height)
-        tf = tb.text_frame
-        tf.word_wrap = True
-        first = True
-        for line in (text if isinstance(text, list) else [text]):
-            p = tf.paragraphs[0] if first else tf.add_paragraph()
-            first = False
-            run = p.add_run()
-            run.text = ("• " + line) if isinstance(text, list) else line
-            run.font.size = Pt(size)
-            run.font.bold = bold
-        return tb
+        def add_textbox(slide, text, left, top, width, height, size, bold=False):
+            tb = slide.shapes.add_textbox(left, top, width, height)
+            tf = tb.text_frame
+            tf.word_wrap = True
+            first = True
+            for line in (text if isinstance(text, list) else [text]):
+                p = tf.paragraphs[0] if first else tf.add_paragraph()
+                first = False
+                run = p.add_run()
+                raw = ("• " + line) if isinstance(text, list) else line
+                run.text = _illegal_xml_re.sub("", raw)
+                run.font.size = Pt(size)
+                run.font.bold = bold
+            return tb
 
-    def add_image(slide, path, left, top, width):
-        try:
-            slide.shapes.add_picture(path, left, top, width=width)
-        except Exception as e:
-            print(f"   [PPTX画像埋込エラー: {e}]")
+        def add_image(slide, path, left, top, width):
+            try:
+                slide.shapes.add_picture(path, left, top, width=width)
+            except Exception as e:
+                print(f"   [PPTX画像埋込エラー: {e}]")
 
-    # タイトルスライド
-    s0 = prs.slides.add_slide(blank)
-    if 0 in imgs:
-        add_image(s0, imgs[0], Inches(4.17), Inches(2.5), Inches(5.0))
-        add_textbox(s0, title, Inches(0.7), Inches(0.6), Inches(12.0), Inches(1.3), 40, True)
-        add_textbox(s0, "Fugu MoA 生成", Inches(0.7), Inches(1.9), Inches(12.0), Inches(0.6), 18)
-    else:
-        add_textbox(s0, title, Inches(0.9), Inches(2.6), Inches(11.5), Inches(1.6), 44, True)
-        add_textbox(s0, "Fugu MoA 生成", Inches(0.9), Inches(4.2), Inches(11.5), Inches(0.7), 20)
+        # タイトルスライド
+        s0 = prs.slides.add_slide(blank)
+        if 0 in imgs:
+            add_image(s0, imgs[0], Inches(4.17), Inches(2.5), Inches(5.0))
+            add_textbox(s0, title, Inches(0.7), Inches(0.6), Inches(12.0), Inches(1.3), 40, True)
+            add_textbox(s0, "Fugu MoA 生成", Inches(0.7), Inches(1.9), Inches(12.0), Inches(0.6), 18)
+        else:
+            add_textbox(s0, title, Inches(0.9), Inches(2.6), Inches(11.5), Inches(1.6), 44, True)
+            add_textbox(s0, "Fugu MoA 生成", Inches(0.9), Inches(4.2), Inches(11.5), Inches(0.7), 20)
 
-    # コンテンツスライド
-    for i, s in enumerate(slides, start=1):
-        sl = prs.slides.add_slide(blank)
-        add_textbox(sl, s["title"], Inches(0.6), Inches(0.4), Inches(12.1), Inches(1.0), 30, True)
-        has_img = i in imgs
-        body_w = Inches(7.0) if has_img else Inches(12.1)
-        add_textbox(sl, s["bullets"], Inches(0.6), Inches(1.6), body_w, Inches(5.4), 18)
-        if has_img:
-            add_image(sl, imgs[i], Inches(7.9), Inches(1.7), Inches(4.9))
+        # コンテンツスライド
+        for i, s in enumerate(slides, start=1):
+            sl = prs.slides.add_slide(blank)
+            add_textbox(sl, s["title"], Inches(0.6), Inches(0.4), Inches(12.1), Inches(1.0), 30, True)
+            has_img = i in imgs
+            body_w = Inches(7.0) if has_img else Inches(12.1)
+            add_textbox(sl, s["bullets"], Inches(0.6), Inches(1.6), body_w, Inches(5.4), 18)
+            if has_img:
+                add_image(sl, imgs[i], Inches(7.9), Inches(1.7), Inches(4.9))
 
-    prs.save(str(out_path))
-    return out_path
+        prs.save(str(out_path))
+        return out_path
+    except Exception as e:
+        md = out_path.with_suffix(".md")
+        _save_as_markdown(md, question, answer, 0.0, "")
+        print(f"   [PPTX保存に失敗しました ({e!r})。代わりに保存: {md}]")
+        return md
 
 
 def _save_answer_to_file(question: str, answer: str, elapsed: float,

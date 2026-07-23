@@ -4384,6 +4384,170 @@ with _tempfile.TemporaryDirectory() as _pdf_dir:
         else:
             del sys.modules["fpdf"]
 
+# ---------- build_pptx: XML不正制御文字によるValueError耐性 + 保存失敗の.md降格 (2026-07-23) ----------
+# add_textbox が run.text に渡す文字列（タイトルスライド見出し・コンテンツスライド
+# 見出し・箇条書き）に LLM 回答由来の制御文字 (NUL 0x00, ESC 0x1B 等) が混入すると、
+# python-pptx/lxml が ValueError ('All strings must be XML compatible: no NULL bytes
+# or control characters') を送出する。従来コードは except ImportError しか捕捉して
+# おらず、_save_answer_to_file・さらには ask_fugu の make_pptx 経路まで例外が
+# そのまま伝播し、計算済み（math/mcqではSC投票済みの）回答ごと失われていた
+# （iteration 41 の _save_as_excel の IllegalCharacterError 修正・iteration 43 の
+# _save_as_docx の制御文字 ValueError 修正・iteration 44 の _save_as_pdf の
+# FPDFUnicodeEncodingException 修正と同じバグクラス）。ここでは python-pptx の
+# 有無を検出し、(1) 制御文字混入でもサニタイズして.pptx生成できること・実データは
+# 保持されること、(2) 制御文字なしの通常回答は従来通りの構造で生成されること
+# （既存挙動不変）、(3) デッキ構築/保存自体が失敗しても.mdへ安全に降格すること、
+# (4) python-pptx未インストール時の既存.mdフォールバックが変わらないことを検証する。
+# 画像バックエンドは f.IMAGE_BACKEND="off" に固定し（試行後に必ず復元）、
+# _detect_backend() がネットワーク探索なしで None を返すようにして画像生成経路を
+# 完全に迂回する。本物のOllama/ネットワーク/画像バックエンド呼び出しは一切行わない。
+import pathlib as _pathlib_pptx
+
+try:
+    import pptx as _pptx_probe
+    _HAS_PPTX = True
+except ImportError:
+    _HAS_PPTX = False
+
+with _tempfile.TemporaryDirectory() as _pptx_dir:
+    _pptx_root = _pathlib_pptx.Path(_pptx_dir)
+    _orig_image_backend_pptx = f.IMAGE_BACKEND
+
+    if _HAS_PPTX:
+        f.IMAGE_BACKEND = "off"
+        try:
+            # (1) 制御文字混入(ESC/NUL、見出し行・箇条書き行それぞれの単語の途中)でも
+            # 例外を送出せず.pptxが生成され、除去後の実データが読み取れること。
+            _illegal_question_pptx = "PPTX 制御文字テスト"
+            _illegal_answer_pptx = (
+                "## Sec\x1btion One\n"
+                "\n"
+                "- Bul\x00let Al\x1bpha\n"
+                "- Bullet Beta\n"
+            )
+            _out_illegal_pptx = _pptx_root / "illegal.pptx"
+            _exc_pptx = None
+            try:
+                _ret_illegal_pptx = f.build_pptx(_illegal_question_pptx, _illegal_answer_pptx,
+                                                  out_path=_out_illegal_pptx)
+            except Exception as _e:
+                _exc_pptx = _e
+                _ret_illegal_pptx = None
+            check("build_pptx: XML不正制御文字混入でも例外を送出しない(ValueError回帰)",
+                  _exc_pptx is None)
+            check("build_pptx: 制御文字混入時も.pptxファイルが生成される(戻り値がPath)",
+                  isinstance(_ret_illegal_pptx, _pathlib_pptx.Path) and
+                  _ret_illegal_pptx.suffix == ".pptx" and _ret_illegal_pptx.exists())
+
+            if _exc_pptx is None and _ret_illegal_pptx is not None and _ret_illegal_pptx.exists():
+                _prs_illegal = _pptx_probe.Presentation(str(_ret_illegal_pptx))
+                _runs_illegal = [run.text
+                                 for slide in _prs_illegal.slides
+                                 for shape in slide.shapes if shape.has_text_frame
+                                 for para in shape.text_frame.paragraphs
+                                 for run in para.runs]
+                _all_text_illegal_pptx = "\n".join(_runs_illegal)
+                check("build_pptx: 制御文字(ESC/NUL)は本文から除去される",
+                      "\x1b" not in _all_text_illegal_pptx and "\x00" not in _all_text_illegal_pptx)
+                check("build_pptx: 制御文字除去後も見出しの実データは保持される(単語がくっつく)",
+                      "Section One" in _runs_illegal)
+                check("build_pptx: 制御文字除去後も箇条書きの実データは保持される",
+                      "• Bullet Alpha" in _runs_illegal and "• Bullet Beta" in _runs_illegal)
+
+            # (2) 制御文字を含まない通常の複数セクション回答は、従来通りタイトル
+            # スライド+各見出しごとのコンテンツスライド+箇条書きが生成される
+            # (既存挙動不変の回帰確認)。
+            _clean_question_pptx = "Clean Question"
+            _clean_answer_pptx = "## Intro\n- Point A\n- Point B\n\n## Details\n- Point C\n- Point D\n"
+            _out_clean_pptx = _pptx_root / "clean.pptx"
+            _ret_clean_pptx = f.build_pptx(_clean_question_pptx, _clean_answer_pptx,
+                                            out_path=_out_clean_pptx)
+            check("build_pptx: 制御文字なしの通常回答は成功時に.pptxのPathを返す(既存挙動不変)",
+                  _ret_clean_pptx == _out_clean_pptx and _out_clean_pptx.exists())
+            _prs_clean = _pptx_probe.Presentation(str(_ret_clean_pptx))
+            _slides_clean = list(_prs_clean.slides)
+            check("build_pptx: タイトルスライド+見出し2枚=計3枚のスライドが生成される(既存挙動不変)",
+                  len(_slides_clean) == 3)
+
+            def _slide_texts(_slide):
+                return [run.text
+                        for shape in _slide.shapes if shape.has_text_frame
+                        for para in shape.text_frame.paragraphs
+                        for run in para.runs]
+
+            check("build_pptx: タイトルスライドに質問文がそのまま使われる(既存挙動不変)",
+                  len(_slides_clean) > 0 and _clean_question_pptx in _slide_texts(_slides_clean[0]))
+            check("build_pptx: 1枚目のコンテンツスライド見出しがIntroになる(既存挙動不変)",
+                  len(_slides_clean) > 1 and "Intro" in _slide_texts(_slides_clean[1]))
+            check("build_pptx: 1枚目のコンテンツスライドに箇条書きが両方含まれる(既存挙動不変)",
+                  len(_slides_clean) > 1 and
+                  "• Point A" in _slide_texts(_slides_clean[1]) and
+                  "• Point B" in _slide_texts(_slides_clean[1]))
+            check("build_pptx: 2枚目のコンテンツスライド見出しがDetailsになる(既存挙動不変)",
+                  len(_slides_clean) > 2 and "Details" in _slide_texts(_slides_clean[2]))
+
+            # (3) デッキ構築/保存自体が失敗するケースを pptx.presentation.Presentation.save
+            # をモンキーパッチして模擬し、例外が外へ漏れずに既存の.mdフォールバックへ
+            # 安全に降格することを確認する。
+            import pptx.presentation as _pptx_presentation_mod
+            _orig_pptx_save = _pptx_presentation_mod.Presentation.save
+
+            def _boom_pptx_save(self, *_a, **_kw):
+                raise RuntimeError("simulated pptx save failure")
+
+            _pptx_presentation_mod.Presentation.save = _boom_pptx_save
+            try:
+                _out_fail_pptx = _pptx_root / "fail.pptx"
+                _exc_fail_pptx = None
+                try:
+                    _ret_fail_pptx = f.build_pptx("Q?", "A.", out_path=_out_fail_pptx)
+                except Exception as _e:
+                    _exc_fail_pptx = _e
+                    _ret_fail_pptx = None
+                check("build_pptx: 保存失敗時も例外は外へ伝播しない", _exc_fail_pptx is None)
+                check("build_pptx: 保存失敗時は.mdへフォールバックする",
+                      _ret_fail_pptx == _out_fail_pptx.with_suffix(".md"))
+                check("build_pptx: 保存失敗フォールバック時の.mdファイルが実際に書かれる",
+                      _ret_fail_pptx is not None and _ret_fail_pptx.exists())
+            finally:
+                _pptx_presentation_mod.Presentation.save = _orig_pptx_save
+
+            # (4) python-pptx が未インストールの場合の分岐: sys.modules['pptx'] を None に
+            # することで `from pptx import Presentation` に ImportError を送出させる
+            # （実インストール状態を変更せずに未インストール環境を模擬する標準的な手法。
+            # iteration 43/44 と同じ手法）。
+            _orig_pptx_mod = sys.modules.get("pptx")
+            sys.modules["pptx"] = None
+            try:
+                _out_missing_pptx = _pptx_root / "missing.pptx"
+                _ret_missing_pptx = f.build_pptx("Q?", "A.", out_path=_out_missing_pptx)
+                check("build_pptx: python-pptx未インストール時は.mdへフォールバックする(既存挙動不変)",
+                      _ret_missing_pptx == _out_missing_pptx.with_suffix(".md"))
+                check("build_pptx: フォールバック時の.mdファイルが実際に書かれる",
+                      _ret_missing_pptx is not None and _ret_missing_pptx.exists())
+            finally:
+                if _orig_pptx_mod is not None:
+                    sys.modules["pptx"] = _orig_pptx_mod
+                else:
+                    del sys.modules["pptx"]
+        finally:
+            f.IMAGE_BACKEND = _orig_image_backend_pptx
+    else:
+        # python-pptx が本当に存在しない環境: 既存の.mdフォールバック(拡張子/戻り値)が
+        # 従来通り機能すること(iteration 41/43/44 の else分岐スタイルを踏襲)。
+        try:
+            _out_missing_pptx_real = _pptx_root / "missing_real.pptx"
+            _result_missing_pptx_real = f.build_pptx("Q?", "A.", out_path=_out_missing_pptx_real)
+            check("build_pptx: python-pptx未インストール環境では.mdへフォールバックする",
+                  _result_missing_pptx_real == _out_missing_pptx_real.with_suffix(".md"))
+            check("build_pptx: フォールバック時の.mdファイルが実際に書かれる(未インストール環境)",
+                  _result_missing_pptx_real is not None and _result_missing_pptx_real.exists())
+        finally:
+            f.IMAGE_BACKEND = _orig_image_backend_pptx
+
+check("build_pptx: IMAGE_BACKEND はテスト後に既定値へ復元されている",
+      f.IMAGE_BACKEND == _orig_image_backend_pptx)
+
 # ---------- _trim_history: 直近ペアを消さない (2026-07-23回帰) ----------
 # 背景: ask_fugu は直近の [user, assistant] ペアを _HISTORY に追記した「直後」に
 # _trim_history を呼ぶ。旧ガード `len(history) >= 2` だと、履歴が直近ペア1組
