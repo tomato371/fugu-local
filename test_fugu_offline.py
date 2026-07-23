@@ -2223,6 +2223,97 @@ finally:
     f._SECOND_OPINION_DISABLED = _orig_disabled_flag
     f.ask = _orig_ask
 
+# ---------- verify_single: second_opinion 有効時（自己評価バイアス対策 seam, 2026-07-23）----------
+# 上の 2 ブロック（second_opinion のバイアス対策 / verify_single の think=True 最終審判）は
+# どちらも PROPOSERS=["qwen3:4b"] のみで SECOND_OPINION_MODEL(既定 gpt-oss:20b、ここでは
+# phi4-mini) を含めていない。そのため second_opinion() は毎回 (True, "") を即返して
+# _SECOND_OPINION_DISABLED=True に自己ラッチするだけで、ask を一度も呼ばない
+# 「独立チェック無効」分岐しか通っていなかった。verify_single の目玉である
+# 「2系統独立チェック（qwen3 think=False の自己批評 と 別モデル phi4-mini の独立チェック）を
+# 両方揃えたときの高速一致即採用」と「片方だけが疑義を出したら think=True 最終審判に
+# 格上げする自己評価バイアス対策そのもの」は一度も検証されていなかった。
+# ここでは PROPOSERS に SECOND_OPINION_MODEL を含めて「有効」経路を通し、label
+# ("critic"/"critic2") と think の組み合わせで 3 種類の呼び出し
+# （fast self-critic=critic/think=False, 独立second opinion=critic2, think=True最終審判=
+# critic/think=True）を区別してモックする。fast self-critic と second_opinion はどちらも
+# think を渡さない（falsy）ため、think だけでは区別できず label 分岐が必須になる点に注意。
+_orig_proposers = f.PROPOSERS
+_orig_second_opinion_model = f.SECOND_OPINION_MODEL
+_orig_disabled_flag = f._SECOND_OPINION_DISABLED
+_orig_ask = f.ask
+
+
+def _make_vs_ask(calls, ok1, issue1, ok2, issue2, ok3=False, issue3=""):
+    """label と think(bool化) で 3種の呼び出しを切り分けて記録するモック。
+    calls には (label, think) の実呼び出しログを積む（呼ばれた事実自体をテストで検証する）。"""
+    def _ask(model, messages, temperature, think=None, fmt=None, label=None,
+             num_predict=None, num_ctx=None):
+        calls.append((label, bool(think)))
+        if label == "critic" and think:
+            return json.dumps({"ok": ok3, "issue": issue3})
+        if label == "critic2":
+            return json.dumps({"ok": ok2, "issue": issue2})
+        return json.dumps({"ok": ok1, "issue": issue1})
+    return _ask
+
+
+try:
+    f.PROPOSERS = ["phi4-mini", "qwen3:4b"]  # SECOND_OPINION_MODEL を含める→有効経路
+    f.SECOND_OPINION_MODEL = "phi4-mini"
+
+    # (A) ok1=True かつ ok2=True: 高速2系統が一致→即採用。think=True 最終審判は
+    #     呼ばれないはず（高速パスの短絡が壊れていないことをロックする）。
+    f._SECOND_OPINION_DISABLED = False
+    _calls = []
+    f.ask = _make_vs_ask(_calls, ok1=True, issue1="", ok2=True, issue2="")
+    ok, issue = f.verify_single("2+2?", "4")
+    check("vs(有効) A: ok1=True/ok2=True→即採用", ok is True and issue == "")
+    check("vs(有効) A: second_opinionが実際に呼ばれた(critic2が無効化せず発火)",
+          any(lbl == "critic2" for lbl, _th in _calls))
+    check("vs(有効) A: 高速一致時はthink=True最終審判を呼ばない(短絡ロック)",
+          not any(lbl == "critic" and th for lbl, th in _calls))
+
+    # (B) ok1=True(fast self-critic は合格) だが ok2=False(独立モデルが疑義)。
+    #     自己評価バイアス対策の本丸：片方だけの疑義でも think=True 最終審判へ格上げされる。
+    #   (B1) 最終審判が ok→採用(True)。
+    f._SECOND_OPINION_DISABLED = False
+    _calls = []
+    f.ask = _make_vs_ask(_calls, ok1=True, issue1="", ok2=False, issue2="second opinion doubt",
+                          ok3=True, issue3="")
+    ok, issue = f.verify_single("2+2?", "4")
+    check("vs(有効) B1: ok1=True/ok2=False→think=True最終審判が呼ばれる",
+          any(lbl == "critic" and th for lbl, th in _calls))
+    check("vs(有効) B1: 最終審判okなら採用(True)", ok is True and issue == "")
+
+    #   (B2) 最終審判もNG→不採用(False)。理由は最終審判(issue3)が権威として使われる。
+    f._SECOND_OPINION_DISABLED = False
+    _calls = []
+    f.ask = _make_vs_ask(_calls, ok1=True, issue1="", ok2=False, issue2="second opinion doubt",
+                          ok3=False, issue3="final check: real issue found")
+    ok, issue = f.verify_single("2+2?", "4")
+    check("vs(有効) B2: 最終審判もNGなら不採用(False)でissue非空",
+          ok is False and bool(issue))
+    check("vs(有効) B2: 不採用理由はthink=True最終審判が権威(issue3を採用)",
+          issue == "final check: real issue found")
+
+    # (C) ok1=False(fast self-critic が疑義) だが ok2=True(独立モデルは合格)。
+    #     こちらの片方だけの疑義でも think=True 最終審判へ格上げされることを確認する。
+    #     最終審判がNGでissue3が空文字のときは doubt(=issue1) にフォールバックする。
+    f._SECOND_OPINION_DISABLED = False
+    _calls = []
+    f.ask = _make_vs_ask(_calls, ok1=False, issue1="fast critic doubt", ok2=True, issue2="",
+                          ok3=False, issue3="")
+    ok, issue = f.verify_single("2+2?", "4")
+    check("vs(有効) C: ok1=False/ok2=True→think=True最終審判が呼ばれる(doubtはissue1側)",
+          any(lbl == "critic" and th for lbl, th in _calls))
+    check("vs(有効) C: 最終審判issue3が空ならdoubt(issue1)にフォールバック",
+          ok is False and issue == "fast critic doubt")
+finally:
+    f.PROPOSERS = _orig_proposers
+    f.SECOND_OPINION_MODEL = _orig_second_opinion_model
+    f._SECOND_OPINION_DISABLED = _orig_disabled_flag
+    f.ask = _orig_ask
+
 # ---------- bench_queue: 異常終了コード分類（gotcha 8 再発防止, 2026-07-21）----------
 # job 4 (math500/sc+pot) が rc=1073807364 で落ちた際、旧実装は成功/失敗/クラッシュを
 # 区別せず、以降のジョブが rc=3221226091 で連鎖即死してもキューは気づかず
