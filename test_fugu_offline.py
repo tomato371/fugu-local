@@ -5774,6 +5774,77 @@ try:
     _di6 = f._ddg_instant("例外クエリ", max_results=5)
     check("_ddg_instant: urlopen例外時は[]を返す(既存挙動)",
           _di6 == [])
+
+    # ---------- (7)-(11) RelatedTopicsのグループ化トピック1階層フラット化 (2026-07-24追加) ----------
+    # DuckDuckGo Instant Answer APIのRelatedTopicsは、トップレベルにTextを持つ
+    # 「直接トピック」と{"Name": "カテゴリ名", "Topics": [...]}形式の「グループ化
+    # トピック」が混在する一覧である。従来はisinstance(t, dict) and t.get("Text")
+    # のみを見ており、グループ化エントリ配下にネストされた事実が無条件で握り潰され
+    # ていた(イテレーション85がこの関数を整備した際に残った既知の欠落)。以下は
+    # その1階層フラット化(再帰はしない)を検証する。
+
+    # --- (7) 直接トピックとグループ化トピックが混在 -> 順序を保ったまま全て展開 ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [
+            {"Text": "t0"},
+            {"Name": "X", "Topics": [{"Text": "t1"}, {"Text": "t2"}]},
+        ],
+    })
+    _di7 = f._ddg_instant("混在RelatedTopicsクエリ", max_results=50)
+    check("_ddg_instant: 直接トピックとグループ化トピックの混在は順序を保ったまま展開される",
+          _di7 == ["t0", "t1", "t2"])
+
+    # --- (8) ネストされたTextも上限に切り詰められる(直接トピックと同じ切り詰め) ---
+    _long_nested_text = "C" * (f.WEB_SEARCH_SNIPPET_CHARS * 2)
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [
+            {"Name": "Y", "Topics": [{"Text": _long_nested_text}]},
+        ],
+    })
+    _di8 = f._ddg_instant("巨大ネストTextクエリ", max_results=10)
+    check("_ddg_instant: グループ化トピック内のネストTextも上限に正確に切り詰められる",
+          _di8 == ["C" * f.WEB_SEARCH_SNIPPET_CHARS])
+
+    # --- (9) max_resultsがフラット化後のネストトピックにも従来通り適用される ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [
+            {"Name": "Z", "Topics": [{"Text": f"nested{i}"} for i in range(20)]},
+        ],
+    })
+    _di9 = f._ddg_instant("多数ネストトピッククエリ", max_results=3)
+    check("_ddg_instant: max_resultsはフラット化後のネストトピックにも適用され、"
+          "内側ループのbreakと最終スライスの両方が効く",
+          _di9 == ["nested0", "nested1", "nested2"])
+
+    # --- (10) 壊れた形状は例外を出さず読み飛ばす ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [
+            {"Name": "A", "Topics": "not-a-list"},
+            {"Name": "B", "Topics": []},
+            {"Name": "C", "Topics": ["not-a-dict"]},
+            {"Name": "D", "Topics": [{"NoText": "x"}]},
+        ],
+    })
+    _di10 = f._ddg_instant("壊れた形状クエリ", max_results=10)
+    check("_ddg_instant: 壊れた形状(Topicsがリストでない/空/非dict要素/Text欠落)は"
+          "例外を出さずに読み飛ばされる",
+          _di10 == [])
+
+    # --- (11) トップレベルTextとTopicsを両方持つ場合はトップレベルTextのみ追加 ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [
+            {"Text": "only-top", "Topics": [{"Text": "should-not-appear"}]},
+        ],
+    })
+    _di11 = f._ddg_instant("Text優先クエリ", max_results=10)
+    check("_ddg_instant: トップレベルTextとTopicsが両方ある場合はTextのみ追加され"
+          "二重追加されない",
+          _di11 == ["only-top"])
 finally:
     urllib.request.urlopen = _orig_urlopen_di
 

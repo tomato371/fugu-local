@@ -499,7 +499,23 @@ def _ddg_instant(query: str, max_results: int) -> list:
                        f"Source: {data.get('AbstractURL', '')}")
     for t in data.get("RelatedTopics", []):
         if isinstance(t, dict) and t.get("Text"):
+            # トップレベルに Text がある「直接トピック」はこちらを優先し、
+            # 仮に Topics も併存していても展開しない（下の分岐と二重追加しない
+            # ための優先順位。直接トピックの既存挙動を保つ）。
             results.append(t["Text"][:WEB_SEARCH_SNIPPET_CHARS])
+        elif isinstance(t, dict) and isinstance(t.get("Topics"), list):
+            # 2026-07-24: RelatedTopics には、トップレベル Text を持つ直接トピックと
+            # {"Name": "カテゴリ名", "Topics": [...]} 形式の「グループ化トピック」が
+            # 混在する。従来は isinstance(t, dict) and t.get("Text") しか見ておらず、
+            # グループ化エントリ配下にネストされた事実（Topics 配列の各要素）が無条件
+            # で握り潰されていた（イテレーション85がこの関数を整備した際に残った
+            # 既知の欠落）。DDG のネストは1階層のみなので、ここでも1階層だけを
+            # フラット化する（再帰はしない。壊れた形状は例外を出さず読み飛ばす）。
+            for nested in t["Topics"]:
+                if isinstance(nested, dict) and nested.get("Text"):
+                    results.append(nested["Text"][:WEB_SEARCH_SNIPPET_CHARS])
+                if len(results) >= max_results:
+                    break
         if len(results) >= max_results:
             break
     return results[:max_results]
