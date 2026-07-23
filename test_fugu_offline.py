@@ -257,6 +257,168 @@ check("route: 通常質問は据え置き",
       _r["make_pptx"] is False and _r["use_image_generation"] is False)
 f.PROPOSERS = _op_persona
 
+# ---------- conduct(): プランオーケストレーション ----------
+# conduct() は f.ask のみをモックし、extract_json/validate_plan/_apply_*_guardrails/
+# build_proposer_desc は実物をそのまま通す（本物の合成ロジックを検証するため）。
+# PERSONA_MODELS のキー(Proposer A〜D)は fugu_local.py の定義に合わせた実在値。
+_orig_ask_conduct = f.ask
+_orig_props_conduct = f.PROPOSERS
+f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "qwen3.6:35b"]
+
+
+def _valid_plan_json(**overrides):
+    plan = {
+        "mode": "moa",
+        "task_type": "knowledge",
+        "selected_proposers": ["Proposer A", "Proposer B"],
+        "rounds": 1,
+        "use_image_generation": False,
+        "image_only": False,
+        "make_pptx": False,
+        "search_required": False,
+        "reason": "test plan",
+    }
+    plan.update(overrides)
+    return json.dumps(plan)
+
+
+def _make_conduct_ask(responses):
+    """呼び出し毎に responses を順に返す f.ask 互換フェイク。
+    どのモデルの ask() 呼び出しでも messages と label を記録する。"""
+    calls = []
+
+    def _fake(model, messages, temperature, **kwargs):
+        calls.append({"messages": messages, "label": kwargs.get("label")})
+        idx = min(len(calls) - 1, len(responses) - 1)
+        return responses[idx]
+
+    return _fake, calls
+
+
+# --- 正常系: 1回目でJSONが取れればask()は1回だけ・引き直し無し ---
+try:
+    _resp_happy = _valid_plan_json(task_type="chat", reason="happy path")
+    f.ask, _calls_happy = _make_conduct_ask([_resp_happy])
+    _plan_happy, _raw_happy = f.conduct("こんにちは")
+finally:
+    f.ask = _orig_ask_conduct
+
+check("conduct: 正常系はask()を1回だけ呼ぶ(引き直し無し)", len(_calls_happy) == 1)
+check("conduct: 正常系のrawは最初のレスポンスそのもの", _raw_happy == _resp_happy)
+check("conduct: 正常系のplanはJSONのmode/task_typeをvalidate_plan経由で反映",
+      _plan_happy["mode"] == "moa" and _plan_happy["task_type"] == "chat")
+check("conduct: 正常系のselected_proposersはペルソナ名から実モデル名へ解決",
+      _plan_happy["selected_proposers"] == ["gpt-oss:20b", "qwen3-coder:30b"])
+
+# --- 引き直し系: 1回目がJSON抽出失敗 -> 同一messagesで1回だけ引き直し、2回目を採用 ---
+try:
+    _resp_redraw = _valid_plan_json(task_type="writing", reason="second draw")
+    f.ask, _calls_redraw = _make_conduct_ask(["not json at all, sorry", _resp_redraw])
+    _plan_redraw, _raw_redraw = f.conduct("これは何ですか")
+finally:
+    f.ask = _orig_ask_conduct
+
+check("conduct: 1回目JSON抽出失敗なら合計2回askする", len(_calls_redraw) == 2)
+check("conduct: 引き直し時のmessagesは1回目と同一",
+      _calls_redraw[0]["messages"] == _calls_redraw[1]["messages"])
+check("conduct: 引き直し後のplanは2回目のJSONを反映",
+      _plan_redraw["task_type"] == "writing" and "second draw" in _plan_redraw["reason"])
+check("conduct: 引き直し後のrawは2回目のレスポンス", _raw_redraw == _resp_redraw)
+
+# --- 二重失敗系: 両方JSON抽出失敗でも例外を送出せずdefault_plan()ベースへ劣化する ---
+try:
+    f.ask, _calls_double = _make_conduct_ask(["nonsense", "still nonsense"])
+    _plan_fail, _raw_fail = f.conduct("42 を計算しなさい。答えを求めよ。")
+finally:
+    f.ask = _orig_ask_conduct
+
+check("conduct: 両方失敗でもask()は2回で打ち切る(それ以上引き直さない)", len(_calls_double) == 2)
+check("conduct: 両方失敗時のplanはdefault_planベースのフォールバック",
+      _plan_fail.get("_fallback") is True)
+check("conduct: フォールバックでも数学キーワードのtask_typeガードレールは効く",
+      _plan_fail["task_type"] == "math")
+check("conduct: 両方失敗時のrawは2回目の生レスポンス", _raw_fail == "still nonsense")
+
+# --- ガードレール適用順の一貫性: validate_plan -> routing -> accuracy -> tasktype ---
+try:
+    _resp_code = _valid_plan_json(mode="single", task_type="knowledge",
+                                   selected_proposers=["Proposer A"], reason="raw single")
+    f.ask, _calls_code = _make_conduct_ask([_resp_code])
+    _plan_code, _ = f.conduct("再帰関数を実装してください")
+finally:
+    f.ask = _orig_ask_conduct
+check("conduct: コード質問はraw planがsingleでもmoaへ格上げ(精度ガードレール)",
+      _plan_code["mode"] == "moa")
+
+try:
+    _resp_math = _valid_plan_json(mode="moa", task_type="knowledge", reason="raw math")
+    f.ask, _calls_math = _make_conduct_ask([_resp_math])
+    _plan_math, _ = f.conduct("100 の階乗を 7 で割った余りを求めよ")
+finally:
+    f.ask = _orig_ask_conduct
+check("conduct: 数学キーワードはConductorの誤分類(knowledge)をmathへ上書き",
+      _plan_math["task_type"] == "math")
+
+try:
+    _resp_pptx = _valid_plan_json(mode="single", task_type="writing",
+                                   selected_proposers=["Proposer A"],
+                                   image_only=True, use_image_generation=True,
+                                   reason="raw pptx-ish")
+    f.ask, _calls_pptx = _make_conduct_ask([_resp_pptx])
+    _plan_pptx, _ = f.conduct("来週の会議用にパワポのスライド資料を作って")
+finally:
+    f.ask = _orig_ask_conduct
+check("conduct: パワポ要求はraw planの中身に関わらずmake_pptx+moa+image_only=Falseに確定",
+      _plan_pptx["make_pptx"] is True and _plan_pptx["mode"] == "moa"
+      and _plan_pptx["image_only"] is False)
+
+# --- プロンプト構築: office_attached のヒント文言 ---
+try:
+    _resp_office = _valid_plan_json(reason="office test")
+    f.ask, _calls_office = _make_conduct_ask([_resp_office])
+    f.conduct("この資料の要点をまとめて", office_attached=True)
+finally:
+    f.ask = _orig_ask_conduct
+_office_user_msg = _calls_office[0]["messages"][1]["content"]
+check("conduct: office_attached=Trueでヒント文言(Proposer C / 特殊ルーティング指示#2)が挿入される",
+      "Proposer C" in _office_user_msg and "特殊ルーティング指示 #2" in _office_user_msg)
+
+try:
+    _resp_no_office = _valid_plan_json(reason="no office test")
+    f.ask, _calls_no_office = _make_conduct_ask([_resp_no_office])
+    f.conduct("この資料の要点をまとめて", office_attached=False)
+finally:
+    f.ask = _orig_ask_conduct
+_no_office_user_msg = _calls_no_office[0]["messages"][1]["content"]
+check("conduct: office_attached=Falseではヒント文言が挿入されない",
+      "特殊ルーティング指示 #2" not in _no_office_user_msg)
+
+# --- プロンプト構築: history の直近の会話ノート(200字超は切り詰め) ---
+try:
+    _long_content = "あ" * 250
+    _history = [
+        {"role": "user", "content": "最古の質問(除外されるはず)"},
+        {"role": "assistant", "content": "最古の回答(除外されるはず)"},
+        {"role": "user", "content": "短い質問1"},
+        {"role": "assistant", "content": "短い回答1"},
+        {"role": "user", "content": _long_content},
+        {"role": "assistant", "content": "直近の回答2"},
+    ]
+    _resp_hist = _valid_plan_json(reason="history test")
+    f.ask, _calls_hist = _make_conduct_ask([_resp_hist])
+    _plan_hist, _ = f.conduct("続きを教えて", history=_history)
+finally:
+    f.ask = _orig_ask_conduct
+_hist_user_msg = _calls_hist[0]["messages"][1]["content"]
+check("conduct: history指定時は直近の会話ノートが埋め込まれ例外なく完走する",
+      "直近の会話" in _hist_user_msg)
+check("conduct: 200字超のhistory本文は200字に切り詰められ...が付く",
+      ("あ" * 200 + "...") in _hist_user_msg and ("あ" * 250) not in _hist_user_msg)
+check("conduct: history[-4:]より古い発言は含まれない",
+      "除外されるはず" not in _hist_user_msg)
+
+f.PROPOSERS = _orig_props_conduct
+
 # ---------- 自己一貫性投票（答え抽出・正規化・同値判定・投票） ----------
 check("sc: boxed 抽出", f.extract_boxed("thus \\boxed{42}") == "42")
 check("sc: boxed 入れ子", f.extract_boxed("\\boxed{\\frac{1}{2}}") == "\\frac{1}{2}")
