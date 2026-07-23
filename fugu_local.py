@@ -3126,7 +3126,19 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
     # --- 会話履歴を更新（エラーでなければ記録・永続化）---
     if not final.startswith("__ERROR__"):
         _HISTORY.append({"role": "user", "content": question})   # 元の質問を保存
-        _HISTORY.append({"role": "assistant", "content": final})
+        # 2026-07-23: L3098 のコメント「履歴にはテキスト本文のみ保存する」の
+        # 意図と実装が乖離していたのを修正。旧実装は final（PPTX 経路では
+        # '## 生成した PowerPoint / 保存先: <deck>'、イラスト経路では
+        # '## 生成画像 / <img markup-or-status>' が本文に追記された成果物付き
+        # 文字列）をそのまま履歴に積んでおり、次ターンの Conductor/proposers が
+        # ファイルパスや画像生成ステータスを「前回回答の実質的内容」として誤読
+        # し得る状態だった（iteration 59/67/70 で対処した複数ターン間の忠実性
+        # 劣化と同種の問題）。加えて MAX_HISTORY_CHARS の予算も無駄に消費する。
+        # 修正: 履歴には text_answer（成果物注記より前のクリーンな本文）を積む。
+        # 画像・PPTX 経路を使わない通常パスでは text_answer == final のため
+        # 挙動は変わらない。戻り値・コンソール出力・notify_slack・
+        # _save_answer_to_file は従来通り final（成果物付き）を使い続ける。
+        _HISTORY.append({"role": "assistant", "content": text_answer})
         _trim_history(_HISTORY)
         save_history_file(_HISTORY, path=history_file)
         print(f"   [会話履歴: {len(_HISTORY) // 2} 往復保持中]")

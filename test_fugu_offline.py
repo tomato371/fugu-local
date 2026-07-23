@@ -5029,6 +5029,112 @@ with _tempfile.TemporaryDirectory() as _hist_dir:
     check("history: 破損していない兄弟エントリはバイト単位で無傷のまま読み込まれる",
           _loaded_cp932[1]["content"] == "無傷であるはずの兄弟エントリ：日本語も含む")
 
+# ---------- ask_fugu: _HISTORY には成果物付き final ではなく text_answer を保存 ----------
+# 2026-07-23: fugu_local.py L3098 のコメント「履歴にはテキスト本文のみ保存する」が
+# 実装(L3129 で _HISTORY に final を追記)と乖離していたバグの修正を検証する。
+# make_pptx / イラスト付き回答の各経路では、final は text_answer に
+# '## 生成した PowerPoint / 保存先: <deck>' や '## 生成画像 / <img markup-or-status>'
+# という「その場限りの成果物ノート」を追記した文字列であり、これをそのまま履歴に
+# 積むと次ターンの Conductor/proposers がファイルパスや画像生成ステータスを
+# 「前回回答の実質的内容」として誤読しうる(iteration 59/67/70 で対処した複数ターン
+# 間の忠実性劣化と同種の回帰)上、MAX_HISTORY_CHARS の予算も無駄になる。
+# 修正は _HISTORY への assistant 追記だけを text_answer に変更するもので、
+# 戻り値・コンソール出力・notify_slack・_save_answer_to_file は従来通り成果物付き
+# final を使い続ける。setup/conduct/fugu_answer/build_pptx/handle_image_generation/
+# notify_slack/save_history_file をすべてモックしており、実際の Ollama・
+# ネットワーク・サブプロセス呼び出しは一切発生しない。
+_orig_af_hist = list(f._HISTORY)
+_orig_af_setup = f.setup
+_orig_af_conduct = f.conduct
+_orig_af_fugu_answer = f.fugu_answer
+_orig_af_build_pptx = f.build_pptx
+_orig_af_handle_image = f.handle_image_generation
+_orig_af_notify = f.notify_slack
+_orig_af_save_hist = f.save_history_file
+
+
+def _af_base_plan(**overrides):
+    plan = {
+        "mode": "moa",
+        "rounds": 1,
+        "selected_proposers": [],
+        "search_required": False,
+        "use_image_generation": False,
+        "image_only": False,
+        "make_pptx": False,
+        "task_type": "creative",
+        "reason": "offline test",
+    }
+    plan.update(overrides)
+    return plan
+
+
+try:
+    f.setup = lambda: True
+    f.notify_slack = lambda *a, **k: None
+    f.save_history_file = lambda *a, **k: None
+
+    # --- (1) PPTX 経路: _HISTORY にはクリーンな本文のみ、戻り値には成果物ノートも含む ---
+    f._HISTORY = []
+    _clean_body_pptx = "これはクリーンな本文です。PowerPoint化されます。"
+    f.conduct = lambda question, history=None, office_attached=False: (
+        _af_base_plan(make_pptx=True), {})
+    f.fugu_answer = lambda question, plan=None, history=None: _clean_body_pptx
+    f.build_pptx = lambda question, answer, out_path=None: "C:/fake/deck.pptx"
+
+    _ret_pptx = f.ask_fugu("PPTXにして", baseline=False)
+
+    check("ask_fugu/pptx: _HISTORY[-1]は成果物ノートを含まないクリーンな本文と一致",
+          f._HISTORY[-1]["content"] == _clean_body_pptx)
+    check("ask_fugu/pptx: _HISTORY[-1]に'生成した PowerPoint'が混入しない",
+          "生成した PowerPoint" not in f._HISTORY[-1]["content"])
+    check("ask_fugu/pptx: _HISTORY[-1]に'保存先'が混入しない",
+          "保存先" not in f._HISTORY[-1]["content"])
+    check("ask_fugu/pptx: 戻り値には'生成した PowerPoint'/'保存先'ノートが含まれる(従来通り)",
+          "生成した PowerPoint" in _ret_pptx and "保存先" in _ret_pptx)
+    check("ask_fugu/pptx: _HISTORY[0]は元の質問文をそのまま保存(user側は既存挙動)",
+          f._HISTORY[0]["content"] == "PPTXにして")
+
+    # --- (2) イラスト付き回答経路: _HISTORY にはクリーンな本文のみ ---
+    f._HISTORY = []
+    _clean_body_img = "これはクリーンな本文です。イラストが付きます。"
+    f.conduct = lambda question, history=None, office_attached=False: (
+        _af_base_plan(use_image_generation=True, image_only=False), {})
+    f.fugu_answer = lambda question, plan=None, history=None: _clean_body_img
+    f.handle_image_generation = lambda user_request, **k: "![img](fake.png)"
+
+    _ret_img = f.ask_fugu("イラスト付きで説明して", baseline=False)
+
+    check("ask_fugu/image: _HISTORY[-1]は成果物ノート('生成画像')を含まないクリーンな本文と一致",
+          f._HISTORY[-1]["content"] == _clean_body_img
+          and "生成画像" not in f._HISTORY[-1]["content"])
+    check("ask_fugu/image: 戻り値には'生成画像'ノートが含まれる(従来通り)",
+          "生成画像" in _ret_img)
+
+    # --- (3) 通常経路(画像/PPTXなし): text_answer と final が同一 -> 既存挙動の回帰なし ---
+    f._HISTORY = []
+    _plain_body = "画像もPPTXも使わない通常のMoA回答本文です。"
+    f.conduct = lambda question, history=None, office_attached=False: (
+        _af_base_plan(), {})
+    f.fugu_answer = lambda question, plan=None, history=None: _plain_body
+
+    _ret_plain = f.ask_fugu("普通の質問", baseline=False)
+
+    check("ask_fugu/plain: 画像/PPTXなし経路では_HISTORY[-1]・戻り値・本文がバイト一致",
+          f._HISTORY[-1]["content"] == _ret_plain == _plain_body)
+finally:
+    f._HISTORY = _orig_af_hist
+    f.setup = _orig_af_setup
+    f.conduct = _orig_af_conduct
+    f.fugu_answer = _orig_af_fugu_answer
+    f.build_pptx = _orig_af_build_pptx
+    f.handle_image_generation = _orig_af_handle_image
+    f.notify_slack = _orig_af_notify
+    f.save_history_file = _orig_af_save_hist
+
+check("ask_fugu: テスト後に_HISTORYが元の状態へ復元されている",
+      f._HISTORY == _orig_af_hist)
+
 # 念のため: 本セクションはグローバル状態を try/finally で復元済みであることを確認
 check("history: SESSION_SAVE はテスト後に既定値へ復元されている",
       f.SESSION_SAVE == _orig_session_save)
