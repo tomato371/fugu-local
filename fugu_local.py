@@ -3726,9 +3726,23 @@ def build_pptx(question, answer, out_path=None):
     imgs = {}
     if _detect_backend() is not None and IMAGE_BACKEND != "off":
         plan = plan_pptx_images(title, slides)
+        had_zero = 0 in plan
         plan.setdefault(0, None)  # タイトルには必ずヒーロー画像
+        items = list(plan.items())
+        if not had_zero and len(items) > PPTX_MAX_IMAGES:
+            # 2026-07-23: dict は挿入順を保持するため、plan_pptx_images が
+            # index 0 を含めずに（LLM が上の「タイトルには必ずヒーロー画像」
+            # 指示を無視して）ちょうど PPTX_MAX_IMAGES 件返した場合、直上の
+            # setdefault(0, None) は 0 を末尾に追加するだけになる。従来は
+            # 直後の [:PPTX_MAX_IMAGES] スライスがその末尾の 0 を切り捨てて
+            # おり、タイトルスライドにヒーロー画像が入らないまま不変条件が
+            # 静かに破られていた。0 を先頭に固定してから残りを詰め直すことで
+            # 画像総数は PPTX_MAX_IMAGES のまま（枠を1つタイトルへ再割当）0
+            # の生成を保証する。0 が既に予算内にある場合／plan が定員未満の
+            # 場合はこの分岐に入らず、従来と完全に同じ順序のまま処理する。
+            items = [(0, plan[0])] + [kv for kv in items if kv[0] != 0]
         print(f"   [PPTX画像: {min(len(plan), PPTX_MAX_IMAGES)} 枚を生成します...]")
-        for idx, pr in list(plan.items())[:PPTX_MAX_IMAGES]:
+        for idx, pr in items[:PPTX_MAX_IMAGES]:
             if pr:
                 path = generate_image(pr, "")
             else:

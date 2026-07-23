@@ -4863,6 +4863,125 @@ with _tempfile.TemporaryDirectory() as _pptx_dir:
 check("build_pptx: IMAGE_BACKEND はテスト後に既定値へ復元されている",
       f.IMAGE_BACKEND == _orig_image_backend_pptx)
 
+# ---------- build_pptx: 画像プランが index 0 を省略し枠が満杯でも
+# タイトルヒーロー画像が生き残ることの確認 (2026-07-23) ----------
+# 背景: plan_pptx_images() は最大 PPTX_MAX_IMAGES 件の {index: prompt} を返す。
+# build_pptx はその直後に plan.setdefault(0, None) で「タイトルには必ず
+# ヒーロー画像」という不変条件を保証しようとするが、dict は挿入順を保持する
+# ため、plan が index 0 を含まずに PPTX_MAX_IMAGES 件ちょうどで満杯だった
+# 場合、setdefault は 0 を末尾に追加するだけになる。従来コードの
+# list(plan.items())[:PPTX_MAX_IMAGES] スライスは直後にその末尾の 0 を
+# 切り捨ててしまい、LLM が plan_pptx_images のシステムプロンプトの
+# 「Include index 0」指示に従わなかった場合、タイトルスライドへヒーロー
+# 画像が入らないまま不変条件が静かに破られていた。本テストは
+# _detect_backend / plan_pptx_images / generate_image / author_image_prompt を
+# 全てモックし、実際の Ollama・画像バックエンド・ネットワーク呼び出しを
+# 一切行わずにこのバグと修正後の挙動、および既存の非バグケース(byte-for-byte
+# 不変)を検証する。
+import base64 as _base64_pptx_hero
+
+_ONE_PX_PNG_HERO = _base64_pptx_hero.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY"
+    "42YAAAAASUVORK5CYII="
+)
+
+if _HAS_PPTX:
+    with _tempfile.TemporaryDirectory() as _pptx_hero_dir:
+        _pptx_hero_root = _pathlib_pptx.Path(_pptx_hero_dir)
+        _fake_img_path_hero = _pptx_hero_root / "fake.png"
+        _fake_img_path_hero.write_bytes(_ONE_PX_PNG_HERO)
+
+        _orig_ib_hero = f.IMAGE_BACKEND
+        _orig_detect_hero = f._detect_backend
+        _orig_plan_hero = f.plan_pptx_images
+        _orig_genimg_hero = f.generate_image
+        _orig_authimg_hero = f.author_image_prompt
+
+        _genimg_calls_hero = []
+        _authimg_calls_hero = []
+
+        def _fake_generate_image_hero(prompt, negative=""):
+            _genimg_calls_hero.append((prompt, negative))
+            return str(_fake_img_path_hero)
+
+        def _fake_author_image_prompt_hero(base_text, panel=None):
+            _authimg_calls_hero.append(base_text)
+            return ("TITLE_PROMPT", "TITLE_NEG")
+
+        try:
+            f.IMAGE_BACKEND = "a1111"
+            f._detect_backend = lambda: "a1111"
+            f.generate_image = _fake_generate_image_hero
+            f.author_image_prompt = _fake_author_image_prompt_hero
+
+            check("build_pptx: このテストはPPTX_MAX_IMAGES==4を前提にしている",
+                  f.PPTX_MAX_IMAGES == 4)
+
+            _hero_question = "Hero Bug Test"
+            _hero_answer = "## S1\n- b1\n\n## S2\n- b2\n\n## S3\n- b3\n\n## S4\n- b4\n"
+
+            # (A) バグ再現ケース: plan が PPTX_MAX_IMAGES 件ちょうど、index 0 を含まない。
+            f.plan_pptx_images = lambda title, slides: {1: "p1", 2: "p2", 3: "p3", 4: "p4"}
+            _genimg_calls_hero.clear()
+            _authimg_calls_hero.clear()
+            _out_hero_a = _pptx_hero_root / "hero_full_no_zero.pptx"
+            _ret_hero_a = f.build_pptx(_hero_question, _hero_answer, out_path=_out_hero_a)
+            check("build_pptx/画像0省略+満杯: 例外を送出せず.pptxを生成する",
+                  isinstance(_ret_hero_a, _pathlib_pptx.Path) and _ret_hero_a.suffix == ".pptx"
+                  and _ret_hero_a.exists())
+            check("build_pptx/画像0省略+満杯: タイトルヒーロー画像生成が実行される"
+                  "(author_image_promptがタイトルで呼ばれる)",
+                  _hero_question in _authimg_calls_hero)
+            check("build_pptx/画像0省略+満杯: タイトルヒーロー画像がgenerate_imageに渡る(TITLE_PROMPT)",
+                  any(p == "TITLE_PROMPT" for p, _n in _genimg_calls_hero))
+            check("build_pptx/画像0省略+満杯: 画像総数はPPTX_MAX_IMAGESを超えない"
+                  "(タイトル用に1枠を再割当するだけで追加はしない)",
+                  len(_genimg_calls_hero) <= f.PPTX_MAX_IMAGES)
+            check("build_pptx/画像0省略+満杯: contentスライド側は1枠だけ犠牲になり3枚は生き残る",
+                  sum(1 for p, _n in _genimg_calls_hero if p in {"p1", "p2", "p3", "p4"})
+                  == f.PPTX_MAX_IMAGES - 1)
+
+            # (B) 回帰ケース1: plan が既に index 0 を含み、かつ枠がちょうど満杯
+            # (PPTX_MAX_IMAGES件)。0 が既に予算内にあるので並び替え分岐に入らず、
+            # 従来通り全4件がそのまま生成対象になる(byte-for-byte不変)。
+            f.plan_pptx_images = lambda title, slides: {0: "p0", 1: "p1", 2: "p2", 3: "p3"}
+            _genimg_calls_hero.clear()
+            _authimg_calls_hero.clear()
+            _out_hero_b = _pptx_hero_root / "hero_full_with_zero.pptx"
+            f.build_pptx(_hero_question, _hero_answer, out_path=_out_hero_b)
+            check("build_pptx/画像0含む+満杯(回帰): author_image_promptは一切呼ばれない"
+                  "(全エントリにプロンプトがあるため)",
+                  _authimg_calls_hero == [])
+            check("build_pptx/画像0含む+満杯(回帰): 生成対象の集合は従来通り{p0,p1,p2,p3}のまま",
+                  {p for p, _n in _genimg_calls_hero} == {"p0", "p1", "p2", "p3"}
+                  and len(_genimg_calls_hero) == 4)
+
+            # (C) 回帰ケース2: plan が PPTX_MAX_IMAGES 未満で index 0 を含まない。
+            # setdefaultで0が追加されても件数は定員未満のままなのでスライスは
+            # 何も切り捨てず、0を含め全エントリがそのまま生き残る(従来通り)。
+            f.plan_pptx_images = lambda title, slides: {2: "p2"}
+            _genimg_calls_hero.clear()
+            _authimg_calls_hero.clear()
+            _out_hero_c = _pptx_hero_root / "hero_partial_no_zero.pptx"
+            f.build_pptx(_hero_question, _hero_answer, out_path=_out_hero_c)
+            check("build_pptx/画像0省略+定員未満(回帰): タイトル用にauthor_image_promptが呼ばれる",
+                  _hero_question in _authimg_calls_hero)
+            check("build_pptx/画像0省略+定員未満(回帰): 元々あったp2も生き残る",
+                  any(p == "p2" for p, _n in _genimg_calls_hero))
+            check("build_pptx/画像0省略+定員未満(回帰): タイトル用のTITLE_PROMPTも生成される",
+                  any(p == "TITLE_PROMPT" for p, _n in _genimg_calls_hero))
+            check("build_pptx/画像0省略+定員未満(回帰): 生成呼び出しは2件のみ(p2 + タイトル)",
+                  len(_genimg_calls_hero) == 2)
+        finally:
+            f.IMAGE_BACKEND = _orig_ib_hero
+            f._detect_backend = _orig_detect_hero
+            f.plan_pptx_images = _orig_plan_hero
+            f.generate_image = _orig_genimg_hero
+            f.author_image_prompt = _orig_authimg_hero
+
+    check("build_pptx: 画像ヒーローテスト後にIMAGE_BACKENDが既定値へ復元されている",
+          f.IMAGE_BACKEND == _orig_image_backend_pptx)
+
 # ---------- _trim_history: 直近ペアを消さない (2026-07-23回帰) ----------
 # 背景: ask_fugu は直近の [user, assistant] ペアを _HISTORY に追記した「直後」に
 # _trim_history を呼ぶ。旧ガード `len(history) >= 2` だと、履歴が直近ペア1組
