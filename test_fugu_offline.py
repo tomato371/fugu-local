@@ -284,6 +284,20 @@ check("route: 説明+図→イラスト付き(image_only=False)",
 _r = f._apply_routing_guardrails("日本の首都は？", _base_plan())
 check("route: 通常質問は据え置き",
       _r["make_pptx"] is False and _r["use_image_generation"] is False)
+
+# 2026-07-24: validate_plan(iteration 40) が確立した make_pptx=True⇒image_only=False
+# の不変条件を、conduct() 内で validate_plan の「後」に呼ばれる
+# _apply_routing_guardrails の画像分岐が再び壊さないことの回帰テスト。
+# 例: コンダクタが '発表資料'（_PPTX_SIGNALS 非一致のPPTX同義語）から
+# make_pptx=True を立てた plan に、_IMAGE_SIGNALS には一致するが
+# _TEXT_TASK_SIGNALS には一致しない質問が来た場合。
+_pptx_already_true_plan = _base_plan()
+_pptx_already_true_plan["make_pptx"] = True
+_r = f._apply_routing_guardrails("かわいい柴犬のイラスト付き発表資料を作成して", _pptx_already_true_plan)
+check("route: make_pptx=True済みプランは画像分岐でimage_only=Trueにならない(不変条件維持)",
+      _r["make_pptx"] is True and _r["image_only"] is False)
+check("route: make_pptx かつ image_only が同時にTrueにはならない",
+      not (_r["make_pptx"] and _r["image_only"]))
 f.PROPOSERS = _op_persona
 
 # ---------- conduct(): プランオーケストレーション ----------

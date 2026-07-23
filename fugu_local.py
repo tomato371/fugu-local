@@ -2151,8 +2151,19 @@ def _apply_routing_guardrails(question, plan):
         return plan
     if _IMAGE_SIGNALS.search(q):
         plan["use_image_generation"] = True
+        # 2026-07-24: make_pptx=True ⇒ image_only=False は validate_plan
+        # (iteration 40, 2227-2228/2240-2241) が確立した不変条件。ここは
+        # validate_plan の「後」に conduct() から呼ばれる（2320行目）ため、
+        # plan["make_pptx"] を見ずに image_only を立てるとその不変条件を
+        # 再び壊してしまう（コンダクタが '発表資料'/'デッキ' 等 _PPTX_SIGNALS
+        # 非一致のPPTX同義語で make_pptx=True にした上で、質問が画像シグナルに
+        # マッチし解説シグナルには非マッチな場合、make_pptx=True かつ
+        # image_only=True という矛盾が復活する）。ask_fugu はルート1(画像)を
+        # ルート2(PowerPoint)より先に判定するため、その矛盾は要求された
+        # PowerPoint を黙って握りつぶし画像のみを返す形で表面化する。
         # テキスト解説も求めている＝イラスト付き / 画像だけ＝image_only
-        plan["image_only"] = not bool(_TEXT_TASK_SIGNALS.search(q))
+        # （ただし make_pptx が既に True なら image_only は常に False）
+        plan["image_only"] = (not plan.get("make_pptx")) and not bool(_TEXT_TASK_SIGNALS.search(q))
     return plan
 
 
