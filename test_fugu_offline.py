@@ -2149,6 +2149,83 @@ try:
 finally:
     f.ask = _orig_ask
 
+# ---------- critique(): 2段階エスカレーションの直接テスト (iter 58) ----------
+# critique() は fugu_answer() の MoA 継続判定(need_more = not ok, fugu_local.py:2929)と
+# aggregate() の保険2採用判定(fugu_local.py:2245)の両方を左右するが、既存テストは
+# critique 自体を lambda で丸ごと差し替えて使っており(前掲の agg 保険2テスト参照)、
+# 本物の2段階ロジック(1段目: think=False+スキーマで高速判定、ok ならそこで確定。
+# 2段目: 1段目が NG のときだけ think=True で再検算し、その結果を最終判定とする)は
+# 一度も直接実行されていなかった。この2段階構成は 2026-07-03 のフル評価で実測された
+# 偽エスカレーション(think=False critic が正答 '700' を誤って NG にし 310秒浪費)への
+# 対策であり、以下の不変条件を直接ロックする:
+#   (1) think=False が ok なら think=True は一切呼ばずに (True, "") で確定(高速パス短絡)
+#   (2) think=False が NG のときだけ think=True 再検算が発火し、その結果(issue含む)が
+#       そのまま最終判定になる(権威は think=True 側であって think=False の issue ではない)
+#   (3) think=True 側が _critic_judge の __ERROR__ センチネル形(ok=False, "critic call
+#       failed: ...")を返した場合でも、critique() は黙って ok=True にせず reject する
+# f._critic_judge をモックし、think 引数(キーワード呼び出し)で分岐・記録することで検証する。
+# ask() 自体は一切呼ばない(_critic_judge の一段上を差し替えるため、実運用の think=False/True
+# ラベル分岐が critique() 側で正しく起きているかだけを見る)。
+_orig_critic_judge = f._critic_judge
+
+
+def _make_critique_judge(ok1, issue1, ok2=False, issue2="", calls=None):
+    """think 引数(bool化)で呼び出しを分岐・記録するモック。calls に think 値を記録する。"""
+    if calls is None:
+        calls = []
+
+    def _judge(question, answer, think=False):
+        calls.append(bool(think))
+        if think:
+            return ok2, issue2
+        return ok1, issue1
+    _judge.calls = calls
+    return _judge
+
+
+try:
+    # (1) think=False が ok → 即 (True, "") で確定し、think=True は呼ばれない(高速パス短絡)。
+    _calls = []
+    f._critic_judge = _make_critique_judge(ok1=True, issue1="unused fast-path issue",
+                                            calls=_calls)
+    ok, issue = f.critique("2+2?", "4")
+    check("critique: think=False合格は(True,'')で確定", ok is True and issue == "")
+    check("critique: think=False合格時はthink=Trueを呼ばない(高速パス短絡)",
+          _calls == [False])
+
+    # (2a) think=False NG → think=True 再検算が発火し、think=True 側が ok なら採用。
+    _calls = []
+    f._critic_judge = _make_critique_judge(ok1=False, issue1="fast doubt",
+                                            ok2=True, issue2="", calls=_calls)
+    ok, issue = f.critique("700は正しいか?", "700")
+    check("critique: think=False NGでthink=True再検算が発火する", _calls == [False, True])
+    check("critique: think=True再検算がokなら(True,'')で採用", ok is True and issue == "")
+
+    # (2b) think=False NG → think=True も NG。最終issueはthink=True側(issue3)がそのまま
+    #      使われ、think=False側のissue1は使われない(権威は再検算側であることの確認)。
+    _calls = []
+    f._critic_judge = _make_critique_judge(ok1=False, issue1="fast doubt",
+                                            ok2=False, issue2="authoritative issue",
+                                            calls=_calls)
+    ok, issue = f.critique("q", "a")
+    check("critique: think=True再検算もNGならreject(False)", ok is False)
+    check("critique: 最終issueはthink=True側(権威)がそのまま使われる",
+          issue == "authoritative issue")
+
+    # (3) think=True 側が _critic_judge の __ERROR__ センチネル形(ok=False, "critic call
+    #     failed: ...")を返す場合。critic 呼び出し自体の失敗であって「回答に問題なし」
+    #     ではないため、critique() はこれを ok=True に握りつぶさず reject のまま返す必要がある。
+    _calls = []
+    f._critic_judge = _make_critique_judge(
+        ok1=False, issue1="fast doubt",
+        ok2=False, issue2="critic call failed: __ERROR__: simulated transport failure",
+        calls=_calls)
+    ok, issue = f.critique("q", "a")
+    check("critique: think=True側がcritic呼び出し失敗センチネルでもok=Trueに握りつぶさない",
+          ok is False)
+finally:
+    f._critic_judge = _orig_critic_judge
+
 _orig_proposers = f.PROPOSERS
 _orig_second_opinion_model = f.SECOND_OPINION_MODEL
 _orig_disabled_flag = f._SECOND_OPINION_DISABLED
