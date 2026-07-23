@@ -5307,6 +5307,134 @@ try:
 finally:
     f._get_rag_chunks = _orig_get_rag_chunks
 
+# ---------- build_context / _with_context: Web検索+RAGのコンテキスト組み立てと注入 ----------
+# build_context()(~L1104)と_with_context()(~L1125)は、Web検索(research_search)とRAG
+# (rag_search)の結果を組み立てて全proposer/aggregatorへ、そしてmath/mcqでは
+# solve_verifiableの自己一貫性投票(gotcha #7の精度クリティカル経路)にまで伝わる質問へ
+# 注入する唯一の合流点だが、grep上コメントからの言及しかなく直接テストが皆無だった。
+# ここではf.research_searchとf.rag_searchのみをモックし、パート順序・空ハンドリング
+# (空検索がRAGを消さない)・use_search=Falseでの検索スキップ・結合セパレータの契約を
+# 固定する。print文言そのものはアサート対象にしない(将来変わりうるため)。
+# 万一モックが外れて実ネットワーク/subprocessに落ちないよう、urllib.request.urlopenと
+# f.subprocess.runも「呼ばれたら即座にAssertionError」の番人に差し替える
+# (gotcha #8 / iter 38・39・76のtripwire流儀を踏襲)。
+
+_orig_research_search_bc = f.research_search
+_orig_rag_search_bc = f.rag_search
+_orig_urlopen_bc = urllib.request.urlopen
+_orig_subprocess_run_bc = f.subprocess.run
+
+
+def _bc_no_network_urlopen(*a, **k):
+    raise AssertionError("build_context: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _bc_no_subprocess_run(*a, **k):
+    raise AssertionError("build_context: モック漏れで実subprocess.runが呼ばれた")
+
+
+try:
+    urllib.request.urlopen = _bc_no_network_urlopen
+    f.subprocess.run = _bc_no_subprocess_run
+
+    # --- (a) use_search=False -> research_searchは一切呼ばれず、rag_search部分のみが返る ---
+    _bc_a_search_calls = []
+
+    def _bc_a_research_search(q):
+        _bc_a_search_calls.append(q)
+        return "SHOULD_NOT_APPEAR"
+
+    try:
+        f.research_search = _bc_a_research_search
+        f.rag_search = lambda q, dirs=None, top_k=None: (
+            "## Relevant Document Context (RAG)\n\nRAG_ONLY_BODY")
+        with contextlib.redirect_stdout(io.StringIO()):
+            _bc_a = f.build_context("Q_A", use_search=False, rag_dirs=["dummy"])
+        check("build_context: use_search=Falseならresearch_searchは呼ばれない(呼び出し数0)",
+              len(_bc_a_search_calls) == 0)
+        check("build_context: use_search=Falseの戻り値はrag_search部分のみ",
+              _bc_a == "## Relevant Document Context (RAG)\n\nRAG_ONLY_BODY")
+    finally:
+        f.research_search = _orig_research_search_bc
+        f.rag_search = _orig_rag_search_bc
+
+    # --- (b) use_search=Trueかつresearch_searchが非空 -> 検索ブロックを含み、RAGより前に来る ---
+    try:
+        f.research_search = lambda q: "## Web Search Results\n\nSEARCH_BODY"
+        f.rag_search = lambda q, dirs=None, top_k=None: (
+            "## Relevant Document Context (RAG)\n\nRAG_BODY")
+        with contextlib.redirect_stdout(io.StringIO()):
+            _bc_b = f.build_context("Q_B", use_search=True, rag_dirs=["dummy"])
+        check("build_context: use_search=Trueで検索結果非空ならSEARCH_BODYを含む",
+              "SEARCH_BODY" in _bc_b)
+        check("build_context: use_search=Trueで検索結果非空ならRAG_BODYも含む",
+              "RAG_BODY" in _bc_b)
+        check("build_context: 検索ブロックはRAGブロックより前に来る(検索->RAGの順)",
+              _bc_b.index("SEARCH_BODY") < _bc_b.index("RAG_BODY"))
+    finally:
+        f.research_search = _orig_research_search_bc
+        f.rag_search = _orig_rag_search_bc
+
+    # --- (c) use_search=Trueかつresearch_searchが''を返す -> 検索ブロックはないがRAGは残る ---
+    try:
+        f.research_search = lambda q: ""
+        f.rag_search = lambda q, dirs=None, top_k=None: (
+            "## Relevant Document Context (RAG)\n\nRAG_SURVIVES")
+        with contextlib.redirect_stdout(io.StringIO()):
+            _bc_c = f.build_context("Q_C", use_search=True, rag_dirs=["dummy"])
+        check("build_context: 検索結果が空文字でもRAG結果は落とされない",
+              _bc_c == "## Relevant Document Context (RAG)\n\nRAG_SURVIVES")
+    finally:
+        f.research_search = _orig_research_search_bc
+        f.rag_search = _orig_rag_search_bc
+
+    # --- (d) research_search・rag_searchとも'' -> build_contextはちょうど''を返す ---
+    try:
+        f.research_search = lambda q: ""
+        f.rag_search = lambda q, dirs=None, top_k=None: ""
+        with contextlib.redirect_stdout(io.StringIO()):
+            _bc_d = f.build_context("Q_D", use_search=True, rag_dirs=["dummy"])
+        check("build_context: 検索・RAGとも空文字ならちょうど空文字を返す", _bc_d == "")
+    finally:
+        f.research_search = _orig_research_search_bc
+        f.rag_search = _orig_rag_search_bc
+
+    # --- (e) 両パートがある場合、ちょうど'\n\n'で結合され検索->RAGの順である ---
+    try:
+        f.research_search = lambda q: "SEARCH_PART"
+        f.rag_search = lambda q, dirs=None, top_k=None: "RAG_PART"
+        with contextlib.redirect_stdout(io.StringIO()):
+            _bc_e = f.build_context("Q_E", use_search=True, rag_dirs=["dummy"])
+        check("build_context: 両パートはちょうど'\\n\\n'で結合され検索->RAG順",
+              _bc_e == "SEARCH_PART\n\nRAG_PART")
+    finally:
+        f.research_search = _orig_research_search_bc
+        f.rag_search = _orig_rag_search_bc
+
+finally:
+    f.research_search = _orig_research_search_bc
+    f.rag_search = _orig_rag_search_bc
+    urllib.request.urlopen = _orig_urlopen_bc
+    f.subprocess.run = _orig_subprocess_run_bc
+
+check("build_context: テスト後にresearch_searchが元の状態へ復元されている",
+      f.research_search == _orig_research_search_bc)
+check("build_context: テスト後にrag_searchが元の状態へ復元されている",
+      f.rag_search == _orig_rag_search_bc)
+check("build_context: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_urlopen_bc)
+check("build_context: テスト後にsubprocess.runが元の状態へ復元されている",
+      f.subprocess.run == _orig_subprocess_run_bc)
+
+# --- _with_context: コンテキストの前置ロジック ---
+_wc_question = "元の質問そのまま"
+check("_with_context: 空文字コンテキストは質問をbyte-for-byteそのまま返す(同一オブジェクト)",
+      f._with_context(_wc_question, "") is _wc_question)
+check("_with_context: Noneコンテキスト(falsey)も質問をそのまま返す",
+      f._with_context(_wc_question, None) is _wc_question)
+check("_with_context: 非空コンテキストはcontext+'\\n\\n---\\n\\n'+questionを返す",
+      f._with_context("質問本体", "CTX_BODY") == "CTX_BODY\n\n---\n\n質問本体")
+
 # ---------- _save_as_html: コードフェンスの開始/終了タグ整合性 (2026-07-22) ----------
 # 旧実装は開始/終了 ``` フェンスを両方とも "<pre><code>" にマップし、
 # "</code></pre>" を一度も出力しないため <pre><code>...<pre><code> という
