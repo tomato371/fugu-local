@@ -2845,15 +2845,30 @@ def extract_final_answer(text, task_type="math"):
             # 誤って拾わない。先頭にマッチしなければ（\boxed{None of the above} 等）誤った
             # 文字を返さず、下の宣言パターン探索 → 最終的に None（無投票、誤投票より安全）に
             # フォールスルーさせる。
-            m = re.match(r"\(?\s*([A-E])\b", normalize_answer(boxed).upper())
+            # 2026-07-24: \(? は ASCII 括弧しか許容しておらず、CJK寄りのプロポーザー
+            # （qwen/gemma 系）が好む全角括弧 \boxed{（A）} を通すと、normalize_answer/
+            # _FW_TRANS（iter 13）は全角数字・A-E・マイナス・小数点・スラッシュ・カンマは
+            # 正規化するが全角括弧（U+FF08/FF09）は意図的に対象外のため （ がそのまま残り、
+            # \(? は幅ゼロでマッチ済み、続く ([A-E]) が （ に一致できず extract_final_answer
+            # が None を返して自己整合性投票（gotcha #7）から正当な1票が無投票のまま
+            # 静かに失われていた。[(（]? に広げて全角括弧も許容し、この票落ちを回復する
+            # （無投票より正しい1票、精度優先・時間は気にしない）。iter 3 の \b 境界ガードと
+            # iter 26 の複数文字競合時の棄権ロジックはそのまま維持する。
+            m = re.match(r"[(（]?\s*([A-E])\b", normalize_answer(boxed).upper())
             if m:
                 return m.group(1)
         # 2026-07-22: 連結詞（is/：/は）を省略可にしていたせいで、「answer A」のような
         # 単なる言及（例:「Note that answer A was a common distractor.」）まで宣言と
         # 誤認していた。本物の宣言は「answer is B」「答え：B」のように連結詞を伴うのが
         # 通例なので、下の math 宣言ブランチ（L2334 付近）と同じく連結詞を必須にする。
-        for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])\s*\(?([A-EＡ-Ｅ])\)?(?![A-Za-z])",
-                    r"^\s*\(?([A-E])\)?\s*(?:が正解|です)?\s*$"):
+        # 2026-07-24: 上の boxed 分岐と同じ理由（全角括弧はカッコ内はA-E数字と異なり
+        # _FW_TRANS 未対応、iter 13 参照）で、宣言パターン「答えは（B）です」・単独行
+        # パターン「（C）」のどちらも \(?/\)? のままだと全角括弧を素通りできず None を
+        # 返し無投票になる。[(（]?/[)）]? に広げて ASCII と同様に許容する。iter 3 の
+        # \b・先頭文字ガードと iter 26 の複数文字競合時 None 化（下の len(letters) > 1）は
+        # 変更しない。
+        for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])\s*[(（]?([A-EＡ-Ｅ])[)）]?(?![A-Za-z])",
+                    r"^\s*[(（]?([A-E])[)）]?\s*(?:が正解|です)?\s*$"):
             ms = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
             if ms:
                 letters = {m.translate(_FW_TRANS).upper() for m in ms}

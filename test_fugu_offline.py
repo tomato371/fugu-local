@@ -611,6 +611,31 @@ check("sc: mcq 宣言 同一文字の繰り返しは誤棄権しない",
       f.extract_final_answer(
           "The answer is D. Restating: the answer is D.", "mcq") == "D")
 
+# 2026-07-24: _FW_TRANS（iter 13）は全角数字/A-E/マイナス/小数点/スラッシュ/カンマは
+# 正規化するが全角括弧（U+FF08/FF09）は対象外のまま。CJK寄りのプロポーザーが
+# \boxed{（A）}や『答えは（B）です』のように選択肢文字を全角括弧で囲むと、iter 3/26/78
+# の mcq 抽出正規表現が ASCII 括弧しか許容していなかったため None（無投票）になり、
+# 自己整合性投票（gotcha #7）から正当な1票が静かに失われていた。[(（]?/[)）]? へ
+# 括弧クラスを広げてこの票落ちを回復する回帰確認（無投票より正しい1票）。
+check("sc: mcq boxed 全角括弧付き先頭文字（票落ち回帰）",
+      f.extract_final_answer("\\boxed{（A）}", "mcq") == "A")
+check("sc: mcq boxed 全角文字+全角括弧（票落ち回帰）",
+      f.extract_final_answer("\\boxed{（Ａ）}", "mcq") == "A")
+check("sc: mcq 宣言 全角括弧付き（票落ち回帰）",
+      f.extract_final_answer("したがって答えは（B）です。", "mcq") == "B")
+check("sc: mcq 単独行 全角括弧のみ（票落ち回帰）",
+      f.extract_final_answer("（C）", "mcq") == "C")
+# 既存のASCII括弧・散文混じり・散文のみのケースが全角対応後も従来通りであることの回帰確認
+check("sc: mcq boxed ASCII括弧は従来通り（全角対応の副作用なし）",
+      f.extract_final_answer("\\boxed{(A)}", "mcq") == "A")
+check("sc: mcq boxed 散文のみは全角対応後もNone（iter 3ガード維持）",
+      f.extract_final_answer("\\boxed{None of the above}", "mcq") is None)
+check("sc: mcq boxed 散文混じりは全角対応後も先頭文字（iter 3ガード維持）",
+      f.extract_final_answer("\\boxed{C, because it is the largest}", "mcq") == "C")
+check("sc: mcq 宣言 全角対応後も訂正で文字が競合したら棄権（iter 26ガード維持）",
+      f.extract_final_answer(
+          "The answer is B; oh wait, the answer: A", "mcq") is None)
+
 # 2026-07-22: iteration 28 — math 宣言ブランチにも iteration 26 の MCQ 修正
 # （複数宣言が競合したら無投票=None）を対称に適用した回帰確認。
 # 注: 宣言抽出の捕獲グループ ([^\n]{1,60}) は改行を跨がず貪欲マッチするため、同一行に
