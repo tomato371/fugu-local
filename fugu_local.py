@@ -451,12 +451,20 @@ def notify_slack(question: str, answer: str, elapsed: float):
 # Web 検索
 # ==================================================
 
-def _ddg_full(query: str, max_results: int) -> list:
-    """ddgs パッケージ（旧 duckduckgo_search）を使ってフル検索結果を返す。"""
+def _resolve_ddgs_class():
+    """DDGS クラスを解決するだけ（クエリは実行しない＝import 段階のみ）。
+    ddgs（後継、pip install ddgs）→ duckduckgo_search（旧名）の順に import を試み、
+    両方とも未インストールの場合のみ ImportError を送出する。"""
     try:
         from ddgs import DDGS  # 後継パッケージ（pip install ddgs）
     except ImportError:
         from duckduckgo_search import DDGS  # 旧名（非推奨）
+    return DDGS
+
+
+def _ddg_full(query: str, max_results: int) -> list:
+    """ddgs パッケージ（旧 duckduckgo_search）を使ってフル検索結果を返す。"""
+    DDGS = _resolve_ddgs_class()
     results = []
     with DDGS() as ddgs:
         for r in ddgs.text(query, max_results=max_results):
@@ -491,14 +499,27 @@ def _ddg_instant(query: str, max_results: int) -> list:
 def _search_raw(query: str, max_results: int = None) -> list:
     """1 クエリ分の検索結果をリストで返す。失敗時は空リスト（呼び出し側を止めない）。"""
     max_results = max_results or WEB_SEARCH_MAX_RESULTS
+    # 2026-07-23: 「ライブラリ解決(import)」と「クエリ実行(DDGS().text())」を別の try
+    # に分離する。旧実装は _ddg_full 内部の import 段階とクエリ実行段階を1つの try に
+    # まとめて except ImportError で受けていたため、ddgs/duckduckgo_search が正しく
+    # インストール済みでも、それが内部で遅延 import する primp/lxml 等のバックエンドが
+    # 実行時に ImportError を送出するケースまで「ライブラリ未インストール」と誤認して
+    # いた。その結果、誤った pip install 警告を出した上に Instant Answer フォールバック
+    # （下の警告コメントの通り、事実系クエリで古い知識を返す事故の温床）に倒れてしまう。
+    # ここでは _resolve_ddgs_class() の import 失敗（＝本当に未インストール）だけを
+    # Instant Answer フォールバックの対象とし、解決後の実行時エラーは ImportError で
+    # あっても他の実行時例外と同じ扱い（[] を返すのみ・Instant Answer には倒さない）にする。
     try:
-        return _ddg_full(query, max_results)
+        _resolve_ddgs_class()
     except ImportError:
         # Instant Answer API は事実系クエリでほぼ空を返す。無警告だと「検索したのに
         # 古い知識で回答」する事故になる（実測 2026-07-06: 最新GPUで1世代前を回答）。
         print("   [警告: ddgs 未インストールのため Instant Answer フォールバック中。"
               "pip install ddgs でフル検索が有効になります]")
         return _ddg_instant(query, max_results)
+
+    try:
+        return _ddg_full(query, max_results)
     except Exception as e:
         print(f"   [Web検索エラー: {e}]")
         return []

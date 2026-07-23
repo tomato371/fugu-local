@@ -4007,6 +4007,141 @@ with _tempfile.TemporaryDirectory() as _sv_dir:
         check("_save_as_html: 有効UTF-8既存ファイルへの2回目保存(<body>マージ)はbyte-for-byte従来通り",
               _html_good_content == _html_expected)
 
+# ---------- _search_raw: import段階 vs 実行段階の ImportError 誤爆防止 (2026-07-23修正) ----------
+# 旧実装は _ddg_full 内部の「ライブラリ import」と「DDGS().text()のクエリ実行」を
+# 1つの try にまとめて except ImportError で受けていたため、ddgs/duckduckgo_search が
+# 正しく import できていても、内部で遅延importされる primp/lxml 等のバックエンドが
+# 実行時に ImportError を送出すると「ライブラリ未インストール」と誤認し、誤った
+# pip install 警告を出した上で Instant Answer フォールバック（事実系クエリでほぼ空を
+# 返し、古い知識で回答する事故の温床）に倒れていた。
+# _resolve_ddgs_class() と _ddg_instant をモックし、実ネットワーク呼び出しなしで
+# (1) 本当にライブラリが無い場合は従来通りInstant Answerへ縮退すること、
+# (2) ライブラリ解決後の実行時ImportErrorはInstant Answerに縮退せず[]を返すこと、
+# (3) 実行時の非ImportError例外も従来通り[]を返すこと、
+# (4) 成功時の整形済み結果とweb_searchのヘッダ付与が従来通りであること、を検証する。
+
+_orig_resolve_ddgs_sr = f._resolve_ddgs_class
+_orig_ddg_instant_sr = f._ddg_instant
+
+
+class _FakeDDGSCtx:
+    """DDGS() as ... のコンテキストマネージャを模す最小限のフェイク。"""
+    def __init__(self, text_fn):
+        self._text_fn = text_fn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def text(self, query, max_results=None):
+        return self._text_fn(query, max_results)
+
+
+def _make_fake_ddgs_class(text_fn):
+    def _factory(*a, **k):
+        return _FakeDDGSCtx(text_fn)
+    return _factory
+
+
+try:
+    # --- (1) 本当にライブラリ未インストール(解決段階でImportError) -> Instant Answerへ縮退 ---
+    _sentinel_instant = ["INSTANT_ANSWER_SENTINEL"]
+
+    def _resolve_raises_importerror():
+        raise ImportError("ddgs / duckduckgo_search いずれも未インストール(模擬)")
+
+    def _instant_returns_sentinel(query, max_results):
+        return list(_sentinel_instant)
+
+    f._resolve_ddgs_class = _resolve_raises_importerror
+    f._ddg_instant = _instant_returns_sentinel
+
+    _buf1 = io.StringIO()
+    with contextlib.redirect_stdout(_buf1):
+        _r1 = f._search_raw("ライブラリ未インストールクエリ", max_results=3)
+    _out1 = _buf1.getvalue()
+
+    check("_search_raw: ライブラリ未インストール時はInstant Answerの結果を返す(既存挙動)",
+          _r1 == _sentinel_instant)
+    check("_search_raw: ライブラリ未インストール時は既存のpip install警告を表示する(既存挙動)",
+          "ddgs 未インストール" in _out1 and "pip install ddgs" in _out1)
+
+    # --- (2) ライブラリ解決は成功、クエリ実行(.text())が実行時ImportErrorを送出 ---
+    #     -> Instant Answerには倒れず(警告メッセージも出さず)、[]を返す。
+    def _resolve_ok_for_runtime_importerror():
+        return _make_fake_ddgs_class(
+            lambda q, mr: (_ for _ in ()).throw(
+                ImportError("primp/lxml 等バックエンドの遅延import失敗(模擬)")))
+
+    def _instant_must_not_be_called(query, max_results):
+        raise AssertionError(
+            "_search_raw: 実行時ImportErrorなのにInstant Answerへ縮退した(誤爆再発)")
+
+    f._resolve_ddgs_class = _resolve_ok_for_runtime_importerror
+    f._ddg_instant = _instant_must_not_be_called
+
+    _buf2 = io.StringIO()
+    with contextlib.redirect_stdout(_buf2):
+        _r2 = f._search_raw("実行時ImportErrorクエリ", max_results=3)
+    _out2 = _buf2.getvalue()
+
+    check("_search_raw: 実行時ImportErrorは[]を返す(Instant Answerへ誤爆しない)",
+          _r2 == [])
+    check("_search_raw: 実行時ImportErrorではpip install警告を表示しない",
+          "ddgs 未インストール" not in _out2 and "pip install ddgs" not in _out2)
+    check("_search_raw: 実行時ImportErrorは他の実行時エラーと同じ[Web検索エラー]表記",
+          "[Web検索エラー:" in _out2)
+
+    # --- (3) クエリ実行が非ImportErrorの通常例外を送出 -> 従来通り[]を返す ---
+    def _resolve_ok_for_runtime_generic_error():
+        return _make_fake_ddgs_class(
+            lambda q, mr: (_ for _ in ()).throw(RuntimeError("ネットワーク断(模擬)")))
+
+    f._resolve_ddgs_class = _resolve_ok_for_runtime_generic_error
+    f._ddg_instant = _instant_must_not_be_called
+
+    _buf3 = io.StringIO()
+    with contextlib.redirect_stdout(_buf3):
+        _r3 = f._search_raw("実行時RuntimeErrorクエリ", max_results=3)
+    _out3 = _buf3.getvalue()
+
+    check("_search_raw: 実行時の非ImportError例外も従来通り[]を返す(既存挙動)",
+          _r3 == [])
+    check("_search_raw: 実行時の非ImportError例外でもInstant Answerへ縮退しない(既存挙動)",
+          "ddgs 未インストール" not in _out3)
+
+    # --- (4) 正常系: 整形済み結果 + web_search のヘッダ付与が従来通り ---
+    def _canned_rows(query, max_results):
+        return [
+            {"title": "結果1", "body": "本文1本文1本文1", "href": "https://example.com/1"},
+            {"title": "結果2", "body": "本文2本文2本文2", "href": "https://example.com/2"},
+        ]
+
+    f._resolve_ddgs_class = lambda: _make_fake_ddgs_class(_canned_rows)
+    f._ddg_instant = _instant_must_not_be_called
+
+    _r4 = f._search_raw("正常系クエリ", max_results=5)
+    _expected_r4 = [
+        "[結果1]\n本文1本文1本文1\nSource: https://example.com/1",
+        "[結果2]\n本文2本文2本文2\nSource: https://example.com/2",
+    ]
+    check("_search_raw: 正常系は_ddg_fullの整形形式(タイトル/本文/Source)通りの結果を返す",
+          _r4 == _expected_r4)
+
+    _ws4 = f.web_search("正常系クエリ", max_results=5)
+    check("web_search: 正常系はDuckDuckGoヘッダを付与して結果を連結する(既存挙動)",
+          _ws4 == "## Web Search Results (DuckDuckGo)\n" + "\n\n".join(_expected_r4))
+finally:
+    f._resolve_ddgs_class = _orig_resolve_ddgs_sr
+    f._ddg_instant = _orig_ddg_instant_sr
+
+check("_search_raw: テスト後に_resolve_ddgs_classが元の状態へ復元されている",
+      f._resolve_ddgs_class == _orig_resolve_ddgs_sr)
+check("_search_raw: テスト後に_ddg_instantが元の状態へ復元されている",
+      f._ddg_instant == _orig_ddg_instant_sr)
+
 # ---------- research_search: 反復リサーチループ (dedup / ラウンド上限 / 早期終了) ----------
 # research_search は「Conductor/proposer 全員に注入される権威コンテキスト」を作る
 # 精度クリティカルな経路だが、これまでオフラインテストが皆無だった。
