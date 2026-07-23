@@ -935,8 +935,19 @@ def _with_context(question: str, context: str) -> str:
 
 def _trim_history(history):
     """_HISTORY が MAX_HISTORY_CHARS を超えたら古い (user, assistant) ペアを先頭から削除する。"""
+    # 2026-07-23: ガードを `>= 2` から `> 2` に修正。
+    # ask_fugu は直近の [user, assistant] ペアを追記した「直後」に本関数を呼ぶため、
+    # 旧ガード `len(history) >= 2` だと履歴がその最新ペア1組だけ（長さ2）に
+    # なった状態でも、文字数がまだ MAX_HISTORY_CHARS（4000。詳細なMoA回答は
+    # コード/証明/節見出し込みですぐ超える）を超えていればループに入り、
+    # pop(0) を2回叩いて最新ペアごと消してしまっていた。結果、直前に生成した
+    # ばかりの回答が跡形もなく消え、次の行で「[会話履歴: 0 往復保持中]」と出て
+    # 以降のフォローアップ質問が文脈ゼロで飛ぶ。docstring 通り「古いペアを
+    # 先頭から削除する」のが目的であり、最新ペアまで削るのは仕様外。
+    # `> 2` にすることで、削除対象が残り最新ペアのみになった時点でループを
+    # 止め、多ターン対話の文脈（精度に直結）を必ず1ペアは残すようにする。
     while (sum(len(m["content"]) for m in history) > MAX_HISTORY_CHARS
-           and len(history) >= 2):
+           and len(history) > 2):
         history.pop(0)
         if history and history[0]["role"] == "assistant":
             history.pop(0)

@@ -3959,6 +3959,95 @@ with _tempfile.TemporaryDirectory() as _pdf_dir:
         else:
             del sys.modules["fpdf"]
 
+# ---------- _trim_history: 直近ペアを消さない (2026-07-23回帰) ----------
+# 背景: ask_fugu は直近の [user, assistant] ペアを _HISTORY に追記した「直後」に
+# _trim_history を呼ぶ。旧ガード `len(history) >= 2` だと、履歴が直近ペア1組
+# (長さ2) まで削られた状態でもまだ MAX_HISTORY_CHARS 超過ならループに入り、
+# pop(0) を2回叩いて直近ペアごと消してしまい、履歴が完全に空になっていた
+# (直後に "[会話履歴: 0 往復保持中]" と出る既知の再現手順)。
+# `len(history) > 2` に直したことで、削除対象が最後の1ペアだけになった時点で
+# 必ず停止し、多ターン対話の文脈(精度に直結)を失わないことをここで検証する。
+_orig_max_hist_chars = f.MAX_HISTORY_CHARS
+
+# (1) 予算内なら無加工でそのまま(同一オブジェクト・同一順序・同一長)
+_hist_small = [{"role": "user", "content": "hello"},
+               {"role": "assistant", "content": "world"}]
+_hist_small_ids_before = [id(m) for m in _hist_small]
+f._trim_history(_hist_small)
+check("trim_history: 予算内は要素数不変(無加工)", len(_hist_small) == 2)
+check("trim_history: 予算内は同一オブジェクト・順序も不変(無加工)",
+      [id(m) for m in _hist_small] == _hist_small_ids_before)
+
+# (2) バグ再現(主目的): 直近1ペアだけの状態で単独で予算超過しても消えない
+try:
+    f.MAX_HISTORY_CHARS = 4000
+    _hist_one_pair = [{"role": "user", "content": "q"},
+                       {"role": "assistant", "content": "X" * 6000}]
+    f._trim_history(_hist_one_pair)
+    check("trim_history: 直近1ペアが単独で予算超過しても消えない(バグ再現)",
+          len(_hist_one_pair) == 2)
+    check("trim_history: 残るのは直近のuser/assistantペアそのもの(内容不変)",
+          _hist_one_pair[0]["role"] == "user"
+          and _hist_one_pair[0]["content"] == "q"
+          and _hist_one_pair[1]["role"] == "assistant"
+          and _hist_one_pair[1]["content"] == "X" * 6000)
+finally:
+    f.MAX_HISTORY_CHARS = _orig_max_hist_chars
+
+# (3) 回帰: 複数ペアが予算超過なら古いペアから先頭ごと削除され、
+#     生き残りは元リストの末尾(tail)と一致する(順序維持・ペア単位で削除)
+try:
+    f.MAX_HISTORY_CHARS = 250
+    _pair1 = [{"role": "user", "content": "u" * 50},
+              {"role": "assistant", "content": "a" * 50}]
+    _pair2 = [{"role": "user", "content": "u" * 50},
+              {"role": "assistant", "content": "a" * 50}]
+    _pair3 = [{"role": "user", "content": "u" * 50},
+              {"role": "assistant", "content": "a" * 50}]
+    _hist_multi = _pair1 + _pair2 + _pair3
+    _hist_multi_expected_tail = _pair2 + _pair3
+    f._trim_history(_hist_multi)
+    check("trim_history: 予算超過時は古いペアが先頭からペア単位で削除される",
+          _hist_multi == _hist_multi_expected_tail)
+    check("trim_history: 生き残りは元リストの末尾と一致する(順序維持)",
+          len(_hist_multi) == 4 and _hist_multi[0]["content"] == "u" * 50)
+finally:
+    f.MAX_HISTORY_CHARS = _orig_max_hist_chars
+
+# (4) 全ペアが予算超過でも直近の1ペアだけは必ず残る(先頭ペアのみ削除)
+try:
+    f.MAX_HISTORY_CHARS = 4000
+    _big_pair1 = [{"role": "user", "content": "u" * 3000},
+                  {"role": "assistant", "content": "a" * 3000}]
+    _big_pair2 = [{"role": "user", "content": "u" * 3000},
+                  {"role": "assistant", "content": "a" * 3000}]
+    _hist_two_big = _big_pair1 + _big_pair2
+    f._trim_history(_hist_two_big)
+    check("trim_history: 2ペアとも予算超過でも直近ペアのみ残る(先頭ペア削除)",
+          _hist_two_big == _big_pair2)
+finally:
+    f.MAX_HISTORY_CHARS = _orig_max_hist_chars
+
+# (5) 一般化: 極小予算・様々なペア数でも空にならず、例外を送出せず完走する(ハングしない)
+try:
+    f.MAX_HISTORY_CHARS = 1
+    _no_hang_exc = None
+    try:
+        for _n_pairs in (1, 2, 3, 5):
+            _h = []
+            for _i in range(_n_pairs):
+                _h.append({"role": "user", "content": "u" * 500})
+                _h.append({"role": "assistant", "content": "a" * 500})
+            f._trim_history(_h)
+            check(f"trim_history: 予算1でも空にならない(ペア数={_n_pairs})",
+                  len(_h) >= 2)
+    except Exception as _e:
+        _no_hang_exc = _e
+    check("trim_history: 極小予算でも例外を送出せず完走する(ハング/クラッシュなし)",
+          _no_hang_exc is None)
+finally:
+    f.MAX_HISTORY_CHARS = _orig_max_hist_chars
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
