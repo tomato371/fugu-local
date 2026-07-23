@@ -540,6 +540,51 @@ check("sc: 投票 最多クラス", _top == "42" and _cnt == 2)
 check("sc: 投票 同値クラス集約", any(c[1] == 2 and f.answers_equivalent(c[0], "0.5") for c in _cls))
 check("sc: 投票 空リスト", f.vote_answers([]) == (None, 0, []))
 
+# ---------- vote_answers（tie安定性・代表選定・None/空フィルタ・件数降順） ----------
+# gotcha #7 の自己整合性投票（solve_verifiable/_arbitrate）が構造的に依拠する契約を
+# 直接ロックする。iteration 32 (answers_equivalent) / iteration 52 (_sc_sample) の
+# 姉妹カバレッジ。全て answers_equivalent の高速パス（normalize一致/Fraction/_FW_TRANS）
+# のみで解決する組み合わせを使い、math_verify の実体（サブプロセス/ライブラリ有無）には
+# 依存しない。
+
+# (a) 同数タイは「先出現が勝つ」: classes.sort(key=lambda c: -c[1]) は Python の安定
+#     ソートなので、件数が同じクラス同士は出現順（挿入順）が保たれる。solve_verifiable の
+#     拮抗判定 classes[0][1]==classes[1][1] や、_arbitrate が None を返した際の
+#     先出現フォールバックは、この安定性に構造的に依存している。Counter や非安定ソートへの
+#     リファクタはここを静かに壊しうる。
+_top_a1, _cnt_a1, _cls_a1 = f.vote_answers(["7", "3", "3", "7"])
+check("vote: 同数タイは先出現(7)が勝つ",
+      _top_a1 == "7" and _cnt_a1 == 2 and _cls_a1 == [["7", 2], ["3", 2]])
+
+_top_a2, _cnt_a2, _cls_a2 = f.vote_answers(["3", "7", "7", "3"])
+check("vote: 入力順を逆にすると先出現(3)が勝つ(値の大小ではない)",
+      _top_a2 == "3" and _cnt_a2 == 2 and _cls_a2 == [["3", 2], ["7", 2]])
+
+# (b) 統合クラスの代表文字列は「最初に見た表記」。Fraction 高速パスで 1/2 と 0.5 が
+#     同一クラスに集約されても、代表（res['votes'] のキー/_arbitrate の候補ラベルに使われる）
+#     は後から来た '0.5' ではなく先出の '1/2' のまま。
+_top_b, _cnt_b, _cls_b = f.vote_answers(["1/2", "0.5", "0.5"])
+check("vote: 統合クラスの代表は最初に見た表記(1/2)のまま(0.5にならない)",
+      (_top_b, _cnt_b, _cls_b) == ("1/2", 3, [["1/2", 3]]))
+
+# (c) normalize_answer / _FW_TRANS 高速パス経由の統合（全角マイナス U+2212 → 半角ハイフン）。
+_top_c, _cnt_c, _cls_c = f.vote_answers(["-5", "−5"])
+check("vote: 全角マイナス(U+2212)と半角ハイフンの'-5'は同一クラスに統合される",
+      (_top_c, _cnt_c, _cls_c) == ("-5", 2, [["-5", 2]]))
+
+# (d) None/空文字は集計から除外される。
+_top_d1, _cnt_d1, _cls_d1 = f.vote_answers(["5", None, "", "5"])
+check("vote: Noneと空文字は集計から除外される",
+      _top_d1 == "5" and _cnt_d1 == 2 and len(_cls_d1) == 1)
+check("vote: 全てNone/空文字なら(None, 0, [])",
+      f.vote_answers([None, "", None]) == (None, 0, []))
+
+# (e) classes は件数降順で返る。入力の先頭に出た低頻度クラスも件数順どおり後ろに回る。
+_top_e, _cnt_e, _cls_e = f.vote_answers(["5", "9", "9", "9", "2", "2"])
+check("vote: classesは件数降順(入力先頭の低頻度クラスは後ろに回る)",
+      _top_e == "9" and _cnt_e == 3
+      and _cls_e == [["9", 3], ["2", 2], ["5", 1]])
+
 # ---------- solve_verifiable（ask をモックして適応サンプリングを検証） ----------
 _orig_ask2 = f.ask
 _orig_props2 = f.PROPOSERS
