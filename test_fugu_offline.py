@@ -1832,6 +1832,69 @@ finally:
 check("sc: PoT stdout_onlyで警告行ではなく印字された答えが投票になる",
       _pot_ans == f.normalize_answer("7"))
 
+# ---------- _sc_sample: __ERROR__ センチネルは投票を汚染せずそのまま素通しする (2026-07-23) ----------
+# ask() は失敗時 '__ERROR__: HTTP Error 500: Internal Server Error' のような文字列を返す
+# (line ~1079)。_sc_sample の L2558 (`if raw.startswith("__ERROR__"): return None, raw`) は
+# これを extract_final_answer/PoT実行より前段で弾いている。弾かなければ math の最終数値
+# フォールバック(extract_final_answer, line ~2497)がエラーメッセージ中の '500' を確信ありの
+# 1票として誤採用しうる。同種ガードは ask()自身(iter9)・_critic_judge/second_opinion(iter15)・
+# _arbitrate(iter20)では回帰確認済みだったが、自己一貫性投票(gotcha#7)の最小単位である
+# _sc_sample 自身は iteration 4 で PoT の happy path しか検証されておらず、非PoT分岐・mcq分岐・
+# PoTのガード早期リターン(サブプロセス不起動)は無防備だった。ここで塞ぐ。
+_orig_ask_scerr = f.ask
+_orig_extract_code_scerr = f.extract_code
+_orig_run_python_scerr = f.run_python
+
+try:
+    # (1) 非PoT math: __ERROR__ は数値 '500' に化けず、素の (None, raw) を返す
+    f.ask = lambda *a, **k: "__ERROR__: HTTP Error 500: Internal Server Error"
+    _ans_math_err, _text_math_err = f._sc_sample("m1", "1+1=?", "math", pot=False)
+    check("sc-err: 非PoT mathの__ERROR__は'500'を誤採用せずanswer=None",
+          _ans_math_err is None)
+    check("sc-err: 非PoT mathの__ERROR__はtextに生のエラー文字列をそのまま返す",
+          _text_math_err == "__ERROR__: HTTP Error 500: Internal Server Error")
+
+    # (2) 非PoT mcq: エラー文中にA-E文字や数字が含まれていても選択肢を誤採用しない
+    f.ask = lambda *a, **k: "__ERROR__: HTTP Error 400 for model A"
+    _ans_mcq_err, _text_mcq_err = f._sc_sample("m1", "Which is correct?", "mcq", pot=False)
+    check("sc-err: 非PoT mcqの__ERROR__は選択肢文字/数字を誤採用せずanswer=None",
+          _ans_mcq_err is None)
+
+    # (3) PoT math: ガードが extract_code/run_python より前段で早期returnし、
+    # サブプロセスが一切起動されないことを証明する(到達すればAssertionErrorで即検知)。
+    _pot_err_touched = []
+
+    def _extract_code_forbidden_scerr(*a, **kw):
+        _pot_err_touched.append("extract_code")
+        raise AssertionError("__ERROR__ガード後にextract_codeへ到達してはならない")
+
+    def _run_python_forbidden_scerr(*a, **kw):
+        _pot_err_touched.append("run_python")
+        raise AssertionError("__ERROR__ガード後にrun_pythonへ到達してはならない(subprocess起動)")
+
+    f.extract_code = _extract_code_forbidden_scerr
+    f.run_python = _run_python_forbidden_scerr
+    f.ask = lambda *a, **k: "__ERROR__: HTTP Error 500: Internal Server Error"
+    _ans_pot_err, _text_pot_err = f._sc_sample("m1", "1+1=?", "math", pot=True)
+    check("sc-err: PoT分岐でも__ERROR__は(None, raw)を返す",
+          _ans_pot_err is None
+          and _text_pot_err == "__ERROR__: HTTP Error 500: Internal Server Error")
+    check("sc-err: PoT分岐の__ERROR__はextract_code/run_pythonへ到達しない(subprocess不起動)",
+          not _pot_err_touched)
+finally:
+    f.ask = _orig_ask_scerr
+    f.extract_code = _orig_extract_code_scerr
+    f.run_python = _orig_run_python_scerr
+
+# regression: 正常な非PoT math応答は従来どおり\boxed{}から答えが採れる(ガードの過検知なし)
+try:
+    f.ask = lambda *a, **k: "計算しました。\\boxed{42}"
+    _ans_ok_scerr, _text_ok_scerr = f._sc_sample("m1", "6*7=?", "math", pot=False)
+finally:
+    f.ask = _orig_ask_scerr
+check("sc-err: 通常応答は__ERROR__ガードに過検知されず'42'を採票",
+      _ans_ok_scerr == "42" and _text_ok_scerr == "計算しました。\\boxed{42}")
+
 check("code: code_check 正常コードは None", f.code_check("```python\nprint(1)\n```") is None)
 _issue = f.code_check("```python\n1/0\n```")
 check("code: code_check 失敗はエラー要約", _issue is not None and "ZeroDivision" in _issue)
