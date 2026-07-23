@@ -3653,6 +3653,38 @@ with _tempfile.TemporaryDirectory() as _html_dir:
     check("_save_as_html: 生の(未escape)コード本文は出力に含まれない",
           "a < b && c" not in _content_e)
 
+    # ---- (f) インデントされたフェンス (2026-07-23) ----
+    # 旧実装は line.startswith("```") で列0固定だったため、番号付きリスト内に
+    # 3スペースインデントで置かれた```pythonブロック（LLMがよく出す形）を
+    # フェンスとして検出できず、```python/```自体がプレーン行としてescapeされ
+    # コード本文も<br>付きの通常行として崩れて出力されていた。extract_boxed
+    # （iteration 11）・strip_think（iteration 16）・_save_as_htmlのタグ整合性
+    # （iteration 37）・_parse_slides（iteration 50）と同じフェンス未検出系
+    # バグクラス。line.strip().startswith("```")への統一で解消したことを検証。
+    _html_out_f = _html_root / "f.html"
+    _answer_f = "1. Do this:\n   ```python\n   x = 1\n   print(x)\n   ```\n2. Done"
+    f._save_as_html(_html_out_f, "q6", _answer_f, 0.2)
+    _content_f = _html_out_f.read_text(encoding="utf-8")
+    check("_save_as_html: インデントされたフェンスでも<pre><code>が正確に1回出現",
+          _content_f.count("<pre><code>") == 1)
+    check("_save_as_html: インデントされたフェンスでも</code></pre>が正確に1回出現",
+          _content_f.count("</code></pre>") == 1)
+    check("_save_as_html: インデントされたフェンス記号自体がエスケープされた文字列として残らない",
+          "```python" not in _content_f and "```" not in _content_f)
+    _code_body_f = _content_f.split("<pre><code>", 1)[1].split("</code></pre>", 1)[0]
+    check("_save_as_html: インデントされたフェンスのコード本文に<br>が混入しない",
+          "<br>" not in _code_body_f)
+    check("_save_as_html: インデントされたフェンスのコード本文はそのまま含まれる",
+          "x = 1" in _content_f and "print(x)" in _content_f)
+
+    # ---- (g) インデントされた未終端フェンス（```が奇数個）でもバランスが取れる ----
+    _html_out_g = _html_root / "g.html"
+    _answer_g = "  - step:\n    ```python\n    x = 1\n"  # 閉じフェンスなし、インデント付き
+    f._save_as_html(_html_out_g, "q7", _answer_g, 0.1)
+    _content_g = _html_out_g.read_text(encoding="utf-8")
+    check("_save_as_html: インデントされた未終端フェンスでも<pre><code>と</code></pre>の個数が一致",
+          _content_g.count("<pre><code>") == _content_g.count("</code></pre>") == 1)
+
 # ---------- _save_as_markdown/_save_as_text/_save_as_html: 既存ファイルが非UTF-8でも
 # クラッシュしない (2026-07-23) ----------
 # 3関数とも既存 --out ファイルの読み戻しに encoding="utf-8" のみを渡しており

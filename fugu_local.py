@@ -3283,7 +3283,22 @@ def _save_as_html(out: Path, question: str, answer: str, elapsed: float):
     # まま escape して <pre><code>...</code></pre> の中に入れる。
     in_code = False
     for line in answer.splitlines():
-        if line.startswith("```"):
+        # 2026-07-23: フェンス判定が line.startswith("```") のまま列0固定
+        # だったため、LLM が番号付き/箇条書きリストの中に```pythonブロックを
+        # 2〜4スペースでインデントして出力する（よくあるケース）と、行頭に
+        # 空白があるだけでフェンスとして認識されず in_code に入れなかった。
+        # 結果、```python/``` の行自体がプレーンテキストとして escape され
+        # そのまま文字列として表示され、コード本文の各行も else 節に落ちて
+        # 余計な <br> が付与された状態で崩れて出力されていた。これは
+        # extract_boxed（iteration 11）・strip_think（iteration 16）・
+        # _save_as_html のタグ整合性そのもの（iteration 37）・_parse_slides
+        # （iteration 50）で既に対処済みのフェンス未検出/不整合と同種の
+        # バグクラスで、本関数だけインデント方向が未対応だった。他の全ての
+        # フェンス処理（extract_code, _extract_code_for_output, _parse_slides）
+        # と同じ line.strip().startswith("```") に揃えることで、インデント
+        # されたフェンスも列0のフェンスと同様に単一の <pre><code>…
+        # </code></pre> へバランスよく変換されるようにする。
+        if line.strip().startswith("```"):
             if in_code:
                 a_lines.append("</code></pre>")
                 in_code = False
