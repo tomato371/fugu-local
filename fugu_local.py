@@ -2204,7 +2204,12 @@ def get_single_proposal(model, question, reference, issue=None, history=None):
                 "accurate. Output your improved answer only."
             )}]
         )
-    return model, ask(model, msgs, PROPOSER_TEMP, think=PROPOSER_THINK,
+    # 2026-07-23: ここは長らく think=PROPOSER_THINK（生のグローバル、既定 None）を直接渡して
+    # おり、num_predict だけ proposer_predict_for(model) で MODEL_CONFIG 対応させたのに think
+    # が取り残されていた欠落サイト。これだと gpt-oss:20b/qwen3.6:35b が MoA 提案でも
+    # think:"high"/True を一度も受け取れず、_sc_sample（SC 経路、proposer_think_for 使用済み）
+    # とだけ非対称だった。proposer_think_for に揃えて解決（PROPOSER_THINK override 優先は温存）。
+    return model, ask(model, msgs, PROPOSER_TEMP, think=proposer_think_for(model),
                       num_predict=proposer_predict_for(model), label="proposer")
 
 
@@ -2951,7 +2956,12 @@ def fugu_answer(question, plan=None, history=None):
              + history
              + [{"role": "user", "content": question}]),
             PROPOSER_TEMP,
-            think=PROPOSER_THINK,
+            # 2026-07-23: get_single_proposal と同じ欠落パターン（gotcha 該当箇所として明記）。
+            # 単体モードの ask も think=PROPOSER_THINK の生グローバルを直渡ししており、隣の
+            # num_predict=proposer_predict_for(model) だけがモデル別設定に対応していた非対称を
+            # 解消。proposer_think_for(model) で _sc_sample と同じ解決順（PROPOSER_THINK override
+            # > MODEL_CONFIG > モデル既定）に統一する。
+            think=proposer_think_for(model),
             num_predict=proposer_predict_for(model),
             label="single",
         ))

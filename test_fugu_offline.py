@@ -2069,6 +2069,66 @@ check("agg: 正常系はアグリゲータ出力をそのまま返す", out3 == 
 check("agg: アグリゲータへのプロンプトには[Execution check: PASSED]が残る",
       any("[Execution check: PASSED]" in u for u in _captured_user))
 
+# ---------- get_single_proposal: think 解決に proposer_think_for を使う (2026-07-23) ----------
+# 2026-07-23 fix: get_single_proposal は隣の num_predict こそ proposer_predict_for(model) で
+# MODEL_CONFIG 対応していたが、think は生の PROPOSER_THINK グローバル(既定 None)を直渡し
+# していた欠落サイト。これだと gpt-oss:20b/qwen3.6:35b が MoA 提案(get_single_proposal 経由)
+# で think:"high"/True を一度も受け取れず、既に proposer_think_for 経由で正しく解決していた
+# _sc_sample(SC経路) とだけ非対称になっていた。ここでは f.ask をモックして think/num_predict
+# kwarg を直接キャプチャし、reference無(新規回答)/reference有(改善分岐)の両方で
+# proposer_think_for(model) の解決結果がそのまま渡ることを検証する。ネットワーク/GPU呼び出し無し。
+_gsp_think_calls = []
+
+
+def _fake_ask_capture_think(model, messages, temperature, think=None, fmt=None,
+                             label=None, num_predict=None):
+    _gsp_think_calls.append({"model": model, "think": think, "num_predict": num_predict})
+    return "proposal text"
+
+
+_orig_ask_gsp_think = f.ask
+_orig_pt_gsp = f.PROPOSER_THINK
+f.ask = _fake_ask_capture_think
+try:
+    f.PROPOSER_THINK = None
+    _gsp_think_calls.clear()
+    f.get_single_proposal("gpt-oss:20b", "Q?", None)
+    check("gsp: think解決 gpt-oss:20b(reference無=新規回答)はMODEL_CONFIGのhighを渡す",
+          _gsp_think_calls[-1]["think"] == "high")
+    check("gsp: num_predictはproposer_predict_for(model)のまま(回帰・不変)",
+          _gsp_think_calls[-1]["num_predict"] == f.proposer_predict_for("gpt-oss:20b"))
+
+    _gsp_think_calls.clear()
+    f.get_single_proposal("gpt-oss:20b", "Q?", "draft answer")
+    check("gsp: think解決 gpt-oss:20b(reference有=ドラフト改善分岐)もhighを渡す",
+          _gsp_think_calls[-1]["think"] == "high")
+
+    _gsp_think_calls.clear()
+    f.get_single_proposal("qwen3.6:35b", "Q?", None)
+    check("gsp: think解決 qwen3.6:35bはTrueを渡す", _gsp_think_calls[-1]["think"] is True)
+
+    _gsp_think_calls.clear()
+    f.get_single_proposal("qwen3-coder:30b", "Q?", None)
+    check("gsp: think解決 qwen3-coder:30b(MODEL_CONFIGにthink無し)はNoneのまま(回帰・400防止)",
+          _gsp_think_calls[-1]["think"] is None)
+
+    _gsp_think_calls.clear()
+    f.get_single_proposal("gemma4:26b", "Q?", None)
+    check("gsp: think解決 gemma4:26b(MODEL_CONFIGにthink無し)はNoneのまま(回帰・400防止)",
+          _gsp_think_calls[-1]["think"] is None)
+
+    # override優先: PROPOSER_THINK が None 以外なら全モデルそちらが最優先(eval一括OFF等)
+    f.PROPOSER_THINK = False
+    _gsp_think_calls.clear()
+    f.get_single_proposal("gpt-oss:20b", "Q?", None)
+    check("gsp: PROPOSER_THINK override時はgpt-oss:20bもFalse(eval一括OFFとbyte一致)",
+          _gsp_think_calls[-1]["think"] is False)
+finally:
+    f.ask = _orig_ask_gsp_think
+    f.PROPOSER_THINK = _orig_pt_gsp
+check("gsp: テスト後にf.askが元に復元されている", f.ask == _orig_ask_gsp_think)
+check("gsp: テスト後にPROPOSER_THINKが元に復元されている", f.PROPOSER_THINK == _orig_pt_gsp)
+
 # ---------- get_proposals の多様性（先頭はドラフト無しで新規回答） ----------
 _seen_refs = []
 
@@ -3542,6 +3602,60 @@ check("fugu_answer: SCがNoneならMoA(get_proposals/aggregate)へフォール�
       _ans_c == _MOA_SENTINEL)
 check("fugu_answer: フォールバック時は実際にget_proposals/aggregateが呼ばれる",
       len(_get_proposals_calls_c) >= 1 and len(_aggregate_calls_c) >= 1)
+
+# ---------- fugu_answer 単体モード: think 解決に proposer_think_for を使う (2026-07-23) ----------
+# 2026-07-23 fix の適用対象その2（get_single_proposal と全く同じ欠落パターン）: 単体モードの
+# ask 呼び出しも think=PROPOSER_THINK の生グローバルを直渡ししており、隣の
+# num_predict=proposer_predict_for(model) だけがMODEL_CONFIG対応済みという非対称があった。
+# f.ask をモックしてthink/num_predict kwargを捕捉し、f.verify_singleをok=Trueに固定して
+# 単体モードが合議へフォールバックせず即returnする経路（ADAPTIVE_ESCALATION=True既定）を通す。
+# task_type をmath/mcq以外にしてSC経路(solve_verifiable)には触れさせない。
+_fa_think_calls = []
+
+
+def _fake_ask_capture_single(model, messages, temperature, think=None, fmt=None,
+                              label=None, num_predict=None):
+    _fa_think_calls.append({"model": model, "think": think, "num_predict": num_predict})
+    return "single-mode answer"
+
+
+_orig_ask_fa = f.ask
+_orig_verify_single_fa = f.verify_single
+_orig_pt_fa = f.PROPOSER_THINK
+f.ask = _fake_ask_capture_single
+f.verify_single = lambda question, answer: (True, None)
+try:
+    f.PROPOSER_THINK = None
+    _fa_think_calls.clear()
+    _fa_plan = _validated_plan(None, mode="single")
+    _fa_plan["selected_proposers"] = ["gpt-oss:20b"]
+    with contextlib.redirect_stdout(io.StringIO()):
+        _fa_out = f.fugu_answer("Q?", plan=_fa_plan, history=[])
+    check("fugu_answer単体: think解決 gpt-oss:20bはMODEL_CONFIGのhighを渡す(旧: 生PROPOSER_THINKで欠落)",
+          _fa_think_calls and _fa_think_calls[-1]["think"] == "high")
+    check("fugu_answer単体: num_predictはproposer_predict_for(model)のまま(回帰・不変)",
+          _fa_think_calls[-1]["num_predict"] == f.proposer_predict_for("gpt-oss:20b"))
+    check("fugu_answer単体: verify_single ok=Trueで即returnし単体回答をそのまま返す",
+          _fa_out == "single-mode answer")
+
+    # PROPOSER_THINK override優先の確認（eval の一括OFF等とbyte一致でなければならない）
+    f.PROPOSER_THINK = False
+    _fa_think_calls.clear()
+    _fa_plan2 = _validated_plan(None, mode="single")
+    _fa_plan2["selected_proposers"] = ["gpt-oss:20b"]
+    with contextlib.redirect_stdout(io.StringIO()):
+        f.fugu_answer("Q?", plan=_fa_plan2, history=[])
+    check("fugu_answer単体: PROPOSER_THINK override時はgpt-oss:20bもFalse(eval一括OFFとbyte一致)",
+          _fa_think_calls[-1]["think"] is False)
+finally:
+    f.ask = _orig_ask_fa
+    f.verify_single = _orig_verify_single_fa
+    f.PROPOSER_THINK = _orig_pt_fa
+check("fugu_answer単体: テスト後にf.askが元に復元されている", f.ask == _orig_ask_fa)
+check("fugu_answer単体: テスト後にf.verify_singleが元に復元されている",
+      f.verify_single == _orig_verify_single_fa)
+check("fugu_answer単体: テスト後にPROPOSER_THINKが元に復元されている",
+      f.PROPOSER_THINK == _orig_pt_fa)
 
 # ---------- _load_rag_chunks: '[' 始まりの過剰フィルタ回帰防止 (2026-07-22) ----------
 # _read_excel/_read_pptx の成功時出力（"[Sheet: ...]" / "[Slide 1]"）が
