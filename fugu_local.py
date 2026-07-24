@@ -3098,11 +3098,33 @@ def _arbitrate(question, task_type, samples, classes):
     # と言われ、3件目以降への精査が手薄になる恐れがあった。「each candidate」
     # 「the incorrect one(s)」という候補数非依存の表現に統一する。2択の場合も
     # 意味は従来の "check both / find the flaw in the wrong one" と同等。
+    # 2026-07-24: _arbitrate は math/mcq 両方の拮抗解消で共用される（呼び出し元は
+    # solve_verifiable）が、末尾の出力形式指示はここまで math 前提の "put ONLY the
+    # correct final answer in \boxed{}" 一本しか無かった。extract_final_answer(text,
+    # 'mcq')（iter 3 で確立・iter 26/102 で誤爆修正済み）は \boxed{} の中身が選択肢
+    # 文字 A-E で始まる場合しか採用せず、計算値や選択肢本文（\boxed{7} や
+    # \boxed{Paris} 等）は None（無投票）になる。math 寄りの文言に引きずられた裁定役が
+    # それを箱に入れると、下のループが全裁定役で ans=None のまま尽き、_arbitrate 全体が
+    # None を返して mcq の拮抗が黙って MoA フォールバックへ劣化していた（iter 16/45 は
+    # math 側の文言調整のみで、この mcq 側の出力形式齟齬は未対応だった）。
+    # task_type=='mcq' のときだけ「\boxed{} には選択肢の文字(A-Eのいずれか1文字)だけを
+    # 入れよ」と明示する。推論自体（"solve the problem yourself if needed"）は禁止せず、
+    # 制約するのは最後の boxed トークンのみ。math/その他の文言は従来と完全に同一
+    # （バイト単位で不変。回帰テストで固定）。
+    if task_type == "mcq":
+        final_instruction = (
+            "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
+            "and solve the problem yourself if needed. At the very end, put ONLY the "
+            "single choice letter (A, B, C, D, or E) in \\boxed{} -- not the option's "
+            "wording or a computed value, just that one letter.")
+    else:
+        final_instruction = (
+            "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
+            "and solve the problem yourself if needed. At the very end, put ONLY the "
+            "correct final answer in \\boxed{}.")
     prompt = (f"Problem:\n{question}\n\n"
               f"{len(reps)} candidate solutions disagree:\n\n{listing}\n\n"
-              "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
-              "and solve the problem yourself if needed. At the very end, put ONLY the "
-              "correct final answer in \\boxed{}.")
+              + final_instruction)
     for arb in chain:
         print(f"   [SC] 票が拮抗 → {arb} が裁定します")
         raw = ask(arb, [{"role": "user", "content": prompt}], 0.1,

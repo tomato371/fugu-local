@@ -1540,6 +1540,165 @@ check("arb-body3: \\boxed{} による単一最終解答の指示は維持され�
 check("arb-body3: 有効な(answer, text)タプルを返す",
       _body3_result is not None and _body3_result[0] == "1")
 
+# ---------- 2026-07-24: _arbitrate のプロンプト末尾指示を task_type で分岐 ----------
+# _arbitrate は solve_verifiable から math/mcq 両方の拮抗解消で共用されるが、末尾の
+# 出力形式指示はこれまで math 前提の "put ONLY the correct final answer in \boxed{}"
+# 一本だった。extract_final_answer(text, 'mcq')（iter 3 で確立、iter 26/102 で誤爆
+# 修正済み）は \boxed{} の中身が選択肢文字 A-E で始まる場合のみ採用するため、math
+# 寄りの文言に引きずられた裁定役が計算値や選択肢本文（\boxed{7} や \boxed{Paris} 等）を
+# 箱に入れると mcq の拮抗解決チェーンが丸ごと失敗し、MoA フォールバックへ黙って
+# 劣化していた（iter 16/45 は math 側の文言のみ調整で、この mcq 側の齟齬は未対応
+# だった）。ここでは (a) math/その他のプロンプトが従来と完全に同一(バイト単位)で
+# あること、(b) mcq のプロンプトが選択肢文字を要求する新しい文言になっていて、かつ
+# math 向けの汎用文言が残っていないこと、(c) 両 task_type とも \boxed{} からの
+# 抽出・(answer, text) 契約が従来通り機能すること、を検証する。
+_MATH_FINAL_INSTRUCTION = (
+    "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
+    "and solve the problem yourself if needed. At the very end, put ONLY the "
+    "correct final answer in \\boxed{}.")
+
+_orig_installed_tt = f.installed_models
+_orig_arbiter_model_tt = f.ARBITER_MODEL
+_orig_reasoning_tt = f.REASONING_MODELS
+_orig_props_tt = f.PROPOSERS
+
+# (a) math: プロンプト全文がバイト単位で不変であること（回帰ピン）。
+#     裁定役の \boxed{7} は従来通り '7' を返すことも合わせて確認する。
+_tt_math_prompts = []
+_tt_samples = [{"answer": "1", "text": "reasoning for 1", "model": "m1", "pot": False},
+               {"answer": "2", "text": "reasoning for 2", "model": "m1", "pot": False}]
+_tt_classes = [["1", 2], ["2", 2]]
+
+
+def _fake_ask_tt_math(model, messages, temperature, think=None, fmt=None,
+                       label=None, num_predict=None, num_ctx=None):
+    if label == "arbiter":
+        _tt_math_prompts.append(messages[0]["content"])
+        return "ARBITER_REASONING_TT_MATH: re-derived correctly \\boxed{7}"
+    return "\\boxed{1}"
+
+
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = lambda: ["m1"]
+    f.ask = _fake_ask_tt_math
+    _tt_math_result = f._arbitrate("test question", "math", _tt_samples, _tt_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_tt
+    f.REASONING_MODELS = _orig_reasoning_tt
+    f.ARBITER_MODEL = _orig_arbiter_model_tt
+    f.installed_models = _orig_installed_tt
+
+_tt_math_prompt = _tt_math_prompts[0] if _tt_math_prompts else ""
+check("arb-tt: mathプロンプトの末尾指示はバイト単位で従来と同一(回帰ピン)",
+      _tt_math_prompt.endswith(_MATH_FINAL_INSTRUCTION))
+check("arb-tt: math裁定役の\\boxed{7}は従来通り'7'を返す((answer, text)契約維持)",
+      _tt_math_result is not None and _tt_math_result[0] == "7"
+      and "ARBITER_REASONING_TT_MATH" in _tt_math_result[1])
+
+# (b) mcq: プロンプトが選択肢文字を要求する新しい文言になっていること。
+#     裁定役の \boxed{B} は 'B' として抽出されることも合わせて確認する。
+_tt_mcq_prompts = []
+_tt_mcq_samples = [{"answer": "A", "text": "reasoning for A", "model": "m1", "pot": False},
+                   {"answer": "C", "text": "reasoning for C", "model": "m1", "pot": False}]
+_tt_mcq_classes = [["A", 2], ["C", 2]]
+
+
+def _fake_ask_tt_mcq(model, messages, temperature, think=None, fmt=None,
+                      label=None, num_predict=None, num_ctx=None):
+    if label == "arbiter":
+        _tt_mcq_prompts.append(messages[0]["content"])
+        return "ARBITER_REASONING_TT_MCQ: candidate C misreads the question \\boxed{B}"
+    return "\\boxed{A}"
+
+
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = lambda: ["m1"]
+    f.ask = _fake_ask_tt_mcq
+    _tt_mcq_result = f._arbitrate("test mcq question", "mcq", _tt_mcq_samples, _tt_mcq_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_tt
+    f.REASONING_MODELS = _orig_reasoning_tt
+    f.ARBITER_MODEL = _orig_arbiter_model_tt
+    f.installed_models = _orig_installed_tt
+
+_tt_mcq_prompt = _tt_mcq_prompts[0] if _tt_mcq_prompts else ""
+check("arb-tt: mcqプロンプトは選択肢文字(A-E)のみをboxedに入れるよう明示指示している",
+      "single choice letter" in _tt_mcq_prompt and "A, B, C, D, or E" in _tt_mcq_prompt
+      and "\\boxed{}" in _tt_mcq_prompt)
+check("arb-tt: mcqプロンプトにmath向けの汎用文言('the correct final answer')が残っていない",
+      "the correct final answer" not in _tt_mcq_prompt)
+check("arb-tt: mcqプロンプトのヘッダー行/候補見出しは変更されていない(既存契約維持)",
+      "2 candidate solutions disagree:" in _tt_mcq_prompt and "Candidate A" in _tt_mcq_prompt
+      and "Candidate B" in _tt_mcq_prompt)
+check("arb-tt: mcq裁定役の\\boxed{B}は従来通り'B'を返す((answer, text)契約維持)",
+      _tt_mcq_result is not None and _tt_mcq_result[0] == "B"
+      and "ARBITER_REASONING_TT_MCQ" in _tt_mcq_result[1])
+
+# ---------- 2026-07-24: solve_verifiable レベルでの新挙動保証（mcqタイの裁定成功）----------
+# 修正前は math 前提の文言に引きずられた裁定役が \boxed{選択肢本文/計算値} を返して
+# extract_final_answer(text, 'mcq') が None を返し続け、_arbitrate 全体が None になって
+# mcq の拮抗が黙って MoA フォールバックへ劣化しうる状況だった。ここでは 2-2 の mcq
+# 拮抗を強制発生させ、裁定役が素の選択肢文字(\boxed{A})を返すケースで、None への
+# 劣化ではなくその文字へ解決すること・votes が水増しなく truthful であることを検証する。
+_orig_installed_mcqtie = f.installed_models
+_orig_arbiter_model_mcqtie = f.ARBITER_MODEL
+_orig_reasoning_mcqtie = f.REASONING_MODELS
+_orig_props_mcqtie = f.PROPOSERS
+_orig_cheap_mcqtie = f.SC_CHEAP_VOTES
+_orig_pot_mcqtie = f.SC_POT
+_arb_mcqtie_calls = []
+
+
+def _fake_ask_mcq_tie(model, messages, temperature, think=None, fmt=None,
+                       label=None, num_predict=None, num_ctx=None):
+    _arb_mcqtie_calls.append((label, model))
+    if label == "arbiter":
+        return ("ARBITER_REASONING_MCQTIE: candidate C misreads the question; "
+                 "the correct choice is \\boxed{A}")
+    idx = len(_arb_mcqtie_calls) - 1
+    ans = "A" if idx % 2 == 0 else "C"
+    return f"sc reasoning candidate {ans}\n\\boxed{{{ans}}}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_m1m2
+    f.ask = _fake_ask_mcq_tie
+    _res_mcqtie = f.solve_verifiable("test mcq question", "mcq")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_mcqtie
+    f.REASONING_MODELS = _orig_reasoning_mcqtie
+    f.SC_CHEAP_VOTES = _orig_cheap_mcqtie
+    f.SC_POT = _orig_pot_mcqtie
+    f.ARBITER_MODEL = _orig_arbiter_model_mcqtie
+    f.installed_models = _orig_installed_mcqtie
+
+_valid_votes_mcqtie = sum(1 for lab, _m in _arb_mcqtie_calls if lab != "arbiter")
+check("arb-mcqtie: mcqの拮抗で裁定役が呼ばれる",
+      any(lab == "arbiter" for lab, _m in _arb_mcqtie_calls))
+check("arb-mcqtie: mcqの拮抗が裁定で解決しMoAフォールバック(None)へ劣化しない",
+      _res_mcqtie is not None)
+check("arb-mcqtie: 裁定役が採用した文字'A'がそのままanswerになる",
+      _res_mcqtie is not None and _res_mcqtie["answer"] == "A")
+check("arb-mcqtie: votesが truthful('A'/'C'が実票数でキー登録、水増しなし)",
+      _res_mcqtie is not None and _res_mcqtie["votes"].get("A") is not None
+      and _res_mcqtie["votes"].get("C") is not None
+      and _res_mcqtie["votes"]["A"] == _res_mcqtie["votes"]["C"] > 0
+      and sum(_res_mcqtie["votes"].values()) == _valid_votes_mcqtie)
+
 # ==================================================
 # ---------- solve_verifiable: SC_POT(PoT票混入)統合テスト (2026-07-23) ----------
 # ==================================================
