@@ -6970,6 +6970,112 @@ check("_search_raw: テスト後に_resolve_ddgs_classが元の状態へ復元�
 check("_search_raw: テスト後に_ddg_instantが元の状態へ復元されている",
       f._ddg_instant == _orig_ddg_instant_sr)
 
+# ---------- _ddg_full: 壊れた行(非dict)・非文字列title/body/hrefの防御 (2026-07-25追加) ----------
+# _ddg_full はプライマリ検索経路（ddgs/duckduckgo_search インストール済みの通常運用時に
+# 必ず通る）でありながら、フォールバック側の _ddg_instant（イテレーション103/111/112/113/
+# 138/139で「壊れた外部ペイロードの1件が全体を握り潰さない」よう isinstance ガードで段階的
+# に固められてきた）とは非対称に、ddgs.text() が yield する各行 r に対して
+# r.get("body")/r.get("title")/r.get("href") を型チェックなしで直接呼んでいた。行が dict
+# でなければ即 AttributeError となり、_search_raw の `except Exception: return []` がクエリ
+# 全体を空リストに丸め込むため、同じクエリ内の他の正常な行まで道連れにしていた
+# （iter113/138と同じ「1件の破損が全体を握り潰す」問題）。ここでは
+# _make_fake_ddgs_class/_FakeDDGSCtx（上のセクションで定義済み）を再利用し、
+# f._resolve_ddgs_class をモック(try/finallyで復元)、さらに f._ddg_instant を
+# 「呼ばれたらAssertionError」というトリップワイヤに差し替えて、フォールバック/実
+# ネットワーク経路が一切使われないことも合わせて検証する。
+_orig_resolve_ddgs_sr4 = f._resolve_ddgs_class
+_orig_ddg_instant_sr4 = f._ddg_instant
+
+
+def _ddg_instant_tripwire_sr4(query, max_results):
+    raise AssertionError(
+        "_ddg_full: 壊れた行の防御テスト中にフォールバック_ddg_instantが呼ばれた"
+        "(プライマリ経路内で処理されるべき)")
+
+
+try:
+    f._ddg_instant = _ddg_instant_tripwire_sr4
+
+    # --- (1) dict行と非dict行(str/int/None)が混在 -> 非dict行だけ読み飛ばし、
+    #         有効な行は提出順のまま全て残る(1件の破損で全件を道連れにしない) ---
+    def _mixed_rows_sr4(query, max_results):
+        return [
+            {"title": "T1", "body": "B1", "href": "https://example.com/1"},
+            "こんな行はdictではない(壊れた形状)",
+            {"title": "T2", "body": "B2", "href": "https://example.com/2"},
+            12345,
+            None,
+            {"title": "T3", "body": "B3", "href": "https://example.com/3"},
+        ]
+
+    f._resolve_ddgs_class = lambda: _make_fake_ddgs_class(_mixed_rows_sr4)
+    _expected_mixed_sr4 = [
+        "[T1]\nB1\nSource: https://example.com/1",
+        "[T2]\nB2\nSource: https://example.com/2",
+        "[T3]\nB3\nSource: https://example.com/3",
+    ]
+
+    _r_mixed_sr4 = f._search_raw("非dict行混在クエリ", max_results=10)
+    check("_search_raw: 非dict行(str/int/None)が混在しても例外を出さず、"
+          "有効な行だけを提出順のまま全て返す(1件の破損で全件を道連れにしない)",
+          _r_mixed_sr4 == _expected_mixed_sr4)
+
+    # _ddg_full 自体を直接呼んでも(=_search_rawのexcept Exceptionに守られない状態でも)
+    # 例外が伝播しないことを確認する。
+    _exc_mixed_sr4 = None
+    try:
+        _r_mixed_direct_sr4 = f._ddg_full("非dict行混在クエリ", 10)
+    except Exception as _e:
+        _exc_mixed_sr4 = _e
+        _r_mixed_direct_sr4 = None
+    check("_ddg_full: 非dict行が混在しても関数自体が例外を送出しない(直接呼び出しで確認)",
+          _exc_mixed_sr4 is None)
+    check("_ddg_full: 直接呼び出しでも_search_raw経由と同じ結果(有効な行のみ提出順)",
+          _r_mixed_direct_sr4 == _expected_mixed_sr4)
+
+    # --- (2) dict行だがbodyが非文字列(list/dict/int) -> その行は残るがスニペットは
+    #         ''になり、list/dictのrepr文字列はコンテキストへ混入しない ---
+    for _bad_body, _label in [(["not", "a", "string"], "list"),
+                               ({"nested": "dict"}, "dict"),
+                               (12345, "int")]:
+        def _bad_body_rows_sr4(query, max_results, _bad_body=_bad_body):
+            return [{"title": "TB", "body": _bad_body, "href": "https://example.com/b"}]
+
+        f._resolve_ddgs_class = lambda _fn=_bad_body_rows_sr4: _make_fake_ddgs_class(_fn)
+        _r_bad_body_sr4 = f._search_raw(f"非文字列body({_label})クエリ", max_results=5)
+        check(f"_ddg_full: bodyが非文字列({_label})でも行自体は残り、"
+              f"スニペットは''になりrepr文字列は混入しない",
+              _r_bad_body_sr4 == ["[TB]\n\nSource: https://example.com/b"])
+
+    # --- (3) dict行だがtitleが非文字列(list) -> ''になり行は残る ---
+    def _bad_title_rows_sr4(query, max_results):
+        return [{"title": ["not", "a", "string"], "body": "Body text",
+                 "href": "https://example.com/t"}]
+
+    f._resolve_ddgs_class = lambda: _make_fake_ddgs_class(_bad_title_rows_sr4)
+    _r_bad_title_sr4 = f._search_raw("非文字列titleクエリ", max_results=5)
+    check("_ddg_full: titleが非文字列(list)でも行自体は残り、"
+          "タイトルは''になりrepr文字列は混入しない",
+          _r_bad_title_sr4 == ["[]\nBody text\nSource: https://example.com/t"])
+
+    # --- (4) dict行だがhrefが非文字列(dict) -> ''になり行は残る ---
+    def _bad_href_rows_sr4(query, max_results):
+        return [{"title": "TH", "body": "Body text2", "href": {"nested": "dict"}}]
+
+    f._resolve_ddgs_class = lambda: _make_fake_ddgs_class(_bad_href_rows_sr4)
+    _r_bad_href_sr4 = f._search_raw("非文字列hrefクエリ", max_results=5)
+    check("_ddg_full: hrefが非文字列(dict)でも行自体は残り、"
+          "Source欄は''になりrepr文字列は混入しない",
+          _r_bad_href_sr4 == ["[TH]\nBody text2\nSource: "])
+finally:
+    f._resolve_ddgs_class = _orig_resolve_ddgs_sr4
+    f._ddg_instant = _orig_ddg_instant_sr4
+
+check("_ddg_full: 壊れた行防御テスト後にf._resolve_ddgs_classが元の状態へ復元されている",
+      f._resolve_ddgs_class == _orig_resolve_ddgs_sr4)
+check("_ddg_full: 壊れた行防御テスト後にf._ddg_instantが元の状態へ復元されている",
+      f._ddg_instant == _orig_ddg_instant_sr4)
+
 # ---------- _ddg_instant: Abstract/RelatedTopics スニペットの長さ上限 (2026-07-24修正) ----------
 # _ddg_full は (r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS] で各スニペットを必ず
 # 切り詰めるが、_ddg_instant (ddgs/duckduckgo_search 未インストール時のフォールバック。

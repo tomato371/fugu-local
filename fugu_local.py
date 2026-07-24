@@ -468,8 +468,34 @@ def _ddg_full(query: str, max_results: int) -> list:
     results = []
     with DDGS() as ddgs:
         for r in ddgs.text(query, max_results=max_results):
-            snippet = (r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS]
-            results.append(f"[{r.get('title', '')}]\n{snippet}\nSource: {r.get('href', '')}")
+            # 2026-07-25: _ddg_full は ddgs/duckduckgo_search がインストール済みの
+            # 通常運用時に必ず通るプライマリ検索経路であるにもかかわらず、フォール
+            # バック側の _ddg_instant（iter103/111/112/113/138/139で「壊れた外部
+            # ペイロードの1件が全体を握り潰さない」よう isinstance ガードで段階的に
+            # 固められてきた）とは非対称に、r.get("body")/r.get("title")/
+            # r.get("href") を型チェックなしで直接呼んでいた。ddgs.text() が yield
+            # する行が dict でない場合、r.get(...) は即座に AttributeError を送出し、
+            # _search_raw の `except Exception: return []` がそれをクエリ全体の空
+            # リストへ丸ごと潰すため、同じクエリ内の他の正常な行まで全て失われる
+            # （1件の壊れた行が全件を道連れにする、iter113/iter138と同じ問題）。
+            # ここでも同じ作法に倣い、行(r)が dict でなければ例外を出さず continue
+            # して後続の有効な行を救済する。また title/body/href が str でない場合
+            # （list/dict/int 等）は、そのrepr文字列をモデルの検索コンテキストへ
+            # ノイズとして混入させないため str() 変換はせず空文字列として扱う
+            # （_ddg_instant の末端型ガード、2026-07-25追加分と同じ考え方）。
+            if not isinstance(r, dict):
+                continue
+            title = r.get("title", "")
+            if not isinstance(title, str):
+                title = ""
+            body = r.get("body")
+            if not isinstance(body, str):
+                body = ""
+            href = r.get("href", "")
+            if not isinstance(href, str):
+                href = ""
+            snippet = (body or "")[:WEB_SEARCH_SNIPPET_CHARS]
+            results.append(f"[{title}]\n{snippet}\nSource: {href}")
     return results
 
 
