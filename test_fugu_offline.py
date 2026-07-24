@@ -636,6 +636,37 @@ check("sc: mcq 宣言 全角対応後も訂正で文字が競合したら棄権�
       f.extract_final_answer(
           "The answer is B; oh wait, the answer: A", "mcq") is None)
 
+# 2026-07-24 (iter 109): 上の全角括弧対応時（iter 102）に宣言パターンの文字クラスは
+# [A-EＡ-Ｅ] へ広げたが、単独行パターンは [A-E] のままASCII限定に取り残されていた。
+# そのためCJK寄りのプロポーザー（qwen/gemma系、iter 102 が想定した対象そのもの）が
+# \boxed{} を無視して「Ｃ」「（Ｃ）」のように全角の選択肢文字だけを単独行で答えると、
+# boxed分岐（該当なし）・宣言パターン（answer/答え/正解の連結詞なし）・単独行パターン
+# （[A-E] が U+FF23 等の全角文字に不一致）のいずれにも拾われず None となり、
+# 自己整合性投票（gotcha #7）の正当な1票が静かに失われていた。宣言パターン（iter 102）
+# と同じ [A-EＡ-Ｅ] に揃えてこの票落ちを解消する。iter 13 の _FW_TRANS が全角→ASCII
+# 正規化を担うため誤投票のリスクはなく、iter 3 の boxed 先頭文字ガード・iter 26 の
+# 複数文字競合時の棄権ロジックもそのまま維持される。
+check("sc: mcq 単独行 全角括弧+全角文字（票落ち回帰, iter109）",
+      f.extract_final_answer("（Ｃ）", "mcq") == "C")
+check("sc: mcq 単独行 括弧無し全角文字のみ（票落ち回帰, iter109）",
+      f.extract_final_answer("Ｂ", "mcq") == "B")
+check("sc: mcq 単独行 全角文字+が正解サフィックス（票落ち回帰, iter109）",
+      f.extract_final_answer("Ｄが正解", "mcq") == "D")
+# 回帰: 全角括弧+ASCII文字（iter 102 で既に対応済み）は今回の変更後も不変
+check("sc: mcq 単独行 全角括弧+ASCII文字は従来通り（iter102回帰）",
+      f.extract_final_answer("（C）", "mcq") == "C")
+# 回帰: 素のASCII単独行文字（括弧・連結詞なし）と小文字（re.IGNORECASE）は不変
+check("sc: mcq 単独行 ASCII文字のみ大文字は従来通り",
+      f.extract_final_answer("C", "mcq") == "C")
+check("sc: mcq 単独行 ASCII文字のみ小文字はIGNORECASEでCへ",
+      f.extract_final_answer("c", "mcq") == "C")
+# 回帰(iter 26棄権ロジック維持): 全角文字同士でも複数行で異なる文字が競合したらNone
+check("sc: mcq 単独行 全角文字が複数行で競合したら棄権（iter26ガード維持）",
+      f.extract_final_answer("Ａ\nＢ", "mcq") is None)
+# 回帰: 文中(行の一部)に埋没した全角文字は ^...$ アンカーでスコープ外のままNone
+check("sc: mcq 単独行 文中に埋没した全角文字は捕捉しない(^...$維持)",
+      f.extract_final_answer("選択肢Ｃが気になるが自信はない", "mcq") is None)
+
 # 2026-07-22: iteration 28 — math 宣言ブランチにも iteration 26 の MCQ 修正
 # （複数宣言が競合したら無投票=None）を対称に適用した回帰確認。
 # 注: 宣言抽出の捕獲グループ ([^\n]{1,60}) は改行を跨がず貪欲マッチするため、同一行に

@@ -2886,8 +2886,18 @@ def extract_final_answer(text, task_type="math"):
         # 返し無投票になる。[(（]?/[)）]? に広げて ASCII と同様に許容する。iter 3 の
         # \b・先頭文字ガードと iter 26 の複数文字競合時 None 化（下の len(letters) > 1）は
         # 変更しない。
+        # 2026-07-24: iter 102 は上記の全角括弧対応時に宣言パターン（1行下）の文字クラスは
+        # [A-EＡ-Ｅ] に広げたが、こちらの単独行パターンは [A-E] のまま ASCII 限定に
+        # 取り残されていた。そのため CJK 寄りのプロポーザー（qwen/gemma 系、iter 102 が
+        # 想定した対象そのもの）が \boxed{} を無視して「Ｃ」「（Ｃ）」のように全角文字だけを
+        # 単独行で答えると、boxed 分岐（該当なし）・宣言パターン（answer/答え/正解 の
+        # 連結詞なし）・この単独行パターン（[A-E] は U+FF23 に不一致）のいずれにも拾われず
+        # None となり、自己整合性投票（gotcha #7）の正当な1票が静かに失われていた。
+        # 宣言パターンと同じ [A-EＡ-Ｅ] に揃えて票落ちを解消する。.translate(_FW_TRANS)
+        # （iter 13）が全角→ASCII正規化を担うため誤投票のリスクはなく、iter 26 の
+        # 複数文字競合時の棄権ロジックもそのまま維持する。
         for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])\s*[(（]?([A-EＡ-Ｅ])[)）]?(?![A-Za-z])",
-                    r"^\s*[(（]?([A-E])[)）]?\s*(?:が正解|です)?\s*$"):
+                    r"^\s*[(（]?([A-EＡ-Ｅ])[)）]?\s*(?:が正解|です)?\s*$"):
             ms = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
             if ms:
                 letters = {m.translate(_FW_TRANS).upper() for m in ms}
