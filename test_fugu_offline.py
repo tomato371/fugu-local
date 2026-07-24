@@ -4546,6 +4546,62 @@ with _tempfile.TemporaryDirectory() as _ri_dir:
     check("_read_ipynb: cells内の非dictエントリはskipされ後続の正当なセルは抽出される",
           _ri_out_f == "# Title")
 
+    # (g) json.loadsは成功するがトップレベルがdictでない(配列)場合: iter72はセル単位の
+    #     壊れたsourceのみ対処しており、トップレベル構造自体が非dictだと
+    #     nb.get("cells", [])がAttributeErrorを送出して外側exceptに落ち、notebook
+    #     全体の生JSON(この場合は配列全文)がRAG/--fileコンテキストへ丸ごと注入
+    #     されていた(iter71がフラグ、iter72未対応部分)。本iterationでの修正後は
+    #     例外を送出せず空文字列を返す。
+    _ri_g = _ri_root / "g.ipynb"
+    _ri_raw_g = json.dumps([{"cell_type": "code", "source": ["x = 1"]}])
+    _ri_g.write_text(_ri_raw_g, encoding="utf-8")
+    _ri_out_g = f._read_ipynb(_ri_g)
+    check("_read_ipynb: トップレベルが配列(非dict)の場合は例外を送出せず空文字を返す",
+          _ri_out_g == "")
+    check("_read_ipynb: トップレベル配列ケースの結果に生JSONマーカーが含まれない",
+          "cell_type" not in _ri_out_g and "source" not in _ri_out_g and "[" not in _ri_out_g)
+
+    # (g2) json.loadsは成功するがトップレベルが裸のスカラー(数値)の場合: (g)と同じ
+    #     AttributeErrorの経路だが、int.get自体が存在しないという別の失敗形。
+    _ri_g2 = _ri_root / "g2.ipynb"
+    _ri_raw_g2 = json.dumps(12345)
+    _ri_g2.write_text(_ri_raw_g2, encoding="utf-8")
+    _ri_out_g2 = f._read_ipynb(_ri_g2)
+    check("_read_ipynb: トップレベルが裸の数値(非dict)の場合は例外を送出せず空文字を返す",
+          _ri_out_g2 == "")
+
+    # (g3) json.loadsは成功するがトップレベルが裸の文字列の場合: 同様にAttributeError経路。
+    _ri_g3 = _ri_root / "g3.ipynb"
+    _ri_raw_g3 = json.dumps("not a notebook")
+    _ri_g3.write_text(_ri_raw_g3, encoding="utf-8")
+    _ri_out_g3 = f._read_ipynb(_ri_g3)
+    check("_read_ipynb: トップレベルが裸の文字列(非dict)の場合は例外を送出せず空文字を返す",
+          _ri_out_g3 == "")
+
+    # (h) トップレベルはdictだが nb["cells"] がtruthyな非list(整数)の場合: 旧実装は
+    #     for cell in <int> でTypeErrorを送出し外側exceptで生JSON全文がRAG/--file
+    #     コンテキストへ丸ごと注入されていた。修正後はcellsを[]へ強制変換して空文字を返す。
+    _ri_nb_h = {"cells": 42}
+    _ri_h = _ri_root / "h.ipynb"
+    _ri_raw_h = json.dumps(_ri_nb_h)
+    _ri_h.write_text(_ri_raw_h, encoding="utf-8")
+    _ri_out_h = f._read_ipynb(_ri_h)
+    check("_read_ipynb: cellsがtruthyな非list(整数)の場合は例外を送出せず空文字を返す",
+          _ri_out_h == "")
+    check("_read_ipynb: cells=整数ケースの結果に生JSONマーカーが含まれない",
+          "cells" not in _ri_out_h and "42" not in _ri_out_h)
+
+    # (i) nb["cells"] がdict(非list)の場合: (h)と同じ非list強制変換で救済される。
+    _ri_nb_i = {"cells": {"0": {"cell_type": "code", "source": ["x = 1"]}}}
+    _ri_i = _ri_root / "i.ipynb"
+    _ri_raw_i = json.dumps(_ri_nb_i)
+    _ri_i.write_text(_ri_raw_i, encoding="utf-8")
+    _ri_out_i = f._read_ipynb(_ri_i)
+    check("_read_ipynb: cellsがdict(非list)の場合は例外を送出せず空文字を返す",
+          _ri_out_i == "")
+    check("_read_ipynb: cells=dictケースの結果に生JSONマーカーが含まれない",
+          "cell_type" not in _ri_out_i and "source" not in _ri_out_i)
+
 # ---------- _decode_text_bytes / read_file_text・_read_html cp932フォールバック (2026-07-24) ----------
 # このマシンのコンソールが cp932(Shift-JIS) である既知の落とし穴 #4 と同根の環境要因で、
 # ローカルに保存された非UTF-8(Shift-JIS/cp932)の .txt/.csv/.html 等が普通に存在する。

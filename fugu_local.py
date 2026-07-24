@@ -1091,8 +1091,30 @@ def _read_ipynb(path: Path) -> str:
     """Jupyter Notebook からコードセルとマークダウンセルを抽出。"""
     try:
         nb = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        # 2026-07-24: json.loads自体は成功しても、トップレベルがdictでない
+        # ケース（例: [{"cell_type": "code"}] のような配列、あるいは裸の数値・
+        # 文字列）や、nb["cells"]がtruthyな非list値（例: {"cells": 42} や
+        # {"cells": {"0": {...}}} のようなdict）が存在しうる。旧実装は前者で
+        # nb.get(...)がAttributeErrorを、後者でfor cell in <non-list>が
+        # TypeErrorを送出し、いずれも本関数の外側except Exceptionに落ちて
+        # notebook全体の生JSON（metadata・execution_count・base64画像出力を
+        # 含む）がそのままRAG/--fileコンテキストへ丸ごと注入されていた。
+        # これはiteration 71がtest-onlyで発見してフラグし、iteration 72が
+        # セル単位の壊れたsourceについてのみ対処した「1件の破損で全体を
+        # 道連れにする」劣化のトップレベル構造版であり、対処が漏れていた
+        # ものである。iteration 103/111/112と同じ非list強制変換（truthy
+        # チェックのトリックに頼らず必ず既定値へ倒す）の作法に倣い、構造が
+        # 不正な場合は例外を送出させず空文字列/空contextへ落とす（精度優先：
+        # 生JSON混入より整形済みの空の方がまし）。json.loadsが失敗した場合
+        # （真に不正なJSON）は従来通り外側exceptで生テキストへフォールバック
+        # する経路を変えない。
+        if not isinstance(nb, dict):
+            return ""
+        cells = nb.get("cells", [])
+        if not isinstance(cells, list):
+            cells = []
         parts = []
-        for cell in nb.get("cells", []):
+        for cell in cells:
             # 2026-07-23 (iter72): nbformat仕様上 'source' はstrまたはlist[str]だが、
             # 壊れた/書きかけのnotebookでは source: null や、list内に非str要素
             # （例: 42）が混入することがある。旧実装は"".join(cell.get("source", []))を
