@@ -787,7 +787,26 @@ def _read_docx(path: Path) -> str:
                 rows_text.append("\t".join(cells_text))
             return rows_text
 
-        doc = docx.Document(str(path))
+        # 2026-07-24 (iter123): docx.Document() 自体は import docx の成功/失敗とは
+        # 別に、破損したzip(BadZipFile)やレガシーバイナリ.docを.docx拡張子のまま
+        # 開いた場合(PackageNotFoundError)等、実行時例外を送出しうる。従来はここが
+        # except ImportError のみで守られていたため、そうした例外は_read_docxの
+        # 外へそのまま伝播し、read_file_text（iter53）の外側ガードに握りつぶされて
+        # "" になるだけで、なぜ失敗したかの情報が失われていた。iter83(_read_pdf)/
+        # iter84(_read_excel)がpdf/excelで行った「実行時例外もopen/parse範囲だけで
+        # 狭く捕捉し、可視化されたnotice文字列に変換する」修正をここにも適用する。
+        # bare exceptにはせずException限定でKeyboardInterrupt/SystemExitは伝播させる。
+        # 直下の except ImportError: pass は既存のバイト単位のまま温存し、
+        # 新しいnoticeは既存の "python-docx が必要" notice とは別の文言にして、
+        # _is_lib_missing_notice の「1行・[...]・pip install を含む」という構造的
+        # 判定には意図的にヒットしない（"pip install" を含まない）ようにする。
+        # ライブラリはインストール済みで読めているのに"未インストール"と誤判定され
+        # RAG側で扱いを誤らないようにするための意図的な区別。
+        try:
+            doc = docx.Document(str(path))
+        except Exception as exc:
+            print(f"[_read_docx] Document()での読み込みに失敗: {path.name} ({type(exc).__name__})")
+            return f"[DOCX: {path.name} — 読み込みエラー ({type(exc).__name__}): 破損しているか非対応形式の可能性があります]"
         parts = []
 
         # 2026-07-24 (iter93): 従来はdoc.paragraphsを全件処理してからdoc.tablesを
@@ -960,7 +979,21 @@ def _read_pptx(path: Path) -> str:
     """PowerPoint (.pptx) からテキストを抽出。"""
     try:
         from pptx import Presentation
-        prs = Presentation(str(path))
+        # 2026-07-24 (iter123): _read_docx の Document() と同じ隙間が Presentation()
+        # にもある。破損したzip(BadZipFile)やレガシーバイナリ.pptを.pptx拡張子の
+        # まま開いた場合(PackageNotFoundError)等の実行時例外が、従来は
+        # except ImportError のみでは捕捉されず外へ伝播していた。iter83/84/直上の
+        # _read_docx修正と同じ方針で、open/parseの1行だけを狭くException限定で
+        # 捕捉し、可視化されたnotice文字列に変換する（bare exceptにはしない。
+        # KeyboardInterrupt/SystemExitは伝播させる）。直下の except ImportError: pass
+        # は既存のバイト単位のまま温存。新noticeは"pip install"を含まないため
+        # _is_lib_missing_notice の構造判定には意図的にヒットしない(未インストール
+        # と誤判定させないための意図的な区別)。
+        try:
+            prs = Presentation(str(path))
+        except Exception as exc:
+            print(f"[_read_pptx] Presentation()での読み込みに失敗: {path.name} ({type(exc).__name__})")
+            return f"[PPTX: {path.name} — 読み込みエラー ({type(exc).__name__}): 破損しているか非対応形式の可能性があります]"
         parts = []
         for i, slide in enumerate(prs.slides, 1):
             texts = []

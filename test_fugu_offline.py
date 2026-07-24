@@ -9691,6 +9691,167 @@ def _t_frac_fastpath_equiv(calls):
 
 _run_with_math_verify_stub(None, "parse", _t_frac_fastpath_equiv)
 
+# ---------- _read_docx/_read_pptx: Document()/Presentation()の実行時例外もクラッシュせず
+# notice文字列に劣化させる (2026-07-24 / iter123) ----------
+# iter83(_read_pdf)/iter84(_read_excel)が確立した「except ImportErrorだけでは
+# 実際にライブラリがインストールされていて実行時に失敗するケース(破損ファイル・
+# レガシーバイナリを現代拡張子のまま開いた場合等)を捕捉できない」という穴を
+# _read_docx/_read_pptxにも同じ方針で塞ぐ。ここでは(1)本物のpython-docx/
+# python-pptxが利用可能な環境でも決定的に検証できるよう、乱数バイト列(zipにも
+# レガシーバイナリにもならない不正データ)を実際のtempファイルとして書き、
+# Document()/Presentation()に本当に例外を送出させるケースと、(2)iter83/84の
+# sys.modules差し替えスタイルを踏襲し、docx.Document/pptx.Presentationを
+# PackageNotFoundError等を送出するフェイクに差し替えるケースの両方を確認する。
+import random as _rdx_random
+
+_rdx_orig_docx_mod = sys.modules.get("docx")
+_rdx_orig_pptx_mod = sys.modules.get("pptx")
+
+with _rfd_tempfile.TemporaryDirectory() as _rdx_td:
+    _rdx_root = _rfd_pathlib.Path(_rdx_td)
+
+    # (1) 破損/ガーベジバイト列の.docxを実際のtempファイルとして用意し、
+    #     python-docxが利用可能ならDocument()に本当に例外を投げさせて確認する。
+    _rdx_corrupt_docx = _rdx_root / "corrupt.docx"
+    _rdx_random.seed(123)
+    _rdx_corrupt_docx.write_bytes(bytes(_rdx_random.getrandbits(8) for _ in range(512)))
+
+    try:
+        import docx as _rdx_probe  # noqa: F401
+        _rdx_docx_available = True
+    except ImportError:
+        _rdx_docx_available = False
+
+    if _rdx_docx_available:
+        _rdx_cap1 = io.StringIO()
+        with contextlib.redirect_stdout(_rdx_cap1):
+            _rdx_result1 = f._read_docx(_rdx_corrupt_docx)
+        check("_read_docx: 破損/ガーベジバイト列の.docxを実python-docxに渡しても例外を送出せず文字列を返す",
+              isinstance(_rdx_result1, str))
+        check("_read_docx: 破損.docxの読み込み失敗はnotice文字列に劣化する(先頭が'[DOCX:')",
+              _rdx_result1.startswith("[DOCX:") and "読み込みエラー" in _rdx_result1)
+        check("_read_docx: 破損.docxのnotice文字列はファイル名を含む",
+              _rdx_corrupt_docx.name in _rdx_result1)
+        check("_read_docx: 破損.docxの読み込み失敗の警告メッセージはcp932でエンコード可能(gotcha#4)",
+              _rpdf_is_cp932_safe(_rdx_cap1.getvalue()))
+        check("_is_lib_missing_notice: _read_docxの実行時エラーnotice(pip installを含まない)はFalseと判定される"
+              "(未インストールと誤判定させない意図的な区別)",
+              f._is_lib_missing_notice(_rdx_result1) is False)
+    else:
+        print("   [SKIP] python-docx未インストールのため破損.docx実ファイルテストをスキップ")
+
+    # (2) 破損/ガーベジバイト列の.pptxも同様に確認する。
+    _rdx_corrupt_pptx = _rdx_root / "corrupt.pptx"
+    _rdx_random.seed(456)
+    _rdx_corrupt_pptx.write_bytes(bytes(_rdx_random.getrandbits(8) for _ in range(512)))
+
+    try:
+        import pptx as _rpx_probe  # noqa: F401
+        _rdx_pptx_available = True
+    except ImportError:
+        _rdx_pptx_available = False
+
+    if _rdx_pptx_available:
+        _rdx_cap2 = io.StringIO()
+        with contextlib.redirect_stdout(_rdx_cap2):
+            _rdx_result2 = f._read_pptx(_rdx_corrupt_pptx)
+        check("_read_pptx: 破損/ガーベジバイト列の.pptxを実python-pptxに渡しても例外を送出せず文字列を返す",
+              isinstance(_rdx_result2, str))
+        check("_read_pptx: 破損.pptxの読み込み失敗はnotice文字列に劣化する(先頭が'[PPTX:')",
+              _rdx_result2.startswith("[PPTX:") and "読み込みエラー" in _rdx_result2)
+        check("_read_pptx: 破損.pptxのnotice文字列はファイル名を含む",
+              _rdx_corrupt_pptx.name in _rdx_result2)
+        check("_read_pptx: 破損.pptxの読み込み失敗の警告メッセージはcp932でエンコード可能(gotcha#4)",
+              _rpdf_is_cp932_safe(_rdx_cap2.getvalue()))
+        check("_is_lib_missing_notice: _read_pptxの実行時エラーnotice(pip installを含まない)はFalseと判定される"
+              "(未インストールと誤判定させない意図的な区別)",
+              f._is_lib_missing_notice(_rdx_result2) is False)
+    else:
+        print("   [SKIP] python-pptx未インストールのため破損.pptx実ファイルテストをスキップ")
+
+    # (3) iter83/84のsys.modules差し替えスタイル: docx.Document/pptx.Presentationを
+    #     実ライブラリの有無に関わらず決定的にPackageNotFoundError相当で失敗させる
+    #     フェイクモジュールに差し替え、環境非依存で同じ挙動を確認する。
+    _rdx_legacy_doc = _rdx_root / "legacy.doc"
+    _rdx_legacy_doc.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 legacy binary ole marker")
+
+    class _RdxFakePackageNotFoundError(Exception):
+        pass
+
+    def _rdx_fake_document_raises(path):
+        raise _RdxFakePackageNotFoundError(f"Package not found at '{path}'")
+
+    _rdx_fake_docx_mod = types.ModuleType("docx")
+    _rdx_fake_docx_mod.Document = _rdx_fake_document_raises
+    # oxml/table/text サブモジュールへの遅延importは本経路では到達しないため
+    # フェイクモジュールに用意する必要はない(Document()の時点で例外が飛ぶ)。
+
+    _rdx_cap3 = io.StringIO()
+    with contextlib.redirect_stdout(_rdx_cap3):
+        _rdx_result3 = _rpdf_swap_modules(
+            {"docx": _rdx_fake_docx_mod},
+            lambda: f._read_docx(_rdx_legacy_doc),
+        )
+    check("_read_docx: docx.Documentがモンキーパッチでruntime例外(PackageNotFoundError相当)を"
+          "送出しても伝播せず文字列を返す(iter83/84スタイル)",
+          isinstance(_rdx_result3, str) and _rdx_result3.startswith("[DOCX:") and "読み込みエラー" in _rdx_result3)
+    check("_read_docx: モンキーパッチ経路の警告に例外型名が出力される",
+          "_RdxFakePackageNotFoundError" in _rdx_cap3.getvalue())
+
+    _rdx_legacy_ppt = _rdx_root / "legacy.ppt"
+    _rdx_legacy_ppt.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1 legacy binary ole marker")
+
+    def _rdx_fake_presentation_raises(path):
+        raise _RdxFakePackageNotFoundError(f"Package not found at '{path}'")
+
+    _rdx_fake_pptx_mod = types.ModuleType("pptx")
+    _rdx_fake_pptx_mod.Presentation = _rdx_fake_presentation_raises
+
+    _rdx_cap4 = io.StringIO()
+    with contextlib.redirect_stdout(_rdx_cap4):
+        _rdx_result4 = _rpdf_swap_modules(
+            {"pptx": _rdx_fake_pptx_mod},
+            lambda: f._read_pptx(_rdx_legacy_ppt),
+        )
+    check("_read_pptx: pptx.Presentationがモンキーパッチでruntime例外(PackageNotFoundError相当)を"
+          "送出しても伝播せず文字列を返す(iter83/84スタイル)",
+          isinstance(_rdx_result4, str) and _rdx_result4.startswith("[PPTX:") and "読み込みエラー" in _rdx_result4)
+    check("_read_pptx: モンキーパッチ経路の警告に例外型名が出力される",
+          "_RdxFakePackageNotFoundError" in _rdx_cap4.getvalue())
+
+check("_read_docx: テスト後にsys.modulesの'docx'エントリが元通り解決可能(復元確認、iter123)",
+      (sys.modules.get("docx") is _rdx_orig_docx_mod) if _rdx_orig_docx_mod is not None
+      else ("docx" not in sys.modules or sys.modules["docx"] is not None))
+check("_read_pptx: テスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認、iter123)",
+      (sys.modules.get("pptx") is _rdx_orig_pptx_mod) if _rdx_orig_pptx_mod is not None
+      else ("pptx" not in sys.modules or sys.modules["pptx"] is not None))
+
+# ---------- _read_docx/_read_pptx: 成功パス(正常なファイル)の出力は変更前と不変 (2026-07-24 / iter123) ----------
+# 開放/パース周りにtry/exceptを追加しただけで、正常系の抽出ロジック(iter82/87/91/93/98の
+# テーブル/グループ/ノート/マージセル/読み順テスト)には一切触れていないため、成功時の
+# 出力が変わらないことを軽く再確認する(詳細な回帰ガードは既存のiter82等のテストが担う)。
+if _rdx_docx_available:
+    with _rfd_tempfile.TemporaryDirectory() as _rdx_ok_td:
+        _rdx_ok_path = _rfd_pathlib.Path(_rdx_ok_td) / "ok.docx"
+        _rdx_ok_doc = _rdx_probe.Document()
+        _rdx_ok_doc.add_paragraph("iter123 success path paragraph")
+        _rdx_ok_doc.save(str(_rdx_ok_path))
+        _rdx_ok_result = f._read_docx(_rdx_ok_path)
+        check("_read_docx: 正常な.docxの成功パス出力は変更後も期待通り(notice文字列に劣化しない)",
+              _rdx_ok_result == "iter123 success path paragraph")
+
+if _rdx_pptx_available:
+    with _rfd_tempfile.TemporaryDirectory() as _rdx_ok_td2:
+        _rdx_ok_path2 = _rfd_pathlib.Path(_rdx_ok_td2) / "ok.pptx"
+        _rdx_ok_prs = _rpx_probe.Presentation()
+        _rdx_ok_slide_layout = _rdx_ok_prs.slide_layouts[0]
+        _rdx_ok_slide = _rdx_ok_prs.slides.add_slide(_rdx_ok_slide_layout)
+        _rdx_ok_slide.shapes.title.text = "iter123 success path title"
+        _rdx_ok_prs.save(str(_rdx_ok_path2))
+        _rdx_ok_result2 = f._read_pptx(_rdx_ok_path2)
+        check("_read_pptx: 正常な.pptxの成功パス出力は変更後も期待通り(notice文字列に劣化しない)",
+              "iter123 success path title" in _rdx_ok_result2)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
