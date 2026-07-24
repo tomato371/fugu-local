@@ -9,6 +9,7 @@ import json
 import sys
 import types
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import fugu_local as f
@@ -10483,6 +10484,257 @@ check("apply_high_vram_profile: テスト後にPARALLEL_PROPOSERS/MODEL_NUM_CTX�
       and f.SC_MAX == _hvp_saved["SC_MAX"]
       and f.SC_CHEAP_VOTES == _hvp_saved["SC_CHEAP_VOTES"]
       and f.ARBITER_MODEL == _hvp_saved["ARBITER_MODEL"])
+
+# ---------- generate_image_comfyui: 壊れたSaveImage出力エントリのskip-and-recover (2026-07-25 / iter139) ----------
+# generate_image_comfyui (fugu_local.py ~L1983-1997) のoutputs/imageエントリ走査は、
+# 隣接するsubfolder/typeがimg.get()で守られている一方、filenameだけがimg["filename"]の
+# 直接dictアクセスとして2箇所に残っていた。ComfyUI /history の壊れたエントリ
+# （filenameキー欠落・null・空文字・非str、またはimages配列内の非dict要素）は
+# KeyError/TypeErrorを送出し、本関数を丸ごと巻き込んで呼び出し元generate_imageの外側
+# except Exceptionまで伝播、後続のノード/エントリに有効な画像が残っていても生成結果
+# ごと握り潰してNoneを返していた。iter77（良い方を回収する）・iter103/111/112
+# （非list/非dictの強制truthy変換に頼らない既定値フォールバック）・iter113/iter138
+# （外部由来ペイロードの1件の破損で全体を道連れにしないentry単位skip）と同じ作法の
+# 回帰防止テスト。generate_image_comfyui/generate_image_a1111/generate_image/
+# _detect_backend/_backend_up/_http_post_jsonはこれまで直接のオフラインカバレッジが
+# 0件（既存テストは全て丸ごとモック）だったため、ここで初めてComfyUIフォールバック
+# 経路そのものに直接テストを追加し、カバレッジの穴も塞ぐ。
+# urllib.request.urlopen(/history, /view のGET)と f._http_post_json(/prompt のPOST)の
+# みをモックし、実Ollama/ComfyUI/A1111/GPU/ネットワーク呼び出しは一切発生させない。
+# f.COMFYUI_CKPTを非空にしてobject_infoチェックポイント自動取得を、f.IMAGE_OUT_DIRを
+# tempfile.TemporaryDirectoryにして実ファイルシステム/ホームディレクトリへの書き込みを、
+# それぞれ回避する。ワークフロー(wf)辞書・チェックポイント自動検出・/prompt投入・
+# /history ポーリングループ・IMAGE_TIMEOUT/deadlineロジック・generate_image_a1111/
+# generate_image/_detect_backend/_backend_up/_http_post_json自体には一切触れない
+# （このテストが検証するのはoutputs/imageエントリ走査ループのみ）。
+
+
+class _CjFakeResponse:
+    """urllib.request.urlopen が返す `with ... as r:` 用の最小モック(生バイト列を保持)。"""
+
+    def __init__(self, body_bytes):
+        self._body = body_bytes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _cj_no_network_urlopen(*a, **k):
+    raise AssertionError("generate_image_comfyui: モック漏れで実urlopen(ネットワーク)が呼ばれた"
+                          "(object_info取得はCOMFYUI_CKPTプリセットで回避されるはず)")
+
+
+def _make_comfy_urlopen(history_payload, view_bytes_by_filename, view_calls_log):
+    """/history/<pid> と /view?... のGETのみをモックする最小フェイクurlopen。
+    generate_image_comfyui はどちらも `urlopen(url_str, timeout=...)` という
+    プレーンなURL文字列呼び出しなので、Requestオブジェクトのdata属性は見ない。
+    想定外URL(例: object_info。COMFYUI_CKPTプリセットで回避されるはず)は
+    AssertionErrorで即座に可視化する。"""
+
+    def _fake(url, timeout=None):
+        if "/history/" in url:
+            return _CjFakeResponse(json.dumps(history_payload).encode("utf-8"))
+        if "/view?" in url:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            fn = (qs.get("filename") or [None])[0]
+            view_calls_log.append(fn)
+            if fn in view_bytes_by_filename:
+                return _CjFakeResponse(view_bytes_by_filename[fn])
+            raise AssertionError(f"generate_image_comfyui test: 未定義の/view filename={fn!r}")
+        raise AssertionError(f"generate_image_comfyui test: 想定外のurlopen呼び出し url={url!r}")
+
+    return _fake
+
+
+_orig_cj_urlopen = urllib.request.urlopen
+_orig_cj_post_json = f._http_post_json
+_orig_cj_ckpt = f.COMFYUI_CKPT
+_orig_cj_out_dir = f.IMAGE_OUT_DIR
+
+# --- (1) 最初のimageエントリにfilenameが無い(欠落)が、同ノード内の後続エントリに
+#     有効なfilenameがある -> Noneで諦めず後続の有効画像を回収してPathを返す ---
+_cj_td1 = None
+try:
+    import tempfile as _cj_tempfile
+    from pathlib import Path as _cj_Path
+
+    _cj_td1 = _cj_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _cj_Path(_cj_td1.name)
+    f.COMFYUI_CKPT = "dummy-ckpt-preset"  # 非空 -> object_info自動取得は発火しない
+    f._http_post_json = lambda url, payload, timeout: {"prompt_id": "pid-1"}
+    _cj_view_calls1 = []
+    urllib.request.urlopen = _make_comfy_urlopen(
+        {"pid-1": {"outputs": {
+            "9": {"images": [
+                {"subfolder": "", "type": "output"},         # filenameキー欠落
+                {"filename": "good_first.png", "subfolder": "", "type": "output"},
+            ]}
+        }}},
+        {"good_first.png": b"PNGDATA-first"},
+        _cj_view_calls1,
+    )
+    _cj_r1 = f.generate_image_comfyui("a cat", "blurry")
+    check("generate_image_comfyui: 先頭エントリのfilename欠落を飛ばして後続の有効画像を回収",
+          _cj_r1 is not None)
+    check("generate_image_comfyui: 回収したPathのファイル名に有効エントリのfilenameが埋め込まれる",
+          _cj_r1 is not None and _cj_r1.name.endswith("_good_first.png"))
+    check("generate_image_comfyui: 回収したPathへ/viewの応答バイト列が書き込まれている",
+          _cj_r1 is not None and _cj_r1.read_bytes() == b"PNGDATA-first")
+    check("generate_image_comfyui: 壊れた先頭エントリでは/viewを呼ばない(2件目のみ1回)",
+          _cj_view_calls1 == ["good_first.png"])
+finally:
+    urllib.request.urlopen = _orig_cj_urlopen
+    f._http_post_json = _orig_cj_post_json
+    f.COMFYUI_CKPT = _orig_cj_ckpt
+    f.IMAGE_OUT_DIR = _orig_cj_out_dir
+    if _cj_td1 is not None:
+        _cj_td1.cleanup()
+
+# --- (1b) filenameがNoneの壊れたエントリを含むノードの後、別ノードに有効なfilenameが
+#     ある -> ノードをまたいでも後続の有効画像を回収する ---
+_cj_td1b = None
+try:
+    _cj_td1b = _cj_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _cj_Path(_cj_td1b.name)
+    f.COMFYUI_CKPT = "dummy-ckpt-preset"
+    f._http_post_json = lambda url, payload, timeout: {"prompt_id": "pid-1b"}
+    _cj_view_calls1b = []
+    urllib.request.urlopen = _make_comfy_urlopen(
+        {"pid-1b": {"outputs": {
+            "8": {"images": [{"filename": None, "subfolder": "", "type": "output"}]},
+            "9": {"images": [{"filename": "good_other_node.png", "type": "output"}]},
+        }}},
+        {"good_other_node.png": b"PNGDATA-other-node"},
+        _cj_view_calls1b,
+    )
+    _cj_r1b = f.generate_image_comfyui("a dog", "")
+    check("generate_image_comfyui: filename=Noneの壊れたエントリを飛ばし、別ノードの有効画像を回収",
+          _cj_r1b is not None and _cj_r1b.name.endswith("_good_other_node.png"))
+finally:
+    urllib.request.urlopen = _orig_cj_urlopen
+    f._http_post_json = _orig_cj_post_json
+    f.COMFYUI_CKPT = _orig_cj_ckpt
+    f.IMAGE_OUT_DIR = _orig_cj_out_dir
+    if _cj_td1b is not None:
+        _cj_td1b.cleanup()
+
+# --- (2) imageエントリ自体が非dict(文字列/数値) -> 例外を出さずskipし、有効な
+#     エントリが1件も残らなければNoneを返す ---
+_cj_td2 = None
+try:
+    _cj_td2 = _cj_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _cj_Path(_cj_td2.name)
+    f.COMFYUI_CKPT = "dummy-ckpt-preset"
+    f._http_post_json = lambda url, payload, timeout: {"prompt_id": "pid-2"}
+    _cj_view_calls2 = []
+    urllib.request.urlopen = _make_comfy_urlopen(
+        {"pid-2": {"outputs": {
+            "9": {"images": ["not-a-dict-entry", 12345, {"filename": None}, {"subfolder": "x"}]}
+        }}},
+        {},
+        _cj_view_calls2,
+    )
+    _cj_exc2 = None
+    try:
+        _cj_r2 = f.generate_image_comfyui("prompt", "")
+    except Exception as _e:
+        _cj_exc2 = _e
+        _cj_r2 = "__RAISED__"
+    check("generate_image_comfyui: 非dictのimageエントリ(文字列/数値)で例外を送出しない",
+          _cj_exc2 is None)
+    check("generate_image_comfyui: 有効なfilenameが1件も残らなければNoneを返す",
+          _cj_r2 is None)
+    check("generate_image_comfyui: 有効エントリが無いので/viewは一度も呼ばれない",
+          _cj_view_calls2 == [])
+finally:
+    urllib.request.urlopen = _orig_cj_urlopen
+    f._http_post_json = _orig_cj_post_json
+    f.COMFYUI_CKPT = _orig_cj_ckpt
+    f.IMAGE_OUT_DIR = _orig_cj_out_dir
+    if _cj_td2 is not None:
+        _cj_td2.cleanup()
+
+# --- (3) 回帰: 単一の正常なimageエントリでは従来通りPathを返し、/viewは1回だけ
+#     フェッチされる(ハッピーパスはバイト単位で不変) ---
+_cj_td3 = None
+try:
+    _cj_td3 = _cj_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _cj_Path(_cj_td3.name)
+    f.COMFYUI_CKPT = "dummy-ckpt-preset"
+    f._http_post_json = lambda url, payload, timeout: {"prompt_id": "pid-3"}
+    _cj_view_calls3 = []
+    urllib.request.urlopen = _make_comfy_urlopen(
+        {"pid-3": {"outputs": {
+            "9": {"images": [{"filename": "solo.png", "subfolder": "", "type": "output"}]}
+        }}},
+        {"solo.png": b"PNGDATA-solo"},
+        _cj_view_calls3,
+    )
+    _cj_r3 = f.generate_image_comfyui("solo prompt", "neg")
+    check("generate_image_comfyui: 単一正常エントリの回帰確認(Pathを返す)",
+          _cj_r3 is not None and isinstance(_cj_r3, _cj_Path))
+    check("generate_image_comfyui: 単一正常エントリのファイル名にfilenameが埋め込まれる(回帰)",
+          _cj_r3 is not None and _cj_r3.name.endswith("_solo.png"))
+    check("generate_image_comfyui: 単一正常エントリで/viewはちょうど1回だけ呼ばれる(回帰)",
+          _cj_view_calls3 == ["solo.png"])
+    check("generate_image_comfyui: 単一正常エントリの保存先ディレクトリがIMAGE_OUT_DIR配下(回帰)",
+          _cj_r3 is not None and _cj_r3.parent == f.IMAGE_OUT_DIR)
+finally:
+    urllib.request.urlopen = _orig_cj_urlopen
+    f._http_post_json = _orig_cj_post_json
+    f.COMFYUI_CKPT = _orig_cj_ckpt
+    f.IMAGE_OUT_DIR = _orig_cj_out_dir
+    if _cj_td3 is not None:
+        _cj_td3.cleanup()
+
+# --- (4) 回帰: 全imageエントリが壊れている/使えるfilenameが無い -> 例外を伝播させずNoneを返す ---
+_cj_td4 = None
+try:
+    _cj_td4 = _cj_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _cj_Path(_cj_td4.name)
+    f.COMFYUI_CKPT = "dummy-ckpt-preset"
+    f._http_post_json = lambda url, payload, timeout: {"prompt_id": "pid-4"}
+    _cj_view_calls4 = []
+    urllib.request.urlopen = _make_comfy_urlopen(
+        {"pid-4": {"outputs": {
+            "8": {"images": [{}, {"filename": ""}, {"filename": 123}]},
+            "9": {"images": [{"filename": None}, "bogus", 42, None]},
+        }}},
+        {},
+        _cj_view_calls4,
+    )
+    _cj_exc4 = None
+    try:
+        _cj_r4 = f.generate_image_comfyui("prompt", "")
+    except Exception as _e:
+        _cj_exc4 = _e
+        _cj_r4 = "__RAISED__"
+    check("generate_image_comfyui: 全エントリ壊れていても例外を送出しない(回帰)",
+          _cj_exc4 is None)
+    check("generate_image_comfyui: 全エントリ壊れていればNoneを返す(回帰)",
+          _cj_r4 is None)
+finally:
+    urllib.request.urlopen = _orig_cj_urlopen
+    f._http_post_json = _orig_cj_post_json
+    f.COMFYUI_CKPT = _orig_cj_ckpt
+    f.IMAGE_OUT_DIR = _orig_cj_out_dir
+    if _cj_td4 is not None:
+        _cj_td4.cleanup()
+
+check("generate_image_comfyui: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_cj_urlopen)
+check("generate_image_comfyui: テスト後にf._http_post_jsonが元の状態へ復元されている",
+      f._http_post_json == _orig_cj_post_json)
+check("generate_image_comfyui: テスト後にf.COMFYUI_CKPTが元の状態へ復元されている",
+      f.COMFYUI_CKPT == _orig_cj_ckpt)
+check("generate_image_comfyui: テスト後にf.IMAGE_OUT_DIRが元の状態へ復元されている",
+      f.IMAGE_OUT_DIR == _orig_cj_out_dir)
 
 print()
 if _FAILS:

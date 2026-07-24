@@ -1982,7 +1982,25 @@ def generate_image_comfyui(prompt, negative=""):
         return None
     for node in hist.get("outputs", {}).values():
         for img in node.get("images", []):
-            q = urllib.parse.urlencode({"filename": img["filename"],
+            # 2026-07-25 (iter139): 隣接するsubfolder/typeは.get()で守られている
+            # 一方、filenameだけはimg["filename"]の直接dictアクセスが2箇所に
+            # 残っていた。ComfyUI /history の壊れたエントリ（filenameキー欠落・
+            # null・またはimages配列内の非dict要素、例えば文字列/数値）に対して
+            # 旧実装はKeyError/TypeErrorを送出し、それが本関数を丸ごと巻き込んで
+            # 呼び出し元generate_imageの外側except Exceptionまで伝播、以降の
+            # ノード・エントリに有効な画像があっても生成結果ごと握り潰して
+            # Noneを返していた。iter77（良い方を回収する）・iter103/111/112
+            # （非list/非dictの強制truthy変換に頼らない既定値フォールバック）・
+            # iter113/iter138（外部由来ペイロードの1件の破損で全体を道連れに
+            # しないためのentry単位skip）と同じ作法に倣い、ここでもfilenameを
+            # img.get()で一度だけ読み、非dictエントリ・欠落/None/空/非str
+            # filenameは例外を出さずcontinueして後続の有効なエントリを救済する。
+            if not isinstance(img, dict):
+                continue
+            filename = img.get("filename")
+            if not isinstance(filename, str) or not filename:
+                continue
+            q = urllib.parse.urlencode({"filename": filename,
                                         "subfolder": img.get("subfolder", ""),
                                         "type": img.get("type", "output")})
             try:
@@ -1991,7 +2009,7 @@ def generate_image_comfyui(prompt, negative=""):
             except Exception:
                 continue
             IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{img['filename']}"
+            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{filename}"
             out.write_bytes(blob)
             return out
     return None
