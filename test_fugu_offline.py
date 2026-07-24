@@ -677,6 +677,50 @@ finally:
     else:
         del sys.modules["math_verify"]
 
+# 2026-07-25: \(...\)（inline 数式）/ \[...\]（display 数式）はエスケープ済みの LaTeX
+# 数式モード区切り文字であり、上の '$'（同じ数式モードの別綴り）/ '\!'/'\,' の除去と
+# 対称的な、値を持たない体裁トークン。normalize_answer がこれらを剥がさないままだと
+# \boxed{\(5\)} や \[x+1\]、「answer is \(42\)」のような区切り文字付きの答えが素の
+# "5"/"x+1"/"42" とは別の投票クラスに分裂し（自己整合性投票 gotcha #7 の票割れ）、
+# iteration 13/22/78/122/134/136 と同系統の姉妹修正としてここで剥がす。
+check("sc: 正規化 \\(...\\) 剥がし", f.normalize_answer("\\(5\\)") == "5")
+check("sc: 正規化 \\[...\\] 剥がし", f.normalize_answer("\\[x+1\\]") == "x+1")
+check("sc: 正規化 \\(\\frac{}{}\\) は区切り剥がし後にfrac正規化される",
+      f.normalize_answer("\\(\\frac{1}{2}\\)") == "1/2")
+# 回帰: $ 剥がし・'\!' 桁区切り剥がし・素の値は不変のまま
+check("sc: 正規化 \\(...\\)/\\[...\\] 以外の既存回帰は不変",
+      f.normalize_answer("$5$") == "5"
+      and f.normalize_answer("5") == "5"
+      and f.normalize_answer("11,\\! 111,\\! 111,\\! 100") == "11111111100")
+
+check("sc: 抽出 宣言分岐の\\(...\\)が剥がれる",
+      f.extract_final_answer("The final answer is \\(42\\)", "math") == "42")
+check("sc: 抽出 boxed分岐の\\(...\\)が剥がれる",
+      f.extract_final_answer("\\boxed{\\(7\\)}", "math") == "7")
+
+# answers_equivalent: math_verify を「呼ばれたら必ず例外」なスタブに差し替えても、
+# \(5\) と 5 が normalize_answer の高速パス（na.lower() 一致）だけで合流することを確認する
+# （上の百分率ブロックと同じ swap-and-restore パターン、iteration 122/129/134 と同系統）。
+def _mv_must_not_be_called_delim(*_a, **_kw):
+    raise RuntimeError("math_verify should not be needed for these fast-path cases (delimiters)")
+
+
+_fake_math_verify_delim = types.ModuleType("math_verify")
+_fake_math_verify_delim.parse = _mv_must_not_be_called_delim
+_fake_math_verify_delim.verify = _mv_must_not_be_called_delim
+_orig_math_verify_mod_delim = sys.modules.get("math_verify")
+sys.modules["math_verify"] = _fake_math_verify_delim
+try:
+    check("sc: 同値 \\(5\\)と5（math_verify不要）", f.answers_equivalent("\\(5\\)", "5"))
+    _delim_top, _delim_count, _delim_classes = f.vote_answers(["\\(5\\)", "5", "5"])
+    check("sc: 投票 \\(5\\)/5/5の3票が単一クラスに集約される（票割れしない）",
+          _delim_count == 3 and len(_delim_classes) == 1)
+finally:
+    if _orig_math_verify_mod_delim is not None:
+        sys.modules["math_verify"] = _orig_math_verify_mod_delim
+    else:
+        del sys.modules["math_verify"]
+
 check("sc: 抽出 答え宣言", f.extract_final_answer("計算すると、答えは 700 円です") == "700")
 check("sc: 抽出 最後の数値", f.extract_final_answer("17 * 23 = 391") == "391")
 check("sc: 抽出 無しは None", f.extract_final_answer("わかりません") is None)
