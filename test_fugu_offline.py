@@ -6468,11 +6468,98 @@ try:
     check("_ddg_instant: トップレベルTextとTopicsが両方ある場合はTextのみ追加され"
           "二重追加されない",
           _di11 == ["only-top"])
+
+    # ---------- (12)-(15) 壊れたペイロード全体への耐性 (2026-07-24追加) ----------
+    # data.get("RelatedTopics", []) は "RelatedTopics" キーが存在するが値が null の
+    # 場合はdefaultが使われずNoneを返す(dict.getのdefaultは「キー不在」時のみ有効という
+    # 仕様の落とし穴)ため、`for t in None` がTypeErrorになる。また DuckDuckGo Instant
+    # Answer APIはクエリ次第でトップレベルがdictでないJSON(配列・文字列・数値)を返す
+    # こともあり、その場合は data.get("Abstract") がAttributeErrorになる。_ddg_instant は
+    # _search_raw() の except ImportError ブロックからtryに包まれず直接呼ばれる(L544相当)
+    # ため、これらの例外は _search_raw の「失敗時は空リスト(呼び出し側を止めない)」契約
+    # (イテレーション75)をすり抜けてターン全体を落としてしまう。以下は本イテレーションで
+    # 追加した防御(dict以外のトップレベル->[]、非listなRelatedTopics->[]に丸め)を検証する。
+
+    # --- (12) RelatedTopicsキーは存在するが値がnull -> []を返し例外なし ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": None,
+    })
+    _di12 = f._ddg_instant("null-RelatedTopicsクエリ", max_results=5)
+    check("_ddg_instant: RelatedTopicsが存在するがnullの場合は[]を返し例外を出さない",
+          _di12 == [])
+
+    # --- (13) トップレベルJSONがdictでない(配列/文字列/数値) -> []を返し例外なし ---
+    for _bad_payload, _label in [
+        ([{"Text": "x"}], "配列"),
+        ("just-a-string", "文字列"),
+        (12345, "数値"),
+    ]:
+        urllib.request.urlopen = _fake_urlopen_di_payload(_bad_payload)
+        _di13 = f._ddg_instant(f"非dictペイロード({_label})クエリ", max_results=5)
+        check(f"_ddg_instant: トップレベルJSONが{_label}(dict以外)の場合は"
+              "[]を返し例外を出さない",
+              _di13 == [])
+
+    # --- (14) RelatedTopicsがdict(非list)でも、有効なAbstractは従来通り返る ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "正常な要約",
+        "AbstractTitle": "タイトル",
+        "AbstractURL": "https://example.com/ok",
+        "RelatedTopics": {"not": "a-list"},
+    })
+    _di14 = f._ddg_instant("非listRelatedTopics(dict)クエリ", max_results=5)
+    check("_ddg_instant: RelatedTopicsがdict(非list)でもAbstractは従来通り返り例外なし",
+          _di14 == ["[タイトル]\n正常な要約\nSource: https://example.com/ok"])
+
+    # --- (15) RelatedTopicsが文字列(非list) -> トピック側は[]に丸められ例外なし ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": "not-a-list-either",
+    })
+    _di15 = f._ddg_instant("非listRelatedTopics(文字列)クエリ", max_results=5)
+    check("_ddg_instant: RelatedTopicsが文字列(非list)の場合も[]を返し例外を出さない",
+          _di15 == [])
 finally:
     urllib.request.urlopen = _orig_urlopen_di
 
 check("_ddg_instant: テスト後にurllib.request.urlopenが元の状態へ復元されている",
       urllib.request.urlopen == _orig_urlopen_di)
+
+# ---------- _search_raw: _ddg_instantフォールバック経路での壊れたペイロード伝播防止 (2026-07-24追加) ----------
+# _search_raw は _resolve_ddgs_class() が ImportError を送出した場合、
+# except ImportError: ブロックの中から `return _ddg_instant(...)` を直接呼ぶ(L544相当)。
+# _ddg_full を包む try/except Exception のような保護がここには無いため、_ddg_instant が
+# 上で追加した防御(非dictペイロード/null RelatedTopicsへの耐性)を持たないと、
+# _search_raw の「失敗時は空リスト(呼び出し側を止めない)」契約(イテレーション75)が
+# ここで破られる。_resolve_ddgs_class を ImportError へ、urllib.request.urlopen を
+# 壊れたペイロードへそれぞれモックし(_ddg_instant自体はモックせず本物を経由させる)、
+# 実ネットワーク呼び出しなしでこの伝播防止を検証する。
+
+_orig_resolve_ddgs_sr2 = f._resolve_ddgs_class
+_orig_urlopen_sr2 = urllib.request.urlopen
+
+try:
+    f._resolve_ddgs_class = _resolve_raises_importerror
+    urllib.request.urlopen = _fake_urlopen_di_payload({"RelatedTopics": None})
+
+    _buf_sr2 = io.StringIO()
+    with contextlib.redirect_stdout(_buf_sr2):
+        _r_sr2 = f._search_raw("壊れたペイロード経由クエリ", max_results=5)
+
+    check("_search_raw: ライブラリ未インストール経由で_ddg_instantに渡った壊れたペイロード"
+          "(RelatedTopics=null)も[]を返し例外を出さない(never-raise契約の維持)",
+          _r_sr2 == [])
+finally:
+    f._resolve_ddgs_class = _orig_resolve_ddgs_sr2
+    urllib.request.urlopen = _orig_urlopen_sr2
+
+check("_search_raw: 壊れたペイロード伝播テスト後にurllib.request.urlopenが"
+      "元の状態へ復元されている",
+      urllib.request.urlopen == _orig_urlopen_sr2)
+check("_search_raw: 壊れたペイロード伝播テスト後に_resolve_ddgs_classが"
+      "元の状態へ復元されている",
+      f._resolve_ddgs_class == _orig_resolve_ddgs_sr2)
 
 # ---------- research_search: 反復リサーチループ (dedup / ラウンド上限 / 早期終了) ----------
 # research_search は「Conductor/proposer 全員に注入される権威コンテキスト」を作る

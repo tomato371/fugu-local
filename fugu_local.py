@@ -484,6 +484,22 @@ def _ddg_instant(query: str, max_results: int) -> list:
             data = json.loads(r.read().decode("utf-8"))
     except Exception:
         return []
+    # 2026-07-24: DuckDuckGo Instant Answer API はクエリ次第で JSON のトップレベルが
+    # dict ではない（配列・文字列・数値など、いずれも json.loads は例外にしない）ことが
+    # あり、また "RelatedTopics" キーが存在していても値が null のことがある。
+    # dict.get(key, default) の default は「キーが存在しない」場合にのみ使われる仕様の
+    # ため、{"RelatedTopics": null} では data.get("RelatedTopics", []) は [] ではなく
+    # None を返し、続く `for t in None` が TypeError になる。この関数は
+    # _search_raw() の L544 相当 `except ImportError: return _ddg_instant(...)` の
+    # 内側から try に包まれず直接呼ばれているため、その TypeError は _search_raw の
+    # 「失敗時は空リスト（呼び出し側を止めない）」という契約（イテレーション75で確立）
+    # をすり抜けて呼び出し元（web_search/research_search/build_context）まで伝播し、
+    # ターン全体を落としてしまう。ここで dict 以外のトップレベルは即座に [] を返し、
+    # RelatedTopics も非 list（null・dict・str 等）なら [] に丸めることで、
+    # イテレーション85/89で整備した整形済みペイロードの挙動は一切変えずに、
+    # 壊れたペイロードでも例外を出さないようにする。
+    if not isinstance(data, dict):
+        return []
     results = []
     # 2026-07-24: _ddg_full は (r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS] で
     # 各スニペットを必ず切り詰めているが、この Instant Answer フォールバックは
@@ -497,7 +513,10 @@ def _ddg_instant(query: str, max_results: int) -> list:
         abstract = data["Abstract"][:WEB_SEARCH_SNIPPET_CHARS]
         results.append(f"[{data.get('AbstractTitle', '')}]\n{abstract}\n"
                        f"Source: {data.get('AbstractURL', '')}")
-    for t in data.get("RelatedTopics", []):
+    rel = data.get("RelatedTopics")
+    if not isinstance(rel, list):
+        rel = []
+    for t in rel:
         if isinstance(t, dict) and t.get("Text"):
             # トップレベルに Text がある「直接トピック」はこちらを優先し、
             # 仮に Topics も併存していても展開しない（下の分岐と二重追加しない
