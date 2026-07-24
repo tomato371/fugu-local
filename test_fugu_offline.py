@@ -7901,6 +7901,254 @@ finally:
 check("ask_fugu/image失敗テスト: テスト後に_HISTORYが元の状態へ復元されている",
       f._HISTORY == _orig_af2_hist)
 
+# ---------- 画像プロンプト起草チェーン: _sd_prompt_from_request / moa_image_prompt /
+# author_image_prompt (2026-07-24) ----------
+# この3関数はSDXL画像プロンプト起草パイプラインを構成し、ask_fugu 経路1(画像のみ)・
+# 経路3(イラスト付き回答、直上のテスト)・build_pptx のヒーロー/スライド画像
+# (handle_image_generation L1970経由でauthor_image_promptを呼ぶ)の全てから使われる
+# が、grep上は一貫してモックされるだけで直接のテストが皆無だった。
+# moa_image_prompt/_sd_prompt_from_request はどちらも、ask() が壊れたJSONや
+# '__ERROR__: ...' センチネルを返した場合に extract_json(raw) が None を返す
+# (または j.get('prompt') が falsy になる)ことに暗黙的に依存してフォールバック
+# している。他の全ての類似箇所 ―― iteration 9 の aggregate、iteration 15 の
+# _critic_judge/second_opinion、iteration 20 の _arbitrate、iteration 52 の
+# _sc_sample、直上(iteration 99)の ask_fugu 経路3 ―― はセンチネル漏出を明示的に
+# テスト済みだったのに対し、ここだけ空白地帯だった。
+# f.ask のみをモックし、extract_json は本物を実行してセンチネル拒否経路を実際に
+# 通す(extract_jsonそのものはモックしない)。urllib.request.urlopen と
+# f.subprocess.run にも「呼ばれたら即AssertionError」の番人を仕込み
+# (gotcha #8 / iteration 38・39・76の流儀)、モック漏れで実ネットワーク/
+# サブプロセスへ落ちないことを保証する。実際の Ollama・画像バックエンド・
+# ネットワーク・subprocess 呼び出しは一切発生しない。
+_orig_ip_ask = f.ask
+_orig_ip_proposers = f.PROPOSERS
+_orig_ip_conductor = f.CONDUCTOR
+_orig_ip_moa_flag = f.IMAGE_PROMPT_MOA
+_orig_ip_translate = f.IMAGE_TRANSLATE_PROMPT
+_orig_ip_panel = f.IMAGE_PROMPT_PANEL
+_orig_ip_urlopen = urllib.request.urlopen
+_orig_ip_subprocess_run = f.subprocess.run
+
+
+def _ip_no_network_urlopen(*a, **k):
+    raise AssertionError("image-prompt起草チェーン: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _ip_no_subprocess_run(*a, **k):
+    raise AssertionError("image-prompt起草チェーン: モック漏れで実subprocess.runが呼ばれた")
+
+
+_IP_SENTINEL = "__ERROR__: HTTP Error 500 (模擬)"
+
+try:
+    urllib.request.urlopen = _ip_no_network_urlopen
+    f.subprocess.run = _ip_no_subprocess_run
+    f.PROPOSERS = ["ip_p1", "ip_p2", "ip_p3"]
+    f.CONDUCTOR = "ip_conductor"
+    f.IMAGE_PROMPT_PANEL = 2
+
+    _ip_calls = []
+
+    def _make_ip_ask(moa_responses=None, merge_response=None, sd_response=None):
+        moa_responses = moa_responses or {}
+
+        def _fake_ask(model, messages, temperature, think=None, fmt=None,
+                      label=None, num_predict=None, num_ctx=None):
+            _ip_calls.append((model, label))
+            if label == "img-prompt":
+                return sd_response
+            if label == "img-merge":
+                return merge_response
+            if label == "img-moa":
+                return moa_responses.get(model, "__ERROR__: no response configured (test)")
+            raise AssertionError(
+                f"image-prompt起草チェーン: 想定外のlabel={label!r} model={model!r}")
+        return _fake_ask
+
+    # === _sd_prompt_from_request ===
+    # (a) IMAGE_TRANSLATE_PROMPT=False: askを一切呼ばず(user_request, "")をそのまま返す
+    f.IMAGE_TRANSLATE_PROMPT = False
+    _ip_calls.clear()
+    f.ask = _make_ip_ask()
+    _sd_a = f._sd_prompt_from_request("猫の絵")
+    check("_sd_prompt_from_request: IMAGE_TRANSLATE_PROMPT=Falseはaskを呼ばない",
+          _ip_calls == [])
+    check("_sd_prompt_from_request: IMAGE_TRANSLATE_PROMPT=Falseは(user_request,'')をそのまま返す",
+          _sd_a == ("猫の絵", ""))
+
+    # (b) True + 正当なJSON -> パース結果の(prompt,negative)を返す
+    f.IMAGE_TRANSLATE_PROMPT = True
+    _ip_calls.clear()
+    f.ask = _make_ip_ask(sd_response='{"prompt": "a cat, masterpiece", "negative": "blurry"}')
+    _sd_b = f._sd_prompt_from_request("猫の絵")
+    check("_sd_prompt_from_request: 正当なJSONはパースした(prompt,negative)を返す",
+          _sd_b == ("a cat, masterpiece", "blurry"))
+    check("_sd_prompt_from_request: 正当なJSON経路ではaskが1回だけ呼ばれる(label=img-prompt)",
+          _ip_calls == [("ip_conductor", "img-prompt")])
+
+    # (c) 壊れたJSON(パース不能) -> (user_request, "")へフォールバック
+    _ip_calls.clear()
+    f.ask = _make_ip_ask(sd_response="not json at all, just prose")
+    _sd_c = f._sd_prompt_from_request("犬の絵")
+    check("_sd_prompt_from_request: パース不能出力は(user_request,'')へフォールバックする",
+          _sd_c == ("犬の絵", ""))
+    check("_sd_prompt_from_request: パース不能フォールバックの戻り値に'__ERROR__'を含まない",
+          "__ERROR__" not in _sd_c[0] and "__ERROR__" not in _sd_c[1])
+
+    # (d) '__ERROR__'センチネル -> (user_request, "")へフォールバックし生センチネルを漏らさない
+    _ip_calls.clear()
+    f.ask = _make_ip_ask(sd_response=_IP_SENTINEL)
+    _sd_d = f._sd_prompt_from_request("鳥の絵")
+    check("_sd_prompt_from_request: '__ERROR__'センチネルは(user_request,'')へフォールバックする",
+          _sd_d == ("鳥の絵", ""))
+    check("_sd_prompt_from_request: '__ERROR__'センチネルは戻り値に漏出しない",
+          "__ERROR__" not in _sd_d[0] and "__ERROR__" not in _sd_d[1])
+
+    # === moa_image_prompt ===
+    _valid_ip_p1 = {"prompt": "cand from p1", "negative": "neg p1"}
+    _valid_ip_p2 = {"prompt": "cand from p2", "negative": "neg p2"}
+    _valid_ip_p3 = {"prompt": "cand from p3", "negative": "neg p3"}
+
+    # (e) 使える候補が1件のみ -> マージaskを一切呼ばずその候補をそのまま返す(短絡)
+    _ip_calls.clear()
+    f.ask = _make_ip_ask(moa_responses={
+        "ip_p1": json.dumps(_valid_ip_p1),
+        "ip_p2": "__ERROR__: proposer failed (test)",
+    })
+    _moa_e = f.moa_image_prompt("猫を描いて")
+    check("moa_image_prompt: 使える候補1件は短絡しその(prompt,negative)をそのまま返す",
+          _moa_e == ("cand from p1", "neg p1"))
+    check("moa_image_prompt: 候補1件のときマージask(img-merge)は呼ばれない",
+          all(lbl != "img-merge" for _m, lbl in _ip_calls))
+    check("moa_image_prompt: 候補1件のときも起草askはpanel全員(既定2件)に対して行われる",
+          [m for m, lbl in _ip_calls if lbl == "img-moa"] == ["ip_p1", "ip_p2"])
+
+    # (f) 使える候補が2件以上 -> マージaskが発行されその結果を返す
+    _ip_calls.clear()
+    _merge_result = {"prompt": "merged prompt", "negative": "merged neg"}
+    f.ask = _make_ip_ask(
+        moa_responses={"ip_p1": json.dumps(_valid_ip_p1), "ip_p2": json.dumps(_valid_ip_p2)},
+        merge_response=json.dumps(_merge_result))
+    _moa_f = f.moa_image_prompt("猫を描いて")
+    check("moa_image_prompt: 候補2件以上はマージaskの結果を返す",
+          _moa_f == ("merged prompt", "merged neg"))
+    check("moa_image_prompt: 候補2件以上のときマージaskがCONDUCTORに対して発行される",
+          ("ip_conductor", "img-merge") in _ip_calls)
+
+    # (g) マージaskがパース不能/センチネル -> 最初の候補の(prompt,negative)へフォールバック
+    _ip_calls.clear()
+    f.ask = _make_ip_ask(
+        moa_responses={"ip_p1": json.dumps(_valid_ip_p1), "ip_p2": json.dumps(_valid_ip_p2)},
+        merge_response="__ERROR__: merge failed (test)")
+    _moa_g = f.moa_image_prompt("猫を描いて")
+    check("moa_image_prompt: マージask失敗時は最初の候補の(prompt,negative)へフォールバックする",
+          _moa_g == ("cand from p1", "neg p1"))
+    check("moa_image_prompt: マージask失敗フォールバックは戻り値に'__ERROR__'を含まない",
+          "__ERROR__" not in _moa_g[0] and "__ERROR__" not in _moa_g[1])
+
+    # (h) 全proposerが失敗('__ERROR__'/非JSON、使える候補0件) -> Noneを返す
+    _ip_calls.clear()
+    f.ask = _make_ip_ask(moa_responses={
+        "ip_p1": "__ERROR__: fail1 (test)",
+        "ip_p2": "not json either",
+    })
+    _moa_h = f.moa_image_prompt("猫を描いて")
+    check("moa_image_prompt: 全proposer失敗(候補0件)はNoneを返す", _moa_h is None)
+    check("moa_image_prompt: 全proposer失敗時はマージask(img-merge)を呼ばない",
+          all(lbl != "img-merge" for _m, lbl in _ip_calls))
+
+    # (i) panelはPROPOSERSの構成員へフィルタされ、IMAGE_PROMPT_PANEL件で打ち切られる
+    _ip_calls.clear()
+    f.ask = _make_ip_ask(moa_responses={
+        "ip_p1": json.dumps(_valid_ip_p1),
+        "ip_p2": json.dumps(_valid_ip_p2),
+        "ip_p3": json.dumps(_valid_ip_p3),
+    })
+    f.moa_image_prompt("猫を描いて", panel=["ip_p2", "not_a_proposer", "ip_p1", "ip_p3"])
+    check("moa_image_prompt: panelはPROPOSERS外('not_a_proposer')を除外し"
+          "IMAGE_PROMPT_PANEL(=2)件で打ち切って実際にaskする",
+          [m for m, lbl in _ip_calls if lbl == "img-moa"] == ["ip_p2", "ip_p1"])
+
+    # === author_image_prompt ===
+    # moa_image_prompt/_sd_prompt_from_request 自体をモックしてルーティングのみを検証する
+    # (ask経由のセンチネル拒否は上のmoa_image_prompt/_sd_prompt_from_requestテストで
+    # 既に直接カバー済みのため)。
+    _orig_ip_moa_fn = f.moa_image_prompt
+    _orig_ip_sd_fn = f._sd_prompt_from_request
+    try:
+        _sd_calls_author = []
+
+        def _fake_sd_author(user_request):
+            _sd_calls_author.append(user_request)
+            return ("SD_FALLBACK_PROMPT", "SD_FALLBACK_NEG")
+
+        f._sd_prompt_from_request = _fake_sd_author
+
+        # (j) IMAGE_PROMPT_MOA=True かつ moa_image_prompt がタプルを返す
+        # -> それをそのまま返し、単独翻訳フォールバックは一切呼ばれない
+        f.IMAGE_PROMPT_MOA = True
+        _sd_calls_author.clear()
+        f.moa_image_prompt = lambda base_text, panel=None: ("MOA_PROMPT", "MOA_NEG")
+        _auth_j = f.author_image_prompt("何か描いて")
+        check("author_image_prompt: MOA=Trueでmoa_image_promptがタプルを返せばそれを返す",
+              _auth_j == ("MOA_PROMPT", "MOA_NEG"))
+        check("author_image_prompt: moa_image_prompt成功時は_sd_prompt_from_requestを呼ばない",
+              _sd_calls_author == [])
+
+        # (k) moa_image_promptがNoneを返す -> _sd_prompt_from_requestへフォールバックする
+        _sd_calls_author.clear()
+        f.moa_image_prompt = lambda base_text, panel=None: None
+        _auth_k = f.author_image_prompt("何か描いて")
+        check("author_image_prompt: moa_image_promptがNoneなら_sd_prompt_from_requestへ"
+              "フォールバックする",
+              _auth_k == ("SD_FALLBACK_PROMPT", "SD_FALLBACK_NEG"))
+        check("author_image_prompt: Noneフォールバック時に_sd_prompt_from_requestが実際に呼ばれる",
+              _sd_calls_author == ["何か描いて"])
+
+        # (l) IMAGE_PROMPT_MOA=False -> MoA起草を一切経由せず直接_sd_prompt_from_requestへ行く
+        f.IMAGE_PROMPT_MOA = False
+        _sd_calls_author.clear()
+
+        def _moa_forbidden_author(base_text, panel=None):
+            raise AssertionError(
+                "author_image_prompt: IMAGE_PROMPT_MOA=Falseなのにmoa_image_promptが呼ばれた")
+
+        f.moa_image_prompt = _moa_forbidden_author
+        _auth_l = f.author_image_prompt("何か描いて")
+        check("author_image_prompt: MOA=Falseは直接_sd_prompt_from_requestへ行く"
+              "(MoA起草askを経由しない)",
+              _auth_l == ("SD_FALLBACK_PROMPT", "SD_FALLBACK_NEG"))
+        check("author_image_prompt: MOA=Falseのとき_sd_prompt_from_requestが呼ばれる",
+              _sd_calls_author == ["何か描いて"])
+    finally:
+        f.moa_image_prompt = _orig_ip_moa_fn
+        f._sd_prompt_from_request = _orig_ip_sd_fn
+finally:
+    f.ask = _orig_ip_ask
+    f.PROPOSERS = _orig_ip_proposers
+    f.CONDUCTOR = _orig_ip_conductor
+    f.IMAGE_PROMPT_MOA = _orig_ip_moa_flag
+    f.IMAGE_TRANSLATE_PROMPT = _orig_ip_translate
+    f.IMAGE_PROMPT_PANEL = _orig_ip_panel
+    urllib.request.urlopen = _orig_ip_urlopen
+    f.subprocess.run = _orig_ip_subprocess_run
+
+check("image-prompt起草チェーン: テスト後にaskが元へ復元されている", f.ask == _orig_ip_ask)
+check("image-prompt起草チェーン: テスト後にPROPOSERSが元へ復元されている",
+      f.PROPOSERS == _orig_ip_proposers)
+check("image-prompt起草チェーン: テスト後にCONDUCTORが元へ復元されている",
+      f.CONDUCTOR == _orig_ip_conductor)
+check("image-prompt起草チェーン: テスト後にIMAGE_PROMPT_MOAが元へ復元されている",
+      f.IMAGE_PROMPT_MOA == _orig_ip_moa_flag)
+check("image-prompt起草チェーン: テスト後にIMAGE_TRANSLATE_PROMPTが元へ復元されている",
+      f.IMAGE_TRANSLATE_PROMPT == _orig_ip_translate)
+check("image-prompt起草チェーン: テスト後にIMAGE_PROMPT_PANELが元へ復元されている",
+      f.IMAGE_PROMPT_PANEL == _orig_ip_panel)
+check("image-prompt起草チェーン: テスト後にurllib.request.urlopenが元へ復元されている",
+      urllib.request.urlopen == _orig_ip_urlopen)
+check("image-prompt起草チェーン: テスト後にf.subprocess.runが元へ復元されている",
+      f.subprocess.run == _orig_ip_subprocess_run)
+
 # ---------- resolve_models: PROPOSERS/AGGREGATOR/CONDUCTOR プール構成 ----------
 # resolve_models() (fugu_local.py L1084) は SC投票パネル(solve_verifiableが
 # `[m for m in REASONING_MODELS if m in PROPOSERS]` で組む)と _arbitrate のアービター
