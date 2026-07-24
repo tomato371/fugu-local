@@ -596,7 +596,59 @@ check("sc: 正規化 ASCII 1,234 不変", f.normalize_answer("1,234") == "1234")
 check("sc: 正規化 末尾カンマ除去", f.normalize_answer("42,") == "42")
 check("sc: 正規化 桁区切り+末尾カンマ除去", f.normalize_answer("1234,") == "1234")
 
-check("sc: 抽出 boxed優先", f.extract_final_answer("答えは 5 です。\\boxed{7}") == "7")
+# 2026-07-25: LaTeX でバレの '\%' と全角パーセント '％'(U+FF05) を '%' へ正規化する。
+# 百分率の答えは \boxed{50\%}（LaTeX エスケープ、行儀の良いモデルが好む）/ \boxed{50%}
+# （素の散文）/ \boxed{５０％}（CJK 寄りの qwen/gemma 系）の3系統の綴りに分裂しうるが、
+# いずれも値としては同じ50%であり、投票を分裂させるべきではない（自己整合性投票
+# gotcha #7、iteration 13/22/78/122 と同系統の姉妹修正。詳細は normalize_answer /
+# _FW_TRANS 定義部のコメント参照）。パーセント記号自体は落とさない（50% を 50 という
+# 別の値に変えてしまうと精度劣化になる）。
+check("sc: 正規化 LaTeXエスケープ%", f.normalize_answer("50\\%") == "50%")
+check("sc: 正規化 LaTeXエスケープ% + 末尾句点", f.normalize_answer("50\\%.") == "50%")
+check("sc: 正規化 全角パーセント(全角数字込み)", f.normalize_answer("５０％") == "50%")
+# 回帰: 素の '%' は従来どおり変化しない（%自体を落とさない・全角以外の桁区切り等）
+check("sc: 正規化 素の%は不変", f.normalize_answer("50%") == "50%")
+check("sc: 正規化 %以外の既存回帰は不変",
+      f.normalize_answer("50") == "50"
+      and f.normalize_answer("1/2") == "1/2"
+      and f.normalize_answer("-5") == "-5"
+      and f.normalize_answer(r"\frac{1}{2}") == "1/2"
+      and f.normalize_answer("\\textbf{B}") == "B")
+
+check("sc: 抽出 boxedのLaTeXエスケープ%とASCII%が同じ票に正規化される",
+      f.extract_final_answer("\\boxed{50\\%}", "math")
+      == f.extract_final_answer("\\boxed{50%}", "math")
+      == "50%")
+
+# answers_equivalent: math_verify を「呼ばれたら必ず例外」なスタブに差し替えても
+# 高速パス（na.lower() 一致）だけで正しく判定できることを確認する（下の
+# U+2212/全角スラッシュ用スタブブロック、L~763 と同じ swap-and-restore パターンだが、
+# そちらの _fake_math_verify はまだ未定義のためここではローカルに同等のスタブを作る）。
+def _mv_must_not_be_called_pct(*_a, **_kw):
+    raise RuntimeError("math_verify should not be needed for these fast-path cases (percent)")
+
+
+_fake_math_verify_pct = types.ModuleType("math_verify")
+_fake_math_verify_pct.parse = _mv_must_not_be_called_pct
+_fake_math_verify_pct.verify = _mv_must_not_be_called_pct
+_orig_math_verify_mod_pct = sys.modules.get("math_verify")
+sys.modules["math_verify"] = _fake_math_verify_pct
+try:
+    check("sc: 同値 LaTeXエスケープ%とASCII%（math_verify不要）",
+          f.answers_equivalent("50\\%", "50%"))
+    check("sc: 同値 全角パーセントとASCII%（math_verify不要）",
+          f.answers_equivalent("５０％", "50%"))
+    # 回帰: %を落として値まで変えてしまう誤修正でないことの確認。50% と 50 は
+    # 異なる値であり、math_verify が例外を返す（=利用不能）環境でも高速パスのみで
+    # 正しく非同値のまま（誤って併合されない）。
+    check("sc: 非同値 50%と50は別クラスのまま（math_verifyスタブが例外を返しても誤併合しない）",
+          not f.answers_equivalent("50%", "50"))
+finally:
+    if _orig_math_verify_mod_pct is not None:
+        sys.modules["math_verify"] = _orig_math_verify_mod_pct
+    else:
+        del sys.modules["math_verify"]
+
 check("sc: 抽出 答え宣言", f.extract_final_answer("計算すると、答えは 700 円です") == "700")
 check("sc: 抽出 最後の数値", f.extract_final_answer("17 * 23 = 391") == "391")
 check("sc: 抽出 無しは None", f.extract_final_answer("わかりません") is None)
