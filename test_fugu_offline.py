@@ -8746,6 +8746,202 @@ check("mcq-e2e: テスト後にf._sc_sample/SC_POT/SC_INITIAL等のグローバ�
       and f.SC_CHEAP_VOTES == _orig_mcqv_cheap_votes and f.PROPOSERS == _orig_mcqv_props
       and f.REASONING_MODELS == _orig_mcqv_reasoning and f.SC_INITIAL == _orig_mcqv_initial)
 
+# ==================================================
+# ---------- plan_pptx_images: index範囲/重複/予算上限のパース契約 (2026-07-24) ----------
+# ==================================================
+# 背景: plan_pptx_images() (fugu_local.py L4095) は Conductor の JSON 画像プランを
+# {index: prompt} の dict へパースする。この契約 ―
+#   index 0 = タイトルヒーロー画像、1..len(slides) は build_pptx 側で
+#   slides[idx-1] に対応、非整数/None index・辞書でないエントリ・'index'欠落は
+#   try/except-continue で無視、空/空白のみの prompt はスキップ、重複 index は
+#   先勝ち(idx not in out)、範囲は 0 <= idx <= len(slides) の閉区間、最大
+#   PPTX_MAX_IMAGES 件で打ち切り ― は build_pptx の slides[idx-1] アクセスと
+# iter77 のタイトルヒーロー保証(plan.setdefault(0, None)/L4164)が前提とする
+# 不変条件そのものである。従来 test_fugu_offline.py 内では plan_pptx_images は
+# build_pptx テスト(iter68/77、L7505/7533等)の中で常に丸ごとモックされるだけで、
+# この関数自体への直接テストは皆無だった。将来の変更で範囲外 index や
+# PPTX_MAX_IMAGES 超過件数を返すよう壊れた場合、タイトルヒーロー保証が静かに
+# 崩れるか、build_pptx が IndexError で落ちる。
+# ここでは plan_pptx_images の唯一の外部呼び出しである f.ask のみをモックし、
+# extract_json は実物をそのまま通す(純粋ロジックのため安全)。モック漏れの
+# 即時検知のため urllib.request.urlopen と f.subprocess.run も「呼ばれたら
+# 即AssertionError」の番人に差し替える(iteration 38/39/76/104と同じ流儀)。
+# Ollama/ネットワーク/bench呼び出しは一切発生しない。
+
+check("plan_pptx_images: このテストはPPTX_MAX_IMAGES==4を前提にしている",
+      f.PPTX_MAX_IMAGES == 4)
+
+_orig_pi_ask = f.ask
+_orig_pi_urlopen = urllib.request.urlopen
+_orig_pi_subprocess_run = f.subprocess.run
+
+
+def _pi_no_network_urlopen(*a, **k):
+    raise AssertionError("plan_pptx_images: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _pi_no_subprocess_run(*a, **k):
+    raise AssertionError("plan_pptx_images: モック漏れで実subprocess.runが呼ばれた")
+
+
+# len(slides) == PPTX_MAX_IMAGES + 2。境界値(index==len(slides))と
+# 予算超過(有効エントリ > PPTX_MAX_IMAGES)の両方を無理なく作れる件数にする。
+_PI_N_SLIDES = f.PPTX_MAX_IMAGES + 2
+_pi_slides = [{"title": f"Slide {i + 1}",
+               "bullets": [f"b{i + 1}-1", f"b{i + 1}-2", f"b{i + 1}-3", f"b{i + 1}-4"]}
+              for i in range(_PI_N_SLIDES)]
+
+_pi_calls = []
+
+
+def _make_pi_ask(canned):
+    # 呼び出し形状は実装(fugu_local.py L4109-4112)通り: 位置引数
+    # model/messages/temperature + キーワード think=/fmt=/num_predict=/label=。
+    # (*args, **kwargs) で受け止め、その形をそのまま記録して後で検証する。
+    def _fake_pi_ask(*args, **kwargs):
+        _pi_calls.append((args, kwargs))
+        return canned
+    return _fake_pi_ask
+
+
+try:
+    urllib.request.urlopen = _pi_no_network_urlopen
+    f.subprocess.run = _pi_no_subprocess_run
+
+    # (0) 呼び出し形状の確認: askは位置引数3個(model,messages,temperature)+
+    #     think=/fmt=/num_predict=/label=キーワードで呼ばれる(実装の唯一の外部呼び出し)。
+    _pi_calls.clear()
+    f.ask = _make_pi_ask('{"images":[{"index":0,"prompt":"Hero"}]}')
+    f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(0): askは位置引数3個(model,messages,temperature)で呼ばれる",
+          len(_pi_calls) == 1 and len(_pi_calls[0][0]) == 3)
+    check("plan_pptx_images(0): askはthink=/fmt=/num_predict=/label=キーワードで呼ばれる"
+          "(label='pptx-img-plan')",
+          _pi_calls[0][1].keys() == {"think", "fmt", "num_predict", "label"}
+          and _pi_calls[0][1]["label"] == "pptx-img-plan")
+
+    # (1) 正常系: index 0 + 範囲内の複数indexを含むプラン -> そのまま{index:prompt}で返る。
+    f.ask = _make_pi_ask(json.dumps({"images": [
+        {"index": 0, "prompt": "Hero image"},
+        {"index": 2, "prompt": "Slide2 image"},
+        {"index": 4, "prompt": "Slide4 image"},
+    ]}))
+    _pi_r1 = f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(1): 正常系は指定した{index:prompt}をそのまま返す",
+          _pi_r1 == {0: "Hero image", 2: "Slide2 image", 4: "Slide4 image"})
+    check("plan_pptx_images(1): index 0(タイトルヒーロー)が含まれる", 0 in _pi_r1)
+
+    # (2) 不正エントリ(非整数index/None index/辞書でないエントリ/index欠落)は
+    #     例外を送出せずスキップされる(int(it.get("index"))のtry/except-continue)。
+    f.ask = _make_pi_ask(json.dumps({"images": [
+        {"index": "not-an-int", "prompt": "bad1"},
+        {"index": None, "prompt": "bad2"},
+        "just-a-string-not-a-dict",
+        {"prompt": "missing index key"},
+        {"index": 1, "prompt": "good"},
+    ]}))
+    _pi_r2, _pi_r2_exc = None, None
+    try:
+        _pi_r2 = f.plan_pptx_images("Title", _pi_slides)
+    except Exception as _exc:
+        _pi_r2_exc = _exc
+    check("plan_pptx_images(2): 不正エントリ混在でも例外を送出しない", _pi_r2_exc is None)
+    check("plan_pptx_images(2): 不正エントリは無視され有効な1件のみ残る",
+          _pi_r2 == {1: "good"})
+
+    # (3) 空/空白のみのpromptはスキップされる(if p and ...)。
+    f.ask = _make_pi_ask(json.dumps({"images": [
+        {"index": 1, "prompt": ""},
+        {"index": 2, "prompt": "   "},
+        {"index": 3, "prompt": "kept"},
+    ]}))
+    _pi_r3 = f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(3): 空/空白のみのpromptは除外される", _pi_r3 == {3: "kept"})
+
+    # (4) 重複indexは先勝ち(idx not in out)。
+    f.ask = _make_pi_ask(json.dumps({"images": [
+        {"index": 1, "prompt": "first"},
+        {"index": 1, "prompt": "second"},
+    ]}))
+    _pi_r4 = f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(4): 重複indexは最初のpromptが勝つ", _pi_r4 == {1: "first"})
+
+    # (5) 範囲外indexは除外され、index==len(slides)の境界値は保持される(閉区間)。
+    f.ask = _make_pi_ask(json.dumps({"images": [
+        {"index": -1, "prompt": "negative"},
+        {"index": _PI_N_SLIDES + 1, "prompt": "too-high"},
+        {"index": _PI_N_SLIDES, "prompt": "boundary"},
+    ]}))
+    _pi_r5 = f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(5): 負のindexは除外される", -1 not in _pi_r5)
+    check("plan_pptx_images(5): len(slides)を超えるindexは除外される",
+          (_PI_N_SLIDES + 1) not in _pi_r5)
+    check("plan_pptx_images(5): index==len(slides)の境界値は保持される"
+          "(閉区間 0<=idx<=len(slides)、切り捨てではない)",
+          _pi_r5 == {_PI_N_SLIDES: "boundary"})
+
+    # (6) 有効エントリがPPTX_MAX_IMAGESを超えても、その上限で打ち切られる。
+    f.ask = _make_pi_ask(json.dumps({"images": [
+        {"index": i, "prompt": f"p{i}"} for i in range(_PI_N_SLIDES + 1)
+    ]}))
+    _pi_r6 = f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(6): 有効件数がPPTX_MAX_IMAGESを超えても上限で打ち切られる",
+          len(_pi_r6) == f.PPTX_MAX_IMAGES)
+    check("plan_pptx_images(6): 打ち切りは出現順(先頭からPPTX_MAX_IMAGES件が残る)",
+          _pi_r6 == {i: f"p{i}" for i in range(f.PPTX_MAX_IMAGES)})
+
+    # (7) askが解析不能な文字列/'__ERROR__'センチネルを返す
+    #     -> extract_jsonがNoneになりj={}に落ち、{}を返す(例外は送出しない)。
+    f.ask = _make_pi_ask("__ERROR__: HTTP Error 500 (模擬)")
+    _pi_r7a = f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(7a): '__ERROR__'センチネルは例外なく{}を返す", _pi_r7a == {})
+    f.ask = _make_pi_ask("this is not json at all, just prose")
+    _pi_r7b = f.plan_pptx_images("Title", _pi_slides)
+    check("plan_pptx_images(7b): 解析不能な出力も例外なく{}を返す", _pi_r7b == {})
+
+    # (8) 'images'がリストでない値(文字列)でもクラッシュせず{}を返す。
+    #     注記: j.get("images") or [] の `or` は falsy値のみを[]化するため、
+    #     "images"が真になり得る非リスト値(文字列)でもfor文自体は実行される。
+    #     文字列を反復すると1文字ずつの文字列(str)が it に入り、it.get(...)は
+    #     AttributeErrorを投げるが、これは int(it.get("index")) のtry/exceptで
+    #     握りつぶされるため、この非リスト値では安全に{}へ縮退する
+    #     (発見事項: "images"がint/float/True等の非反復可能な真値の場合は
+    #     for文自体がTypeErrorを送出し未捕捉のまま伝播することを個別に確認した。
+    #     本タスクは test_fugu_offline.py のみの変更に限定されており、これは
+    #     production コードの新規欠陥のため、ここでは修正せず
+    #     surface-don't-fix方針(iteration 48/66/71と同じ)に従い報告のみに
+    #     留める。fmt=_PPTX_IMG_SCHEMA によりOllama側は通常"images"を配列に
+    #     強制するため実運用での発現可能性は低いが、モデルがスキーマを逸脱した
+    #     場合にbuild_pptxの画像計画段(try/exceptで保護されていないL4162)が
+    #     computed済みの回答ごと丸ごと落ちる経路として要注意)。
+    f.ask = _make_pi_ask(json.dumps({"images": "oops-not-a-list"}))
+    _pi_r8, _pi_r8_exc = None, None
+    try:
+        _pi_r8 = f.plan_pptx_images("Title", _pi_slides)
+    except Exception as _exc:
+        _pi_r8_exc = _exc
+    check("plan_pptx_images(8): 'images'が非リスト(文字列)でも例外を送出しない",
+          _pi_r8_exc is None)
+    check("plan_pptx_images(8): 'images'が非リスト(文字列)の場合は{}を返す", _pi_r8 == {})
+
+    # (contract) build_pptxが依存する不変条件: 返る全キーが0<=k<=len(slides)を
+    #     満たし、件数はPPTX_MAX_IMAGES以下である。(1)(5)(6)の結果で確認する。
+    for _pi_label, _pi_r in (("(1)", _pi_r1), ("(5)", _pi_r5), ("(6)", _pi_r6)):
+        check(f"plan_pptx_images contract{_pi_label}: 全キーが0<=k<=len(slides)を満たす",
+              all(0 <= k <= _PI_N_SLIDES for k in _pi_r.keys()))
+        check(f"plan_pptx_images contract{_pi_label}: 件数はPPTX_MAX_IMAGES以下",
+              len(_pi_r) <= f.PPTX_MAX_IMAGES)
+finally:
+    f.ask = _orig_pi_ask
+    urllib.request.urlopen = _orig_pi_urlopen
+    f.subprocess.run = _orig_pi_subprocess_run
+
+check("plan_pptx_images: テスト後にf.askが元の状態へ復元されている", f.ask == _orig_pi_ask)
+check("plan_pptx_images: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_pi_urlopen)
+check("plan_pptx_images: テスト後にf.subprocess.runが元の状態へ復元されている",
+      f.subprocess.run == _orig_pi_subprocess_run)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
