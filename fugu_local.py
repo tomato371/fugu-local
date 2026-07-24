@@ -2884,6 +2884,25 @@ def normalize_answer(ans):
         if not m:
             break
         s = m.group(1).strip()
+    # 2026-07-24: \frac{a}{b}/\dfrac{a}{b}/\tfrac{a}{b}（純粋に数値のみ、非入れ子）を
+    # "a/b" 形に正規化する。iteration 108 で同じ修正を試みて3回スタックしたまま未着手
+    # だったギャップ（gotcha #7 の自己整合性投票がここに直結）で、\boxed{\frac{1}{2}} と
+    # \boxed{0.5}/\boxed{1/2} が本来同じ値なのに別の投票クラスに分裂し、票の合算を
+    # 過小評価する（math_verify に頼れば拾えるが遅く、_FW_TRANS/Fraction 比較等の
+    # 既存ファストパス優先方針に反する）。前回の停滞を踏まえてスコープを最小化し、
+    # ネストした中括弧（\frac{\frac{1}{2}}{3} 等）や変数を含む場合（\frac{x}{2} 等）は
+    # 正規表現で捕捉せずそのまま素通りさせ、既存の math_verify フォールバックに委ねる
+    # （クラッシュさせない・誤った値を作らない）。iteration 13/22/78 の姉妹的な
+    # normalize_answer 修正群と同じ「ファストパスで拾えない票を拾う」方針に沿う。
+    _frac_re = re.compile(
+        r"^(-?)\\[dt]?frac\{\s*(-?\d+(?:\.\d+)?)\s*\}\{\s*(-?\d+(?:\.\d+)?)\s*\}$"
+    )
+    m = _frac_re.match(s)
+    if m:
+        sign, num, den = m.group(1), m.group(2), m.group(3)
+        neg = (sign == "-") ^ num.startswith("-")
+        num = num.lstrip("-")
+        s = f"{'-' if neg else ''}{num}/{den}"
     return s
 
 

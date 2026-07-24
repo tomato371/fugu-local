@@ -517,8 +517,10 @@ check("sc: 正規化 textbf外殻", f.normalize_answer("\\textbf{B}") == "B")
 check("sc: 正規化 mathbf外殻", f.normalize_answer("\\mathbf{42}") == "42")
 check("sc: 正規化 boldsymbol外殻", f.normalize_answer("\\boldsymbol{x}") == "x")
 check("sc: 正規化 入れ子体裁マクロ", f.normalize_answer("\\mathbf{\\text{D}}") == "D")
-# 値を変えうる意味論的マクロ（\frac 等）は対象外のまま維持することの回帰確認
-check("sc: 正規化 frac不変（意味論的マクロは非対象）", f.normalize_answer("\\frac{1}{2}") == "\\frac{1}{2}")
+# 2026-07-24 (iteration 122): 単純な数値のみの \frac{a}{b} は "a/b" に正規化されるように
+# なった（iteration 108 で3回スタックした修正のリトライ、詳細は normalize_answer 内コメント
+# 参照）。変数を含む場合など非数値の \frac は引き続き対象外（下のテスト群で別途確認）。
+check("sc: 正規化 数値fracはa/bに変換される", f.normalize_answer("\\frac{1}{2}") == "1/2")
 # 2026-07-22: _FW_TRANS 拡張分（Unicode MINUS SIGN / 全角句点・読点・スラッシュ）の
 # 正規化。CJK 寄りのプロポーザ (qwen/gemma 系) がこれらを出力し、正規化しないと
 # vote_answers で本来同値な答えが2系統の票に割れてしまう（詳細は _FW_TRANS 定義部の
@@ -767,8 +769,13 @@ def _run_with_math_verify_stub(verify_result, raise_in, body):
             del sys.modules["math_verify"]
 
 
-# 高速パスを迂回する入力ペア（正規化後も非空・lower()不一致・Fraction変換失敗）
-_MV_A, _MV_B = r"\frac{1}{2}", "0.5"
+# 高速パスを迂回する入力ペア（正規化後も非空・lower()不一致・Fraction変換失敗）。
+# 2026-07-24: 以前はここで \frac{1}{2} vs 0.5 を使っていたが、iteration 122 で
+# normalize_answer に単純数値の \frac{a}{b} 正規化（"a/b" 化）を追加したため、
+# \frac{1}{2} は "1/2" に正規化されて Fraction 高速パスに乗るようになった
+# （math_verify フォールバックには到達しなくなる）。math_verify 呼び出しの実検証には
+# 高速パスに絶対に乗らないペア（\sqrt は非対応マクロなので数値化されない）に差し替える。
+_MV_A, _MV_B = r"\sqrt{2}", "1.41421356"
 
 
 def _t_mv_verify_true(calls):
@@ -9657,6 +9664,32 @@ with _rfd_tempfile.TemporaryDirectory() as _rce_td:
             _rce_all_fallthrough = False
     check("read_file_text: _CODE_EXTENSIONS全25拡張子が汎用テキスト読み込みへフォールスルーし内容がそのまま返る",
           _rce_all_fallthrough)
+
+# 2026-07-24: normalize_answer の \frac/\dfrac/\tfrac 数値正規化（iteration 122、
+# iteration 108 で3回スタックしたまま未着手だった修正のリトライ）。
+check("normalize_answer: \\frac{1}{2} -> 1/2",
+      f.normalize_answer(r"\frac{1}{2}") == "1/2")
+check("normalize_answer: \\dfrac{3}{4} -> 3/4",
+      f.normalize_answer(r"\dfrac{3}{4}") == "3/4")
+check("normalize_answer: \\tfrac{-1}{2} -> -1/2",
+      f.normalize_answer(r"\tfrac{-1}{2}") == "-1/2")
+check("normalize_answer: 外側マイナス + 分子マイナス -> 相殺",
+      f.normalize_answer(r"-\frac{-1}{2}") == "1/2")
+check("normalize_answer: ネストした \\frac は素通り(クラッシュせず未変更)",
+      f.normalize_answer(r"\frac{\frac{1}{2}}{3}") == r"\frac{\frac{1}{2}}{3}")
+check("normalize_answer: 変数を含む \\frac は素通り(クラッシュせず未変更)",
+      f.normalize_answer(r"\frac{x}{2}") == r"\frac{x}{2}")
+
+
+def _t_frac_fastpath_equiv(calls):
+    result = f.answers_equivalent(r"\frac{1}{2}", "0.5")
+    check("answers_equivalent: \\frac{1}{2} と 0.5 がFractionファストパスで一致(math_verify不使用)",
+          result is True)
+    check("answers_equivalent: \\frac{1}{2}/0.5 一致判定はmath_verify.parseを一切呼ばない(高速パス経由)",
+          len(calls["parse_args"]) == 0)
+
+
+_run_with_math_verify_stub(None, "parse", _t_frac_fastpath_equiv)
 
 print()
 if _FAILS:
