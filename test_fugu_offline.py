@@ -620,6 +620,33 @@ check("sc: 抽出 boxedのLaTeXエスケープ%とASCII%が同じ票に正規化
       == f.extract_final_answer("\\boxed{50%}", "math")
       == "50%")
 
+# 2026-07-25 (iteration 136): iteration 134 は normalize_answer/boxed 経路の '%' 保持を
+# 修正したが、extract_final_answer の宣言ブランチ・最後の数値フォールバックの数値コア
+# 正規表現は '%' を含めておらず、非boxedの百分率回答が "50%"（boxed票）と "50"
+# （宣言/フォールバック票）という別クラスに分裂したまま残っていた（このタスクが仕上げる
+# iteration 134 の積み残し）。宣言ブランチ・フォールバックの両方が boxed と同じ "50%" を
+# 返し、3経路が1つの投票クラスに合流することを確認する。
+check("sc: 抽出 宣言分岐の%が落ちない（boxed票との合流）",
+      f.extract_final_answer("The final answer is 50%", "math") == "50%")
+check("sc: 抽出 最後の数値フォールバックの%が落ちない（boxed票との合流）",
+      f.extract_final_answer("so the probability is 50%.", "math") == "50%")
+check("sc: 抽出 boxed/宣言/フォールバックの3経路が同一の50%票に合流",
+      f.extract_final_answer("The final answer is 50%", "math")
+      == f.extract_final_answer("so the probability is 50%.", "math")
+      == f.extract_final_answer("\\boxed{50\\%}", "math")
+      == "50%")
+_pct_votes = [
+    f.extract_final_answer("The final answer is 50%", "math"),
+    f.extract_final_answer("so the probability is 50%.", "math"),
+    f.extract_final_answer("\\boxed{50\\%}", "math"),
+]
+_pct_top, _pct_count, _pct_classes = f.vote_answers(_pct_votes)
+check("sc: 投票 50%の3票が単一クラスに集約される（票割れしない）",
+      _pct_top == "50%" and _pct_count == 3 and len(_pct_classes) == 1)
+# 回帰: 途中に出てくるpercentは末尾の別の数値へ誤って付与されない
+check("sc: 抽出 最後の数値フォールバック 途中percentは末尾数値に伝播しない",
+      f.extract_final_answer("increased by 50% to reach 75", "math") == "75")
+
 # answers_equivalent: math_verify を「呼ばれたら必ず例外」なスタブに差し替えても
 # 高速パス（na.lower() 一致）だけで正しく判定できることを確認する（下の
 # U+2212/全角スラッシュ用スタブブロック、L~763 と同じ swap-and-restore パターンだが、
