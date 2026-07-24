@@ -8602,6 +8602,119 @@ with _pd_tempfile.TemporaryDirectory() as _pd_dir:
         check("_save_answer_to_file: 既存ディレクトリへの.md追記はbyte-for-byte従来通り",
               _pd_regress_content == _pd_existing + _pd_expected_block)
 
+# ==================================================
+# ---------- MCQ 選択肢文字(A-E)の投票クラス整合性 (2026-07-24, gotcha #7) ----------
+# ==================================================
+# solve_verifiable の mcq 分岐は vote_answers -> answers_equivalent で選択肢文字(A-E)を
+# 集計するが、既存の SC/投票の直接テスト（iteration 32/54/55/79/105）は全て math の
+# 数値/分数の組み合わせのみを使っており、この「カテゴリカルな文字比較」経路には直接の
+# カバレッジが無かった。2つの異なる文字については answers_equivalent の高速パスが
+# 両方失敗する（na.lower() != nb.lower(); Fraction('A') は例外）ため、異なる文字の票が
+# 別クラスのまま保たれるかどうかは実質的に math_verify（数式の同値判定エンジンであり、
+# 選択肢文字のようなカテゴリカルなラベルの比較に使うことは想定されていない）の判断に
+# 委ねられてしまっている。これは gotcha #7（自己整合性投票の完全性）に直結する未検証の
+# 脆弱な依存であり、iteration 32/54/55/79 が固定したのと同種の特性テストとしてここに
+# 直接ロックする。同一文字の大小/全角違いは併合される（normalize_answer の lower()/
+# _FW_TRANS 高速パス）ことも合わせて確認し、非対称（違う文字は割れる/同じ文字は
+# 統合される）であることを保証する。
+
+# (a) 異なる選択肢文字(A/B/C)は絶対に併合されない。classesは件数降順で返る。
+_top_mcqv1, _cnt_mcqv1, _cls_mcqv1 = f.vote_answers(["A", "B", "A", "C", "A"])
+check("mcq-vote: 異なる選択肢文字は併合されず3クラスのまま",
+      len(_cls_mcqv1) == 3)
+check("mcq-vote: 最多票はA(3票)、票数はA(3)/B(1)/C(1)で件数降順",
+      _top_mcqv1 == "A" and _cnt_mcqv1 == 3
+      and _cls_mcqv1 == [["A", 3], ["B", 1], ["C", 1]])
+
+# (b) tie安定性（iteration 54の数値版と同型）: 同数タイは先出現の文字が勝つ。
+_top_mcqv2, _cnt_mcqv2, _cls_mcqv2 = f.vote_answers(["A", "B", "B", "A"])
+check("mcq-vote: 同数タイは先出現(A)の文字が勝つ",
+      _top_mcqv2 == "A" and _cnt_mcqv2 == 2 and _cls_mcqv2 == [["A", 2], ["B", 2]])
+_top_mcqv3, _cnt_mcqv3, _cls_mcqv3 = f.vote_answers(["B", "A", "A", "B"])
+check("mcq-vote: 入力順を逆にすると先出現(B)の文字が勝つ(値の大小ではない)",
+      _top_mcqv3 == "B" and _cnt_mcqv3 == 2 and _cls_mcqv3 == [["B", 2], ["A", 2]])
+
+# (c)+(d) math_verify を「呼ばれたら必ず例外」なスタブに差し替え(iteration 13/32と同じ
+#     swap-and-restoreパターン。_fake_math_verify は上で定義済みのものを再利用)、
+#     (c) 同一文字の大小/全角違いは高速パス(lower()/_FW_TRANS)だけで併合されること、
+#     (d) 異なる文字は math_verify が例外を投げても(=利用不能でも)絶対に併合されない
+#     ことの両方を、同一のスタブ下で確認する。
+_orig_mv_mod_mcqv = sys.modules.get("math_verify")
+sys.modules["math_verify"] = _fake_math_verify
+try:
+    check("mcq: answers_equivalent 大小文字違い(A/a)は高速パスでTrue(math_verify不要)",
+          f.answers_equivalent("A", "a") is True)
+    check("mcq: answers_equivalent 全角/半角文字(Ａ/A)は高速パスでTrue(math_verify不要)",
+          f.answers_equivalent("Ａ", "A") is True)
+    check("mcq-vote: 大小文字違い(A/a)は高速パスで単一クラス(cnt=2)へ併合",
+          f.vote_answers(["A", "a"]) == ("A", 2, [["A", 2]]))
+    check("mcq-vote: 全角文字(Ａ)は高速パスで単一クラス(cnt=2)へ併合",
+          f.vote_answers(["A", "Ａ"]) == ("A", 2, [["A", 2]]))
+
+    check("mcq: answers_equivalent 異なる文字(A/B)はmath_verify例外時もFalse",
+          f.answers_equivalent("A", "B") is False)
+    _top_mcqv4, _cnt_mcqv4, _cls_mcqv4 = f.vote_answers(["A", "B"])
+    check("mcq-vote: 異なる文字(A/B)はmath_verifyが例外/利用不能でも2クラスのまま"
+          "(併合されない整合性はmath_verifyの判断に依存しない)",
+          len(_cls_mcqv4) == 2 and _cnt_mcqv4 == 1
+          and _cls_mcqv4[0][0] != _cls_mcqv4[1][0])
+finally:
+    if _orig_mv_mod_mcqv is not None:
+        sys.modules["math_verify"] = _orig_mv_mod_mcqv
+    else:
+        del sys.modules["math_verify"]
+# 補足: この開発環境には math_verify が実際にはインストールされておらず(import時点で
+# ModuleNotFoundError)、上のスタブ無しでも同じ結果になる。つまり「math_verifyが
+# 利用不能」なケースは実質的に常時カバーされている。一方「math_verifyが実在し、かつ
+# A/Bのような異なる選択肢文字を誤って同値だと判定してしまう」ケースは、ライブラリ本体を
+# 実際にインストールしない限りここでは再現・検証できない。もし将来 math_verify が
+# 導入され、かつ実際に異なる選択肢文字を同値だと判定する事例が見つかった場合は、
+# 静かに fugu_local.py 側を直さず、票の併合バグとして別イテレーションで報告すること
+# (surface-don't-fix、iteration 66/71/48 の方針)。
+
+# (e) solve_verifiable 全体(mcq)を f._sc_sample のみモックしてE2Eで確認する。
+#     f.ask には一切触れず、B,B,B,A,C のプルラリティ(B)で確定し、votesが
+#     A/B/C を別キーとして正しく持ち、水増し/併合が無いことを検証する。
+#     SC_POT=True のまま渡し、mcqではPoTサンプルが一切要求されないこと
+#     （add_batchの `if SC_POT and task_type == 'math'` ガード）も併せて回帰確認する。
+_orig_mcqv_sc_sample = f._sc_sample
+_orig_mcqv_pot = f.SC_POT
+_orig_mcqv_cheap_votes = f.SC_CHEAP_VOTES
+_orig_mcqv_props = f.PROPOSERS
+_orig_mcqv_reasoning = f.REASONING_MODELS
+_orig_mcqv_initial = f.SC_INITIAL
+_mcqv_calls = []
+_mcqv_map = {("m1", False): ["B", "B", "B", "A", "C"]}
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = True
+    f.SC_INITIAL = 5
+    f._sc_sample = _make_fake_sc_sample(_mcqv_map, _mcqv_calls)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _res_mcqv = f.solve_verifiable("次のうち正しいものはどれか", "mcq")
+finally:
+    f._sc_sample = _orig_mcqv_sc_sample
+    f.PROPOSERS = _orig_mcqv_props
+    f.REASONING_MODELS = _orig_mcqv_reasoning
+    f.SC_CHEAP_VOTES = _orig_mcqv_cheap_votes
+    f.SC_POT = _orig_mcqv_pot
+    f.SC_INITIAL = _orig_mcqv_initial
+
+check("mcq-e2e: B,B,B,A,Cのプルラリティ(B, 3/5)で確定",
+      _res_mcqv is not None and _res_mcqv["answer"] == "B")
+check("mcq-e2e: votesがtruthful(A/B/Cが別キーの実票数、水増し/併合なし)",
+      _res_mcqv is not None and _res_mcqv["votes"] == {"B": 3, "A": 1, "C": 1})
+check("mcq-e2e: n_samplesは5(全てCoT、PoTは含まれない)",
+      _res_mcqv is not None and _res_mcqv["n_samples"] == 5)
+check("mcq-e2e: SC_POT=TrueでもmcqではPoTサンプルは要求されない(全呼び出しがpot=False)",
+      len(_mcqv_calls) == 5 and not any(pot for _m, pot in _mcqv_calls))
+check("mcq-e2e: テスト後にf._sc_sample/SC_POT/SC_INITIAL等のグローバルが復元されている",
+      f._sc_sample == _orig_mcqv_sc_sample and f.SC_POT == _orig_mcqv_pot
+      and f.SC_CHEAP_VOTES == _orig_mcqv_cheap_votes and f.PROPOSERS == _orig_mcqv_props
+      and f.REASONING_MODELS == _orig_mcqv_reasoning and f.SC_INITIAL == _orig_mcqv_initial)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
