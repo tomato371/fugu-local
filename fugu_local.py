@@ -644,7 +644,23 @@ def research_search(question: str) -> str:
         if not isinstance(j, dict) or j.get("sufficient"):
             break
         missing = str(j.get("missing", ""))[:120]
-        queries = [str(x) for x in (j.get("queries") or []) if str(x).strip()][:3]
+        # 2026-07-24: 従来の `j.get("queries") or []` は "queries" が falsy
+        # (None/[]/""/0 等)の場合のみ [] に丸めるトリックで、int/float/bool のような
+        # 真値だが非反復可能(non-iterable)な値はそのまま通してしまっていた。その場合は
+        # 直後のリスト内包表記 `for x in ...` 自体が TypeError を送出する。さらに
+        # truthy な str/dict はそのまま通ると「1文字ずつ」「キーごと」に分解された
+        # 意味のない検索クエリを発行してしまう。research_search は build_context
+        # (L1285付近) から ask_fugu (L3519付近) まで無防備(try/exceptなし)に
+        # 呼ばれているため、この TypeError は Conductor の計画や既に完了した検索
+        # ラウンドの結果ごとターン全体を落とす。イテレーション103の _ddg_instant
+        # (非list RelatedTopics)・イテレーション111の plan_pptx_images (非list
+        # images) と同じ isinstance 判定で丸める方式に倣い、"queries" が非list
+        # (文字列/None/int/float/bool/dict 等)であれば真偽・型に関わらず必ず []
+        # に倒す(`or []` の truthiness トリックには戻さない)。
+        raw_queries = j.get("queries")
+        if not isinstance(raw_queries, list):
+            raw_queries = []
+        queries = [str(x) for x in raw_queries if str(x).strip()][:3]
         if not queries:
             break
         print(f"   [リサーチ継続 R{rnd + 1}: 不足={missing or '(詳細なし)'}]")

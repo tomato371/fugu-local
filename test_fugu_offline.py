@@ -7004,6 +7004,77 @@ try:
         f._search_raw = _orig_search_raw_rs
         f.ask = _orig_ask_rs
 
+    # --- (I) 2026-07-24: "queries" が非list(int/float/bool/dict/str/None)でも
+    #     TypeErrorを送出せず、追加ラウンドの検索を発行しない(=[]として扱われ即座に
+    #     早期終了する)ことを固定化する。従来の `j.get("queries") or []` は
+    #     "queries" が falsy(None/[]/""/0等)の場合のみ[]に丸めるtruthinessトリック
+    #     で、真値だが非反復可能(non-iterable)なint/float/bool/dictはそのまま通り
+    #     `for x in ...` がTypeErrorを送出していた(未捕捉のままbuild_context経由で
+    #     ask_fugu呼び出し元まで伝播しターン全体を落とす)。また反復可能だが意図しない
+    #     truthy str/dictは1文字ずつ/キーごとに分解された無意味なクエリを発行して
+    #     いた。イテレーション103の_ddg_instant(非list RelatedTopics)・イテレーション
+    #     111のplan_pptx_images(非list images)と同じisinstance判定への修正を検証する。
+    _non_list_queries_cases = [
+        ("int", 5),
+        ("float", 3.14),
+        ("bool_true", True),
+        ("dict", {"a": "b"}),
+        ("str", "not a list of strings"),
+        ("none_explicit", None),
+    ]
+    for _case_name, _bad_queries in _non_list_queries_cases:
+        _qname = f"NonList Query {_case_name}"
+        _itemI = (f"[I-{_case_name}]\nnon-list queries body\n"
+                  f"Source: http://example.com/i-{_case_name}")
+        _searchI_calls = []
+        _askI_calls = []
+        try:
+            f._search_raw = _rs_search_factory({_qname: [_itemI]}, _searchI_calls,
+                                                max_calls=1)
+            f.ask = _rs_ask_factory(
+                [{"sufficient": False, "missing": "x", "queries": _bad_queries}],
+                _askI_calls)
+            _resI, _excI = None, None
+            try:
+                _resI = f.research_search(_qname)
+            except Exception as _exc:
+                _excI = _exc
+            check(f"research_search: queries非list({_case_name})でも例外を送出しない",
+                  _excI is None)
+            check(f"research_search: queries非list({_case_name})では追加ラウンドの"
+                  "検索が発生しない(1文字/1キーずつのクエリも発行されない)",
+                  _searchI_calls == [_qname])
+            check(f"research_search: queries非list({_case_name})でもそのラウンドの"
+                  "結果は反映される",
+                  _resI is not None and f"http://example.com/i-{_case_name}" in _resI)
+        finally:
+            f._search_raw = _orig_search_raw_rs
+            f.ask = _orig_ask_rs
+
+    # --- (I-valid) 対照実験: 有効な非空listのqueries + sufficient=falseは、
+    #     修正後も従来通り追加ラウンドの検索を駆動する(既存挙動に変更がないことの確認)。
+    _itemIv1 = "[Iv1]\nvalid list round1\nSource: http://example.com/iv1"
+    _itemIv2 = "[Iv2]\nvalid list round2\nSource: http://example.com/iv2"
+    _searchIv_calls = []
+    _askIv_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"Valid List Query": [_itemIv1], "Valid Follow Up": [_itemIv2]},
+            _searchIv_calls, max_calls=2)
+        f.ask = _rs_ask_factory(
+            [{"sufficient": False, "missing": "x", "queries": ["Valid Follow Up"]},
+             {"sufficient": True, "missing": "", "queries": []}],
+            _askIv_calls)
+        _resIv = f.research_search("Valid List Query")
+        check("research_search: 有効な非空listのqueriesはR2の追加検索を駆動する"
+              "(既存挙動は不変)",
+              _searchIv_calls == ["Valid List Query", "Valid Follow Up"])
+        check("research_search: (I-valid)R1・R2両方の結果が反映される",
+              "http://example.com/iv1" in _resIv and "http://example.com/iv2" in _resIv)
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
 finally:
     f._search_raw = _orig_search_raw_rs
     f.ask = _orig_ask_rs
