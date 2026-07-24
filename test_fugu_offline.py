@@ -9624,6 +9624,40 @@ check("read_file_text: テスト後に_read_pptxが元の関数へ復元され�
 check("read_file_text: テスト後に_read_htmlが元の関数へ復元されている", f._read_html == _orig_read_html)
 check("read_file_text: テスト後に_read_ipynbが元の関数へ復元されている", f._read_ipynb == _orig_read_ipynb)
 
+# ---------- read_file_text: .htm確認 + _CODE_EXTENSIONS/_BINARY_SKIPの相互排他性 (2026-07-24 / iter121) ----------
+# 発端: 「iter120は.htm/.ipynbを'covers'とだけ記載し、.htmが本当に_read_htmlへ
+# ルーティングされるか未確認では」という懸念が上がった。実際にはコード上(L1188:
+# `if suffix in {".html", ".htm"}: return _read_html(path)`)でも、直上のテスト
+# ブロック(2026-07-24, 「(4) html/ipynbも念のため確認」)でも .htm→_read_html は
+# 既に振り分け確認済みであり、本物のディスパッチ漏れではなかった
+# (静的レビューの結果、コード変更は不要と判断。強引な「修正」はしない)。
+# ついでに依頼された第二の観点も点検する: _CODE_EXTENSIONS (iter60, 25拡張子)の
+# 各拡張子が read_file_text の専用ディスパッチ(_BINARY_SKIP・PDF/Word/Excel/
+# PowerPoint/HTML/ipynb)のどれとも重ならず、意図通り汎用テキスト分岐へ
+# フォールスルーしてソースコードがそのまま読めることを、全25拡張子について
+# 直接 read_file_text() を呼んで確認する(lang_mapとの同期は既存テストで別途
+# カバー済みなので、ここではread_file_text側のディスパッチのみを見る)。
+_rft_special_dispatch_suffixes = {
+    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
+    ".html", ".htm", ".ipynb",
+}
+check("read_file_text: _CODE_EXTENSIONSと_BINARY_SKIPは重複しない(コード拡張子がバイナリ扱いされない)",
+      not (f._CODE_EXTENSIONS & f._BINARY_SKIP))
+check("read_file_text: _CODE_EXTENSIONSは専用リーダー(pdf/docx/xlsx/pptx/html/ipynb)とも重複しない",
+      not (f._CODE_EXTENSIONS & _rft_special_dispatch_suffixes))
+
+with _rfd_tempfile.TemporaryDirectory() as _rce_td:
+    _rce_root = _rfd_pathlib.Path(_rce_td)
+    _rce_all_fallthrough = True
+    for _rce_suffix in sorted(f._CODE_EXTENSIONS):
+        _rce_fp = _rce_root / f"sample{_rce_suffix}"
+        _rce_content = f"sample code content for {_rce_suffix}"
+        _rce_fp.write_text(_rce_content, encoding="utf-8")
+        if f.read_file_text(_rce_fp) != _rce_content:
+            _rce_all_fallthrough = False
+    check("read_file_text: _CODE_EXTENSIONS全25拡張子が汎用テキスト読み込みへフォールスルーし内容がそのまま返る",
+          _rce_all_fallthrough)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
