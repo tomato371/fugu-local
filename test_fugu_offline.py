@@ -9852,6 +9852,69 @@ if _rdx_pptx_available:
         check("_read_pptx: 正常な.pptxの成功パス出力は変更後も期待通り(notice文字列に劣化しない)",
               "iter123 success path title" in _rdx_ok_result2)
 
+# ---------- apply_high_vram_profile(): FUGU_HIGH_VRAM=1 プロファイル切替 (iter124) ----------
+# 7つのモジュールグローバルを一括変更する関数で、setup()冒頭(L3540-3541)からのみ呼ばれる。
+# 巻き戻し機構が関数自身には無いため、テスト側でswap-and-restoreする(iter43/44/82/83と同じ流儀)。
+_hvp_saved_model_config = {m: dict(c) for m, c in f.MODEL_CONFIG.items()}
+_hvp_saved = dict(
+    PARALLEL_PROPOSERS=f.PARALLEL_PROPOSERS,
+    MODEL_NUM_CTX=f.MODEL_NUM_CTX,
+    MODEL_KEEP_ALIVE=f.MODEL_KEEP_ALIVE,
+    SC_INITIAL=f.SC_INITIAL,
+    SC_STEP=f.SC_STEP,
+    SC_MAX=f.SC_MAX,
+    SC_CHEAP_VOTES=f.SC_CHEAP_VOTES,
+    ARBITER_MODEL=f.ARBITER_MODEL,
+)
+try:
+    _hvp_cap = io.StringIO()
+    with contextlib.redirect_stdout(_hvp_cap):
+        f.apply_high_vram_profile()
+
+    check("apply_high_vram_profile: 全MODEL_CONFIGエントリのnum_ctxが65536になる",
+          all(cfg.get("num_ctx") == 65536 for cfg in f.MODEL_CONFIG.values()))
+    check("apply_high_vram_profile: 全MODEL_CONFIGエントリのnum_predictが32768になる",
+          all(cfg.get("num_predict") == 32768 for cfg in f.MODEL_CONFIG.values()))
+    check("apply_high_vram_profile: PARALLEL_PROPOSERSがTrueになる(高VRAM前提でのみ有効、既定の逐次動作(gotcha#5)は変えない)",
+          f.PARALLEL_PROPOSERS is True)
+    check("apply_high_vram_profile: MODEL_NUM_CTXが32768になる",
+          f.MODEL_NUM_CTX == 32768)
+    check("apply_high_vram_profile: MODEL_KEEP_ALIVEが'30m'になる",
+          f.MODEL_KEEP_ALIVE == "30m")
+    check("apply_high_vram_profile: ARBITER_MODELが'gpt-oss:120b'になる",
+          f.ARBITER_MODEL == "gpt-oss:120b")
+    check("apply_high_vram_profile: SC_INITIAL/SC_STEP/SC_MAXが12/8/48になる(自己一貫性サンプル数の主レバー)",
+          (f.SC_INITIAL, f.SC_STEP, f.SC_MAX) == (12, 8, 48))
+    check("apply_high_vram_profile: SC_CHEAP_VOTESが16になる",
+          f.SC_CHEAP_VOTES == 16)
+    check("apply_high_vram_profile: 表示サマリの文言が実際に適用した値と一致する(num_ctx/SC/cheap_votes/arbiter)",
+          "num_ctx=65536" in _hvp_cap.getvalue()
+          and "SC(init=12,max=48)" in _hvp_cap.getvalue()
+          and "cheap_votes=16" in _hvp_cap.getvalue()
+          and "arbiter=gpt-oss:120b" in _hvp_cap.getvalue())
+finally:
+    f.MODEL_CONFIG = _hvp_saved_model_config
+    f.PARALLEL_PROPOSERS = _hvp_saved["PARALLEL_PROPOSERS"]
+    f.MODEL_NUM_CTX = _hvp_saved["MODEL_NUM_CTX"]
+    f.MODEL_KEEP_ALIVE = _hvp_saved["MODEL_KEEP_ALIVE"]
+    f.SC_INITIAL = _hvp_saved["SC_INITIAL"]
+    f.SC_STEP = _hvp_saved["SC_STEP"]
+    f.SC_MAX = _hvp_saved["SC_MAX"]
+    f.SC_CHEAP_VOTES = _hvp_saved["SC_CHEAP_VOTES"]
+    f.ARBITER_MODEL = _hvp_saved["ARBITER_MODEL"]
+
+check("apply_high_vram_profile: テスト後にMODEL_CONFIGが既定プロファイルの値へ復元されている(後続テストへの汚染防止)",
+      f.MODEL_CONFIG == _hvp_saved_model_config)
+check("apply_high_vram_profile: テスト後にPARALLEL_PROPOSERS/MODEL_NUM_CTX等7グローバルが既定値へ復元されている",
+      f.PARALLEL_PROPOSERS == _hvp_saved["PARALLEL_PROPOSERS"]
+      and f.MODEL_NUM_CTX == _hvp_saved["MODEL_NUM_CTX"]
+      and f.MODEL_KEEP_ALIVE == _hvp_saved["MODEL_KEEP_ALIVE"]
+      and f.SC_INITIAL == _hvp_saved["SC_INITIAL"]
+      and f.SC_STEP == _hvp_saved["SC_STEP"]
+      and f.SC_MAX == _hvp_saved["SC_MAX"]
+      and f.SC_CHEAP_VOTES == _hvp_saved["SC_CHEAP_VOTES"]
+      and f.ARBITER_MODEL == _hvp_saved["ARBITER_MODEL"])
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
