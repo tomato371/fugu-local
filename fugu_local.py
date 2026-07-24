@@ -4112,7 +4112,27 @@ def plan_pptx_images(title, slides):
               num_predict=768, label="pptx-img-plan")
     j = extract_json(raw) or {}
     out = {}
-    for it in (j.get("images") or []):
+    # 2026-07-24: 従来の `j.get("images") or []` は "images" が falsy(None/{}/[]/""/0
+    # 等)の場合のみ [] に丸めるトリックで、int/float/bool のような真値だが
+    # 非反復可能(non-iterable)な値はそのまま通してしまっていた。その場合は
+    # 直後の `for it in ...` 自体が TypeError を送出し、内側の try/except
+    # (int(it.get("index")) 用)より手前=for文そのもので落ちるため捕捉されない。
+    # plan_pptx_images は build_pptx (L4162付近) から XML安全化 try/except
+    # (iteration68) の外で呼ばれ、build_pptx 自体も ask_fugu (L3545付近) から
+    # 無防備に呼ばれているため、この TypeError は計算済み(数学/MCQでは
+    # solve_verifiable の自己整合性投票済み)の MoA 回答ごとターン全体を落とす
+    # (iteration41-47/68/80と同種の「高コスト回答喪失」障害)。イテレーション110は
+    # このケースをテストコメント(旧case 8)で発見済みだったが、当時はテストのみの
+    # 変更に限定されており修正は見送られていた。イテレーション103の _ddg_instant
+    # における非list RelatedTopics 補正(isinstance判定で丸める方式)と同じやり方
+    # で、"images" が非list(文字列/None/int/float/bool 等)であれば真偽・型に
+    # 関わらず必ず [] に倒す(`or []` の truthiness トリックには戻さない)。
+    imgs = j.get("images")
+    if not isinstance(imgs, list):
+        imgs = []
+    for it in imgs:
+        if not isinstance(it, dict):
+            continue
         try:
             idx = int(it.get("index"))
         except Exception:

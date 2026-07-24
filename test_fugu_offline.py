@@ -8900,20 +8900,20 @@ try:
     check("plan_pptx_images(7b): 解析不能な出力も例外なく{}を返す", _pi_r7b == {})
 
     # (8) 'images'がリストでない値(文字列)でもクラッシュせず{}を返す。
-    #     注記: j.get("images") or [] の `or` は falsy値のみを[]化するため、
-    #     "images"が真になり得る非リスト値(文字列)でもfor文自体は実行される。
-    #     文字列を反復すると1文字ずつの文字列(str)が it に入り、it.get(...)は
-    #     AttributeErrorを投げるが、これは int(it.get("index")) のtry/exceptで
-    #     握りつぶされるため、この非リスト値では安全に{}へ縮退する
-    #     (発見事項: "images"がint/float/True等の非反復可能な真値の場合は
-    #     for文自体がTypeErrorを送出し未捕捉のまま伝播することを個別に確認した。
-    #     本タスクは test_fugu_offline.py のみの変更に限定されており、これは
-    #     production コードの新規欠陥のため、ここでは修正せず
-    #     surface-don't-fix方針(iteration 48/66/71と同じ)に従い報告のみに
-    #     留める。fmt=_PPTX_IMG_SCHEMA によりOllama側は通常"images"を配列に
-    #     強制するため実運用での発現可能性は低いが、モデルがスキーマを逸脱した
-    #     場合にbuild_pptxの画像計画段(try/exceptで保護されていないL4162)が
-    #     computed済みの回答ごと丸ごと落ちる経路として要注意)。
+    #     2026-07-24: 従来の j.get("images") or [] は falsy値のみを[]化するトリック
+    #     だったため、"images"が真になり得る非リスト値(文字列/int/float/bool等)では
+    #     for文自体が例外の温床になり得た。文字列の場合は反復可能なため
+    #     (1文字ずつのstrがitに入りit.get(...)がAttributeErrorになるがtry/exceptで
+    #     握りつぶされる)従来から{}に縮退していたが、int/float/boolのような
+    #     非反復可能な真値ではfor文自体がTypeErrorを送出し未捕捉のまま伝播していた
+    #     (iteration110がこのケースをテストコメントとして発見・記録していたが、
+    #     当時のタスクはテストのみの変更に限定されており修正は見送られていた)。
+    #     本イテレーションで plan_pptx_images 側を
+    #     `imgs = j.get("images"); if not isinstance(imgs, list): imgs = []` に
+    #     修正し、真偽・型に関わらず非list値を確実に[]へ倒すようにした
+    #     (iteration103の_ddg_instant非list RelatedTopics補正と同じ方式)。
+    #     この(8)は文字列ケースの回帰確認、直後の(8b)で新たに修正された
+    #     int/float/bool(非反復可能な真値)のケースを検証する。
     f.ask = _make_pi_ask(json.dumps({"images": "oops-not-a-list"}))
     _pi_r8, _pi_r8_exc = None, None
     try:
@@ -8923,6 +8923,22 @@ try:
     check("plan_pptx_images(8): 'images'が非リスト(文字列)でも例外を送出しない",
           _pi_r8_exc is None)
     check("plan_pptx_images(8): 'images'が非リスト(文字列)の場合は{}を返す", _pi_r8 == {})
+
+    # (8b) 'images'が非反復可能な真値(int/float/bool)でも例外を送出せず{}を返す。
+    #      修正前はここで素の `for it in (j.get("images") or [])` がTypeErrorを
+    #      送出しており、build_pptxのXML安全化try/except(iteration68)の外・
+    #      ask_fuguの無防備な呼び出し元まで伝播して計算済み回答を丸ごと失っていた。
+    for _pi_bad_images in (5, 3.14, True):
+        f.ask = _make_pi_ask(json.dumps({"images": _pi_bad_images}))
+        _pi_r8b, _pi_r8b_exc = None, None
+        try:
+            _pi_r8b = f.plan_pptx_images("Title", _pi_slides)
+        except Exception as _exc:
+            _pi_r8b_exc = _exc
+        check(f"plan_pptx_images(8b): 'images'={_pi_bad_images!r}(非反復可能な真値)"
+              "でも例外を送出しない", _pi_r8b_exc is None)
+        check(f"plan_pptx_images(8b): 'images'={_pi_bad_images!r}の場合は{{}}を返す",
+              _pi_r8b == {})
 
     # (contract) build_pptxが依存する不変条件: 返る全キーが0<=k<=len(slides)を
     #     満たし、件数はPPTX_MAX_IMAGES以下である。(1)(5)(6)の結果で確認する。
