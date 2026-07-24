@@ -3076,6 +3076,22 @@ def answers_equivalent(a, b):
         return False
     if na.lower() == nb.lower():
         return True
+    # 2026-07-25 (iteration 129): iteration 107 が指摘したが当時は未修正のまま残した懸念
+    # への対応（gotcha #6/#7参照）。MCQ の SC サンプルは単一の選択肢文字 A-E であり、ここまで
+    # 到達した時点で na.lower()==nb.lower() は不一致（=文字として異なる）ことが確定している。
+    # このまま下へ抜けると Fraction('A') は例外で次段へフォールスルーし、最終的に
+    # math_verify フォールバックまで到達しうる。だが sympy は 'E' を自然対数の底
+    # (Euler's number)、'I' を虚数単位として数式解釈するため、選択肢文字を数式として解析
+    # するのは意味論的に不健全であり、万一「同値」と誤判定されれば solve_verifiable の
+    # 自己整合性投票（gotcha #7）で本来別クラスの票が併合され多数決が汚染されかねない。
+    # この開発環境には math_verify が未インストールで実挙動を検証できない（import失敗の
+    # 例外はexceptでFalseに握り潰されるだけ）ため、決定的なガードとして「両方とも単一の
+    # 選択肢文字 A-E」の形をしている場合は Fraction/math_verify に一切渡さず、ここで確定的に
+    # 判定して返す（math_verify呼び出し自体・gotcha #6のparsing_timeout=None/
+    # timeout_seconds=Noneは変更しない）。na.lower()==nb.lower()が既に不一致なのでこの分岐の
+    # 戻り値は常にFalseになるが、意図を明示するため case-insensitive 比較として書く。
+    if re.fullmatch(r"[A-Ea-e]", na) and re.fullmatch(r"[A-Ea-e]", nb):
+        return na.upper() == nb.upper()
     try:
         from fractions import Fraction
         if Fraction(na.replace(" ", "")) == Fraction(nb.replace(" ", "")):

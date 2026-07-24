@@ -9113,6 +9113,58 @@ check("mcq-e2e: テスト後にf._sc_sample/SC_POT/SC_INITIAL等のグローバ�
       and f.REASONING_MODELS == _orig_mcqv_reasoning and f.SC_INITIAL == _orig_mcqv_initial)
 
 # ==================================================
+# ---------- answers_equivalent: MCQ選択肢文字(A-E)ガード (2026-07-25, iteration 129) ----------
+# ==================================================
+# 上のMCQ投票クラス整合性テスト(iteration 107)は「異なる選択肢文字がmath_verifyによって
+# 誤って同値と判定される」リスクを指摘したが、その場ではfugu_local.py側を修正せず据え置いた
+# （math_verifyがこの開発環境に無く、実際にそう誤判定する事例を再現できなかったため）。
+# fugu_local.py の answers_equivalent には現在、na.lower()==nb.lower() の直後に「両方とも
+# 単一の選択肢文字A-Eの形をしている場合はFraction/math_verifyへ一切渡さず、
+# case-insensitive文字列比較で確定的に返す」ガードが追加されている(gotcha #6/#7参照)。
+# ここでは math_verify.verify が常にTrueを返す（=iteration 107が懸念した「誤って同値と
+# 判定してしまう」最悪ケースを意図的に再現する）記録スタブに差し替え、それでも異なる
+# 選択肢文字が併合されないこと、かつ選択肢文字ペアではparse/verifyが一切呼ばれないこと
+# （ガードがFraction/math_verifyより手前で確定的にreturnしている直接証拠）を検証する。
+# 対比として、選択肢文字の形をしていない真にmath_verify依存のペア(iteration 122で選定
+# された \sqrt{2} vs 1.41421356、Fraction高速パスを迂回する)は引き続きスタブへ到達し、
+# ガードが過剰発火して本来のmath比較を握り潰していないことも同じスタブの下で確認する。
+
+
+def _t_letter_guard_always_true(calls):
+    check("letter-guard: 異なる選択肢文字(A/B)はverify常にTrueのスタブでも非同値",
+          f.answers_equivalent("A", "B") is False)
+    check("letter-guard: 異なる選択肢文字(E/D)はverify常にTrueのスタブでも非同値"
+          "(sympyはEをEuler数として解釈しうる境界ケース)",
+          f.answers_equivalent("E", "D") is False)
+    check("letter-guard: 異なる選択肢文字(C/A)はverify常にTrueのスタブでも非同値",
+          f.answers_equivalent("C", "A") is False)
+    check("letter-guard: 選択肢文字ペア(A/B, E/D, C/A)ではmath_verify.parseが一切呼ばれない"
+          "(ガードがFraction/math_verifyより手前で確定的にreturnしている証拠)",
+          len(calls["parse_args"]) == 0)
+    check("letter-guard: 選択肢文字ペアではmath_verify.verifyが一切呼ばれない",
+          len(calls["verify_args"]) == 0)
+
+    # 同一文字(大小違い)は従来通りna.lower()の高速パスで解決し、こちらもmath_verifyの
+    # スタブに一切到達しない(直前の異なる文字ペアの検証を経てもなお呼び出し件数は0のまま)。
+    check("letter-guard: 同一選択肢文字(A/A)はna.lower()高速パスでTrue",
+          f.answers_equivalent("A", "A") is True)
+    check("letter-guard: 大小文字違い(a/A)はna.lower()高速パスでTrue",
+          f.answers_equivalent("a", "A") is True)
+    check("letter-guard: 同一文字ペア判定後もmath_verifyスタブは一度も呼ばれていない",
+          len(calls["parse_args"]) == 0 and len(calls["verify_args"]) == 0)
+
+    # 対比: 選択肢文字の形をしていない真にmath_verify依存のペアは、同じ「verifyが常に
+    # Trueを返す」スタブの下で引き続きparse/verifyへ到達しTrueを受け取る(ガードが過剰
+    # 発火してmath比較経路そのものを塞いでいないことの確認。iteration 122のペアを再利用)。
+    _result_math = f.answers_equivalent(_MV_A, _MV_B)
+    check("letter-guard: 選択肢文字でない真のmath_verify依存ペアはガードを迂回されず"
+          "引き続きスタブへ到達しTrueが伝播する(過剰発火していない)",
+          _result_math is True and len(calls["parse_args"]) >= 2 and len(calls["verify_args"]) == 1)
+
+
+_run_with_math_verify_stub(True, "none", _t_letter_guard_always_true)
+
+# ==================================================
 # ---------- plan_pptx_images: index範囲/重複/予算上限のパース契約 (2026-07-24) ----------
 # ==================================================
 # 背景: plan_pptx_images() (fugu_local.py L4095) は Conductor の JSON 画像プランを
