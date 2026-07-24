@@ -9497,6 +9497,133 @@ check("notify_slack: テスト後にSLACK_A_PREVIEWが元の状態へ復元さ�
 check("notify_slack: テスト後にurllib.request.urlopenが元の状態へ復元されている",
       urllib.request.urlopen == _orig_ns_urlopen)
 
+# ---------- read_file_text: 拡張子ディスパッチの直接検証 (2026-07-24) ----------
+# 個々の _read_pdf/_read_docx/_read_excel/_read_pptx の中身は既存テストで検証済みだが、
+# read_file_text がどの拡張子をどのリーダーへ振り分けるか（大文字小文字の扱い、
+# 旧形式 .doc/.ppt/.xls のルーティング、_BINARY_SKIP境界）自体は未検証だった。
+# --file で渡されるパスはユーザー入力由来で大文字拡張子(.PDF等)もあり得るため、
+# ディスパッチ自体にバグがあると RAG/--file コンテキストが静かに劣化する
+# (精度critical パスへの入力なので影響が大きい)。
+# ここでは各 _read_* をmonkeypatchして「どのリーダーが呼ばれたか」だけを見る
+# ことで、リーダー内部から独立してディスパッチ経路だけを検証する。
+import tempfile as _rfd_tempfile
+import pathlib as _rfd_pathlib
+import os as _rfd_os
+
+_orig_read_pdf = f._read_pdf
+_orig_read_docx = f._read_docx
+_orig_read_excel = f._read_excel
+_orig_read_pptx = f._read_pptx
+_orig_read_html = f._read_html
+_orig_read_ipynb = f._read_ipynb
+
+_rfd_calls = []
+
+
+def _mk_fake_reader(tag):
+    def _fake(path):
+        _rfd_calls.append(tag)
+        return f"CALLED:{tag}"
+    return _fake
+
+
+try:
+    f._read_pdf = _mk_fake_reader("pdf")
+    f._read_docx = _mk_fake_reader("docx")
+    f._read_excel = _mk_fake_reader("excel")
+    f._read_pptx = _mk_fake_reader("pptx")
+    f._read_html = _mk_fake_reader("html")
+    f._read_ipynb = _mk_fake_reader("ipynb")
+
+    with _rfd_tempfile.TemporaryDirectory() as _rfd_td:
+        _rfd_root = _rfd_pathlib.Path(_rfd_td)
+
+        # (1) 小文字拡張子は期待通りのリーダーへ
+        _rfd_calls.clear()
+        check("read_file_text: .pdf(小文字)は_read_pdfへ振り分け",
+              f.read_file_text(_rfd_root / "a.pdf") == "CALLED:pdf" and _rfd_calls == ["pdf"])
+        _rfd_calls.clear()
+        check("read_file_text: .docx(小文字)は_read_docxへ振り分け",
+              f.read_file_text(_rfd_root / "a.docx") == "CALLED:docx" and _rfd_calls == ["docx"])
+        _rfd_calls.clear()
+        check("read_file_text: .xlsx(小文字)は_read_excelへ振り分け",
+              f.read_file_text(_rfd_root / "a.xlsx") == "CALLED:excel" and _rfd_calls == ["excel"])
+        _rfd_calls.clear()
+        check("read_file_text: .pptx(小文字)は_read_pptxへ振り分け",
+              f.read_file_text(_rfd_root / "a.pptx") == "CALLED:pptx" and _rfd_calls == ["pptx"])
+
+        # (2) 大文字・混在大小文字の拡張子も同じリーダーへ(ユーザー入力--fileパス対策)
+        _rfd_calls.clear()
+        check("read_file_text: .PDF(大文字)も_read_pdfへ振り分け(小文字と同一)",
+              f.read_file_text(_rfd_root / "a.PDF") == "CALLED:pdf" and _rfd_calls == ["pdf"])
+        _rfd_calls.clear()
+        check("read_file_text: .Docx(混在大小文字)も_read_docxへ振り分け(小文字と同一)",
+              f.read_file_text(_rfd_root / "a.Docx") == "CALLED:docx" and _rfd_calls == ["docx"])
+        _rfd_calls.clear()
+        check("read_file_text: .XLSX(大文字)も_read_excelへ振り分け(小文字と同一)",
+              f.read_file_text(_rfd_root / "a.XLSX") == "CALLED:excel" and _rfd_calls == ["excel"])
+        _rfd_calls.clear()
+        check("read_file_text: .PPTX(大文字)も_read_pptxへ振り分け(小文字と同一)",
+              f.read_file_text(_rfd_root / "a.PPTX") == "CALLED:pptx" and _rfd_calls == ["pptx"])
+
+        # (3) 旧形式(.doc/.ppt/.xls)は現行形式と同じリーダー関数へルーティングされる
+        _rfd_calls.clear()
+        check("read_file_text: 旧形式.docは.docxと同じ_read_docxへ振り分け",
+              f.read_file_text(_rfd_root / "a.doc") == "CALLED:docx" and _rfd_calls == ["docx"])
+        _rfd_calls.clear()
+        check("read_file_text: 旧形式.xlsは.xlsxと同じ_read_excelへ振り分け",
+              f.read_file_text(_rfd_root / "a.xls") == "CALLED:excel" and _rfd_calls == ["excel"])
+        _rfd_calls.clear()
+        check("read_file_text: 旧形式.pptは.pptxと同じ_read_pptxへ振り分け",
+              f.read_file_text(_rfd_root / "a.ppt") == "CALLED:pptx" and _rfd_calls == ["pptx"])
+        # 旧形式の大文字混在も同様(.DOC等)
+        _rfd_calls.clear()
+        check("read_file_text: 旧形式.DOC(大文字)も_read_docxへ振り分け",
+              f.read_file_text(_rfd_root / "a.DOC") == "CALLED:docx" and _rfd_calls == ["docx"])
+
+        # (4) html/ipynbも念のため確認(既存の分岐だが、ディスパッチ経路として一括網羅)
+        _rfd_calls.clear()
+        check("read_file_text: .htmは_read_htmlへ振り分け",
+              f.read_file_text(_rfd_root / "a.htm") == "CALLED:html" and _rfd_calls == ["html"])
+        _rfd_calls.clear()
+        check("read_file_text: .ipynbは_read_ipynbへ振り分け",
+              f.read_file_text(_rfd_root / "a.ipynb") == "CALLED:ipynb" and _rfd_calls == ["ipynb"])
+
+        # (5) _BINARY_SKIP境界: スキップ対象拡張子はどのリーダーも呼ばずに""を返す
+        _rfd_calls.clear()
+        _rfd_png = _rfd_root / "a.png"
+        _rfd_png.write_bytes(b"\x89PNG fake binary content")
+        check("read_file_text: _BINARY_SKIP対象(.png)は\"\"を返しどのリーダーも呼ばない",
+              f.read_file_text(_rfd_png) == "" and _rfd_calls == [])
+        _rfd_calls.clear()
+        _rfd_exe = _rfd_root / "a.exe"
+        _rfd_exe.write_bytes(b"MZ fake binary content")
+        check("read_file_text: _BINARY_SKIP対象(.exe)は\"\"を返しどのリーダーも呼ばない",
+              f.read_file_text(_rfd_exe) == "" and _rfd_calls == [])
+
+        # (6) _BINARY_SKIPにも既知リーダーにも属さない未知拡張子は汎用テキスト読み込みへ
+        #     フォールスルーする(どのfake readerも呼ばれず、ファイル内容がそのまま返る)
+        _rfd_calls.clear()
+        _rfd_unknown = _rfd_root / "a.xyz123"
+        _rfd_unknown_content = "unknown suffix generic text fallback content"
+        _rfd_unknown.write_text(_rfd_unknown_content, encoding="utf-8")
+        check("read_file_text: 未知拡張子(.xyz123)はリーダーを介さず汎用テキスト読み込みへフォールスルー",
+              f.read_file_text(_rfd_unknown) == _rfd_unknown_content and _rfd_calls == [])
+finally:
+    f._read_pdf = _orig_read_pdf
+    f._read_docx = _orig_read_docx
+    f._read_excel = _orig_read_excel
+    f._read_pptx = _orig_read_pptx
+    f._read_html = _orig_read_html
+    f._read_ipynb = _orig_read_ipynb
+
+check("read_file_text: テスト後に_read_pdfが元の関数へ復元されている", f._read_pdf == _orig_read_pdf)
+check("read_file_text: テスト後に_read_docxが元の関数へ復元されている", f._read_docx == _orig_read_docx)
+check("read_file_text: テスト後に_read_excelが元の関数へ復元されている", f._read_excel == _orig_read_excel)
+check("read_file_text: テスト後に_read_pptxが元の関数へ復元されている", f._read_pptx == _orig_read_pptx)
+check("read_file_text: テスト後に_read_htmlが元の関数へ復元されている", f._read_html == _orig_read_html)
+check("read_file_text: テスト後に_read_ipynbが元の関数へ復元されている", f._read_ipynb == _orig_read_ipynb)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
