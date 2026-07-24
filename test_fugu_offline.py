@@ -9384,6 +9384,119 @@ check("handle_image_generation: テスト後にauthor_image_promptが元の状�
 check("handle_image_generation: テスト後にgenerate_imageが元の状態へ復元されている",
       f.generate_image == _orig_hig_generate_image)
 
+# ============================================================
+# _slack_truncate / notify_slack のテスト
+# ============================================================
+# SLACK_WEBHOOK_URL / SLACK_Q_PREVIEW / SLACK_A_PREVIEW / SLACK_NOTIFY_TIMEOUT を
+# 一時的に書き換えるため、finallyで必ず元へ戻す。urllib.request.urlopenも同様。
+
+check("_slack_truncate: 上限以下のテキストはそのまま", f._slack_truncate("hello", 10) == "hello")
+check("_slack_truncate: ちょうど上限のテキストはそのまま", f._slack_truncate("abcde", 5) == "abcde")
+_st_long = "a" * 20
+check("_slack_truncate: 上限超過テキストはlimit文字+省略記号に切り詰め",
+      f._slack_truncate(_st_long, 10) == ("a" * 10) + "…")
+check("_slack_truncate: 切り詰め結果の長さはlimit+1(省略記号込み)",
+      len(f._slack_truncate(_st_long, 10)) == 11)
+check("_slack_truncate: Noneは空文字扱いで例外を送出しない", f._slack_truncate(None, 10) == "")
+check("_slack_truncate: 空文字はそのまま(空文字)", f._slack_truncate("", 10) == "")
+check("_slack_truncate: 前後空白はstripされる", f._slack_truncate("  hi  ", 10) == "hi")
+
+_orig_ns_webhook = f.SLACK_WEBHOOK_URL
+_orig_ns_q_preview = f.SLACK_Q_PREVIEW
+_orig_ns_a_preview = f.SLACK_A_PREVIEW
+_orig_ns_timeout = f.SLACK_NOTIFY_TIMEOUT
+_orig_ns_urlopen = urllib.request.urlopen
+try:
+    # --- (1) SLACK_WEBHOOK_URLがfalsy(None/'') -> urlopenは一切呼ばれず例外も出ない ---
+    for _ns_falsy in (None, ""):
+        f.SLACK_WEBHOOK_URL = _ns_falsy
+
+        def _ns_no_call_urlopen(*a, **k):
+            raise AssertionError("notify_slack: SLACK_WEBHOOK_URLがfalsyなのにurlopenが呼ばれた")
+
+        urllib.request.urlopen = _ns_no_call_urlopen
+        _ns_exc = None
+        try:
+            f.notify_slack("質問です", "回答です", 1.23)
+        except Exception as _exc:
+            _ns_exc = _exc
+        check(f"notify_slack: SLACK_WEBHOOK_URL={_ns_falsy!r}ではurlopenを呼ばず例外も出ない",
+              _ns_exc is None)
+
+    # --- (2) 成功時: 成功アイコンを含み、失敗アイコンは含まない。長文は切り詰められる ---
+    f.SLACK_WEBHOOK_URL = "https://hooks.slack.example/T000/B000/xxxx"
+    f.SLACK_Q_PREVIEW = 20
+    f.SLACK_A_PREVIEW = 30
+    _ns_calls = []
+
+    class _NsOkResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"ok"
+
+    def _ns_ok_urlopen(req, timeout=None):
+        _ns_calls.append((req, timeout))
+        return _NsOkResp()
+
+    urllib.request.urlopen = _ns_ok_urlopen
+    _ns_long_q = "質問" * 30
+    _ns_long_a = "回答" * 30
+    f.notify_slack(_ns_long_q, _ns_long_a, 4.56)
+    check("notify_slack: 成功時にurlopenが1回だけ呼ばれる", len(_ns_calls) == 1)
+    _ns_req = _ns_calls[0][0]
+    _ns_body = json.loads(_ns_req.data.decode("utf-8"))["text"]
+    check("notify_slack: 成功時は成功アイコンを含む", ":white_check_mark:" in _ns_body)
+    check("notify_slack: 成功時は失敗アイコンを含まない", ":x:" not in _ns_body)
+    check("notify_slack: 質問はSLACK_Q_PREVIEW文字に切り詰められる",
+          f._slack_truncate(_ns_long_q, f.SLACK_Q_PREVIEW) in _ns_body)
+    check("notify_slack: 回答はSLACK_A_PREVIEW文字に切り詰められる",
+          f._slack_truncate(_ns_long_a, f.SLACK_A_PREVIEW) in _ns_body)
+    check("notify_slack: timeout引数にSLACK_NOTIFY_TIMEOUTを渡す",
+          _ns_calls[0][1] == f.SLACK_NOTIFY_TIMEOUT)
+
+    # --- (3) 失敗時(__ERROR__プレフィックス): 失敗アイコンを含み、成功アイコンは含まない ---
+    _ns_calls.clear()
+    urllib.request.urlopen = _ns_ok_urlopen
+    f.notify_slack("質問です", "__ERROR__: something broke", 7.89)
+    check("notify_slack: 失敗時にurlopenが1回だけ呼ばれる", len(_ns_calls) == 1)
+    _ns_req2 = _ns_calls[0][0]
+    _ns_body2 = json.loads(_ns_req2.data.decode("utf-8"))["text"]
+    check("notify_slack: __ERROR__プレフィックスでは失敗アイコンを含む", ":x:" in _ns_body2)
+    check("notify_slack: __ERROR__プレフィックスでは成功アイコンを含まない",
+          ":white_check_mark:" not in _ns_body2)
+
+    # --- (4) urlopenが例外を送出しても呼び出し元へ伝播しない(exceptで握り潰される) ---
+    def _ns_raise_urlopen(req, timeout=None):
+        raise RuntimeError("ネットワーク断(模擬)")
+
+    urllib.request.urlopen = _ns_raise_urlopen
+    _ns_exc2 = None
+    try:
+        f.notify_slack("質問です", "回答です", 0.1)
+    except Exception as _exc:
+        _ns_exc2 = _exc
+    check("notify_slack: urlopenが例外を送出しても呼び出し元へは伝播しない", _ns_exc2 is None)
+finally:
+    f.SLACK_WEBHOOK_URL = _orig_ns_webhook
+    f.SLACK_Q_PREVIEW = _orig_ns_q_preview
+    f.SLACK_A_PREVIEW = _orig_ns_a_preview
+    f.SLACK_NOTIFY_TIMEOUT = _orig_ns_timeout
+    urllib.request.urlopen = _orig_ns_urlopen
+
+check("notify_slack: テスト後にSLACK_WEBHOOK_URLが元の状態へ復元されている",
+      f.SLACK_WEBHOOK_URL == _orig_ns_webhook)
+check("notify_slack: テスト後にSLACK_Q_PREVIEWが元の状態へ復元されている",
+      f.SLACK_Q_PREVIEW == _orig_ns_q_preview)
+check("notify_slack: テスト後にSLACK_A_PREVIEWが元の状態へ復元されている",
+      f.SLACK_A_PREVIEW == _orig_ns_a_preview)
+check("notify_slack: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_ns_urlopen)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
