@@ -8364,6 +8364,99 @@ finally:
 check("ask_fugu/image失敗テスト: テスト後に_HISTORYが元の状態へ復元されている",
       f._HISTORY == _orig_af2_hist)
 
+# ---------- ask_fugu 経路1(画像のみ): 画像生成失敗時に __ERROR__ センチネルが
+# コンソール表示へ漏出しないことを検証 ----------
+# 2026-07-24: 経路1(use_image_generation かつ image_only)は handle_image_generation
+# が失敗時に返す内部センチネル '__ERROR__: ...' を print(result) でそのまま
+# '===== 画像生成結果 =====' の下に出力していた。プレーンパス(最終回答表示、
+# final.startswith('__ERROR__') 時は「生成に失敗しました:」と整形して表示)や、
+# 兄弟経路である経路3のイラスト付き回答(iteration 99 で対処済み)には同種の
+# 人間可読化があったが、経路1だけ未対応だった。aggregate()(iteration 9)、
+# _critic_judge/second_opinion(iteration 15)、_arbitrate(iteration 20)で対処した
+# 「内部センチネル/タグをユーザ向け出力に漏らさない」バグと同種。修正はコンソール
+# 表示のみで、result が '__ERROR__' で始まる場合にプレフィックスを剥がした
+# 人間可読な失敗ノートへ置き換える。notify_slack(iteration 119 の失敗アイコン
+# 判定用)には生の result を渡し続け、_save_answer_to_file のゲート
+# (iteration 80 のエラー時未保存)・関数の戻り値(プレーンパスの
+# '__ERROR__'-on-failure 契約と同型)も生の result のまま変更しない。
+# setup/conduct/handle_image_generation/notify_slack/_save_answer_to_file を
+# すべてモックしており、実際の Ollama・ネットワーク・画像バックエンド呼び出しは
+# 一切発生しない。
+_orig_af3_hist = list(f._HISTORY)
+_orig_af3_setup = f.setup
+_orig_af3_conduct = f.conduct
+_orig_af3_handle_image = f.handle_image_generation
+_orig_af3_notify = f.notify_slack
+_orig_af3_save_file = f._save_answer_to_file
+
+try:
+    f.setup = lambda: True
+
+    # --- (1) 画像のみ経路で画像生成が失敗: コンソールにセンチネルが漏出しない ---
+    f._HISTORY = []
+    _notify_calls_r1 = []
+    f.notify_slack = lambda *a, **k: _notify_calls_r1.append(a)
+    _save_calls_r1 = []
+    f._save_answer_to_file = lambda *a, **k: _save_calls_r1.append((a, k))
+    _img_only_sentinel = "__ERROR__: 画像生成は無効化されています（IMAGE_BACKEND=off）。"
+    f.conduct = lambda question, history=None, office_attached=False: (
+        _af_base_plan(use_image_generation=True, image_only=True), {})
+    f.handle_image_generation = lambda user_request, **k: _img_only_sentinel
+
+    _out_r1 = io.StringIO()
+    with contextlib.redirect_stdout(_out_r1):
+        _ret_r1 = f.ask_fugu("猫の絵だけ描いて(失敗)", baseline=False,
+                             out_file="C:/fake/out_imgonly_fail.md")
+    _printed_r1 = _out_r1.getvalue()
+
+    check("ask_fugu/経路1失敗: コンソール出力に生の'__ERROR__'トークンが含まれない",
+          "__ERROR__" not in _printed_r1)
+    check("ask_fugu/経路1失敗: コンソール出力に人間可読な失敗文言が含まれる",
+          "画像生成に失敗しました" in _printed_r1)
+    check("ask_fugu/経路1失敗: notify_slackには生のresult('__ERROR__'始まり)が渡る",
+          len(_notify_calls_r1) == 1 and _notify_calls_r1[0][1] == _img_only_sentinel
+          and _notify_calls_r1[0][1].startswith("__ERROR__"))
+    check("ask_fugu/経路1失敗: out_file指定済みでも_save_answer_to_fileは呼ばれない",
+          len(_save_calls_r1) == 0)
+    check("ask_fugu/経路1失敗: 戻り値は生のresultのまま('__ERROR__'始まり)",
+          _ret_r1 == _img_only_sentinel and _ret_r1.startswith("__ERROR__"))
+
+    # --- (2) 回帰: 画像のみ経路で画像生成が成功時はメッセージがそのまま表示される ---
+    f._HISTORY = []
+    _notify_calls_r2 = []
+    f.notify_slack = lambda *a, **k: _notify_calls_r2.append(a)
+    _save_calls_r2 = []
+    f._save_answer_to_file = lambda *a, **k: _save_calls_r2.append((a, k))
+    _img_only_ok = "画像を生成しました。保存先: C:/fake/cat.png"
+    f.handle_image_generation = lambda user_request, **k: _img_only_ok
+
+    _out_r2 = io.StringIO()
+    with contextlib.redirect_stdout(_out_r2):
+        _ret_r2 = f.ask_fugu("猫の絵だけ描いて(成功)", baseline=False,
+                             out_file="C:/fake/out_imgonly_ok.md")
+    _printed_r2 = _out_r2.getvalue()
+
+    check("ask_fugu/経路1成功(回帰): コンソール出力に成功メッセージがそのまま含まれる",
+          _img_only_ok in _printed_r2)
+    check("ask_fugu/経路1成功(回帰): コンソール出力に'画像生成に失敗しました'が混入しない",
+          "画像生成に失敗しました" not in _printed_r2)
+    check("ask_fugu/経路1成功(回帰): notify_slackには成功メッセージが渡る",
+          len(_notify_calls_r2) == 1 and _notify_calls_r2[0][1] == _img_only_ok)
+    check("ask_fugu/経路1成功(回帰): out_file指定時は_save_answer_to_fileが呼ばれる",
+          len(_save_calls_r2) == 1)
+    check("ask_fugu/経路1成功(回帰): 戻り値は成功メッセージと一致",
+          _ret_r2 == _img_only_ok)
+finally:
+    f._HISTORY = _orig_af3_hist
+    f.setup = _orig_af3_setup
+    f.conduct = _orig_af3_conduct
+    f.handle_image_generation = _orig_af3_handle_image
+    f.notify_slack = _orig_af3_notify
+    f._save_answer_to_file = _orig_af3_save_file
+
+check("ask_fugu/経路1テスト: テスト後に_HISTORYが元の状態へ復元されている",
+      f._HISTORY == _orig_af3_hist)
+
 # ---------- 画像プロンプト起草チェーン: _sd_prompt_from_request / moa_image_prompt /
 # author_image_prompt (2026-07-24) ----------
 # この3関数はSDXL画像プロンプト起草パイプラインを構成し、ask_fugu 経路1(画像のみ)・

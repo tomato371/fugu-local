@@ -3605,7 +3605,21 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
         result = handle_image_generation(question, panel=panel)
         elapsed = round(time.time() - t0, 1)
         print("\n===== 画像生成結果 =====")
-        print(result)
+        # 2026-07-24: handle_image_generation が失敗時に返す内部センチネル
+        # '__ERROR__: ...' をそのまま print(result) していたため、コンソールに
+        # 機械向けマーカーが生のまま漏出していた。aggregate()（iteration 9）、
+        # _critic_judge/second_opinion（iteration 15）、_arbitrate（iteration 20）、
+        # および経路3のイラスト付き回答（iteration 99）で対処した「内部センチネル
+        # をユーザ向け出力に漏らさない」バグと同種。ここではコンソール表示だけを
+        # 人間可読な文言に置き換える。notify_slack への通知（iteration 119 の
+        # 失敗アイコン判定用）・_save_answer_to_file のゲート（iteration 80 の
+        # エラー時未保存）・関数の戻り値は、従来どおり生の result
+        # （'__ERROR__' 始まりで失敗を示す）のまま変更しない。
+        if result.startswith("__ERROR__"):
+            note = result[len("__ERROR__"):].lstrip(":").strip()
+            print(f"画像生成に失敗しました: {note}" if note else "画像生成に失敗しました")
+        else:
+            print(result)
         print(f"\n(所要 {elapsed} 秒)")
         notify_slack(question, result, elapsed)
         if out_file and not result.startswith("__ERROR__"):
