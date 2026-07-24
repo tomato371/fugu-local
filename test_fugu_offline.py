@@ -7182,6 +7182,175 @@ check("_search_raw: 壊れたペイロード伝播テスト後に_resolve_ddgs_c
       "元の状態へ復元されている",
       f._resolve_ddgs_class == _orig_resolve_ddgs_sr2)
 
+# ---------- _ddg_instant: 末端(Abstract/Text)がtruthy非文字列の場合の防御 (2026-07-25追加) ----------
+# イテレーション103はコンテナ形状(トップレベルdata・RelatedTopics)のみをisinstanceで
+# 丸め、末端(Abstract文字列本体・直接トピックのText・ネストされたTopics[].Text)は
+# `if data.get("Abstract"):` のような真偽値チェックの直後で無条件にスライスしていた。
+# DDGは壊れたペイロードでText/Abstractにint/float/bool/list/dictを返すことがあり、
+# int/float/boolはスライス不能のTypeError、dict/listは例外を出さない場合でも
+# research_searchのre.search/'\n\n'.joinを壊す汚染データになる。以下はイテレーション
+# 111/112/113と同じ「isinstanceで判定し例外を出さず読み飛ばす」方式の末端版を検証する。
+# urllib.request.urlopenのみをモックし、実ネットワーク呼び出しは発生させない。
+
+_orig_urlopen_di2 = urllib.request.urlopen
+_BAD_LEAF_VALUES = [12345, 3.14, True, ["not", "a", "string"], {"bad": "dict"}]
+
+try:
+    # --- (16) Abstractがtruthy非文字列(int/float/bool/list/dict) -> Abstract項目のみ
+    #     省略され、例外を出さず、兄弟のRelatedTopics Textは従来通り返る ---
+    for _bad_abstract in _BAD_LEAF_VALUES:
+        urllib.request.urlopen = _fake_urlopen_di_payload({
+            "Abstract": _bad_abstract,
+            "AbstractTitle": "無視されるタイトル",
+            "AbstractURL": "https://example.com/bad-abstract",
+            "RelatedTopics": [{"Text": "有効な兄弟トピック"}],
+        })
+        _di16 = f._ddg_instant(f"非文字列Abstract({type(_bad_abstract).__name__})クエリ",
+                                max_results=10)
+        check(f"_ddg_instant: Abstractがtruthy非文字列({type(_bad_abstract).__name__})でも"
+              "例外を出さずAbstract項目のみ省略され、兄弟のTextは返る",
+              _di16 == ["有効な兄弟トピック"])
+
+    # --- (17) 直接トピックのTextがtruthy非文字列 -> そのリーフのみ省略され、
+    #     兄弟の直接トピックは従来通り返る(direct-topic分岐自体は変わらず選択される) ---
+    for _bad_text in _BAD_LEAF_VALUES:
+        urllib.request.urlopen = _fake_urlopen_di_payload({
+            "Abstract": "",
+            "RelatedTopics": [
+                {"Text": _bad_text},
+                {"Text": "有効な直接トピック"},
+            ],
+        })
+        _di17 = f._ddg_instant(f"非文字列直接Text({type(_bad_text).__name__})クエリ",
+                                max_results=10)
+        check(f"_ddg_instant: 直接トピックのTextがtruthy非文字列({type(_bad_text).__name__})"
+              "でも例外を出さずそのリーフのみ省略され、兄弟の直接トピックは返る",
+              _di17 == ["有効な直接トピック"])
+
+    # --- (17b) 直接トピックのTextが非文字列で、かつ同じ要素にTopicsも併存する場合、
+    #     direct-Text優先の分岐選択自体は変えない(Topicsへのフォールバックはしない)。
+    #     既存のTextTopics優先(_di11相当)を壊れたTextでも保つことを確認する ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "",
+        "RelatedTopics": [
+            {"Text": 999, "Topics": [{"Text": "should-not-appear"}]},
+            {"Text": "good-sibling"},
+        ],
+    })
+    _di17b = f._ddg_instant("非文字列Text優先クエリ", max_results=10)
+    check("_ddg_instant: 直接トピックのTextが非文字列でもdirect-Text優先の分岐選択は"
+          "変わらずTopicsへフォールバックしない(既存の優先順位を維持)",
+          _di17b == ["good-sibling"])
+
+    # --- (18) ネストされたTopics[].Textがtruthy非文字列 -> そのリーフのみ省略され、
+    #     兄弟のネストTextは従来通り返る ---
+    for _bad_nested in _BAD_LEAF_VALUES:
+        urllib.request.urlopen = _fake_urlopen_di_payload({
+            "Abstract": "",
+            "RelatedTopics": [
+                {"Name": "G", "Topics": [{"Text": _bad_nested}, {"Text": "有効なネスト"}]},
+            ],
+        })
+        _di18 = f._ddg_instant(f"非文字列ネストText({type(_bad_nested).__name__})クエリ",
+                                max_results=10)
+        check(f"_ddg_instant: ネストTopics[].Textがtruthy非文字列"
+              f"({type(_bad_nested).__name__})でも例外を出さずそのリーフのみ省略され、"
+              "兄弟のネストTextは返る",
+              _di18 == ["有効なネスト"])
+
+    # --- (19) Abstract/直接Text/ネストTextの全てが同時に壊れていても、正常なリーフは
+    #     全て保たれ、max_resultsの内側/外側breakと最終スライスも従来通り効く ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": ["not", "a", "string"],
+        "AbstractTitle": "無視されるタイトル",
+        "AbstractURL": "https://example.com/bad",
+        "RelatedTopics": [
+            {"Text": {"bad": "dict"}},
+            {"Text": "good-direct-1"},
+            {"Name": "grp", "Topics": [
+                {"Text": 3.14}, {"Text": "good-nested-1"}, {"Text": "good-nested-2"},
+            ]},
+            {"Text": "good-direct-2"},
+        ],
+    })
+    _di19 = f._ddg_instant("複合壊れ形状クエリ", max_results=3)
+    check("_ddg_instant: Abstract/直接Text/ネストTextが同時に壊れていても、正常な"
+          "リーフは順序を保ったまま返り、max_resultsの内側/外側breakも従来通り効く",
+          _di19 == ["good-direct-1", "good-nested-1", "good-nested-2"])
+
+    # --- (20) 回帰: 完全に整形済み(string Abstract/Text)なペイロードはbyte-for-byteで
+    #     従来通り(Abstract+直接トピック+グループ化ネストトピックを1ペイロードに同居させ、
+    #     [AbstractTitle]\nAbstract\nSource: URL の形とネスト展開順序を両方確認する) ---
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": "正常な要約文",
+        "AbstractTitle": "正常タイトル",
+        "AbstractURL": "https://example.com/normal",
+        "RelatedTopics": [
+            {"Text": "直接トピック1"},
+            {"Name": "カテゴリ", "Topics": [{"Text": "ネストトピック1"}, {"Text": "ネストトピック2"}]},
+        ],
+    })
+    _di20 = f._ddg_instant("完全整形ペイロードクエリ", max_results=10)
+    check("_ddg_instant: 完全に整形済みのペイロードはisinstanceガード追加後もbyte-for-byteで"
+          "従来通り(Abstract整形・直接トピック・ネストトピックの展開順序が全て一致)",
+          _di20 == [
+              "[正常タイトル]\n正常な要約文\nSource: https://example.com/normal",
+              "直接トピック1",
+              "ネストトピック1",
+              "ネストトピック2",
+          ])
+finally:
+    urllib.request.urlopen = _orig_urlopen_di2
+
+check("_ddg_instant: 末端型ガードのテスト後にurllib.request.urlopenが"
+      "元の状態へ復元されている",
+      urllib.request.urlopen == _orig_urlopen_di2)
+
+# ---------- _search_raw: _ddg_instant末端型ガード経由での壊れたペイロード伝播防止 (2026-07-25追加) ----------
+# 上のセクションで_ddg_instant単体の末端型ガードを検証したのに続き、ここでは
+# 2026-07-24追加分の「_search_rawはexcept ImportErrorの内側からtryに包まずに
+# _ddg_instantを直接呼ぶ(L544相当)」テストと同じ構成で、末端(Abstract/Text)が
+# truthy非文字列という壊れ方をする実際の経路(f._resolve_ddgs_classをImportErrorへ、
+# urllib.request.urlopenを壊れたペイロードへモックし、_ddg_instant自体はモックせず
+# 本物を経由させる)を通しても、_search_rawのnever-raise契約
+# (「失敗時は空リスト、呼び出し側を止めない」・イテレーション75)が保たれることを
+# 確認する。
+
+_orig_resolve_ddgs_sr3 = f._resolve_ddgs_class
+_orig_urlopen_sr3 = urllib.request.urlopen
+
+try:
+    f._resolve_ddgs_class = _resolve_raises_importerror
+    urllib.request.urlopen = _fake_urlopen_di_payload({
+        "Abstract": ["not", "a", "string"],
+        "AbstractTitle": "T",
+        "AbstractURL": "U",
+        "RelatedTopics": [
+            {"Text": {"bad": "dict"}},
+            {"Text": "good-direct"},
+            {"Name": "grp", "Topics": [{"Text": 12345}, {"Text": "good-nested"}]},
+        ],
+    })
+
+    _buf_sr3 = io.StringIO()
+    with contextlib.redirect_stdout(_buf_sr3):
+        _r_sr3 = f._search_raw("末端型ガード経由クエリ", max_results=5)
+
+    check("_search_raw: ライブラリ未インストール経由で_ddg_instantに渡った"
+          "末端型が壊れたペイロード(Abstract/直接Text/ネストTextが非文字列)でも"
+          "例外を出さず、正常なリーフのみのリストを返す(never-raise契約の維持)",
+          _r_sr3 == ["good-direct", "good-nested"])
+finally:
+    f._resolve_ddgs_class = _orig_resolve_ddgs_sr3
+    urllib.request.urlopen = _orig_urlopen_sr3
+
+check("_search_raw: 末端型ガード伝播テスト後にurllib.request.urlopenが"
+      "元の状態へ復元されている",
+      urllib.request.urlopen == _orig_urlopen_sr3)
+check("_search_raw: 末端型ガード伝播テスト後に_resolve_ddgs_classが"
+      "元の状態へ復元されている",
+      f._resolve_ddgs_class == _orig_resolve_ddgs_sr3)
+
 # ---------- research_search: 反復リサーチループ (dedup / ラウンド上限 / 早期終了) ----------
 # research_search は「Conductor/proposer 全員に注入される権威コンテキスト」を作る
 # 精度クリティカルな経路だが、これまでオフラインテストが皆無だった。

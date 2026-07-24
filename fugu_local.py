@@ -509,7 +509,25 @@ def _ddg_instant(query: str, max_results: int) -> list:
     # `if not body: body = item[:SEARCH_CONTEXT_CHARS]` で break するため、巨大な
     # Abstract 1件が他の収集済み事実を全て握り潰してしまう。_ddg_full と同じ上限を
     # 適用して対称にする（Source 行は切り詰めない）。
-    if data.get("Abstract"):
+    # 2026-07-25: イテレーション103はコンテナ形状（トップレベル data / RelatedTopics）
+    # のみを isinstance で丸め、末端（Abstract 文字列本体・直接トピックの Text・
+    # ネストされた Topics[].Text）はここに来るまで一度も型を見ておらず、
+    # `if data.get("Abstract"):` のような真偽値チェックの直後でいきなり
+    # `[:WEB_SEARCH_SNIPPET_CHARS]` によるスライスを行っていた。DDG は壊れた
+    # ペイロードで Abstract/Text に int・float・bool・list・dict を返すことがあり、
+    # int/float/bool は「添字操作できません」の TypeError、dict はスライス構文上
+    # 例外にはならないが該当キーの意味を持たない値になり、list は例外を出さず
+    # スライスできてしまうが results にリストオブジェクトが混入し、後段の
+    # research_search の `re.search(r'Source: ...')` や `'\n\n'.join(...)` を
+    # 壊す。コンテナ側の非list/非dict丸め（イテレーション103・111・112・113の
+    # 「isinstance で判定し例外を出さず読み飛ばす」系列と同じ考え方）と同様に、
+    # ここでも末端が str でなければスライスせずそのリーフだけを読み飛ばす
+    # （str への str() 変換はしない。list/dict の repr をそのままノイズとして
+    # モデルの検索コンテキストに混入させないため）。_search_raw() は
+    # `except ImportError:` の内側から try に包まずこの関数を直接呼んでいる
+    # （イテレーション103のコメント参照）ため、ここで拾わない例外は
+    # 「失敗時は空リスト」という never-raise 契約をすり抜けてターン全体を落とす。
+    if data.get("Abstract") and isinstance(data["Abstract"], str):
         abstract = data["Abstract"][:WEB_SEARCH_SNIPPET_CHARS]
         results.append(f"[{data.get('AbstractTitle', '')}]\n{abstract}\n"
                        f"Source: {data.get('AbstractURL', '')}")
@@ -521,7 +539,11 @@ def _ddg_instant(query: str, max_results: int) -> list:
             # トップレベルに Text がある「直接トピック」はこちらを優先し、
             # 仮に Topics も併存していても展開しない（下の分岐と二重追加しない
             # ための優先順位。直接トピックの既存挙動を保つ）。
-            results.append(t["Text"][:WEB_SEARCH_SNIPPET_CHARS])
+            # Text が truthy な非文字列（例: int/float/bool/list/dict）の場合は
+            # スライスせずこのリーフだけを読み飛ばす（上のコメント参照）。
+            # ブランチの選択自体（direct-Text 優先）は変えない。
+            if isinstance(t["Text"], str):
+                results.append(t["Text"][:WEB_SEARCH_SNIPPET_CHARS])
         elif isinstance(t, dict) and isinstance(t.get("Topics"), list):
             # 2026-07-24: RelatedTopics には、トップレベル Text を持つ直接トピックと
             # {"Name": "カテゴリ名", "Topics": [...]} 形式の「グループ化トピック」が
@@ -531,7 +553,10 @@ def _ddg_instant(query: str, max_results: int) -> list:
             # 既知の欠落）。DDG のネストは1階層のみなので、ここでも1階層だけを
             # フラット化する（再帰はしない。壊れた形状は例外を出さず読み飛ばす）。
             for nested in t["Topics"]:
-                if isinstance(nested, dict) and nested.get("Text"):
+                # 2026-07-25: nested["Text"] も同様に truthy 非文字列を読み飛ばす
+                # （上の Abstract/direct-Text と同じ理由）。
+                if (isinstance(nested, dict) and nested.get("Text")
+                        and isinstance(nested["Text"], str)):
                     results.append(nested["Text"][:WEB_SEARCH_SNIPPET_CHARS])
                 if len(results) >= max_results:
                     break
