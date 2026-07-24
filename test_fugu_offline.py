@@ -4978,6 +4978,99 @@ with _tempfile.TemporaryDirectory() as _dtb_html_dir:
     check("_read_html: 通常のUTF-8 .htmlは'Hello UTF-8 world. こんにちは。'を正しく抽出する(回帰)",
           f._read_html(_dtb_html_root / "utf8.html") == "Hello UTF-8 world. こんにちは。")
 
+# ---------- read_file_text: 汎用テキスト分岐のNULバイトバイナリ判定 (2026-07-25) ----------
+# read_file_text()のdocstringは「バイナリはスキップして空文字を返す」と約束するが、
+# 実際にこれを支えるのは_BINARY_SKIP（約30拡張子のみのdenylist）だけだった。
+# .npy/.h5/.parquet/.safetensors/.gguf/.sqlite/.db/.woff/.ttf/.class/.wasm/.pyc や
+# 拡張子なしバイナリなど未収載の拡張子は汎用テキスト分岐まで落ちてきて
+# _decode_text_bytes()（iter94: utf-8→cp932→replaceラダー、例外を送出しない設計）に
+# 通され、文字化けした「ゴミテキスト」がそのまま返っていた。このゴミは--file経路
+# ではmain()で質問全文そのものになり（下流フィルタなし）、RAG経路では
+# _load_rag_chunks（iter42のファイル単位隔離）を通じて精度criticalなコンテキストへ
+# チャンク注入される。ここではNUL(0x00)バイトの有無で真のバイナリを検出し""へ
+# 落とす追加ガード（read_file_textの汎用テキスト分岐のみに限定）を検証する。
+# iter94のcp932救済ラダー・iter53/125のgraceful-degradation契約・iter42のRAG単位
+# 隔離のいずれも変更しないことも併せて回帰確認する。Ollama/ネットワーク呼び出しは
+# 一切不要（すべてtempfile上のオフラインI/O）。
+with _tempfile.TemporaryDirectory() as _nulb_dir:
+    _nulb_root = _pathlib.Path(_nulb_dir)
+
+    # (1) _BINARY_SKIP未収載の拡張子でもNULバイトを含めば""を返し警告を表示する
+    _nulb_npy = _nulb_root / "weights.npy"
+    _nulb_npy.write_bytes(b"\x93NUMPY\x01\x00\x00\x00\x00\x00")
+    _nulb_cap1 = io.StringIO()
+    with contextlib.redirect_stdout(_nulb_cap1):
+        _nulb_result1 = f.read_file_text(_nulb_npy)
+    check("read_file_text: _BINARY_SKIP未収載拡張子(.npy)でもNULバイト含有なら\"\"を返す",
+          _nulb_result1 == "")
+    check("read_file_text: NULバイト検出時にスキップ警告を表示する(ファイル名を含む)",
+          "スキップ" in _nulb_cap1.getvalue() and "weights.npy" in _nulb_cap1.getvalue())
+
+    # でっち上げ拡張子(.xyz)や別の未収載拡張子(.dat2)でも同様
+    _nulb_xyz = _nulb_root / "blob.xyz"
+    _nulb_xyz.write_bytes(b"garbage\x00moregarbage\x00\x01\x02")
+    check("read_file_text: でっち上げ拡張子(.xyz)でもNULバイト含有なら\"\"を返す",
+          f.read_file_text(_nulb_xyz) == "")
+
+    _nulb_dat2 = _nulb_root / "raw.dat2"
+    _nulb_dat2.write_bytes(b"\x00\x00\x00\x01binarydata")
+    check("read_file_text: 未収載拡張子(.dat2)でもNULバイト含有なら\"\"を返す",
+          f.read_file_text(_nulb_dat2) == "")
+
+    # (2) 回帰(iter94): NULバイトを含まないcp932(Shift-JIS)日本語は従来通り正しく復元される
+    _nulb_jp = "これはNULバイトを含まないcp932の日本語テキストです。会議は明日です。"
+    (_nulb_root / "sjis_no_nul.txt").write_bytes(_nulb_jp.encode("cp932"))
+    _nulb_jp_out = f.read_file_text(_nulb_root / "sjis_no_nul.txt")
+    check("read_file_text: NUL非含有のcp932日本語は引き続き正しく復元される(iter94回帰なし)",
+          _nulb_jp_out == _nulb_jp)
+    check("read_file_text: NUL非含有のcp932復元結果にU+FFFD(文字化け)が含まれない(iter94回帰なし)",
+          "�" not in _nulb_jp_out)
+
+    # (3) 回帰(iter94): NUL非含有だがutf-8/cp932とも不正なバイト列はガードで弾かれず
+    #     従来通りreplaceラダーを経由する("" にならない、NULガードのfalse positive防止)
+    _nulb_undecodable = b"\x80\x81\xfe\xff"
+    (_nulb_root / "undecodable.xyz").write_bytes(_nulb_undecodable)
+    _nulb_undecodable_out = f.read_file_text(_nulb_root / "undecodable.xyz")
+    check("read_file_text: NUL非含有の不正バイト列はガードで弾かれず従来通りreplaceラダーを経由する",
+          _nulb_undecodable_out == _nulb_undecodable.decode("utf-8", errors="replace"))
+    check("read_file_text: 上記replaceラダー結果は空文字にならない(NULガードのfalse positiveなし)",
+          _nulb_undecodable_out != "")
+
+    # (4) 回帰: NUL非含有のASCII/UTF-8テキストは未知拡張子(iter120)・_CODE_EXTENSIONS(iter121)問わず不変
+    _nulb_ascii = "plain ascii content, nothing binary here at all."
+    (_nulb_root / "note.xyz123").write_text(_nulb_ascii, encoding="utf-8")
+    check("read_file_text: NUL非含有ASCIIの未知拡張子(.xyz123)は従来通り読み込める(iter120回帰なし)",
+          f.read_file_text(_nulb_root / "note.xyz123") == _nulb_ascii)
+
+    _nulb_code = "def f():\n    return 1\n"
+    (_nulb_root / "script.py").write_text(_nulb_code, encoding="utf-8")
+    check("read_file_text: NUL非含有の_CODE_EXTENSIONS(.py)は従来通り読み込める(iter121回帰なし)",
+          f.read_file_text(_nulb_root / "script.py") == _nulb_code)
+
+    # (5) 回帰: 既存の_BINARY_SKIP拡張子(.png/.exe)は従来通り早期リターンで""を返す(NULガードより前段)
+    (_nulb_root / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00")
+    check("read_file_text: _BINARY_SKIP拡張子(.png)は従来通り早期リターンで\"\"を返す(回帰)",
+          f.read_file_text(_nulb_root / "image.png") == "")
+    (_nulb_root / "app.exe").write_bytes(b"MZ\x90\x00\x03\x00\x00\x00")
+    check("read_file_text: _BINARY_SKIP拡張子(.exe)は従来通り早期リターンで\"\"を返す(回帰)",
+          f.read_file_text(_nulb_root / "app.exe") == "")
+
+# (6) _load_rag_chunks経由: NULバイト含有バイナリ(未収載拡張子)は同居する正常な.txtを
+#     巻き添えにせずスキップされ、RAGコンテキストへゴミが注入されない
+with _tempfile.TemporaryDirectory() as _nulb_rag_dir:
+    _nulb_rag_root = _pathlib.Path(_nulb_rag_dir)
+    (_nulb_rag_root / "model.safetensors").write_bytes(
+        b"header\x00\x00binarypayload\x00\x01\x02"
+    )
+    _nulb_rag_txt = "これは正常なテキストファイルの内容です。RAGに載るべき本文。"
+    (_nulb_rag_root / "notes.txt").write_text(_nulb_rag_txt, encoding="utf-8")
+
+    _nulb_rag_chunks = f._load_rag_chunks([str(_nulb_rag_root)])
+    check("_load_rag_chunks: NULバイト含有バイナリ(未収載拡張子.safetensors)はチャンクに含まれない",
+          all("model.safetensors" not in _p for _p, _c in _nulb_rag_chunks))
+    check("_load_rag_chunks: 同居する正常な.txtのチャンクのみが含まれる",
+          _nulb_rag_chunks == [(str(_nulb_rag_root / "notes.txt"), _nulb_rag_txt)])
+
 # ---------- _read_excel/_read_pptx/_read_docx: 成功時の構造化抽出カバレッジ (2026-07-23 / iter82) ----------
 # iteration 71 は stdlib のみで書かれた _read_html/_read_ipynb の「成功時」抽出を直接
 # 検証したが、ライブラリ依存の _read_docx/_read_excel/_read_pptx はこれまで失敗/劣化

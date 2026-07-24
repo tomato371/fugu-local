@@ -1236,7 +1236,33 @@ def read_file_text(path: Path) -> str:
         # 復元する（iter47/iter70のerrors="replace"適用箇所とは目的が異なる:
         # あちらはfugu自身がUTF-8で書いたファイルの読み戻し用の保険で、
         # こちらは他所由来ファイルの元エンコーディングの救済）。
-        return _decode_text_bytes(path.read_bytes())
+        raw_bytes = path.read_bytes()
+        # 2026-07-25: read_file_textのdocstringは「バイナリはスキップして
+        # 空文字を返す」契約（iter53/125のgraceful-degradation方針と同根）を
+        # 約束しているが、実際にこれを支えているのは_BINARY_SKIP（約30拡張子
+        # のみの小さなdenylist、上記）だけである。.npy/.h5/.parquet/
+        # .safetensors/.gguf/.sqlite/.db/.woff/.ttf/.class/.wasm/.pyc や
+        # 拡張子なしバイナリなど_BINARY_SKIP未収載のバイナリはこの汎用分岐まで
+        # 落ちてきて、_decode_text_bytes()（iter94のutf-8→cp932→replace
+        # ラダー、下記関数）は例外を送出しない設計のため、文字化けした
+        # 「ゴミテキスト」がそのまま返っていた。このゴミは--file経路では
+        # main()で質問全文そのものになり（下流フィルタなし）、RAG経路では
+        # _load_rag_chunks（iter42のファイル単位隔離、下記）を通じて精度
+        # criticalなコンテキストへチャンク注入される。RAG_EXTENSIONS（本ファイル
+        # L271）は本来アローリストとして使う想定に見えるが実際は未使用の
+        # dead codeであり、ここをアローリスト化する対処も検討したが、
+        # .log/.conf/Dockerfile/READMEや拡張子なしテキストなど正当なNUL非
+        # 含有テキストまで拡張子未収載を理由に巻き添えで弾いてしまい、
+        # 精度優先・時間は気にしないの方針に反するrecall低下となるため
+        # 採用しない。代わりにgit等が使う標準的なバイナリ判定手法である
+        # 「生バイト列中のNUL(0x00)の有無」で判定する: NULはcp932/Shift-JIS
+        # を含むテキストエンコーディングでは正当な文字の一部として現れない
+        # ため、iter94のcp932救済ラダー（NUL非含有入力）を一切変更せず、
+        # 真のバイナリ（NUL含有）だけを追加で弾ける。
+        if b"\x00" in raw_bytes:
+            print(f"[read_file_text] バイナリ検出(NULバイト)のためスキップ: {path}")
+            return ""
+        return _decode_text_bytes(raw_bytes)
     except Exception as exc:
         # 2026-07-24 (iter125): 上のsuffix-dispatch分岐(iter53)はここに来る前に
         # 例外を捕捉して警告を出すが、この汎用テキストフォールバック分岐は
