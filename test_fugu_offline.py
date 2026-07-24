@@ -4515,6 +4515,32 @@ finally:
 check("read_file_text: リーダーがpip install通知文字列を正常returnした場合はそのまま素通し(\"\"化されない)",
       _rft_result3 == _rft_notice_text)
 
+# ---------- read_file_text: 汎用テキストフォールバック分岐の例外も警告を出す (2026-07-24 / iter125) ----------
+# 上のiter53テストはsuffix-dispatch分岐(.pdf/.docx/.xlsx/.pptx/.html/.ipynb)のみをカバーする。
+# 未知拡張子(.txt等)は最後のelse=汎用テキストフォールバック分岐(Path.read_bytes +
+# _decode_text_bytes)を通るが、従来この分岐は except Exception: return "" のみで、
+# 権限エラー(PermissionError)やread_bytes自体の失敗が無警告のまま握りつぶされていた。
+# ここではPath.read_bytesをmonkeypatchしてPermissionErrorを送出させ、
+# read_file_textが(1)従来通り""を返す((2)警告print(ファイル名+例外型)を出すことを確認する。
+_orig_path_read_bytes = _pathlib.Path.read_bytes
+
+
+def _rft_raise_permission_error(self):
+    raise PermissionError("simulated permission denied")
+
+
+try:
+    _pathlib.Path.read_bytes = _rft_raise_permission_error
+    with contextlib.redirect_stdout(io.StringIO()) as _rft_out4:
+        _rft_result4 = f.read_file_text(_pathlib.Path("dummy_protected.txt"))
+finally:
+    _pathlib.Path.read_bytes = _orig_path_read_bytes
+
+check("read_file_text: 汎用テキスト分岐でPath.read_bytesがPermissionErrorを送出しても伝播せず\"\"を返す(契約不変)",
+      _rft_result4 == "")
+check("read_file_text: 汎用テキスト分岐の読み込み失敗時にも警告(ファイル名+例外型)を表示する(従来は無警告だった)",
+      "dummy_protected.txt" in _rft_out4.getvalue() and "PermissionError" in _rft_out4.getvalue())
+
 # ---------- _read_html / _read_ipynb: 直接カバレッジ (2026-07-23 / iter71) ----------
 # _read_html/_read_ipynb はstdlibのみ(html.parser/json)で書かれた汎用ファイルリーダーで、
 # RAG(_load_rag_chunks -> rag_search -> build_context)や --file 経由でproposerの

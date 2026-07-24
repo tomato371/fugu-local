@@ -1237,7 +1237,15 @@ def read_file_text(path: Path) -> str:
         # あちらはfugu自身がUTF-8で書いたファイルの読み戻し用の保険で、
         # こちらは他所由来ファイルの元エンコーディングの救済）。
         return _decode_text_bytes(path.read_bytes())
-    except Exception:
+    except Exception as exc:
+        # 2026-07-24 (iter125): 上のsuffix-dispatch分岐(iter53)はここに来る前に
+        # 例外を捕捉して警告を出すが、この汎用テキストフォールバック分岐は
+        # 従来 except Exception: return "" のみで、権限エラー(PermissionError)や
+        # Path.read_bytes自体の失敗、_decode_text_bytes内のデコード失敗が
+        # 無警告のまま握りつぶされていた（_load_rag_chunksの個別ファイルガードは
+        # 常に警告を出すのに対し、このパスだけ非対称だった）。read_file_textの
+        # 「例外→空文字」という契約自体は変えず、可視化のための警告printのみ追加する。
+        print(f"[read_file_text] 読み込み失敗のためスキップ: {path} ({type(exc).__name__})")
         return ""
 
 
