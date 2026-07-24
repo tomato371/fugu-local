@@ -9198,6 +9198,192 @@ check("plan_pptx_images: テスト後にurllib.request.urlopenが元の状態へ
 check("plan_pptx_images: テスト後にf.subprocess.runが元の状態へ復元されている",
       f.subprocess.run == _orig_pi_subprocess_run)
 
+# ==================================================
+# handle_image_generation の直接テスト (iteration 118)
+# ==================================================
+# _detect_backend/author_image_prompt/generate_image の3つの外部呼び出しのみを
+# monkeypatchし、実urlopen/subprocessには一切触れない。モック漏れを即座に
+# 可視化するため、urllib.request.urlopenとf.subprocess.runにも「呼ばれたら
+# 即AssertionError」の番人を仕込む(iteration 38/76/103のtripwire流儀を踏襲)。
+
+_orig_hig_urlopen = urllib.request.urlopen
+_orig_hig_subprocess_run = f.subprocess.run
+_orig_hig_image_backend = f.IMAGE_BACKEND
+_orig_hig_detect_backend = f._detect_backend
+_orig_hig_author_image_prompt = f.author_image_prompt
+_orig_hig_generate_image = f.generate_image
+
+
+def _hig_no_network_urlopen(*a, **k):
+    raise AssertionError("handle_image_generation: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _hig_no_subprocess_run(*a, **k):
+    raise AssertionError("handle_image_generation: モック漏れで実subprocess.runが呼ばれた")
+
+
+try:
+    urllib.request.urlopen = _hig_no_network_urlopen
+    f.subprocess.run = _hig_no_subprocess_run
+
+    # --- (1) IMAGE_BACKEND=='off' -> __ERROR__即返し、他の3関数は一切呼ばれない ---
+    f.IMAGE_BACKEND = "off"
+    _hig_calls = {"detect": 0, "author": 0, "generate": 0}
+
+    def _hig_detect_should_not_be_called():
+        _hig_calls["detect"] += 1
+        return "a1111"
+
+    def _hig_author_should_not_be_called(user_request, panel=None):
+        _hig_calls["author"] += 1
+        return ("dummy prompt", "dummy negative")
+
+    def _hig_generate_should_not_be_called(prompt, negative):
+        _hig_calls["generate"] += 1
+        return "dummy.png"
+
+    f._detect_backend = _hig_detect_should_not_be_called
+    f.author_image_prompt = _hig_author_should_not_be_called
+    f.generate_image = _hig_generate_should_not_be_called
+
+    _hig_r1 = f.handle_image_generation("猫の絵を描いて", prompt="既存プロンプト")
+    check("handle_image_generation(1): IMAGE_BACKEND='off'で__ERROR__を返す",
+          isinstance(_hig_r1, str) and _hig_r1.startswith("__ERROR__"))
+    check("handle_image_generation(1): _detect_backendは呼ばれない", _hig_calls["detect"] == 0)
+    check("handle_image_generation(1): author_image_promptは呼ばれない", _hig_calls["author"] == 0)
+    check("handle_image_generation(1): generate_imageは呼ばれない", _hig_calls["generate"] == 0)
+
+    # --- (2) _detect_backend()がNone -> __ERROR__ + A1111_URL/COMFYUI_URLの案内文、
+    #     generate_imageは呼ばれない ---
+    f.IMAGE_BACKEND = "auto"
+    _hig_calls2 = {"author": 0, "generate": 0}
+    f._detect_backend = lambda: None
+    f.author_image_prompt = lambda user_request, panel=None: (
+        _hig_calls2.__setitem__("author", _hig_calls2["author"] + 1) or ("p", "n"))
+    f.generate_image = lambda prompt, negative: (
+        _hig_calls2.__setitem__("generate", _hig_calls2["generate"] + 1) or "out.png")
+
+    _hig_r2 = f.handle_image_generation("猫の絵を描いて")
+    check("handle_image_generation(2): backend未検出で__ERROR__を返す",
+          isinstance(_hig_r2, str) and _hig_r2.startswith("__ERROR__"))
+    check("handle_image_generation(2): A1111_URLの案内文を含む", f.A1111_URL in _hig_r2)
+    check("handle_image_generation(2): COMFYUI_URLの案内文を含む", f.COMFYUI_URL in _hig_r2)
+    check("handle_image_generation(2): generate_imageは呼ばれない", _hig_calls2["generate"] == 0)
+    # backend検出失敗の時点でauthor_image_promptに到達する前にreturnするはず
+    check("handle_image_generation(2): author_image_promptも呼ばれない", _hig_calls2["author"] == 0)
+
+    # --- (3) prompt=None -> author_image_prompt(user_request, panel=panel)が呼ばれ、
+    #     その戻り値(prompt, negative)がgenerate_imageへ渡る ---
+    f.IMAGE_BACKEND = "auto"
+    f._detect_backend = lambda: "a1111"
+    _hig_author_seen = {}
+    _hig_generate_seen = {}
+    _hig_panel_sentinel = object()
+
+    def _hig_author3(user_request, panel=None):
+        _hig_author_seen["user_request"] = user_request
+        _hig_author_seen["panel"] = panel
+        return ("起草されたプロンプト", "起草されたネガティブ")
+
+    def _hig_generate3(prompt, negative):
+        _hig_generate_seen["prompt"] = prompt
+        _hig_generate_seen["negative"] = negative
+        return "saved/path.png"
+
+    f.author_image_prompt = _hig_author3
+    f.generate_image = _hig_generate3
+
+    _hig_r3 = f.handle_image_generation("犬の絵を描いて", panel=_hig_panel_sentinel, prompt=None)
+    check("handle_image_generation(3): prompt=Noneでauthor_image_promptが呼ばれる",
+          _hig_author_seen.get("user_request") == "犬の絵を描いて")
+    check("handle_image_generation(3): author_image_promptにpanelがそのまま渡る",
+          _hig_author_seen.get("panel") is _hig_panel_sentinel)
+    check("handle_image_generation(3): author_image_promptの戻り値のpromptがgenerate_imageへ渡る",
+          _hig_generate_seen.get("prompt") == "起草されたプロンプト")
+    check("handle_image_generation(3): author_image_promptの戻り値のnegativeがgenerate_imageへ渡る",
+          _hig_generate_seen.get("negative") == "起草されたネガティブ")
+    check("handle_image_generation(3): 成功時に保存先パスを含む結果を返す",
+          isinstance(_hig_r3, str) and "saved/path.png" in _hig_r3)
+
+    # --- (4) promptを明示指定 -> author_image_promptは一切呼ばれない ---
+    f.IMAGE_BACKEND = "auto"
+    f._detect_backend = lambda: "a1111"
+    _hig_calls4 = {"author": 0}
+    f.author_image_prompt = lambda user_request, panel=None: (
+        _hig_calls4.__setitem__("author", _hig_calls4["author"] + 1) or ("should-not-be-used", ""))
+    _hig_generate_seen4 = {}
+
+    def _hig_generate4(prompt, negative):
+        _hig_generate_seen4["prompt"] = prompt
+        _hig_generate_seen4["negative"] = negative
+        return "explicit.png"
+
+    f.generate_image = _hig_generate4
+
+    _hig_r4 = f.handle_image_generation("猫の絵を描いて", prompt="明示プロンプト", negative="明示ネガティブ")
+    check("handle_image_generation(4): prompt明示指定時はauthor_image_promptが呼ばれない",
+          _hig_calls4["author"] == 0)
+    check("handle_image_generation(4): 明示指定したpromptがそのままgenerate_imageへ渡る",
+          _hig_generate_seen4.get("prompt") == "明示プロンプト")
+    check("handle_image_generation(4): 明示指定したnegativeがそのままgenerate_imageへ渡る",
+          _hig_generate_seen4.get("negative") == "明示ネガティブ")
+
+    # --- (5) generate_imageがfalsy(None/'')を返す -> __ERROR__を返す(例外を送出しない) ---
+    f.IMAGE_BACKEND = "auto"
+    f._detect_backend = lambda: "a1111"
+    f.author_image_prompt = lambda user_request, panel=None: ("p", "")
+    for _hig_falsy in (None, ""):
+        f.generate_image = lambda prompt, negative, _v=_hig_falsy: _v
+        _hig_r5, _hig_r5_exc = None, None
+        try:
+            _hig_r5 = f.handle_image_generation("何か描いて", prompt="p")
+        except Exception as _exc:
+            _hig_r5_exc = _exc
+        check(f"handle_image_generation(5): generate_imageが{_hig_falsy!r}を返しても例外を送出しない",
+              _hig_r5_exc is None)
+        check(f"handle_image_generation(5): generate_imageが{_hig_falsy!r}を返すと__ERROR__を返す",
+              isinstance(_hig_r5, str) and _hig_r5.startswith("__ERROR__"))
+
+    # --- (6) 成功時のメッセージ構築: negativeがtruthyなら'- negative:'行を含み、
+    #     falsy(空文字/None)なら含まない ---
+    f.IMAGE_BACKEND = "auto"
+    f._detect_backend = lambda: "a1111"
+    f.author_image_prompt = lambda user_request, panel=None: ("使われないはず", "使われないはず")
+    f.generate_image = lambda prompt, negative: "out/dir/result.png"
+
+    _hig_r6a = f.handle_image_generation("風景画を描いて", prompt="山と湖", negative="低品質")
+    check("handle_image_generation(6a): 成功メッセージに保存先パスを含む", "out/dir/result.png" in _hig_r6a)
+    check("handle_image_generation(6a): 成功メッセージにpromptを含む", "山と湖" in _hig_r6a)
+    check("handle_image_generation(6a): negativeがtruthyなら'- negative:'行を含む",
+          "- negative: 低品質" in _hig_r6a)
+
+    for _hig_empty_neg in ("", None):
+        _hig_r6b = f.handle_image_generation("風景画を描いて", prompt="山と湖", negative=_hig_empty_neg)
+        check(f"handle_image_generation(6b): negative={_hig_empty_neg!r}では'- negative:'行を含まない",
+              "- negative:" not in _hig_r6b)
+        check(f"handle_image_generation(6b): negative={_hig_empty_neg!r}でも保存先パスは含む",
+              "out/dir/result.png" in _hig_r6b)
+finally:
+    urllib.request.urlopen = _orig_hig_urlopen
+    f.subprocess.run = _orig_hig_subprocess_run
+    f.IMAGE_BACKEND = _orig_hig_image_backend
+    f._detect_backend = _orig_hig_detect_backend
+    f.author_image_prompt = _orig_hig_author_image_prompt
+    f.generate_image = _orig_hig_generate_image
+
+check("handle_image_generation: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_hig_urlopen)
+check("handle_image_generation: テスト後にf.subprocess.runが元の状態へ復元されている",
+      f.subprocess.run == _orig_hig_subprocess_run)
+check("handle_image_generation: テスト後にIMAGE_BACKENDが元の状態へ復元されている",
+      f.IMAGE_BACKEND == _orig_hig_image_backend)
+check("handle_image_generation: テスト後に_detect_backendが元の状態へ復元されている",
+      f._detect_backend == _orig_hig_detect_backend)
+check("handle_image_generation: テスト後にauthor_image_promptが元の状態へ復元されている",
+      f.author_image_prompt == _orig_hig_author_image_prompt)
+check("handle_image_generation: テスト後にgenerate_imageが元の状態へ復元されている",
+      f.generate_image == _orig_hig_generate_image)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
