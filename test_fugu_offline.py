@@ -1730,6 +1730,119 @@ check("arb-mcqtie: votesが truthful('A'/'C'が実票数でキー登録、水増
       and _res_mcqtie["votes"]["A"] == _res_mcqtie["votes"]["C"] > 0
       and sum(_res_mcqtie["votes"].values()) == _valid_votes_mcqtie)
 
+# ---------- 2026-07-24: mcq拮抗+裁定+票再集計(iteration17)の複合経路カバレッジ ----------
+# 上の arb-mcqtie は「裁定役が拮抗クラスの一つをそのまま採用」する経路のみを見ており、
+# iteration 17（math向け）が固めた「裁定役の答えを既存タイクラスへ answers_equivalent で
+# 同値照合してから votes へ合成する」ロジックが mcq の選択肢文字（大文字/小文字/全角）
+# 表記ゆれと組み合わさったときに二重計上や欠落を起こさないかは未検証だった。
+# extract_final_answer(text, 'mcq') は boxed 内の全角/小文字文字も正規化してASCII大文字
+# 1文字にしてから返す（iter 13の_FW_TRANS + .upper()）ため、裁定役が全角小文字'ａ'を
+# \boxed{}に入れても最終的な top は既存タイクラス'A'と文字列として完全一致するはずだが、
+# 「一致はするが二重キーにならない」契約を solve_verifiable レベルで直接ロックする
+# （_arbitrate単体テストでは votes 合成後の姿までは見えないため）。
+_orig_installed_mcqmerge = f.installed_models
+_orig_arbiter_model_mcqmerge = f.ARBITER_MODEL
+_orig_reasoning_mcqmerge = f.REASONING_MODELS
+_orig_props_mcqmerge = f.PROPOSERS
+_orig_cheap_mcqmerge = f.SC_CHEAP_VOTES
+_orig_pot_mcqmerge = f.SC_POT
+_arb_mcqmerge_calls = []
+
+
+def _fake_ask_mcq_merge(model, messages, temperature, think=None, fmt=None,
+                         label=None, num_predict=None, num_ctx=None):
+    _arb_mcqmerge_calls.append((label, model))
+    if label == "arbiter":
+        # 全角小文字'ａ'(U+FF41) → normalize_answer で 'a' → .upper() で 'A' に正規化される。
+        # 既存のタイクラス'A'と文字列として完全一致するかどうかを検証する。
+        return "ARBITER_REASONING_MCQMERGE: candidate C misreads it; correct is \\boxed{ａ}"
+    idx = len(_arb_mcqmerge_calls) - 1
+    ans = "A" if idx % 2 == 0 else "C"
+    return f"sc reasoning candidate {ans}\n\\boxed{{{ans}}}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_m1m2
+    f.ask = _fake_ask_mcq_merge
+    _res_mcqmerge = f.solve_verifiable("test mcq question", "mcq")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_mcqmerge
+    f.REASONING_MODELS = _orig_reasoning_mcqmerge
+    f.SC_CHEAP_VOTES = _orig_cheap_mcqmerge
+    f.SC_POT = _orig_pot_mcqmerge
+    f.ARBITER_MODEL = _orig_arbiter_model_mcqmerge
+    f.installed_models = _orig_installed_mcqmerge
+
+_valid_votes_mcqmerge = sum(1 for lab, _m in _arb_mcqmerge_calls if lab != "arbiter")
+check("arb-mcqmerge: 裁定役の全角小文字'ａ'が正規化されタイクラス'A'に解決される",
+      _res_mcqmerge is not None and _res_mcqmerge["answer"] == "A")
+check("arb-mcqmerge: votesに'a'/'ａ'等の重複キーが作られない(正規化キー'A'のみ)",
+      _res_mcqmerge is not None
+      and set(_res_mcqmerge["votes"].keys()) == {"A", "C"})
+check("arb-mcqmerge: votesが truthful('A'/'C'が実票数でキー登録、水増しなし)",
+      _res_mcqmerge is not None and _res_mcqmerge["votes"].get("A") is not None
+      and _res_mcqmerge["votes"].get("C") is not None
+      and _res_mcqmerge["votes"]["A"] == _res_mcqmerge["votes"]["C"] > 0
+      and sum(_res_mcqmerge["votes"].values()) == _valid_votes_mcqmerge)
+
+# ---------- 2026-07-24: mcq拮抗+裁定役が既存タイクラスに無い新規文字を採用するケース ----------
+# iteration 22(math向け)が固めた「裁定役の答えが既存タイクラスと無関係な第三の答えなら
+# 0票の新規クラスとしてvotesに追加する（旧トップの票数を誤流用しない）」契約を、mcqの
+# 選択肢文字でも直接ロックする。タイは'A'/'C'（2択）だが裁定役は両方とも誤りとして
+# 第三の選択肢'E'を採用する。
+_orig_installed_mcqnew = f.installed_models
+_orig_arbiter_model_mcqnew = f.ARBITER_MODEL
+_orig_reasoning_mcqnew = f.REASONING_MODELS
+_orig_props_mcqnew = f.PROPOSERS
+_orig_cheap_mcqnew = f.SC_CHEAP_VOTES
+_orig_pot_mcqnew = f.SC_POT
+_arb_mcqnew_calls = []
+
+
+def _fake_ask_mcq_new(model, messages, temperature, think=None, fmt=None,
+                       label=None, num_predict=None, num_ctx=None):
+    _arb_mcqnew_calls.append((label, model))
+    if label == "arbiter":
+        return ("ARBITER_REASONING_MCQNEW: both candidates A and C misread the question; "
+                 "the correct choice is \\boxed{E}")
+    idx = len(_arb_mcqnew_calls) - 1
+    ans = "A" if idx % 2 == 0 else "C"
+    return f"sc reasoning candidate {ans}\n\\boxed{{{ans}}}"
+
+
+try:
+    f.PROPOSERS = ["m1", "m2"]
+    f.REASONING_MODELS = ["m1", "m2"]
+    f.SC_CHEAP_VOTES = 0
+    f.SC_POT = False
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_m1m2
+    f.ask = _fake_ask_mcq_new
+    _res_mcqnew = f.solve_verifiable("test mcq question", "mcq")
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_mcqnew
+    f.REASONING_MODELS = _orig_reasoning_mcqnew
+    f.SC_CHEAP_VOTES = _orig_cheap_mcqnew
+    f.SC_POT = _orig_pot_mcqnew
+    f.ARBITER_MODEL = _orig_arbiter_model_mcqnew
+    f.installed_models = _orig_installed_mcqnew
+
+check("arb-mcqnew: 裁定役が採用した新規文字'E'がそのままanswerになる",
+      _res_mcqnew is not None and _res_mcqnew["answer"] == "E")
+check("arb-mcqnew: 'E'は既存タイクラスに無い第三候補として0票クラスで追加される(旧トップ票数の誤流用なし)",
+      _res_mcqnew is not None and _res_mcqnew["votes"].get("E") == 0)
+check("arb-mcqnew: 'A'/'C'の実票数は裁定後も書き換わらず据え置かれる(truthful)",
+      _res_mcqnew is not None and _res_mcqnew["votes"].get("A") is not None
+      and _res_mcqnew["votes"].get("C") is not None
+      and _res_mcqnew["votes"]["A"] == _res_mcqnew["votes"]["C"] > 0)
+
 # ==================================================
 # ---------- solve_verifiable: SC_POT(PoT票混入)統合テスト (2026-07-23) ----------
 # ==================================================
