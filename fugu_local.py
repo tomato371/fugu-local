@@ -2201,6 +2201,24 @@ def build_proposer_desc():
 def _resolve_proposer(name):
     """ペルソナ名 or モデル名を実モデル名へ解決する（未導入・未知なら None）。
     'Proposer A' / 'proposer a' / 'A' / 実モデル名 の緩い表記を許容。"""
+    # 2026-07-25: CONDUCTOR_SCHEMA は selected_proposers の要素を
+    # items:{type:string} で拘束しているが、本ファイル各所のコメントが
+    # 明記する通りこの強制は完全ではない（"スキーマ強制でも稀に JSON が
+    # 崩れる"）。list/dict のような非文字列・非ハッシュ可能な要素が
+    # 紛れ込むと、直後の `name in PERSONA_MODELS`（dict メンバーシップ
+    # テスト）が isinstance/str() 変換を経る前に TypeError: unhashable
+    # type を送出し、これが唯一の呼び出し元 validate_plan を経て
+    # conduct -> ask_fugu/fugu_answer まで無捕捉で伝播し、ターン全体を
+    # クラッシュさせて計算済みの回答を失っていた。iter 103
+    # (_ddg_instant の非list RelatedTopics)、iter 111
+    # (plan_pptx_images の非list images)、iter 112
+    # (research_search の非list queries)、iter 113 (_read_ipynb の
+    # 非dict/非list cells) と同じ「壊れたスキーマ制約付きプランは例外を
+    # 出さず既定値へフォールバックさせる」作法に倣い、非文字列要素は
+    # ここで即座に None へ倒す（精度優先: フォールバックの方がターン
+    # 喪失よりまし）。
+    if not isinstance(name, str):
+        return None
     if name in PERSONA_MODELS:
         m = PERSONA_MODELS[name]
         return m if m in PROPOSERS else None

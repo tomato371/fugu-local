@@ -130,6 +130,63 @@ check("persona: validate は未導入ペルソナを除外",
                        "selected_proposers": ["Proposer C", "Proposer B"]})["selected_proposers"]
       == ["qwen3-coder:30b"])
 
+# ---------- _resolve_proposer: 非文字列/unhashable要素での例外耐性 (2026-07-25) ----------
+# CONDUCTOR_SCHEMA の items:{type:string} 強制は完全ではない（本ファイル各所が既知の
+# 通り「スキーマ強制でも稀に JSON が崩れる」）。selected_proposers に list/dict の
+# ような非文字列・非ハッシュ可能な要素が紛れ込むと、旧実装は _resolve_proposer 冒頭の
+# `name in PERSONA_MODELS`（dict メンバーシップテスト）で TypeError: unhashable type
+# を送出し、唯一の呼び出し元 validate_plan、さらに conduct -> ask_fugu/fugu_answer まで
+# 無捕捉で伝播してターン全体をクラッシュさせ、計算済みの回答を失っていた。
+# iter 103 (_ddg_instant の非list RelatedTopics)、iter 111 (plan_pptx_images の非list
+# images)、iter 112 (research_search の非list queries)、iter 113 (_read_ipynb の
+# 非dict/非list cells) と同じ「壊れたスキーマ制約付きプランは例外を出さず既定値へ
+# フォールバックさせる」作法での回帰防止。
+_op_persona2 = f.PROPOSERS
+try:
+    f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "qwen3.6:35b"]
+
+    # --- 非文字列/unhashable要素は例外を出さず None (修正前は [] / {} で TypeError) ---
+    check("resolve: 空listはNone(旧: unhashable TypeError)", f._resolve_proposer([]) is None)
+    check("resolve: 空dictはNone(旧: unhashable TypeError)", f._resolve_proposer({}) is None)
+    check("resolve: Noneは例外なくNone", f._resolve_proposer(None) is None)
+    check("resolve: intはNone", f._resolve_proposer(5) is None)
+    check("resolve: 非空listもNone(unhashable)", f._resolve_proposer(["nested"]) is None)
+    check("resolve: 非空dictもNone(unhashable)", f._resolve_proposer({"a": 1}) is None)
+
+    # --- 有効な文字列入力の回帰: 修正前と完全に同一の解決結果であること ---
+    check("resolve回帰: 'Proposer A'(完全表記)",
+          f._resolve_proposer("Proposer A") == "gpt-oss:20b")
+    check("resolve回帰: 'A'(短縮・大文字)", f._resolve_proposer("A") == "gpt-oss:20b")
+    check("resolve回帰: 'proposer a'(小文字・完全表記)",
+          f._resolve_proposer("proposer a") == "gpt-oss:20b")
+    check("resolve回帰: 実モデル名を直接指定",
+          f._resolve_proposer("qwen3.6:35b") == "qwen3.6:35b")
+    check("resolve回帰: 未知の文字列はNone", f._resolve_proposer("Proposer Z") is None)
+
+    # --- validate_plan: 不正要素と有効な文字列が混在しても例外を出さず有効分のみ解決 ---
+    p_mixed = f.validate_plan({"mode": "moa",
+                               "selected_proposers": [[], {}, "Proposer A"]})
+    check("validate: 不正要素混在でも例外なし・有効な1件のみ解決",
+          p_mixed["selected_proposers"] == ["gpt-oss:20b"])
+
+    # --- validate_plan: 全要素が不正なら例外を出さず既定値へフォールバック ---
+    p_all_bad_moa = f.validate_plan({"mode": "moa",
+                                     "selected_proposers": [[], {}, 123]})
+    check("validate: 全要素不正(moa)でも例外なし・PROPOSERS[:3]へフォールバック",
+          p_all_bad_moa["selected_proposers"] == f.PROPOSERS[:3])
+    p_all_bad_single = f.validate_plan({"mode": "single",
+                                        "selected_proposers": [[], {}, 123]})
+    check("validate: 全要素不正(single)でも例外なし・PROPOSERS[:1]へフォールバック",
+          p_all_bad_single["selected_proposers"] == f.PROPOSERS[:1])
+    p_all_bad_image = f.validate_plan({"mode": "moa", "image_only": True,
+                                       "use_image_generation": True,
+                                       "selected_proposers": [[], {}, 123]})
+    check("validate: 全要素不正(image_only)でも例外なし・空panelへ"
+          "(呼び出し側の 'or PROPOSERS[:...]' が下流で担保)",
+          p_all_bad_image["selected_proposers"] == [])
+finally:
+    f.PROPOSERS = _op_persona2
+
 # ---------- 精度ガードレール（code/proof を single→moa へ格上げ） ----------
 f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "phi4"]
 
