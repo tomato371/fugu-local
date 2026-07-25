@@ -775,13 +775,31 @@ def _read_pdf(path: Path) -> str:
     ImportError に加えて except Exception（bare except にはしない。
     KeyboardInterrupt/SystemExit は握りつぶさず伝播させる）でも次候補へ
     フォールスルーさせ、ライブラリが import 自体には成功したのに失敗した場合は
-    cp932セーフな警告（ファイル名+例外型のみ、絵文字等は使わない）で可視化する。"""
+    cp932セーフな警告（ファイル名+例外型のみ、絵文字等は使わない）で可視化する。
+
+    2026-07-25: 上記iter83の修正は自身のコメントが明示する通り「実行時例外」の
+    場合にしか適用されず、pdfplumberが例外を出さずに空文字列/空白のみを返す
+    ケース（フォントエンコーディング等に起因する既知の仕様上の癖で、実際には
+    読める有効なPDFでも起こりうる）は未対応のまま残っていた。iter41-44の
+    graceful degradation方針とiter83の例外フォールスルーの系譜を継ぎ、ここでは
+    「そのライブラリでの抽出処理自体は完走したが結果が空だった」場合も次候補を
+    試すようにする（＝iter83が閉じ損ねた「例外ではなく結果が空」という穴を塞ぐ）。
+    どの層も import すらできなかった場合（従来のpip installが必要なケース）と、
+    1層以上がimportに成功し完走したが全て空だった場合（スキャンPDF等、本当に
+    中身が無いケース）とを区別し、前者のみ従来のpip install通知を返す。"""
+    # 少なくとも1層がimportに成功し抽出処理自体は完走したか（例外で終わった層は
+    # 数えない）。全層がこれを満たさなければ「未インストール」、満たすが全層空
+    # だった場合は「読める中身が無いPDF」として扱いを区別する(2026-07-25)。
+    _pdf_any_tier_completed = False
     # pdfplumber (最高品質)
     try:
         import pdfplumber
         with pdfplumber.open(path) as pdf:
             pages = [p.extract_text() or "" for p in pdf.pages]
-        return "\n\n".join(pages)
+        text = "\n\n".join(pages)
+        _pdf_any_tier_completed = True
+        if text.strip():
+            return text
     except ImportError:
         pass
     except Exception as exc:
@@ -791,7 +809,10 @@ def _read_pdf(path: Path) -> str:
         import pypdf
         with open(path, "rb") as f:
             r = pypdf.PdfReader(f)
-            return "\n\n".join(p.extract_text() or "" for p in r.pages)
+            text = "\n\n".join(p.extract_text() or "" for p in r.pages)
+        _pdf_any_tier_completed = True
+        if text.strip():
+            return text
     except ImportError:
         pass
     except Exception as exc:
@@ -801,11 +822,18 @@ def _read_pdf(path: Path) -> str:
         import PyPDF2
         with open(path, "rb") as f:
             r = PyPDF2.PdfReader(f)
-            return "\n\n".join(p.extract_text() or "" for p in r.pages)
+            text = "\n\n".join(p.extract_text() or "" for p in r.pages)
+        _pdf_any_tier_completed = True
+        if text.strip():
+            return text
     except ImportError:
         pass
     except Exception as exc:
         print(f"[_read_pdf] PyPDF2抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
+    # 2026-07-25: 1層以上が完走していれば(全て空でも)「未インストール」ではないので
+    # pip install通知は返さず、空文字列(スキャンPDF等、本当に中身が無いケース)を返す。
+    if _pdf_any_tier_completed:
+        return ""
     return f"[PDF: {path.name} — テキスト抽出には pdfplumber or pypdf が必要: pip install pdfplumber]"
 
 

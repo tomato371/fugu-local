@@ -6674,6 +6674,149 @@ check("_read_pdf: テスト後にsys.modulesの'pypdf'エントリが元通り�
 check("_read_pdf: テスト後にsys.modulesの'PyPDF2'エントリが元通り解決可能(復元確認)",
       ("PyPDF2" not in sys.modules) or (sys.modules["PyPDF2"] is not None))
 
+# ---------- _read_pdf: 上位ライブラリが例外なしで空文字列を返した場合も下位へ
+# フォールスルー (2026-07-25) ----------
+# 直上のiter83は「実行時例外」に対してのみpypdf/PyPDF2へのフォールスルーを追加したが、
+# iter83自身のコメントが明示する通りその修正は例外ケースに限定されており、
+# pdfplumberが例外を送出せず単に空文字列/空白のみを返すケース（フォントエンコー
+# ディング等に起因する既知の仕様上の癖で、実際には読める有効なPDFでも起こりうる）は
+# 未対応のまま残っていた。fugu_local.py:783-784(pdfplumber.open()が成功し、結合した
+# ページテキストが空)で即座に""を返して以降の層を一切試さないため、pypdf/PyPDF2なら
+# 救えたはずのテキストがPDF丸ごとRAG/--fileコンテキストから静かに失われる
+# （精度優先の方針に反する、iter83が閉じ損ねた「例外ではなく結果が空」という穴）。
+# ここではiter41-44のgraceful degradation方針とiter83の例外フォールスルーの系譜を
+# 継ぎ、「そのライブラリで抽出処理自体は完走したが結果が空だった」場合も次候補を
+# 試す挙動を検証する。iter83と同じくpdfplumber/pypdf/PyPDF2という実ライブラリを
+# 一切必要とせず、sys.modulesにフェイクモジュールを注入する(_rpdf_swap_modules/
+# _rpdf_make_reader_moduleをそのまま再利用)。変更したsys.modulesエントリは
+# すべてtry/finallyで確実に復元する。
+
+
+def _rpdf_make_pdfplumber_module(page_texts):
+    """pdfplumber.open(path) と同一インタフェース(with文 + .pages[i].extract_text())の
+    フェイクモジュールを作る(実PDFパースは一切行わない、常に成功する版)。
+    _rpdf_make_reader_module(pypdf/PyPDF2用)のpdfplumber版。"""
+    mod = types.ModuleType("pdfplumber")
+
+    class _FakePlumberPage:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _FakePlumberPdf:
+        def __init__(self, texts):
+            self.pages = [_FakePlumberPage(t) for t in texts]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+    def _fake_open(path):
+        return _FakePlumberPdf(page_texts)
+
+    mod.open = _fake_open
+    return mod
+
+
+def _rpdf_make_never_called_module(mod_name):
+    """importはできるが、PdfReader()が呼び出されたら即AssertionErrorになる
+    フェイクモジュール。「上位層が成功したら下位層には一切触れない」ことを
+    検証するためのカナリア(_read_pdfはexcept Exceptionで例外を握りつぶすため、
+    このAssertionError自体は外へは伝播しないが、握りつぶされた結果として次候補へ
+    フォールスルーしてしまい、期待した上位層のテキストとは異なる結果が返るため
+    check()で検出できる)。"""
+    mod = types.ModuleType(mod_name)
+
+    class _NeverCalledPdfReader:
+        def __init__(self, fileobj):
+            raise AssertionError(
+                f"{mod_name}.PdfReader が呼び出された(上位層成功時は下位層に触れないはず)")
+
+    mod.PdfReader = _NeverCalledPdfReader
+    return mod
+
+
+with _rpdf_tempfile.TemporaryDirectory() as _rpdf2_dir:
+    _rpdf2_path = _rpdf_pathlib.Path(_rpdf2_dir) / "doc.pdf"
+    _rpdf2_path.write_bytes(b"%PDF-1.4 dummy content, not a real PDF")
+
+    # (1) pdfplumberはimport可能・例外も出さないが抽出結果が空白のみ、
+    #     pypdfはimport可能かつ正常にテキストを返す
+    #     -> フォールスルーが働き、pypdfのテキストが失われずに返ってくること
+    #     (これが今回追加した「結果が空」経路のリカバリケース)。
+    _fake_pdfplumber_empty1 = _rpdf_make_pdfplumber_module(["", "   \n  "])
+    _fake_pypdf_recovers1 = _rpdf_make_reader_module("pypdf", ["pypdf rescued text"])
+    _rpdf2_result1 = _rpdf_swap_modules(
+        {"pdfplumber": _fake_pdfplumber_empty1, "pypdf": _fake_pypdf_recovers1},
+        lambda: f._read_pdf(_rpdf2_path),
+    )
+    check("_read_pdf: pdfplumberが例外なしで空文字列を返してもpypdfへフォールスルーしテキストを失わない",
+          _rpdf2_result1 == "pypdf rescued text")
+
+    # (2) pdfplumberは空、pypdfもimport可能だが空、PyPDF2はimport可能かつ正常
+    #     -> 3層をまたいだフォールスルーチェーンが機能すること。
+    _fake_pdfplumber_empty2 = _rpdf_make_pdfplumber_module([""])
+    _fake_pypdf_empty2 = _rpdf_make_reader_module("pypdf", [None, ""])
+    _fake_pypdf2_recovers2 = _rpdf_make_reader_module("PyPDF2", ["PyPDF2 rescued text"])
+    _rpdf2_result2 = _rpdf_swap_modules(
+        {"pdfplumber": _fake_pdfplumber_empty2, "pypdf": _fake_pypdf_empty2, "PyPDF2": _fake_pypdf2_recovers2},
+        lambda: f._read_pdf(_rpdf2_path),
+    )
+    check("_read_pdf: pdfplumber/pypdfが空でもPyPDF2へフォールスルーしテキストを失わない(3層チェーン)",
+          _rpdf2_result2 == "PyPDF2 rescued text")
+
+    # (3) 3層すべてimport可能だが全て空(スキャンPDF等、本当に中身が無いケース)
+    #     -> pip installの通知ではなく "" (空文字列)を返すこと。
+    _fake_pdfplumber_empty3 = _rpdf_make_pdfplumber_module(["", None])
+    _fake_pypdf_empty3 = _rpdf_make_reader_module("pypdf", [""])
+    _fake_pypdf2_empty3 = _rpdf_make_reader_module("PyPDF2", [None, "  "])
+    _rpdf2_result3 = _rpdf_swap_modules(
+        {"pdfplumber": _fake_pdfplumber_empty3, "pypdf": _fake_pypdf_empty3, "PyPDF2": _fake_pypdf2_empty3},
+        lambda: f._read_pdf(_rpdf2_path),
+    )
+    check("_read_pdf: 3層すべてimport可能だが全て空文字列/空白のみなら\"\"(空文字列)を返す(通知文字列ではない)",
+          _rpdf2_result3 == "")
+    check("_is_lib_missing_notice: 3層すべて空の\"\"はFalse(スキャン済PDF等を未インストール扱いしない)",
+          not f._is_lib_missing_notice(_rpdf2_result3))
+
+    # (4) 3層ともimport不可(全てImportError) -> 従来通りpip install通知を返すこと
+    #     (「importできない」と「importできたが空」を混同していないことの回帰確認)。
+    _rpdf2_result4 = _rpdf_swap_modules(
+        {"pdfplumber": None, "pypdf": None, "PyPDF2": None},
+        lambda: f._read_pdf(_rpdf2_path),
+    )
+    _rpdf2_expected_notice = (
+        f"[PDF: {_rpdf2_path.name} — テキスト抽出には pdfplumber or pypdf が必要: pip install pdfplumber]"
+    )
+    check("_read_pdf: 3層ともImportErrorならpip install通知をbyte-for-byteで返す(空との混同なし)",
+          _rpdf2_result4 == _rpdf2_expected_notice)
+    check("_is_lib_missing_notice: 3層ともImportError時の通知文字列はTrue",
+          f._is_lib_missing_notice(_rpdf2_result4))
+
+    # (5) 回帰: pdfplumberが非空テキストを返した場合、pypdf/PyPDF2には一切触れず
+    #     (importされたら即AssertionErrorになるフェイクで検証)、即座に
+    #     pdfplumberのテキストをそのまま(未加工で)返すこと(共通経路は不変)。
+    _fake_pdfplumber_ok5 = _rpdf_make_pdfplumber_module(["  non-empty pdfplumber text  "])
+    _fake_pypdf_guard5 = _rpdf_make_never_called_module("pypdf")
+    _fake_pypdf2_guard5 = _rpdf_make_never_called_module("PyPDF2")
+    _rpdf2_result5 = _rpdf_swap_modules(
+        {"pdfplumber": _fake_pdfplumber_ok5, "pypdf": _fake_pypdf_guard5, "PyPDF2": _fake_pypdf2_guard5},
+        lambda: f._read_pdf(_rpdf2_path),
+    )
+    check("_read_pdf(回帰): pdfplumberが非空テキストを返せば即座にそれを未加工で返す(strip()されない、下位層は未使用)",
+          _rpdf2_result5 == "  non-empty pdfplumber text  ")
+
+check("_read_pdf: 空結果フォールスルーのテスト後にsys.modulesの'pdfplumber'エントリが元通り(復元確認)",
+      ("pdfplumber" not in sys.modules) or (sys.modules["pdfplumber"] is not None))
+check("_read_pdf: 空結果フォールスルーのテスト後にsys.modulesの'pypdf'エントリが元通り(復元確認)",
+      ("pypdf" not in sys.modules) or (sys.modules["pypdf"] is not None))
+check("_read_pdf: 空結果フォールスルーのテスト後にsys.modulesの'PyPDF2'エントリが元通り(復元確認)",
+      ("PyPDF2" not in sys.modules) or (sys.modules["PyPDF2"] is not None))
+
 # ---------- _read_excel: ImportError以外の実行時例外でもpandas/xlrdへフォールスルー (2026-07-24 / iter84) ----------
 # _read_excel は openpyxl -> pandas/xlrd の順で試行するが、各ブロックは従来
 # except ImportError のみで、下位ライブラリへのフォールスルーは「上位ライブラリが
