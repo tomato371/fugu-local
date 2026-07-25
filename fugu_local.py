@@ -1511,10 +1511,37 @@ def ensure_server():
 
 
 def installed_models():
+    # 2026-07-25 (iter152): 素のリスト内包表記 [m["name"] for m in ...] は、
+    # /api/tags の応答中の1件でも壊れている（要素がdictでない、"name"キーが
+    # 無い、"name"が非文字列、"name"が空文字列）と内包表記の途中でその場で
+    # 例外を出し、外側の except Exception: return [] が正常な要素も含めて
+    # 導入済みモデル一覧を丸ごと空にしてしまっていた。これはiter103/111/
+    # 112/113/139と同じ「1件の壊れた要素が全件を道連れにする」失敗形。
+    # installed_models()はpull()で自己修復しない2箇所の判定に直結しており、
+    # 空リストへの縮退は静かに精度を落とす: _arbitrateのis_installed(
+    # ARBITER_MODEL, installed_models())は最上位知性モデルgpt-oss:120bを
+    # 裁定チェーンへ加えるか否かを決めており、空リストだと裁定が弱い
+    # フォールバックモデルへ静かに格下げされる（gotcha #7: SC投票の
+    # tie-break劣化）。solve_verifiableのis_installed(SC_CHEAP_MODEL,
+    # installed_models())も同様に安価な追加投票の有無を決めており、空
+    # リストだと投票パネルが静かに薄くなる。ここでは壊れた要素だけを
+    # 読み飛ばし、正常な要素は元の順序で回収する。
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as r:
             data = json.loads(r.read().decode())
-        return [m["name"] for m in data.get("models", [])]
+        if not isinstance(data, dict):
+            return []
+        models = data.get("models", [])
+        if not isinstance(models, list):
+            return []
+        names = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            name = m.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+        return names
     except Exception:
         return []
 

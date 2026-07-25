@@ -9608,6 +9608,120 @@ check("resolve_models: テスト後にsubprocess.runが元の状態へ復元さ�
 check("resolve_models: テスト後にurllib.request.urlopenが元の状態へ復元されている",
       urllib.request.urlopen == _orig_rm_urlopen)
 
+# ---------- installed_models(): /api/tags 応答の直接テスト (2026-07-25, iter152) ----------
+# 旧実装は [m["name"] for m in data.get("models", [])] という素のリスト内包表記で、
+# 応答中の1件でも壊れていると(dict以外の要素・"name"キー欠落・"name"が非文字列・
+# "name"が空文字列)その場で例外を出し、外側の except Exception: return [] が正常な
+# 要素も含めて導入済みモデル一覧を丸ごと空にしていた。これはiter103/111/112/113/139と
+# 同じ「1件の壊れた要素が全件を道連れにする」失敗形。installed_models()はpull()で
+# 自己修復しない2箇所の判定に直結しており、空リストへの縮退は静かに精度を落とす:
+# _arbitrate の is_installed(ARBITER_MODEL, installed_models()) は最上位知性モデル
+# gpt-oss:120b を裁定チェーンへ加えるか否かを決めており、空リストだと裁定が弱い
+# フォールバックモデルへ静かに格下げされる(gotcha #7: SC投票のtie-break劣化)。
+# solve_verifiable の is_installed(SC_CHEAP_MODEL, installed_models()) も同様に
+# 安価な追加投票の有無を決めており、空リストだと投票パネルが静かに薄くなる。
+# installed_models() はこれまで resolve_models() のテスト(上のセクション、iter76)で
+# 常に丸ごとモックされるだけで、この関数自体を直接検証するテストが無かった。ここでは
+# urllib.request.urlopen のみをモックし、実ネットワーク/Ollama呼び出しは一切発生させない。
+
+
+class _ImFakeResponse:
+    """installed_models() 用の `with urlopen(...) as r:` 最小モック(bytesを返す)。"""
+
+    def __init__(self, body_bytes):
+        self._body = body_bytes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _im_urlopen_body(raw_text):
+    """rawテキスト(JSON文字列、または壊れた非JSON文字列)をそのままbodyとして
+    返すurlopen代役を作る。"""
+    body_bytes = raw_text.encode("utf-8")
+
+    def _fake(url, timeout=None):
+        return _ImFakeResponse(body_bytes)
+    return _fake
+
+
+def _im_urlopen_payload(payload):
+    """Pythonオブジェクトをjson.dumpsしてbodyとして返すurlopen代役を作る。"""
+    return _im_urlopen_body(json.dumps(payload))
+
+
+def _im_urlopen_raises(exc):
+    def _fake(url, timeout=None):
+        raise exc
+    return _fake
+
+
+_orig_urlopen_im = urllib.request.urlopen
+
+try:
+    # --- (1) 正常な要素の間に壊れた要素が混在 -> 壊れた要素だけ読み飛ばし、
+    #     正常な要素は元の順序で回収する(例外は伝播せず一部も失わない) ---
+    urllib.request.urlopen = _im_urlopen_payload({
+        "models": [
+            {"name": "good-model-1:1b"},
+            "not-a-dict-entry",
+            {"size": 123},
+            {"name": ["not", "a", "string"]},
+            {"name": ""},
+            {"name": "good-model-2:7b"},
+        ]
+    })
+    check("installed_models: 混在応答は壊れた要素だけ読み飛ばし正常分を順序維持で返す",
+          f.installed_models() == ["good-model-1:1b", "good-model-2:7b"])
+
+    # --- (2) "models" が非list -> [] (isinstance判定でリスト内包表記の例外を防ぐ) ---
+    for _bad_models_val, _label in [
+        ({"a": 1}, "dict"), ("oops", "str"), (123, "int"),
+        (True, "bool"), (None, "None"),
+    ]:
+        urllib.request.urlopen = _im_urlopen_payload({"models": _bad_models_val})
+        check(f"installed_models: models が非list({_label})なら例外を出さず[]",
+              f.installed_models() == [])
+
+    # --- (3) "models" キー自体が無い -> [] ---
+    urllib.request.urlopen = _im_urlopen_payload({"other_key": "x"})
+    check("installed_models: modelsキー自体が無いなら[]", f.installed_models() == [])
+
+    # --- (4) 応答トップレベルが非dict -> [] ---
+    for _bad_top, _label in [([1, 2, 3], "list"), ("plain string", "str"), (42, "number")]:
+        urllib.request.urlopen = _im_urlopen_payload(_bad_top)
+        check(f"installed_models: 応答トップレベルが非dict({_label})なら[]",
+              f.installed_models() == [])
+
+    # --- (5) 不正/非JSON本文 -> [] ---
+    urllib.request.urlopen = _im_urlopen_body("{not valid json!!")
+    check("installed_models: 不正な(非JSON)本文でも例外を出さず[]",
+          f.installed_models() == [])
+
+    # --- (6) urlopen自体が例外を投げる(ネットワーク断等) -> [] ---
+    urllib.request.urlopen = _im_urlopen_raises(RuntimeError("ネットワーク断(模擬)"))
+    check("installed_models: urlopenが例外を投げても[]", f.installed_models() == [])
+
+    # --- (7) 正常系のリグレッション: 壊れた要素が無いN件の応答は旧実装のリスト
+    #     内包表記と同じ名前・同じ順序を返す(byte-for-byte) ---
+    _im_happy_models = [{"name": "m1:1b"}, {"name": "m2:7b"}, {"name": "m3:30b"}]
+    urllib.request.urlopen = _im_urlopen_payload({"models": _im_happy_models})
+    _im_expected_happy = [m["name"] for m in _im_happy_models]  # 旧実装と同じ式
+    check("installed_models: 正常系はN件を旧実装と同一・同順序で返す(回帰)",
+          f.installed_models() == _im_expected_happy
+          and f.installed_models() == ["m1:1b", "m2:7b", "m3:30b"])
+finally:
+    urllib.request.urlopen = _orig_urlopen_im
+
+check("installed_models: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_urlopen_im)
+
 # ---------- _save_answer_to_file: --out の親ディレクトリが存在しない場合でも
 # 計算済み回答を失わない (2026-07-23修正) ----------
 # build_pptx は既に自前で out_path.parent.mkdir を呼んでいる(L3729、python-pptx
