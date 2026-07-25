@@ -1522,12 +1522,33 @@ def _get_rag_chunks(dirs: list) -> list:
 
 def _tokenize(text: str) -> set:
     """英字・数字・日本語を混在テキストから別々に抽出してトークンセットを返す。
-    例: 'PINNについて' → {'pinn', 'について'} (単純 \\w+ では 'pinnについて' 1トークンになる)。"""
+    例: 'PINNについて' → {'pinn', 'につ', 'つい', 'いて'}
+    (単純 \\w+ では 'pinnについて' 1トークンになる)。
+
+    2026-07-26: 非ASCII連続列は以前、丸ごと1トークンにしていた
+    （iter38で _tokenize('PINNについて') == {'pinn','について'} として
+    固定化されていた挙動）。しかしこれだと、クエリの部分フレーズが
+    チャンク側のより長い非ASCII連続列と「完全一致」しない限り
+    _score_chunk の集合オーバーラップが常に0になり、'機械学習の手法に
+    ついて' のような現実的な日本語クエリで rag_search が実質常に ''
+    を返す＝日本語RAG再現率がほぼゼロという精度上の問題があった
+    （本プロジェクトの主要言語である日本語で --file / RAG 経由の文書が
+    proposer に一切届かない）。形態素解析器（MeCab等）を追加せずに
+    対処する標準的な手法として、非ASCII連続列を隣接2文字の文字
+    バイグラムに分解する（Lucene/Elasticsearch の CJKBigramFilter と
+    同様の方式）。1文字だけの連続列はそのまま1文字トークンとする。
+    ASCII側の抽出ロジックは一切変更していないため、英語/ASCIIの
+    トークン化・rag_searchの挙動は完全に不変（CJKバイグラムはASCII
+    クエリトークンと一致し得ない）。"""
     lower = text.lower()
-    # ASCII: 英字・数字・アンダースコア
+    # ASCII: 英字・数字・アンダースコア（変更なし・byte-for-byte同一）
     tokens = set(re.findall(r'[a-z0-9_]+', lower))
-    # 非ASCII連続列（日本語・CJK など）
-    tokens |= set(re.findall(r'[^\x00-\x7f\s]+', text))
+    # 非ASCII連続列（日本語・CJK など）→ 隣接2文字ずつのバイグラムに分解
+    for run in re.findall(r'[^\x00-\x7f\s]+', text):
+        if len(run) == 1:
+            tokens.add(run)
+        else:
+            tokens.update(run[i:i + 2] for i in range(len(run) - 1))
     return tokens - {''}
 
 

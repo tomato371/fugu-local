@@ -7428,14 +7428,33 @@ check("_read_excel: テスト後にsys.modulesの'pandas'エントリが元通�
       ("pandas" not in sys.modules) or (sys.modules["pandas"] is not None))
 
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
-check("_tokenize: ASCII+CJK混在を別トークンに分割",
-      f._tokenize("PINNについて") == {"pinn", "について"})
+# 2026-07-26: 以前は非ASCII連続列を丸ごと1トークンにしていたため、iter38では
+# _tokenize('PINNについて') == {'pinn','について'} として「1トークンに固定化
+# される」挙動そのものをロックしていた。しかしこれは、クエリの部分フレーズが
+# チャンク側のより長い非ASCII連続列と完全一致しない限り _score_chunk の集合
+# オーバーラップが常に0になる、という日本語RAG再現率ほぼゼロのバグを固定化
+# していたに過ぎない。本プロジェクトの主要言語である日本語での RAG 再現率を
+# 精度優先（時間は気にしない）の方針で改善するため、非ASCII連続列を隣接2文字
+# の文字バイグラムへ分解するよう _tokenize を変更した（MeCab等の形態素解析器
+# を使わないCJK情報検索の標準的対処、Lucene/ElasticsearchのCJKBigramFilterと
+# 同様）。このassertionはその新挙動へ更新する（iter38の意図＝ASCIIとCJKを
+# 混同しない、は維持したまま、CJK側の粒度だけを1連続列→文字バイグラムへ）。
+check("_tokenize: ASCII+CJK混在を別トークンに分割し、CJK側は文字バイグラムに分解される(iter38改訂, 2026-07-26)",
+      f._tokenize("PINNについて") == {"pinn", "につ", "つい", "いて"})
+check("_tokenize: ASCII側の挙動は完全に不変(英語RAG回帰なし)",
+      f._tokenize("apple pie recipe") == {"apple", "pie", "recipe"})
+check("_tokenize: 日本語の部分フレーズがより長い連続列とバイグラムで重なる(再現率修正の核)",
+      bool(f._tokenize("機械学習") & f._tokenize("本稿では機械学習の手法について述べる")))
 check("_score_chunk: 空チャンクは0.0",
       f._score_chunk({"apple"}, "") == 0.0)
 check("_score_chunk: 重複トークンありは正のスコア",
       f._score_chunk({"apple"}, "apple pie recipe") > 0.0)
 check("_score_chunk: 重複トークンなしは0.0",
       f._score_chunk({"apple"}, "zebra mountain train") == 0.0)
+check("_score_chunk: 日本語の部分フレーズがチャンク中のより長い文へ埋め込まれていても正のスコア(修正前は0.0)",
+      f._score_chunk(f._tokenize("東京の人口"), "東京都の人口は約1400万人です") > 0.0)
+check("_score_chunk: 内容を共有しない無関係な日本語チャンクは引き続き0.0(精度サニティ)",
+      f._score_chunk(f._tokenize("東京の人口"), "桜が満開の京都で紅葉を楽しんだ") == 0.0)
 
 # ---------- rag_search: score>0のみ抽出（2026-07-22） ----------
 # 以前は top = scored[:top_k] のうち先頭(best)が0でなければ丸ごと返しており、
@@ -7508,6 +7527,28 @@ try:
     f._get_rag_chunks = lambda dirs: []
     check("rag_search: チャンクリストが空なら空文字",
           f.rag_search("apple", dirs=["dummy"]) == "")
+finally:
+    f._get_rag_chunks = _orig_get_rag_chunks
+
+# ---------- rag_search: 日本語クエリのEnd-to-Endバイグラム再現率検証（2026-07-26） ----------
+# 修正前は非ASCII連続列が丸ごと1トークンだったため、クエリのキーフレーズが
+# チャンク内のより長い連続文に埋め込まれているだけで一致しなくなり、rag_search は
+# 現実的な日本語クエリ（'機械学習の応用'のような部分フレーズ）に対してほぼ常に
+# ''（該当チャンクなし）を返していた。Ollama/ネットワーク一切なしで
+# _get_rag_chunks のみモックし、「クエリのキーフレーズがチャンク内の長い文に
+# 埋め込まれているケース」で実際に該当チャンクのSourceが返る（かつ内容を
+# 共有しない無関係チャンクは混入しない）ことを検証する。
+try:
+    _chunks_ja = [
+        ("dir/ml.txt", "本稿では機械学習の手法について詳しく説明する。"),
+        ("dir/weather.txt", "今日の天気は晴れ時々曇りでした。"),
+    ]
+    f._get_rag_chunks = lambda dirs: _chunks_ja
+    _res_ja = f.rag_search("機械学習の応用", dirs=["dummy"], top_k=2)
+    check("rag_search: 日本語クエリの部分フレーズがチャンク内の長い文に埋め込まれていてもSourceが返る(修正前は'')",
+          "[Source: ml.txt]" in _res_ja)
+    check("rag_search: 内容を共有しない無関係な日本語チャンク(天気の話題)は混入しない",
+          "天気" not in _res_ja and "曇り" not in _res_ja)
 finally:
     f._get_rag_chunks = _orig_get_rag_chunks
 
