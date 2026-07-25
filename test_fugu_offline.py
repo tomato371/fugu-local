@@ -11253,6 +11253,228 @@ check("handle_image_generation: テスト後にgenerate_imageが元の状態へ�
       f.generate_image == _orig_hig_generate_image)
 
 # ============================================================
+# _detect_backend / generate_image の直接テスト (iteration 176)
+# ============================================================
+# 2026-07-26: _detect_backend (fugu_local.py ~L2308) と generate_image
+# (~L2320) はこれまで直接呼び出すテストが無く、build_pptx/handle_image_generation
+# 経由のテストは常にこの2関数を丸ごとlambdaで差し替えていた(grep確認: f._detect_
+# backend/f.generate_imageへの参照は全てlambda代入かsave/restoreのみで、直接呼んで
+# 戻り値を検証するテストは無かった)。_detect_backendの分岐(明示指定'a1111'/
+# 'comfyui'はプローブなしでそのままpass-through、'auto'はA1111をComfyUIより先に
+# プローブしA1111優先で短絡、'off'/未知の値はNone)と、generate_imageのtry/except
+# Exception->print->return None(バックエンド呼び出し失敗時に例外を外へ伝播させない
+# 契約。高価なMoA/SC計算が完了した後でこの契約が壊れると、計算済みの回答ごと
+# ターンをクラッシュさせてしまう。iter41-47/68/80と同種の「計算済みの結果を失わ
+# ない」保証)を直接ロックする。_detect_backendのテストではf._backend_upのみを
+# モックし(実urlopenには一切触れない)、generate_imageのテストではf._detect_backend/
+# f.generate_image_a1111/f.generate_image_comfyuiをモックする。モック漏れを即座に
+# 可視化するため、urllib.request.urlopenとf.subprocess.runにも「呼ばれたら即
+# AssertionError」の番人を仕込む(iteration 38/76/104の流儀)。f.A1111_URL/
+# f.COMFYUI_URLは読むだけで書き換えない。
+
+_orig_db_urlopen = urllib.request.urlopen
+_orig_db_subprocess_run = f.subprocess.run
+_orig_db_image_backend = f.IMAGE_BACKEND
+_orig_db_backend_up = f._backend_up
+_orig_db_detect_backend = f._detect_backend
+_orig_db_generate_image_a1111 = f.generate_image_a1111
+_orig_db_generate_image_comfyui = f.generate_image_comfyui
+
+
+def _db_no_network_urlopen(*a, **k):
+    raise AssertionError("_detect_backend/generate_image: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _db_no_subprocess_run(*a, **k):
+    raise AssertionError("_detect_backend/generate_image: モック漏れで実subprocess.runが呼ばれた")
+
+
+try:
+    urllib.request.urlopen = _db_no_network_urlopen
+    f.subprocess.run = _db_no_subprocess_run
+
+    _db_a1111_probe_url = f"{f.A1111_URL}/sdapi/v1/sd-models"
+    _db_comfyui_probe_url = f"{f.COMFYUI_URL}/system_stats"
+    _db_backend_up_calls = []
+
+    def _db_make_backend_up(url_map):
+        def _mock(url):
+            _db_backend_up_calls.append(url)
+            return url_map.get(url, False)
+        return _mock
+
+    # --- (1) 明示指定 'a1111'/'comfyui' -> プローブなしでそのままpass-through ---
+    for _db_explicit in ("a1111", "comfyui"):
+        f.IMAGE_BACKEND = _db_explicit
+        _db_backend_up_calls.clear()
+        f._backend_up = _db_make_backend_up({})
+        _db_r1 = f._detect_backend()
+        check(f"_detect_backend: IMAGE_BACKEND={_db_explicit!r}はそのまま返る(pass-through)",
+              _db_r1 == _db_explicit)
+        check(f"_detect_backend: IMAGE_BACKEND={_db_explicit!r}では_backend_upが一切呼ばれない",
+              len(_db_backend_up_calls) == 0)
+
+    # --- (2) 'auto' + A1111稼働中 -> 'a1111'を返す。A1111側URLのみプローブされ、
+    #     ComfyUI側は短絡でプローブされない(A1111優先)。ComfyUI側もupにしておき、
+    #     短絡が「たまたまComfyUIがdownだったから」ではないことを確認する ---
+    f.IMAGE_BACKEND = "auto"
+    _db_backend_up_calls.clear()
+    f._backend_up = _db_make_backend_up({_db_a1111_probe_url: True, _db_comfyui_probe_url: True})
+    _db_r2 = f._detect_backend()
+    check("_detect_backend: auto+A1111稼働中は'a1111'を返す", _db_r2 == "a1111")
+    check("_detect_backend: auto+A1111稼働中はA1111側URLのみをプローブする(短絡)",
+          _db_backend_up_calls == [_db_a1111_probe_url])
+
+    # --- (3) 'auto' + A1111停止/ComfyUI稼働中 -> 'comfyui'を返す。
+    #     A1111が先、ComfyUIが後の順で両方プローブされる ---
+    _db_backend_up_calls.clear()
+    f._backend_up = _db_make_backend_up({_db_a1111_probe_url: False, _db_comfyui_probe_url: True})
+    _db_r3 = f._detect_backend()
+    check("_detect_backend: auto+A1111停止/ComfyUI稼働中は'comfyui'を返す", _db_r3 == "comfyui")
+    check("_detect_backend: auto+A1111停止時はA1111->ComfyUIの順で両方プローブされる",
+          _db_backend_up_calls == [_db_a1111_probe_url, _db_comfyui_probe_url])
+
+    # --- (4) 'auto' + 両方停止 -> None。両方プローブされる ---
+    _db_backend_up_calls.clear()
+    f._backend_up = _db_make_backend_up({})
+    _db_r4 = f._detect_backend()
+    check("_detect_backend: auto+両方停止中はNoneを返す", _db_r4 is None)
+    check("_detect_backend: auto+両方停止中でも両方プローブされる(A1111->ComfyUIの順)",
+          _db_backend_up_calls == [_db_a1111_probe_url, _db_comfyui_probe_url])
+
+    # --- (5) 'off' / 未知の値 -> None。_backend_upは一切呼ばれない ---
+    for _db_none_case in ("off", "xyz"):
+        f.IMAGE_BACKEND = _db_none_case
+        _db_backend_up_calls.clear()
+        f._backend_up = _db_make_backend_up({})
+        _db_r5 = f._detect_backend()
+        check(f"_detect_backend: IMAGE_BACKEND={_db_none_case!r}はNoneを返す", _db_r5 is None)
+        check(f"_detect_backend: IMAGE_BACKEND={_db_none_case!r}では_backend_upが一切呼ばれない",
+              len(_db_backend_up_calls) == 0)
+
+    # --- (6) generate_image: バックエンド未検出 -> Noneを返し、a1111/comfyui
+    #     いずれの低レベル関数も呼ばれない ---
+    f._detect_backend = lambda: None
+    _gi_calls6 = {"a1111": 0, "comfyui": 0}
+    f.generate_image_a1111 = lambda prompt, negative="": (
+        _gi_calls6.__setitem__("a1111", _gi_calls6["a1111"] + 1) or "should-not-be-used")
+    f.generate_image_comfyui = lambda prompt, negative="": (
+        _gi_calls6.__setitem__("comfyui", _gi_calls6["comfyui"] + 1) or "should-not-be-used")
+    _gi_r6 = f.generate_image("a cat")
+    check("generate_image: バックエンド未検出ではNoneを返す", _gi_r6 is None)
+    check("generate_image: バックエンド未検出ではgenerate_image_a1111が呼ばれない",
+          _gi_calls6["a1111"] == 0)
+    check("generate_image: バックエンド未検出ではgenerate_image_comfyuiが呼ばれない",
+          _gi_calls6["comfyui"] == 0)
+
+    # --- (7) generate_image: 'a1111'にdispatch -> generate_image_a1111が
+    #     (prompt, negative)で1回だけ呼ばれ、その戻り値をそのまま返す。
+    #     generate_image_comfyuiは呼ばれない ---
+    f._detect_backend = lambda: "a1111"
+    _gi_seen7 = {"calls": 0}
+
+    def _gi_a1111_7(prompt, negative=""):
+        _gi_seen7["calls"] += 1
+        _gi_seen7["prompt"] = prompt
+        _gi_seen7["negative"] = negative
+        return "a1111-result.png"
+
+    _gi_comfyui_calls7 = {"n": 0}
+    f.generate_image_a1111 = _gi_a1111_7
+    f.generate_image_comfyui = lambda prompt, negative="": (
+        _gi_comfyui_calls7.__setitem__("n", _gi_comfyui_calls7["n"] + 1) or "wrong-backend")
+
+    _gi_r7 = f.generate_image("a cat", "blurry")
+    check("generate_image: 'a1111'検出時はgenerate_image_a1111の戻り値をそのまま返す",
+          _gi_r7 == "a1111-result.png")
+    check("generate_image: 'a1111'検出時はgenerate_image_a1111がちょうど1回呼ばれる",
+          _gi_seen7["calls"] == 1)
+    check("generate_image: 'a1111'検出時はpromptとnegativeがそのまま渡る",
+          _gi_seen7.get("prompt") == "a cat" and _gi_seen7.get("negative") == "blurry")
+    check("generate_image: 'a1111'検出時はgenerate_image_comfyuiが呼ばれない",
+          _gi_comfyui_calls7["n"] == 0)
+
+    # --- (8) generate_image: 'comfyui'にdispatch (7の対称) ---
+    f._detect_backend = lambda: "comfyui"
+    _gi_seen8 = {"calls": 0}
+
+    def _gi_comfyui_8(prompt, negative=""):
+        _gi_seen8["calls"] += 1
+        _gi_seen8["prompt"] = prompt
+        _gi_seen8["negative"] = negative
+        return "comfyui-result.png"
+
+    _gi_a1111_calls8 = {"n": 0}
+    f.generate_image_comfyui = _gi_comfyui_8
+    f.generate_image_a1111 = lambda prompt, negative="": (
+        _gi_a1111_calls8.__setitem__("n", _gi_a1111_calls8["n"] + 1) or "wrong-backend")
+
+    _gi_r8 = f.generate_image("a dog", "ugly")
+    check("generate_image: 'comfyui'検出時はgenerate_image_comfyuiの戻り値をそのまま返す",
+          _gi_r8 == "comfyui-result.png")
+    check("generate_image: 'comfyui'検出時はgenerate_image_comfyuiがちょうど1回呼ばれる",
+          _gi_seen8["calls"] == 1)
+    check("generate_image: 'comfyui'検出時はpromptとnegativeがそのまま渡る",
+          _gi_seen8.get("prompt") == "a dog" and _gi_seen8.get("negative") == "ugly")
+    check("generate_image: 'comfyui'検出時はgenerate_image_a1111が呼ばれない",
+          _gi_a1111_calls8["n"] == 0)
+
+    # --- (9) generate_image: never-crash契約の回帰確認。低レベル関数が例外を
+    #     送出しても外へ伝播させず、Noneを返す(iter41-47/68/80と同種の
+    #     「計算済みの結果を失わない」保証がこの1関数内にも効いている) ---
+    f._detect_backend = lambda: "a1111"
+
+    def _gi_a1111_raises(prompt, negative=""):
+        raise RuntimeError("simulated backend failure")
+
+    f.generate_image_a1111 = _gi_a1111_raises
+    _gi_r9, _gi_exc9 = "unset", None
+    try:
+        _gi_r9 = f.generate_image("prompt")
+    except Exception as _exc:
+        _gi_exc9 = _exc
+    check("generate_image: 低レベル関数が例外を送出しても外へ伝播しない",
+          _gi_exc9 is None)
+    check("generate_image: 低レベル関数が例外を送出した場合はNoneを返す",
+          _gi_r9 is None)
+
+    # --- (10) generate_image: negative省略時は既定の''がそのままdispatch先に渡る ---
+    f._detect_backend = lambda: "a1111"
+    _gi_seen10 = {}
+
+    def _gi_a1111_10(prompt, negative=""):
+        _gi_seen10["negative"] = negative
+        return "ok.png"
+
+    f.generate_image_a1111 = _gi_a1111_10
+    f.generate_image("prompt only")
+    check("generate_image: negative省略時は''がdispatch先に渡る",
+          _gi_seen10.get("negative") == "")
+finally:
+    urllib.request.urlopen = _orig_db_urlopen
+    f.subprocess.run = _orig_db_subprocess_run
+    f.IMAGE_BACKEND = _orig_db_image_backend
+    f._backend_up = _orig_db_backend_up
+    f._detect_backend = _orig_db_detect_backend
+    f.generate_image_a1111 = _orig_db_generate_image_a1111
+    f.generate_image_comfyui = _orig_db_generate_image_comfyui
+
+check("_detect_backend/generate_image: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_db_urlopen)
+check("_detect_backend/generate_image: テスト後にf.subprocess.runが元の状態へ復元されている",
+      f.subprocess.run == _orig_db_subprocess_run)
+check("_detect_backend/generate_image: テスト後にIMAGE_BACKENDが元の状態へ復元されている",
+      f.IMAGE_BACKEND == _orig_db_image_backend)
+check("_detect_backend/generate_image: テスト後にf._backend_upが元の状態へ復元されている",
+      f._backend_up == _orig_db_backend_up)
+check("_detect_backend/generate_image: テスト後にf._detect_backendが元の状態へ復元されている",
+      f._detect_backend == _orig_db_detect_backend)
+check("_detect_backend/generate_image: テスト後にf.generate_image_a1111が元の状態へ復元されている",
+      f.generate_image_a1111 == _orig_db_generate_image_a1111)
+check("_detect_backend/generate_image: テスト後にf.generate_image_comfyuiが元の状態へ復元されている",
+      f.generate_image_comfyui == _orig_db_generate_image_comfyui)
+
+# ============================================================
 # _slack_truncate / notify_slack のテスト
 # ============================================================
 # SLACK_WEBHOOK_URL / SLACK_Q_PREVIEW / SLACK_A_PREVIEW / SLACK_NOTIFY_TIMEOUT を
