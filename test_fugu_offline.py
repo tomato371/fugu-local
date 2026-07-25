@@ -6113,11 +6113,19 @@ with _tempfile.TemporaryDirectory() as _rdxo_dir:
     else:
         print("   [SKIP] python-docx未インストールのため_read_docx本文順序テストをスキップ")
 
-# ---------- _read_docx: セル内にネストした表は再帰しない(トップレベルのみ) (2026-07-24 / iter93) ----------
-# doc.paragraphs/doc.tablesと同じく、本文直下(<w:body>の直接の子)のみを歩くため、
-# 表セル内にネストした段落・表は今回も意図的にスコープ外のまま(iter91が明示した
-# 方針の継続)。ネストした表を含むセルでも例外を送出せず、ネスト表の内容が
-# 二重出力されたり本文の他の位置に漏れ出したりしないことを確認する。
+# ---------- _read_docx: セル内にネストした表へ再帰し、内容の欠落を解消する (2026-07-25) ----------
+# 背景: python-docxの_Cell.textはそのセル直下の<w:p>段落だけを連結し、セル内に
+# ネストされた<w:tbl>は一切含めない。そのため「表の中の表」構成の文書では、
+# ネスト表の内容が_read_docxの出力から――ひいては_load_rag_chunks(RAG)や
+# --fileの全文コンテキストからも――無言で欠落していた。この欠落自体は当時から
+# 認識されていたが、iter91(水平マージ重複排除の導入)・iter93(本文読み取り順序の
+# 修正)はどちらも「ネストした表の再帰抽出は意図的にスコープ外(将来の
+# フォローアップ課題)」と明記して先送りしており、直前のこのテストブロックは
+# その「スコープ外である('InnerCell'が出力に現れない)」ことそのものを固定する
+# 内容だった。本コミットでiter91/93のフォローアップを完了させたため、ここでは
+# 従来の「スコープ外」アサーションを反転させ、ネスト表の内容が実際に出力される
+# ことと、水平マージ重複排除(iter91)・本文順序抽出(iter93)の両方と正しく共存する
+# ことを検証する。
 with _tempfile.TemporaryDirectory() as _rdxn_dir:
     _rdxn_root = _pathlib.Path(_rdxn_dir)
     _rdxn_path = _rdxn_root / "nested.docx"
@@ -6138,22 +6146,121 @@ with _tempfile.TemporaryDirectory() as _rdxn_dir:
             _rdxn_out = f._read_docx(_rdxn_path)
         except Exception as _rdxn_e:
             _rdxn_exc = _rdxn_e
-        check("_read_docx (iter93): セル内にネストした表があっても例外を送出しない",
+        check("_read_docx: セル内にネストした表があっても例外を送出しない",
               _rdxn_exc is None)
         if _rdxn_exc is None:
-            check("_read_docx (iter93): ネストした表の内容('InnerCell')はトップレベルスコープ外"
-                  "のため出力に現れない(doc.tables/doc.paragraphsと同じ既存スコープを維持)",
-                  "InnerCell" not in _rdxn_out)
-            check("_read_docx (iter93): ネスト表を含むセル自身('OuterCell')は二重出力されない",
+            check("_read_docx: ネストした表の内容('InnerCell')が出力に現れる"
+                  "(修正前は'InnerCell'が出力に現れずスコープ外として欠落していた)",
+                  "InnerCell" in _rdxn_out)
+            check("_read_docx: 自身の段落テキストとネスト表を両方持つセル"
+                  "('OuterCell')は二重出力されない",
                   _rdxn_out.count("OuterCell") == 1)
-            _rdxn_lines = _rdxn_out.split("\n")
-            check("_read_docx (iter93): ネスト表を含む文書でも本文順(Before->表行->After)が保たれる",
-                  _rdxn_lines[0] == "Before" and _rdxn_lines[-1] == "After"
-                  and any("OuterCell" in _ln for _ln in _rdxn_lines[1:-1]))
+            check("_read_docx: ネスト表の内容('InnerCell')も二重出力されない",
+                  _rdxn_out.count("InnerCell") == 1)
+            _rdxn_lines = [_ln for _ln in _rdxn_out.split("\n") if _ln]
+            check("_read_docx: ネスト表を含む文書でも本文順(Before->OuterCell->InnerCell->After)"
+                  "が保たれ、ネスト行は自身を含む行の直後に追加される(行の途中に混在しない)",
+                  _rdxn_lines == ["Before", "OuterCell", "InnerCell", "After"])
     else:
         print("   [SKIP] python-docx未インストールのため_read_docxネスト表テストをスキップ")
 
-check("_read_docx: iter93テスト後にsys.modulesの'docx'エントリが元通り解決可能(復元確認)",
+# ---------- _read_docx: ネスト表 x 水平マージ(gridSpan)の相互作用 (2026-07-25) ----------
+# iter91の水平マージ重複排除は、被マージ座標を同一<w:tc>のidで検知してスキップする。
+# ネスト表への再帰はそのdedupループの「初出セルのみ処理する」分岐の内側で行うため、
+# マージされたセルにネスト表がある場合でも、被マージ座標側でネスト表が再度
+# 処理される(内容が重複する)ことがないことを明示的に検証する。
+with _tempfile.TemporaryDirectory() as _rdxhm_dir:
+    _rdxhm_root = _pathlib.Path(_rdxhm_dir)
+    _rdxhm_path = _rdxhm_root / "merged_nested.docx"
+
+    if _HAS_DOCX_RD:
+        _rdxhm_doc = _docx_probe_rd.Document()
+        _rdxhm_table = _rdxhm_doc.add_table(rows=1, cols=2)
+        _rdxhm_merged = _rdxhm_table.cell(0, 0).merge(_rdxhm_table.cell(0, 1))
+        _rdxhm_merged.text = "MergedHeader"
+        _rdxhm_inner = _rdxhm_merged.add_table(rows=1, cols=1)
+        _rdxhm_inner.cell(0, 0).text = "MergedInner"
+        _rdxhm_doc.save(str(_rdxhm_path))
+
+        _rdxhm_out = f._read_docx(_rdxhm_path)
+        _rdxhm_lines = [_ln for _ln in _rdxhm_out.split("\n") if _ln]
+        check("_read_docx: 水平マージされたセルのネスト表内容('MergedInner')は"
+              "被マージ座標の数だけ重複せず1回だけ出力される",
+              _rdxhm_out.count("MergedInner") == 1)
+        check("_read_docx: 水平マージ+ネスト表の出力は"
+              "['MergedHeader', 'MergedInner']のまま(マージヘッダー直後にネスト行)",
+              _rdxhm_lines == ["MergedHeader", "MergedInner"])
+    else:
+        print("   [SKIP] python-docx未インストールのため水平マージ+ネスト表テストをスキップ")
+
+# ---------- _read_docx: ネスト表の行は「自身を含む行」の直後にまとめて追加される (2026-07-25) ----------
+# 複数セルを持つ行の一部のセルだけにネスト表がある場合でも、ネスト表の行が
+# 行の途中(セルとセルの間)に混在せず、行全体のタブ結合済みテキストの直後に
+# まとめて追加されることを検証する(非ネスト表の出力がbyte-for-byte不変である
+# ための配置規約)。
+with _tempfile.TemporaryDirectory() as _rdxp_dir:
+    _rdxp_root = _pathlib.Path(_rdxp_dir)
+    _rdxp_path = _rdxp_root / "placement.docx"
+
+    if _HAS_DOCX_RD:
+        _rdxp_doc = _docx_probe_rd.Document()
+        _rdxp_table = _rdxp_doc.add_table(rows=1, cols=2)
+        _rdxp_table.cell(0, 0).text = "A"
+        _rdxp_cell_b = _rdxp_table.cell(0, 1)
+        _rdxp_cell_b.text = "B"
+        _rdxp_inner = _rdxp_cell_b.add_table(rows=1, cols=1)
+        _rdxp_inner.cell(0, 0).text = "Nested"
+        _rdxp_doc.save(str(_rdxp_path))
+
+        _rdxp_out = f._read_docx(_rdxp_path)
+        _rdxp_lines = [_ln for _ln in _rdxp_out.split("\n") if _ln]
+        check("_read_docx: 行の1セルのみにネスト表があっても行結合('A\\tB')は"
+              "タブ結合のまま不変(セル間に割り込まない)",
+              _rdxp_lines[0] == "A\tB")
+        check("_read_docx: ネスト表の行はその行の直後に追加される(混在しない配置規約)",
+              _rdxp_lines == ["A\tB", "Nested"])
+    else:
+        print("   [SKIP] python-docx未インストールのため行内配置テストをスキップ")
+
+# ---------- _read_docx: ネスト表の再帰深さに上限があり病的な深いネストでも終了する (2026-07-25) ----------
+# 自己参照的/異常に深いネスト構造でも再帰が終わらなくならないよう、_table_rows_text
+# には固定の深さ上限(_DOCX_NESTED_TABLE_MAX_DEPTH)を設けている。深さ上限を超える
+# 階層にあるネスト表は(安全側に倒し)無視されることを、上限を超える深さのチェーンを
+# 実際に構築して検証する。テストがハングせず完走すること自体が上限の効果の証拠。
+with _tempfile.TemporaryDirectory() as _rdxd_dir:
+    _rdxd_root = _pathlib.Path(_rdxd_dir)
+    _rdxd_path = _rdxd_root / "deep_nested.docx"
+
+    if _HAS_DOCX_RD:
+        _rdxd_doc = _docx_probe_rd.Document()
+        _rdxd_table = _rdxd_doc.add_table(rows=1, cols=1)
+        _rdxd_cell = _rdxd_table.cell(0, 0)
+        _rdxd_cell.text = "L0"
+        _RDXD_LEVELS = 8  # 深さ上限(6)より深いL7まで作り、打ち切りを検証する
+        for _rdxd_lvl in range(1, _RDXD_LEVELS):
+            _rdxd_inner = _rdxd_cell.add_table(rows=1, cols=1)
+            _rdxd_cell = _rdxd_inner.cell(0, 0)
+            _rdxd_cell.text = f"L{_rdxd_lvl}"
+        _rdxd_doc.save(str(_rdxd_path))
+
+        _rdxd_exc = None
+        try:
+            _rdxd_out = f._read_docx(_rdxd_path)
+        except Exception as _rdxd_e:
+            _rdxd_exc = _rdxd_e
+        check("_read_docx: 深さ上限を超えるネスト表チェーンでも例外を送出せず完走する"
+              "(再帰が終了しないことへの防御)",
+              _rdxd_exc is None)
+        if _rdxd_exc is None:
+            for _rdxd_lvl in range(0, 7):  # L0..L6(深さ0..6)は上限内なので出力に現れる
+                check(f"_read_docx: 深さ上限内のネスト表(L{_rdxd_lvl})は出力に現れる",
+                      f"L{_rdxd_lvl}" in _rdxd_out)
+            check("_read_docx: 深さ上限を超えた階層(L7、深さ7)は打ち切られ出力に現れない",
+                  "L7" not in _rdxd_out)
+    else:
+        print("   [SKIP] python-docx未インストールのため深さ上限テストをスキップ")
+
+check("_read_docx: ネスト表テスト群の後にsys.modulesの'docx'エントリが元通り解決可能(復元確認)",
       ("docx" not in sys.modules) or (sys.modules["docx"] is not None))
 
 # ---------- _read_pdf: ImportError以外の実行時例外でもpypdf/PyPDF2へフォールスルー (2026-07-23 / iter83) ----------

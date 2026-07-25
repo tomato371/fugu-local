@@ -803,7 +803,11 @@ def _read_docx(path: Path) -> str:
     try:
         import docx
 
-        def _table_rows_text(tbl):
+        # 2026-07-25: ネスト表の再帰の深さに上限を設け、病的/破損した文書
+        # (自己参照的・異常に深いネスト等)で再帰が終わらなくなることを防ぐ。
+        _DOCX_NESTED_TABLE_MAX_DEPTH = 6
+
+        def _table_rows_text(tbl, _depth=0):
             # 2026-07-24 (iter91): python-docxのrow.cellsは表のグリッド座標の数だけ
             # _Cellを返すが、水平方向(gridSpan)にマージされたセルは全ての被マージ
             # 座標で同一の<w:tc>要素を共有する。そのためc.textはマージされた
@@ -815,18 +819,39 @@ def _read_docx(path: Path) -> str:
             # 出力する。_tcが取得できない場合(将来のpython-docx実装変化等)は
             # 安全側に倒し重複排除を行わず従来通りの挙動にフォールバックする。
             # なお本修正は行内(水平/gridSpan)の重複排除のみに限定しており、
-            # 垂直マージ(行をまたぐvMerge)の重複排除やネストした表の再帰抽出は
-            # 意図的にスコープ外としている(将来のフォローアップ課題)。
+            # 垂直マージ(行をまたぐvMerge)の重複排除は意図的にスコープ外としている
+            # (将来のフォローアップ課題)。
             # 同種の「python-docx/python-pptxの属性欠落・仕様により文字列を
             # 取りこぼす/重複する」系統の修正としてiter87(_read_pptxの表/グループ
             # 抽出)の直系であり、iter82では非マージの単純な表しかテストされて
             # いなかった穴を埋めるもの。iter93(下記)でも本ロジックはbyte-for-byte
             # 温存しており、順序修正後の本文経路/従来フォールバック経路の両方から
             # 同一関数として呼ばれる。
+            #
+            # 2026-07-25: python-docxの_Cell.textは、そのセル直下の<w:p>段落だけを
+            # 連結して返し、セル内にネストされた<w:tbl>(表の中の表)は一切含めない。
+            # そのためセルの中にさらに表が入っている文書(よくある「表内表」構成)は、
+            # そのネスト表の内容が丸ごと_read_docxの出力から――ひいてはRAG検索
+            # (_load_rag_chunks)や--fileで各proposerに渡る全文コンテキストからも――
+            # 無言で欠落していた。iter91・iter93はどちらもこれを認識しつつ
+            # 「ネストした表の再帰抽出は意図的にスコープ外(将来のフォローアップ)」と
+            # 明記して先送りしていたもので、本修正がそのフォローアップを完了させる。
+            # python-docxはBlockItemContainerとして_Cell.tablesでネスト表の一覧を
+            # 公開しているため、セル自身のテキストを出力した直後に、そのセルが
+            # 実際に出力対象だった場合(=水平マージの初出セルである場合)に限り
+            # ネスト表へ追加的に再帰する。水平マージでスキップされた被マージセルの
+            # 座標では再帰しない(ネスト表の二重処理を避けるため)。ネスト表の行は
+            # 「そのネスト表を含む行」自身のタブ結合済みテキストの直後にまとめて
+            # 追加し、行の途中に混在させない(フラットな逐次追記という意図的な配置)。
+            # getattr(cell, "tables", [])で取得するため、将来python-docxの属性が
+            # 欠落/改名されても例外化せず現状の(ネスト表を無視する)挙動に安全側で
+            # 縮退する。vMerge(垂直マージ)の重複排除とpptx(セルが表をネストできない)
+            # は引き続き明示的にスコープ外。
             rows_text = []
             for row in tbl.rows:
                 seen_tc_ids = set()
                 cells_text = []
+                nested_rows = []
                 for c in row.cells:
                     tc = getattr(c, "_tc", None)
                     if tc is not None:
@@ -835,7 +860,13 @@ def _read_docx(path: Path) -> str:
                             continue
                         seen_tc_ids.add(tc_id)
                     cells_text.append(c.text)
+                    if _depth < _DOCX_NESTED_TABLE_MAX_DEPTH:
+                        for nested_tbl in getattr(c, "tables", []):
+                            nested_rows.extend(
+                                _table_rows_text(nested_tbl, _depth + 1)
+                            )
                 rows_text.append("\t".join(cells_text))
+                rows_text.extend(nested_rows)
             return rows_text
 
         # 2026-07-24 (iter123): docx.Document() 自体は import docx の成功/失敗とは
