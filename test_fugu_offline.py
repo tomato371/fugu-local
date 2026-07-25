@@ -874,6 +874,50 @@ check("sc: mcq 単独行 全角文字が複数行で競合したら棄権（iter
 check("sc: mcq 単独行 文中に埋没した全角文字は捕捉しない(^...$維持)",
       f.extract_final_answer("選択肢Ｃが気になるが自信はない", "mcq") is None)
 
+# 2026-07-25: SC_PROMPT_MCQ は \boxed{} 指示だが、CJK寄りのプロポーザー（qwen/gemma系、
+# iter 3/26/102/109 が繰り返し記録している対象そのもの）が無視して散文で答えを書き、
+# その答えを Markdown の強調記号（**太字**/*斜体*/__太字__）で装飾するのは LLM の
+# よくある癖。strip_think/normalize_answer は '*'/'_' を除去しないため、装飾された
+# 選択肢文字が boxed 先頭文字・宣言・単独行の3分岐いずれにもマッチせず None（票落ち）に
+# なっていた。文字に直接隣接する強調記号のみを許容して票を回復する回帰確認。
+check("sc: mcq 宣言 太字強調（票落ち回帰, iter173）",
+      f.extract_final_answer("The answer is **B**", "mcq") == "B")
+check("sc: mcq 宣言 斜体強調（票落ち回帰, iter173）",
+      f.extract_final_answer("Answer: *C*", "mcq") == "C")
+check("sc: mcq 単独行 太字強調（票落ち回帰, iter173）",
+      f.extract_final_answer("**D**", "mcq") == "D")
+check("sc: mcq 単独行 アンダースコア太字強調（票落ち回帰, iter173）",
+      f.extract_final_answer("__A__", "mcq") == "A")
+check("sc: mcq boxed 太字強調（票落ち回帰, iter173）",
+      f.extract_final_answer("\\boxed{**B**}", "mcq") == "B")
+# 回帰: 強調記号なしの既存ケースは今回の変更後も不変
+check("sc: mcq 単独行 全角括弧のみは強調対応後も従来通り（回帰）",
+      f.extract_final_answer("答えは（B）です", "mcq") == "B")
+check("sc: mcq 単独行 全角括弧は強調対応後も従来通り（回帰）",
+      f.extract_final_answer("（C）", "mcq") == "C")
+check("sc: mcq boxed ASCII括弧は強調対応後も従来通り（回帰）",
+      f.extract_final_answer("\\boxed{(A)}", "mcq") == "A")
+check("sc: mcq boxed 散文混じりは強調対応後も先頭文字（回帰）",
+      f.extract_final_answer("\\boxed{C, because it is the largest}", "mcq") == "C")
+check("sc: mcq boxed 散文のみは強調対応後もNone（回帰）",
+      f.extract_final_answer("\\boxed{None of the above}", "mcq") is None)
+# 競合棄権(iter 26ガード維持): 強調記号付き文字と素の文字が競合したらNone
+check("sc: mcq 宣言 強調記号付きと素の文字が競合したら棄権（iter26ガード維持）",
+      f.extract_final_answer(
+          "the answer is **A**\nthe answer is B", "mcq") is None)
+# 誤爆防止: 強調された単語の中から文字を誤って拾わない（iter 3 の \b／(?![A-Za-z]) ガード維持）
+check("sc: mcq 宣言 太字語の中から誤爆しない（'**Bee**' が B にならない）",
+      f.extract_final_answer("the answer is **Bee**", "mcq") is None)
+check("sc: mcq 単独行 太字語の中から誤爆しない（'**Bee**' が B にならない）",
+      f.extract_final_answer("**Bee**", "mcq") is None)
+# 誤爆防止: 太字見出し行は単独行パターンの ^...$ アンカーでスコープ外のまま(iter109ガード維持)
+check("sc: mcq 単独行 太字見出し行は捕捉しない(^...$維持)",
+      f.extract_final_answer("**A. Introduction**", "mcq") is None)
+# 非mcqパス(math)は今回の変更で一切触れていないことの確認: bold付き文言でも従来通り
+# 数値抽出ロジックのみが働き、'*'/'_' がそのまま残った文字列を返す(グローバル除去なし)。
+check("sc: math 抽出は強調記号対応の影響を受けない（byte-for-byte不変）",
+      f.extract_final_answer("\\boxed{**42**}", "math") == "**42**")
+
 # 2026-07-22: iteration 28 — math 宣言ブランチにも iteration 26 の MCQ 修正
 # （複数宣言が競合したら無投票=None）を対称に適用した回帰確認。
 # 注: 宣言抽出の捕獲グループ ([^\n]{1,60}) は改行を跨がず貪欲マッチするため、同一行に
