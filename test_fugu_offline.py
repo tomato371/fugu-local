@@ -3349,6 +3349,120 @@ finally:
 check("sc-pot: regression: 短い答え+無関係なstderr警告は従来通り採票される(4ガード追加後も過検知なし)",
       _ans_happy_potguard == f.normalize_answer("99"))
 
+# ---------- _sc_sample: PoT分岐の最終行\boxed{}ラッパをunwrapして票割れを防ぐ (2026-07-25) ----------
+# CoT分岐(直下のextract_final_answer)は\boxed{}を剥がしてからnormalize_answerへ渡すが、PoT分岐は
+# stdout最終行(iteration 4)をnormalize_answerへ素通しするだけで\boxed{}は非対応だった。数学寄りの
+# モデルがコード内でprint(f'\\boxed{{{ans}}}')のように反射的に答えを\boxed{}で包むと、最終行が
+# 丸ごと"\boxed{42}"になりnormalize_answerを素通りし、素の"42"というCoT側の投票クラスとは別クラスに
+# 割れてgotcha #7の自己整合性投票（PoTでCoTの計算ミスを裏取り/上書きする仕組み）でPoT票が丸ごと
+# 死票化していた。ここでは f.ask のみをモックし、run_pythonには実際の軽量・決定的なローカル
+# subprocess（print(...)のみ）を実行させる（iteration 4/46/52/61と同じ流儀。Ollama/ネットワーク
+# 呼び出しは一切発生しない）。値を捏造しない・既存票を壊さない「票を拾えるところだけ拾う」方針は
+# iteration 11/23/25/78/122/134/136/140/148の票救出系修正列と同じ。
+def _make_ask_pot_print(stdout_value):
+    """f.ask差し替え用: 生成コードがstdout_valueをそのまま1行printするPoTサンプルを模す。
+    repr()経由で埋め込むためbackslash等の手動エスケープが不要（誤エスケープでの事故を避ける）。"""
+    _code = "print(" + repr(stdout_value) + ")"
+    return lambda *a, **k: "説明。\n```python\n" + _code + "\n```\n"
+
+
+_orig_ask_potbox = f.ask
+
+# (1) \boxed{42} → '42' を採票し、素のCoT'42'票とanswers_equivalent/vote_answersで併合される
+try:
+    f.ask = _make_ask_pot_print("\\boxed{42}")
+    _ans_potbox42, _text_potbox42 = f._sc_sample("m1", "6*7=?", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potbox
+check("sc-pot-boxed: 最終行が\\boxed{42}のPoTサンプルは'42'を採票する",
+      _ans_potbox42 == f.normalize_answer("42"))
+check("sc-pot-boxed: \\boxed{42}のPoT票と素のCoT'42'票はanswers_equivalentで同一視される",
+      f.answers_equivalent(_ans_potbox42, "42"))
+_classes_potbox42 = f.vote_answers(["42", _ans_potbox42])
+check("sc-pot-boxed: vote_answersでもCoT'42'票とPoTの\\boxed{42}票が単一クラス(2票)に併合される",
+      len(_classes_potbox42[2]) == 1 and _classes_potbox42[1] == 2)
+
+# (2) \boxed{1/2} → '1/2' を採票し、CoTの'0.5'/'1/2'とFractionファストパスで併合される
+try:
+    f.ask = _make_ask_pot_print("\\boxed{1/2}")
+    _ans_potboxfrac, _text_potboxfrac = f._sc_sample("m1", "1/2 は？", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potbox
+check("sc-pot-boxed: \\boxed{1/2}のPoTサンプルは'1/2'を採票する",
+      _ans_potboxfrac == f.normalize_answer("1/2"))
+check("sc-pot-boxed: \\boxed{1/2}のPoT票と素のCoT'0.5'票はFractionファストパスで同一視される",
+      f.answers_equivalent(_ans_potboxfrac, "0.5"))
+check("sc-pot-boxed: \\boxed{1/2}のPoT票と素のCoT'1/2'票も同一視される",
+      f.answers_equivalent(_ans_potboxfrac, "1/2"))
+
+# (3) \boxed{-5} → '-5' を採票する
+try:
+    f.ask = _make_ask_pot_print("\\boxed{-5}")
+    _ans_potboxneg, _text_potboxneg = f._sc_sample("m1", "-5 は？", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potbox
+check("sc-pot-boxed: \\boxed{-5}のPoTサンプルは'-5'を採票する",
+      _ans_potboxneg == f.normalize_answer("-5"))
+
+# regression(バイト単位で不変): \boxed{}を含まない最終行は従来のnormalize_answer(生の行)と
+# 完全に同じ結果を返す（本修正が非boxedケースを一切変えないことの直接ロック）
+for _rv in ("42", "1/2", "-5", "0.5", "1,234"):
+    try:
+        f.ask = _make_ask_pot_print(_rv)
+        _ans_rv, _text_rv = f._sc_sample("m1", "regression-nonboxed", "math", pot=True)
+    finally:
+        f.ask = _orig_ask_potbox
+    check("sc-pot-boxed: regression: 非boxedの'%s'出力はnormalize_answer(ans)と完全一致(変化なし)" % _rv,
+          _ans_rv == f.normalize_answer(_rv))
+
+# regression: 未閉鎖の\boxed{（波括弧が閉じていない）はextract_boxedがNoneを返し、
+# クラッシュせず・値も捏造せず、従来通りnormalize_answer(生の行)へフォールスルーする
+# （iteration 11/23で確立した「閉じていなければNone」という安全側判定はそのまま）
+try:
+    f.ask = _make_ask_pot_print("\\boxed{")
+    _ans_potboxunterm, _text_potboxunterm = f._sc_sample("m1", "壊れたboxed", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potbox
+check("sc-pot-boxed: regression: 未閉鎖の\\boxed{はクラッシュせずnormalize_answer(生の行)にフォールスルーする",
+      _ans_potboxunterm == f.normalize_answer("\\boxed{"))
+
+# regression: 閉じてはいるが中身が空の\boxed{}もextract_boxedがNoneを返し（iteration 25で
+# 確立した「空boxedは無投票」判定）、同様にnormalize_answer(生の行)へフォールスルーする
+try:
+    f.ask = _make_ask_pot_print("\\boxed{}")
+    _ans_potboxempty, _text_potboxempty = f._sc_sample("m1", "空boxed", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potbox
+check("sc-pot-boxed: regression: 空の\\boxed{}はクラッシュせずnormalize_answer(生の行)にフォールスルーする",
+      _ans_potboxempty == f.normalize_answer("\\boxed{}"))
+
+# regression: len>80ガードはunwrap後の「投票される値」に対して適用される。\boxed{42}の前後に
+# 80字を優に超えるパディングが付いた行でも、unwrap後の中身'42'が短ければ採票される
+# （旧実装は生の行の長さで即棄却していたため、この場合は無投票にすり替わっていた）。
+_padded_boxed = "The answer is \\boxed{42} " + "x" * 90
+try:
+    f.ask = _make_ask_pot_print(_padded_boxed)
+    _ans_potboxpad, _text_potboxpad = f._sc_sample("m1", "パディング", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potbox
+check("sc-pot-boxed: 前提確認: パディング付き生の行は80文字を超える",
+      len(_padded_boxed) > 80)
+check("sc-pot-boxed: len>80ガードはunwrap後の値に適用され、\\boxed{42}前後の長いパディングでも'42'を採票する",
+      _ans_potboxpad == f.normalize_answer("42"))
+
+# regression: unwrap後の値そのものが80文字を超える場合は、従来通り無投票(None)になる
+_long_boxed_val = "9" * 90
+try:
+    f.ask = _make_ask_pot_print("\\boxed{" + _long_boxed_val + "}")
+    _ans_potboxlong, _text_potboxlong = f._sc_sample("m1", "長いboxed中身", "math", pot=True)
+finally:
+    f.ask = _orig_ask_potbox
+check("sc-pot-boxed: unwrap後の値自体が80文字を超える場合はanswer=None(無投票、暴走出力を誤採用しない)",
+      _ans_potboxlong is None)
+
+check("sc-pot-boxed: テスト後にf.askが元へ復元されている",
+      f.ask == _orig_ask_potbox)
+
 # ---------- _representative_text: SC勝者クラスの代表テキスト選出 (2026-07-23) ----------
 # solve_verifiable の最終return直前(line ~2788)でres['text']を決める、自己一貫性投票
 # 経路(gotcha#7)で最後まで直接テストされていなかったヘルパー。選出順序は

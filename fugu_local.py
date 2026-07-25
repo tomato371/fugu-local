@@ -3426,9 +3426,32 @@ def _sc_sample(model, question, task_type, pot=False, history=None):
         if not ok or not out:
             return None, text
         ans = out.splitlines()[-1].strip()
-        if not ans or len(ans) > 80:
+        if not ans:
             return None, text
-        return (normalize_answer(ans) or None), text + f"\n\n[PoT execution output]\n{out[-500:]}"
+        # 2026-07-25: PoT分岐(ここ)とCoT分岐(直下の extract_final_answer)で答えの抽出方法が
+        # 非対称だった。CoT側はextract_final_answerがtextから\boxed{}を剥がしてから
+        # normalize_answerへ渡すが、PoT側はstdout最終行(iteration 4)をnormalize_answerへ
+        # 素通しするだけで\boxed{}を剥がしていなかった。数学寄りにチューニングされた
+        # モデルはコード内でprint(f'\\boxed{{{ans}}}')のように反射的に\boxed{}で答えを
+        # 包むことがあり、その場合stdout最終行が丸ごと"\boxed{42}"になる。normalize_answer
+        # は$・\%・\(\)\[\]・\text/\mathbf系ラッパは剥がすが\boxed{}は対象外なので、
+        # 素の"42"というCoT側の投票クラスとは別クラスに割れ、gotcha #7の自己整合性投票
+        # （CoTの計算ミスをPoTで裏取り/上書きするための仕組み）でPoT票が丸ごと死票化して
+        # いた。ここで最終行に\boxed{が含まれる場合のみextract_boxedで中身を取り出し、
+        # 取れた場合だけそれをnormalize_answerへ渡す。取れなかった場合（末尾が
+        # \boxed{や\boxed{}のように閉じていない/空、iteration 11/23/25と同じ安全側判定）は
+        # 従来どおり生の行をnormalize_answerへ渡す。値を捏造しない・既存の票を壊さない
+        # 「票を拾えるところだけ拾う」方針は iteration 11/23/25/78/122/134/136/140/148の
+        # 票救出系修正列と同じ（精度優先・時間は気にしない）。長さガード(len>80)は
+        # 従来どおり最終的に投票される値に対して適用する（生の行ではなく剥がした後の値）。
+        vote_src = ans
+        if "\\boxed{" in ans:
+            unwrapped = extract_boxed(ans)
+            if unwrapped is not None:
+                vote_src = unwrapped
+        if not vote_src or len(vote_src) > 80:
+            return None, text
+        return (normalize_answer(vote_src) or None), text + f"\n\n[PoT execution output]\n{out[-500:]}"
     return extract_final_answer(text, task_type), text
 
 
