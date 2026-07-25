@@ -12182,6 +12182,76 @@ check("extract_json非object回帰: テスト後にSECOND_OPINION_MODELが元へ
 check("extract_json非object回帰: テスト後にIMAGE_TRANSLATE_PROMPTが元へ復元されている",
       f.IMAGE_TRANSLATE_PROMPT == _orig_ej4_translate)
 
+# ---------- normalize_answer: \left(/\right) 等の体裁マクロ除去 (2026-07-25, iter140の残課題) ----------
+# iteration 140（\( \) \[ \] 剥がし）は "\left(/\right)（実括弧を包む別マクロ）...は
+# 対象外のまま維持する" と明記して \left/\right をスコープ外に据え置いていた。しかし
+# grep でも \left/\right はどこでも処理されておらずテストも皆無で、\left(3, 4\right) の
+# ような順序対・区間・集合表記は素の (3,4) 等とは別の投票クラスに分裂したままになる
+# (na.lower() 不一致・Fraction 例外 -> gotcha #6 の math_verify フォールバックに依存、
+# gotcha #7 の自己整合性投票が最も嫌う票割れ)。iteration 13/22/24/30/78/122/134/136/
+# 140/148/160 と同系統の「ファストパスで拾えない票を拾う」姉妹修正としてここで閉じる。
+check("normalize_answer: \\left(3, 4\\right) -> (3,4) (順序対、区切り剥がし+iter160カンマ空白除去)",
+      f.normalize_answer(r"\left(3, 4\right)") == "(3,4)")
+check("normalize_answer: \\left[2, 5\\right) -> [2,5) (半開区間)",
+      f.normalize_answer(r"\left[2, 5\right)") == "[2,5)")
+check("normalize_answer: \\left\\{1, 2\\right\\} -> \\{1,2\\} (エスケープ済み中括弧は保持)",
+      f.normalize_answer(r"\left\{1, 2\right\}") == r"\{1,2\}")
+check("normalize_answer: \\left\\{1, 2\\right\\} と素の \\{1,2\\} が同一クラスに合流する",
+      f.normalize_answer(r"\left\{1, 2\right\}") == f.normalize_answer(r"\{1,2\}"))
+
+# \b 境界の回帰: \leftarrow/\rightarrow/\leftrightarrow/\Leftrightarrow のような矢印マクロは
+# "left"/"right" の直後が英字で単語境界が生じないため（大文字マクロはそもそも小文字専用の
+# 正規表現に一致しない）、バイト単位で不変のまま保たれなければならない。
+check("normalize_answer: \\leftarrow は不変(\\bガードで巻き込まれない)",
+      f.normalize_answer(r"\leftarrow") == r"\leftarrow")
+check("normalize_answer: \\rightarrow は不変(\\bガードで巻き込まれない)",
+      f.normalize_answer(r"\rightarrow") == r"\rightarrow")
+check("normalize_answer: \\leftrightarrow は不変(\\bガードで巻き込まれない)",
+      f.normalize_answer(r"\leftrightarrow") == r"\leftrightarrow")
+check("normalize_answer: \\Leftrightarrow は不変(大文字マクロは対象外)",
+      f.normalize_answer(r"\Leftrightarrow") == r"\Leftrightarrow")
+check("normalize_answer: 'x \\to y' 中の裸の 'to' も不変(無関係の混入確認)",
+      f.normalize_answer(r"x \to y") == r"x \to y")
+
+# 既存回帰: 素の括弧・角括弧・frac・単純な数値表記はバイト単位で不変のまま
+check("normalize_answer: 素の(3,4)は不変(over-stripなし)",
+      f.normalize_answer("(3,4)") == "(3,4)")
+check("normalize_answer: 素の[2,5)は不変(over-stripなし)",
+      f.normalize_answer("[2,5)") == "[2,5)")
+check("normalize_answer: 3.14は不変(over-stripなし)",
+      f.normalize_answer("3.14") == "3.14")
+check("normalize_answer: -5は不変(over-stripなし)",
+      f.normalize_answer("-5") == "-5")
+check("normalize_answer: 1/2は不変(over-stripなし)",
+      f.normalize_answer("1/2") == "1/2")
+check("normalize_answer: 1,234 -> 1234(桁区切り回帰、over-stripなし)",
+      f.normalize_answer("1,234") == "1234")
+check("normalize_answer: 50%は不変(over-stripなし)",
+      f.normalize_answer("50%") == "50%")
+check("normalize_answer: \\frac{1}{2} -> 1/2 (iter122回帰、over-stripなし)",
+      f.normalize_answer(r"\frac{1}{2}") == "1/2")
+check("normalize_answer: \\frac{1}{-2} -> -1/2 (iter148回帰、over-stripなし)",
+      f.normalize_answer(r"\frac{1}{-2}") == "-1/2")
+
+check("extract_final_answer: \\boxed{\\left(3, 4\\right)} -> (3,4) (boxed math分岐がnormalize_answer経由)",
+      f.extract_final_answer(r"\boxed{\left(3, 4\right)}", "math") == "(3,4)")
+
+
+def _t_left_right_fastpath_equiv(calls):
+    result = f.answers_equivalent(r"\left(3,4\right)", "(3,4)")
+    check("answers_equivalent: \\left(3,4\\right) と (3,4) が正規化高速パスで一致(math_verify不使用)",
+          result is True)
+    check("answers_equivalent: \\left/\\right 併合はmath_verify.parseを一切呼ばない(高速パス経由)",
+          len(calls["parse_args"]) == 0)
+
+
+_run_with_math_verify_stub(None, "parse", _t_left_right_fastpath_equiv)
+
+_left_right_votes = [r"\left(3, 4\right)", "(3,4)", "(3,4)"]
+_lr_top, _lr_count, _lr_classes = f.vote_answers(_left_right_votes)
+check("vote_answers: \\left(3, 4\\right)/(3,4)/(3,4) の3票が単一クラスに集約される(票割れしない)",
+      _lr_count == 3 and len(_lr_classes) == 1)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
