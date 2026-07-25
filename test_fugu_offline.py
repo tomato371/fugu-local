@@ -10053,6 +10053,69 @@ with _tempfile.TemporaryDirectory() as _hist_dir:
     check("history: 破損していない兄弟エントリはバイト単位で無傷のまま読み込まれる",
           _loaded_cp932[1]["content"] == "無傷であるはずの兄弟エントリ：日本語も含む")
 
+    # (10) 2026-07-26: save_history_file に force フラグ + 真偽値の戻り値を追加した
+    #      修正の回帰テスト。repl() の 'save <path>' コマンドはユーザーが明示的に
+    #      指示した履歴エクスポートだが、修正前は save_history_file が
+    #      SESSION_SAVE=False (--no-history) 時に無条件で早期returnし、かつ常に
+    #      None を返していたため、repl 側は書き込みの成否に関わらず
+    #      「[履歴を保存しました: ...]」と表示していた（実際にはファイルが
+    #      一切書かれていない/エラーで失敗していてもユーザーには成功したように
+    #      見える、という無言のデータロス）。ここでは save_history_file 単体の
+    #      契約を直接検証する: force=False（既定）は iteration 66/67 と同じ
+    #      SESSION_SAVE=False no-op 契約を保つ（バイト単位で不変）ことと、
+    #      force=True は SESSION_SAVE の値に関わらず書き込みを行うこと、
+    #      戻り値が「実際に書けたか」を正確に反映すること、書き込み失敗時に
+    #      例外を伝播させず既存の '[履歴保存エラー: ...]' 表示を保つことを
+    #      確認する。SESSION_SAVE はこのブロック内で try/finally により復元する。
+    try:
+        # (10a) force=True + SESSION_SAVE=False -> 書き込みが行われ True を返す
+        f.SESSION_SAVE = False
+        _hp_force = _hist_root / "force_write.json"
+        _hist_force = [{"role": "user", "content": "force保存されるはず"}]
+        _ret_force = f.save_history_file(_hist_force, path=_hp_force, force=True)
+        check("history: force=Trueなら SESSION_SAVE=False でもファイルを書き込む",
+              _hp_force.exists())
+        check("history: force=True かつ書き込み成功時は True を返す",
+              _ret_force is True)
+        check("history: force=True で書き込んだ内容はload/jsonでラウンドトリップする",
+              f.load_history_file(path=_hp_force) == _hist_force)
+
+        # (10b) force=False(既定) + SESSION_SAVE=False -> 依然として no-op かつ False
+        _hp_default_nosave = _hist_root / "default_nosave.json"
+        _ret_default_nosave = f.save_history_file(
+            [{"role": "user", "content": "saved?"}], path=_hp_default_nosave)
+        check("history: 既定(force=False)は従来通りSESSION_SAVE=Falseでファイルを作成しない"
+              "(iteration66/67のno-op契約の回帰防止)",
+              not _hp_default_nosave.exists())
+        check("history: 既定(force=False)でSESSION_SAVE=Falseならスキップを示すFalseを返す",
+              _ret_default_nosave is False)
+
+        # (10c) force=False(既定) + SESSION_SAVE=True -> 従来通り書き込み、True を返す
+        f.SESSION_SAVE = True
+        _hp_default_save = _hist_root / "default_save.json"
+        _hist_default_save = [{"role": "assistant", "content": "自動保存されるはず"}]
+        _ret_default_save = f.save_history_file(_hist_default_save, path=_hp_default_save)
+        check("history: 既定(force=False)でSESSION_SAVE=Trueなら従来通り書き込む",
+              f.load_history_file(path=_hp_default_save) == _hist_default_save)
+        check("history: 既定(force=False)でSESSION_SAVE=Trueなら書き込み成功でTrueを返す",
+              _ret_default_save is True)
+    finally:
+        f.SESSION_SAVE = _orig_session_save
+
+    # (10d) 強制書き込みが失敗する場合(存在しないディレクトリ配下への書き込み)は
+    #       例外を伝播させず、既存の '[履歴保存エラー: ...]' 表示を維持しつつ
+    #       False を返す(force=True/SESSION_SAVE いずれの値でも同じ契約)。
+    _hp_bad_dir = _hist_root / "no_such_subdir" / "unwritable.json"
+    with contextlib.redirect_stdout(io.StringIO()) as _hbw_out:
+        _ret_bad_dir = f.save_history_file(
+            [{"role": "user", "content": "x"}], path=_hp_bad_dir, force=True)
+    check("history: 存在しないディレクトリへのforce書き込みは例外を送出せずFalseを返す",
+          _ret_bad_dir is False)
+    check("history: 書き込み失敗時に既存の[履歴保存エラー: ...]表示を維持する",
+          "履歴保存エラー" in _hbw_out.getvalue())
+    check("history: 書き込みに失敗したパスにファイルは作成されない",
+          not _hp_bad_dir.exists())
+
 # ---------- ask_fugu: _HISTORY には成果物付き final ではなく text_answer を保存 ----------
 # 2026-07-23: fugu_local.py L3098 のコメント「履歴にはテキスト本文のみ保存する」が
 # 実装(L3129 で _HISTORY に final を追記)と乖離していたバグの修正を検証する。

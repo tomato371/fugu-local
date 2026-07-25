@@ -389,10 +389,20 @@ def load_history_file(path: Path = None) -> list:
     return []
 
 
-def save_history_file(history: list, path: Path = None):
-    """会話履歴を JSON ファイルに保存する。SESSION_SAVE=False 時は何もしない。"""
-    if not SESSION_SAVE:
-        return
+def save_history_file(history: list, path: Path = None, force: bool = False):
+    """会話履歴を JSON ファイルに保存する。
+
+    SESSION_SAVE=False (--no-history) 時は既定では何もしない（自動/受動的な
+    永続化はユーザーのオプトアウトを尊重する）。ただし force=True を渡すと、
+    'save <path>' のようなユーザー明示的なエクスポート操作として
+    SESSION_SAVE の値に関わらず書き込みを行う。
+
+    戻り値: 実際にファイルへ書き込めた場合のみ True。SESSION_SAVE=False かつ
+    force=False で書き込みをスキップした場合、または書き込み中に例外が
+    発生した場合は False（例外は送出しない）。
+    """
+    if not force and not SESSION_SAVE:
+        return False
     path = path or HISTORY_FILE
     try:
         path.write_text(
@@ -400,8 +410,10 @@ def save_history_file(history: list, path: Path = None):
                        ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        return True
     except Exception as e:
         print(f"   [履歴保存エラー: {e}]")
+        return False
 
 
 # ==================================================
@@ -5065,8 +5077,14 @@ def repl(use_search=False, rag_dirs=None, history_file=None):
             continue
         if low.startswith("save "):
             save_path = q[5:].strip()
-            save_history_file(_HISTORY, path=Path(save_path))
-            print(f"   [履歴を保存しました: {save_path}]")
+            if not save_path:
+                print("   [保存先パスを指定してください: save <path>]")
+                continue
+            ok = save_history_file(_HISTORY, path=Path(save_path), force=True)
+            if ok:
+                print(f"   [履歴を保存しました: {save_path}]")
+            else:
+                print(f"   [履歴の保存に失敗しました: {save_path}]")
             continue
         ask_fugu(q, use_search=use_search, rag_dirs=rag_dirs,
                  history_file=hfile)
