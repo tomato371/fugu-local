@@ -44,6 +44,30 @@ check("json: 文字列値中の}に惑わされない(深さカウントの文�
 check("json: 閉じない{単体はクラッシュせずNone",
       f.extract_json("prefix { unbalanced no closing brace") is None)
 
+# ---------- extract_json: dict-or-None契約の強制 (2026-07-25) ----------
+# 背景: ステップ1 `return json.loads(text)` は json.loads が成功しさえすれば
+# 型を問わず結果を素通しで返していた。docstring は「最初の JSON オブジェクト」
+# (=dict)を約束し、ステップ2/3は実際に dict-or-None 契約を守っているのに、
+# ステップ1だけはトップレベルが妥当なJSONでありさえすれば list/int/float/bool/str
+# も丸ごと返してしまっていた。呼び出し側の一部(_critic_judge/second_opinion/
+# _sd_prompt_from_request/plan_pptx_images)は `extract_json(raw) or {}` の後に
+# 無条件で `.get(...)` するため、モデルが `[{"ok": true}]` や `true`/`42`/`"text"`
+# のようなトップレベル非objectな(しかし妥当な)JSONを出力すると、truthyな
+# 非dict値がそのまま通り抜けて `.get` で AttributeError を送出していた
+# (iteration 103/111/112/113 と同種の「妥当だが型が想定と違うモデル出力」対策)。
+# ここでは extract_json 自体が常に dict か None のどちらかしか返さないことを
+# 直接ロックする。
+for _ej_bad in ('[1,2,3]', '42', '3.14', 'true', 'false', 'null', '"hello"'):
+    check(f"json: トップレベル非object({_ej_bad!r})はNone",
+          f.extract_json(_ej_bad) is None)
+check("json: ネストしたobjectは3)の波括弧スキャナで回収できる([{...}]->中身のdict)",
+      f.extract_json('[{"ok": true}]') == {"ok": True})
+for _ej_case in ('{"a": 1}', '[1,2,3]', '42', '3.14', 'true', 'false', 'null',
+                 '"hello"', '[{"ok": true}]', 'no json here', ''):
+    _ej_r = f.extract_json(_ej_case)
+    check(f"json: 戻り値は常にdictかNone(入力={_ej_case!r})",
+          _ej_r is None or isinstance(_ej_r, dict))
+
 # ---------- strip_think ----------
 check("strip: think除去", f.strip_think("<think>x</think>answer") == "answer")
 check("strip: thinking除去", f.strip_think("<THINKING>x</THINKING>ans") == "ans")
@@ -11517,6 +11541,106 @@ check("generate_image_a1111/comfyui衝突テスト: テスト後にf._http_post_
       f._http_post_json == _orig_a1_post_json)
 check("generate_image_a1111/comfyui衝突テスト: テスト後にf.IMAGE_OUT_DIRが元の状態へ復元されている",
       f.IMAGE_OUT_DIR == _orig_a1_out_dir)
+
+# ---------- extract_json dict-or-None契約の4呼び出し元への波及回帰
+# (_critic_judge/second_opinion/_sd_prompt_from_request/plan_pptx_images, 2026-07-25) ----------
+# 背景: 上の「extract_json: dict-or-None契約の強制」ブロックは extract_json 自体の
+# 契約を直接ロックしたが、そもそもこの修正が必要だったのは `extract_json(raw) or {}`
+# の直後に無条件で `.get(...)` する4箇所の呼び出し元 ―
+# _critic_judge(L2662)/second_opinion(L2710、共に精度優先の critique/verify_single
+# ゲート)/_sd_prompt_from_request(L1944)/plan_pptx_images(L4494) ― が、モデルの
+# raw 出力が json.loads に成功する非object値(`[1,2,3]`/`42`/`true`/`"x"`)のとき
+# 旧実装では truthy な非dict値をそのまま `.get` に渡して AttributeError で
+# ターン全体を落としていたため。extract_json 側を直したことで、この4箇所は
+# 何も変更していないのに自動的に「extract_json(raw) が None になり `or {}` で
+# 空dictへ縮退 → 各関数のドキュメント通りの既定値」という安全な経路に落ちる
+# ようになったはずである。ここではその波及を直接確認する(= extract_json だけを
+# 直せば4箇所全部が閉じる、というタスクの前提そのものの検証)。
+_orig_ej4_ask = f.ask
+_orig_ej4_proposers = f.PROPOSERS
+_orig_ej4_second_opinion_model = f.SECOND_OPINION_MODEL
+_orig_ej4_disabled_flag = f._SECOND_OPINION_DISABLED
+_orig_ej4_translate = f.IMAGE_TRANSLATE_PROMPT
+try:
+    # (A) _critic_judge / second_opinion: 精度優先のcritique/verify_singleゲート。
+    #     second_opinion を「有効」経路に固定する(PROPOSERSにSECOND_OPINION_MODELを含める)。
+    f.SECOND_OPINION_MODEL = "phi4-mini"
+    f.PROPOSERS = ["phi4-mini", "qwen3:4b"]
+    f._SECOND_OPINION_DISABLED = False
+
+    for _ej4_raw, _ej4_label in (
+        ('[1,2,3]', "リスト"), ('42', "整数"), ('true', "真偽値"), ('"x"', "文字列"),
+    ):
+        f.ask = lambda *a, _r=_ej4_raw, **k: _r
+        _ej4_exc = None
+        try:
+            _cj_ok, _cj_issue = f._critic_judge("q", "a", think=False)
+        except Exception as _exc:
+            _ej4_exc = _exc
+        check(f"_critic_judge: トップレベル非object JSON({_ej4_label})はAttributeErrorを送出しない",
+              _ej4_exc is None)
+        check(f"_critic_judge: トップレベル非object JSON({_ej4_label})は既定(True,'')に縮退する",
+              _ej4_exc is None and _cj_ok is True and _cj_issue == "")
+
+        f.ask = lambda *a, _r=_ej4_raw, **k: _r
+        _ej4_exc = None
+        try:
+            _so_ok, _so_issue = f.second_opinion("q", "a")
+        except Exception as _exc:
+            _ej4_exc = _exc
+        check(f"second_opinion: トップレベル非object JSON({_ej4_label})はAttributeErrorを送出しない",
+              _ej4_exc is None)
+        check(f"second_opinion: トップレベル非object JSON({_ej4_label})は既定(True,'')に縮退する",
+              _ej4_exc is None and _so_ok is True and _so_issue == "")
+
+    # (B) _sd_prompt_from_request: 同じ非dict JSONは (user_request, '') へ縮退する。
+    f.IMAGE_TRANSLATE_PROMPT = True
+    for _ej4_raw, _ej4_label in (
+        ('[1,2,3]', "リスト"), ('42', "整数"), ('true', "真偽値"), ('"x"', "文字列"),
+    ):
+        f.ask = lambda *a, _r=_ej4_raw, **k: _r
+        _ej4_exc = None
+        try:
+            _sd_r = f._sd_prompt_from_request("猫の絵")
+        except Exception as _exc:
+            _ej4_exc = _exc
+        check(f"_sd_prompt_from_request: トップレベル非object JSON({_ej4_label})は"
+              "AttributeErrorを送出しない",
+              _ej4_exc is None)
+        check(f"_sd_prompt_from_request: トップレベル非object JSON({_ej4_label})は"
+              "(user_request,'')へ縮退する",
+              _ej4_exc is None and _sd_r == ("猫の絵", ""))
+
+    # (C) plan_pptx_images: 同じ非dict JSONは {} へ縮退する。
+    _ej4_slides = [{"title": "Slide 1", "bullets": ["b1"]}]
+    for _ej4_raw, _ej4_label in (
+        ('[1,2,3]', "リスト"), ('42', "整数"), ('true', "真偽値"), ('"x"', "文字列"),
+    ):
+        f.ask = lambda *a, _r=_ej4_raw, **k: _r
+        _ej4_exc = None
+        try:
+            _pi_r = f.plan_pptx_images("Title", _ej4_slides)
+        except Exception as _exc:
+            _ej4_exc = _exc
+        check(f"plan_pptx_images: トップレベル非object JSON({_ej4_label})は"
+              "AttributeErrorを送出しない",
+              _ej4_exc is None)
+        check(f"plan_pptx_images: トップレベル非object JSON({_ej4_label})は{{}}へ縮退する",
+              _ej4_exc is None and _pi_r == {})
+finally:
+    f.ask = _orig_ej4_ask
+    f.PROPOSERS = _orig_ej4_proposers
+    f.SECOND_OPINION_MODEL = _orig_ej4_second_opinion_model
+    f._SECOND_OPINION_DISABLED = _orig_ej4_disabled_flag
+    f.IMAGE_TRANSLATE_PROMPT = _orig_ej4_translate
+
+check("extract_json非object回帰: テスト後にaskが元へ復元されている", f.ask == _orig_ej4_ask)
+check("extract_json非object回帰: テスト後にPROPOSERSが元へ復元されている",
+      f.PROPOSERS == _orig_ej4_proposers)
+check("extract_json非object回帰: テスト後にSECOND_OPINION_MODELが元へ復元されている",
+      f.SECOND_OPINION_MODEL == _orig_ej4_second_opinion_model)
+check("extract_json非object回帰: テスト後にIMAGE_TRANSLATE_PROMPTが元へ復元されている",
+      f.IMAGE_TRANSLATE_PROMPT == _orig_ej4_translate)
 
 print()
 if _FAILS:

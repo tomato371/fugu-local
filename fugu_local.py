@@ -1755,8 +1755,27 @@ def extract_json(text):
         return None
     text = strip_think(text)
     # 1) そのまま
+    # 2026-07-25: 旧実装はここで json.loads(text) の結果を型を問わず素通しで
+    # return していた。docstring は「最初の JSON オブジェクト」（dict）を約束し、
+    # 2)/3) は実際に dict-or-None 契約を守っているのに、1) だけはトップレベルが
+    # 妥当な JSON でありさえすれば list/int/float/bool/str/None も丸ごと返して
+    # しまい、契約が破られていた。呼び出し側の一部（_critic_judge L2662,
+    # second_opinion L2710, _sd_prompt_from_request L1944, plan_pptx_images
+    # L4494）は `extract_json(raw) or {}` の後に無条件で `.get(...)` するため、
+    # モデルが `[{"ok": true}]` や `true`/`42`/`"text"` のようなトップレベル非
+    # object な（しかし妥当な）JSON を出力すると、truthy な非dict値がそのまま
+    # 通り抜けて `.get` で AttributeError を送出し、精度が最も重要な
+    # critique/verify ゲートを含むターン全体をクラッシュさせていた。
+    # これは iteration 103/111/112/113/138/139 で修正してきた「妥当だが型が
+    # 想定と違うモデル出力」への防御的対処と同種のクラス。
+    # 修正: 1) はパース結果が isinstance(dict) の場合のみ return し、それ以外
+    # （list/int/float/bool/str/None）は return も raise もせず 2)/3) にフォール
+    # スルーする。これにより例えば `[{"ok": true}]` は 3) の波括弧スキャナが
+    # ネストした {"ok": true} を回収できるようになる（副次的な改善）。
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
     except Exception:
         pass
     # 2) ```json ... ``` フェンス内
