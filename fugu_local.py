@@ -4775,8 +4775,29 @@ def _save_as_excel(out: Path, answer: str):
         ws.title = "Fugu Output"
         for line in answer.splitlines():
             if line.strip():
-                cols = [_illegal_xml_re.sub("", c.strip()) for c in re.split(r"[,\t|]", line)]
-                ws.append(cols)
+                _stripped_line = line.strip()
+                # 2026-07-26: LLM の回答が Markdown 表（例: '| Name | Age |'）の場合、
+                # 従来の re.split(r"[,\t|]", line) では行頭/行末の '|' がそれぞれ
+                # 空文字列の列を生み（例: ['', 'Name', 'Age', '']）、区切り線の行
+                # '| --- | --- |' がそのままゴミの1データ行として書き込まれ、さらに
+                # セル内の桁区切りカンマ（例: '| 1,234 | total |'）まで誤って列区切り
+                # とみなされ数値データが '1' と '234' に分断されてしまっていた。これは
+                # iteration 41-47・68 の保存系ハードニング（IllegalCharacterError対策
+                # 等）と同種の、表形式パース漏れによる保存内容の破損バグ。行の前後を
+                # '|' で囲まれた Markdown 表の行だけは、外側の '|' を1つずつ剥がした
+                # うえで中身を '|' のみで分割し（カンマ/タブでは分割しない）、
+                # '---'/':---'/'---:'/':---:' のような区切り線の行は列として追加しない。
+                # それ以外の行（Markdown 表でない行）は従来通り
+                # re.split(r"[,\t|]", line) のままで挙動を一切変えない。
+                if _stripped_line.startswith("|") and _stripped_line.endswith("|"):
+                    inner = _stripped_line[1:-1]
+                    cols = [_illegal_xml_re.sub("", c.strip()) for c in inner.split("|")]
+                    if cols and all(re.match(r"^:?-+:?$", c) for c in cols):
+                        continue
+                    ws.append(cols)
+                else:
+                    cols = [_illegal_xml_re.sub("", c.strip()) for c in re.split(r"[,\t|]", line)]
+                    ws.append(cols)
         wb.save(str(out))
         return
     except Exception as e:

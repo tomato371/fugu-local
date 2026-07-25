@@ -9459,6 +9459,57 @@ with _tempfile.TemporaryDirectory() as _xlsx_dir:
         ]
         check("_save_as_excel: 制御文字なしの通常回答は従来通り列分割される(既存挙動不変)",
               _rows_clean == _expected_clean)
+
+        # ---------- _save_as_excel: Markdown表のパース (2026-07-26) ----------
+        # 従来は全行を re.split(r"[,\t|]", line) で分割していたため、Markdown表の
+        # 行 '| Name | Age |' が ['', 'Name', 'Age', ''] という前後に空列を持つ
+        # 行になり、区切り線 '| --- | --- |' がそのままゴミの1データ行として
+        # 書き込まれ、さらにセル内のカンマ（例: '1,234'）まで列区切りとして
+        # 誤分割されていた。ここでは Markdown表を正しく読み、区切り線が
+        # 除去され、セル内カンマが分割されないことを検証する。
+        _md_answer = "| Name | Age |\n| --- | --- |\n| Alice | 30 |"
+        _out_md = _xlsx_root / "md_table.xlsx"
+        f._save_as_excel(_out_md, _md_answer)
+        _wb_md = _openpyxl_probe.load_workbook(str(_out_md))
+        _rows_md = [_trim_trailing_none(row) for row in _wb_md.active.iter_rows(values_only=True)]
+        check("_save_as_excel: Markdown表は外側の'|'による空列なしで解釈される",
+              _rows_md == [["Name", "Age"], ["Alice", "30"]])
+
+        # コロン付きの整列指定を含む区切り線（左寄せ/右寄せ/中央寄せ）も
+        # データ行として書き込まれず、丸ごとスキップされること。
+        _md_align_answer = "| Name | Score | Note |\n| :--- | ---: | :---: |\n| Bob | 90 | ok |"
+        _out_md_align = _xlsx_root / "md_align.xlsx"
+        f._save_as_excel(_out_md_align, _md_align_answer)
+        _wb_md_align = _openpyxl_probe.load_workbook(str(_out_md_align))
+        _rows_md_align = [_trim_trailing_none(row) for row in _wb_md_align.active.iter_rows(values_only=True)]
+        check("_save_as_excel: コロン付き整列区切り線(:---/---:/:---:)もスキップされる",
+              _rows_md_align == [["Name", "Score", "Note"], ["Bob", "90", "ok"]])
+
+        # セル内のカンマ（桁区切り数値など）が列区切りとして誤分割されないこと。
+        _md_comma_answer = "| 1,234 | total |"
+        _out_md_comma = _xlsx_root / "md_comma.xlsx"
+        f._save_as_excel(_out_md_comma, _md_comma_answer)
+        _wb_md_comma = _openpyxl_probe.load_workbook(str(_out_md_comma))
+        _rows_md_comma = [_trim_trailing_none(row) for row in _wb_md_comma.active.iter_rows(values_only=True)]
+        check("_save_as_excel: Markdown表のセル内カンマは列区切りとみなされない",
+              _rows_md_comma == [["1,234", "total"]])
+
+        # Markdown表の行の中に混入した制御文字も、iteration 41 のサニタイズが
+        # 新しい分岐内でも適用され、除去されつつ実データは保持されること。
+        _md_illegal_answer = "| Ali\x1bce | B\x00ob |"
+        _out_md_illegal = _xlsx_root / "md_illegal.xlsx"
+        _md_illegal_exc = None
+        try:
+            f._save_as_excel(_out_md_illegal, _md_illegal_answer)
+        except Exception as _e:
+            _md_illegal_exc = _e
+        check("_save_as_excel: Markdown表内の制御文字混入でも例外を送出しない",
+              _md_illegal_exc is None)
+        if _md_illegal_exc is None:
+            _wb_md_illegal = _openpyxl_probe.load_workbook(str(_out_md_illegal))
+            _rows_md_illegal = [_trim_trailing_none(row) for row in _wb_md_illegal.active.iter_rows(values_only=True)]
+            check("_save_as_excel: Markdown表内の制御文字は除去されつつ実データは保持される",
+                  _rows_md_illegal == [["Alice", "Bob"]])
     else:
         # openpyxl 未インストール環境: 既存の.csvフォールバック(拡張子/メッセージ/戻り値)が
         # 従来通り機能すること。
