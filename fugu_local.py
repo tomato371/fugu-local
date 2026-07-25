@@ -1267,6 +1267,45 @@ def _read_html(path: Path) -> str:
     """HTML からタグを除去してテキストを返す（stdlib html.parser 使用）。"""
     from html.parser import HTMLParser
 
+    # 2026-07-26: 旧実装は handle_data 1回ごとに data.strip() して self.parts
+    # に積み、最後に "\n".join(parts) していた。これは「テキストノードの区切り
+    # =意味的な区切り」という誤った前提に基づいており、<b>/<strong>/<a>/<sub>/
+    # <sup>/<span>/<code> のようなインライン要素は子孫テキストを別ノードとして
+    # 分割するだけで文/フレーズの継続を意味しない。結果、'<p>The <b>quick</b>
+    # brown fox</p>' は 'The\nquick\nbrown fox' に、日本語の
+    # '機械<strong>学習</strong>技術' は '機械\n学習\n技術' に断片化し、
+    # ノード間の実際の空白（'The ' の末尾スペース等）もstrip()で失われていた。
+    # これは iter71 が直接カバレッジを付けた _read_html の「タグ除去」自体は
+    # 正しいが、iter94 の decode ラダー（_decode_text_bytes、下記で不変のまま
+    # 使用）で正しく日本語復元できても、その後のインライン分割で本文の連続性が
+    # 壊れるという別問題。特に致命的なのは、この断片化が iter179 で導入した
+    # 日本語（CJK）バイグラムトークナイザ（_tokenize: 非ASCII連続列を隣接2文字
+    # ずつのバイグラムに分解し rag_search の再現率を確保する方式）を無力化する
+    # 点: '機械\n学習' のように改行を挟んでしまうと '機械'→'学習' の境界を跨ぐ
+    # バイグラム '械学' が二度と生成されず、RAG検索でヒットしなくなる
+    # （本プロジェクトの主要言語である日本語で --file/RAGコンテキストの再現率が
+    # 下がる）。'10<sup>3</sup>' が '10\n3' になる数値表記の破壊も同根。
+    # 対処: ブロックレベルタグ（p/div/li/tr/td/th/table/ul/ol/h1-6/br/hr/
+    # section/article/header/footer/blockquote/pre 等）の開始・終了時にのみ
+    # 区切り記号を挿入し、インライン/未知タグでは何も挿入しない。テキスト
+    # ノード自体は data.strip() せず生のまま連結する（ノード内・ノード間の
+    # 本来の空白を保持するため）。最後にまとめて行単位へ分割し、各行を
+    # strip() して空行を除去する（1行内の単一スペースは行の内部にあるので
+    # 保持され、既存の完全一致回帰 'Hello UTF-8 world. こんにちは。' 等は
+    # 崩れない）。td/th/tr/li/br は引き続き区切りを出すため、
+    # '<td>A</td><td>B</td>' や 'A<br>B' が1行に潰れる回帰は起きない。
+    # なお <sup>/<sub> はインライン扱いのため 'The best' の '10^3' が視覚的に
+    # 上付き/下付きだった情報自体はプレーンテキスト抽出では原理的に復元
+    # できない（'103' という連結された数字列になる）——これは仕様上の限界で
+    # あり、本修正が解決するのは「分断されない」ことまで。
+    _BLOCK_TAGS = frozenset({
+        "address", "article", "aside", "blockquote", "br", "caption",
+        "dd", "details", "dl", "dt", "div", "figcaption", "figure",
+        "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+        "hr", "li", "main", "nav", "ol", "p", "pre", "section", "summary",
+        "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+    })
+
     class _Strip(HTMLParser):
         def __init__(self):
             super().__init__()
@@ -1275,12 +1314,18 @@ def _read_html(path: Path) -> str:
         def handle_starttag(self, tag, attrs):
             if tag in ("script", "style"):
                 self._skip = True
+            if tag in _BLOCK_TAGS:
+                self.parts.append("\n")
         def handle_endtag(self, tag):
             if tag in ("script", "style"):
                 self._skip = False
+            if tag in _BLOCK_TAGS:
+                self.parts.append("\n")
         def handle_data(self, data):
-            if not self._skip and data.strip():
-                self.parts.append(data.strip())
+            # 生のまま(strip しない)積む: インライン要素をまたぐノード間の
+            # 空白（例: 'The ' の末尾スペース）を保持するため。
+            if not self._skip and data:
+                self.parts.append(data)
 
     # 2026-07-24: 落とし穴 #4 (cp932コンソール) と同根の環境要因で、ローカルの
     # .html/.htm がShift-JIS(cp932)保存されていることがある。旧来の
@@ -1292,7 +1337,12 @@ def _read_html(path: Path) -> str:
     raw = _decode_text_bytes(path.read_bytes())
     p = _Strip()
     p.feed(raw)
-    return "\n".join(p.parts)
+    # ブロック区切り("\n")と生テキストを結合してから行単位に正規化する:
+    # 各行をstrip()して空行を落とす。インライン要素の内側/またぎでは区切りが
+    # 一切挿入されていないため、同じ行内でテキストがそのまま連結される。
+    joined = "".join(p.parts)
+    lines = (line.strip() for line in joined.split("\n"))
+    return "\n".join(line for line in lines if line)
 
 
 def _read_ipynb(path: Path) -> str:

@@ -5221,6 +5221,111 @@ with _tempfile.TemporaryDirectory() as _rh_dir:
     check("_read_html: テキストなし文書は空文字を返す",
           f._read_html(_rh_d) == "")
 
+    # ---------- _read_html: ブロック対応セパレータ (2026-07-26) ----------
+    # 旧実装はhandle_dataのテキストノードごとにdata.strip()して"\n".join()して
+    # いたため、<b>/<strong>/<a>/<sub>/<sup>/<span>/<code>のようなインライン
+    # 要素が子孫テキストを別ノードに分割するだけで、文/フレーズの断片化と
+    # ノード間空白の消失を引き起こしていた。特に日本語では、この断片化が
+    # 直上(iter179)で追加したCJKバイグラムトークナイザ(_tokenize)を無力化し
+    # ていた（改行を挟むと境界を跨ぐバイグラムが二度と生成されない）。以下は
+    # 修正（ブロックレベルタグの開始/終了時のみ区切りを挿入し、インライン/
+    # 未知タグでは何も挿入しない・テキストノードはstripせず生のまま連結）の
+    # 直接検証。iter71の直接カバレッジ・iter94のcp932デコードラダーと合わせて
+    # 参照。
+
+    # (e) インライン要素をまたぐ英文が断片化せず1つに連結される
+    # (旧実装は'The\nquick\nbrown fox'に断片化していた)
+    _rh_e = _rh_root / "e.html"
+    _rh_e.write_text("<p>The <b>quick</b> brown fox</p>", encoding="utf-8")
+    _rh_out_e = f._read_html(_rh_e)
+    check("_read_html(2026-07-26): インライン要素をまたぐ文が断片化せず連結される",
+          "The quick brown fox" in _rh_out_e)
+    check("_read_html(2026-07-26): インライン結合結果にもタグは残らない(山括弧なし)",
+          "<" not in _rh_out_e and ">" not in _rh_out_e)
+
+    # (f) 日本語: インライン要素をまたぐ断片化はiter179のCJKバイグラム
+    # トークナイザを無力化していた('機械\n学習'では境界バイグラム'械学'が
+    # 生成されない)。修正後は1行に連結され、境界バイグラムが復活することを
+    # _tokenize経由で直接確認する。
+    _rh_f = _rh_root / "f.html"
+    _rh_f.write_text(
+        "<p>機械<strong>学習</strong>技術の解説</p>", encoding="utf-8")
+    _rh_out_f = f._read_html(_rh_f)
+    check("_read_html(2026-07-26): 日本語がインライン要素をまたいでも断片化せず連結される",
+          "機械学習技術の解説" in _rh_out_f)
+    check("_read_html(2026-07-26/iter179再現率修正): 修正後の出力から境界バイグラム'械学'が_tokenizeで得られる",
+          "械学" in f._tokenize(_rh_out_f))
+    check("_read_html(2026-07-26/対照): 断片化された'機械\\n学習技術の解説'相当の文字列には'械学'が含まれない"
+          "(=修正前の挙動ではiter179の再現率が回復しないことの確認)",
+          "械学" not in f._tokenize("機械\n学習技術の解説"))
+
+    # (g) '10<sup>3</sup>'のような上付き表記は'103'に連結される(旧実装の
+    # '10\n3'分断を回避)。真の上付き/下付きの意味論はプレーンテキスト抽出
+    # からは原理的に復元不能で、本修正が保証するのは「分断されない」ことまで。
+    _rh_g = _rh_root / "g.html"
+    _rh_g.write_text("<p>10<sup>3</sup></p>", encoding="utf-8")
+    check("_read_html(2026-07-26): '10<sup>3</sup>'が'103'に連結され'10/3'に分断されない",
+          "103" in f._read_html(_rh_g))
+
+    # (h) 回帰: ブロックレベルの区切り(table/td/th/tr, ul/li, br)は引き続き
+    # 行として分離されること。インライン修正が誤ってセル/項目/改行を1行に
+    # 潰してしまわないことの確認。
+    _rh_h1 = _rh_root / "h1.html"
+    _rh_h1.write_text(
+        "<table><tr><td>A</td><td>B</td></tr></table>", encoding="utf-8")
+    check("_read_html(2026-07-26回帰): <td>セルはインライン修正後も別行のまま(A/Bが結合しない)",
+          f._read_html(_rh_h1) == "A\nB")
+
+    _rh_h2 = _rh_root / "h2.html"
+    _rh_h2.write_text("<ul><li>x</li><li>y</li></ul>", encoding="utf-8")
+    check("_read_html(2026-07-26回帰): <li>項目はインライン修正後も別行のまま(x/yが結合しない)",
+          f._read_html(_rh_h2) == "x\ny")
+
+    _rh_h3 = _rh_root / "h3.html"
+    _rh_h3.write_text("A<br>B", encoding="utf-8")
+    check("_read_html(2026-07-26回帰): <br>で区切られたA/Bも別行のまま(結合しない)",
+          f._read_html(_rh_h3) == "A\nB")
+
+    # (i) 回帰再確認: 単一段落の完全一致(exact-equality)はブロック区切り
+    # 導入後も崩れない(既存の~L5550の完全一致回帰とは別の新規フィクスチャ)。
+    _rh_i = _rh_root / "i.html"
+    _rh_i.write_text(
+        "<html><body><p>Hello again world. こんにちは、世界。</p></body></html>",
+        encoding="utf-8")
+    check("_read_html(2026-07-26回帰再確認): 単一段落の完全一致は崩れない",
+          f._read_html(_rh_i) == "Hello again world. こんにちは、世界。")
+
+    # (j) 回帰再確認: cp932保存HTMLの日本語復元(iter94のutf-8→cp932→replace
+    # ラダー)はブロック区切り導入後も無傷であること。
+    _rh_j = _rh_root / "j.html"
+    _rh_j.write_bytes(
+        "<html><body><h2>速報</h2><p>台風が接近しています。</p></body></html>"
+        .encode("cp932"))
+    _rh_out_j = f._read_html(_rh_j)
+    check("_read_html(2026-07-26回帰再確認): cp932保存HTMLの日本語復元は無傷",
+          "速報" in _rh_out_j and "台風が接近しています。" in _rh_out_j
+          and "�" not in _rh_out_j and "<" not in _rh_out_j)
+
+    # (k) 回帰再確認: HTML文字参照のデコードはブロック区切り導入後も無傷。
+    _rh_k = _rh_root / "k.html"
+    _rh_k.write_text("<p>Rock &amp; Roll &lt;loud&gt;</p>", encoding="utf-8")
+    _rh_out_k = f._read_html(_rh_k)
+    check("_read_html(2026-07-26回帰再確認): エンティティデコード('&amp;'->'&'等)は無傷",
+          "Rock & Roll" in _rh_out_k and "<loud>" in _rh_out_k)
+
+    # (l) 回帰再確認: <script>/<style>本文除外はブロック区切り導入後も無傷。
+    _rh_l = _rh_root / "l.html"
+    _rh_l.write_text(
+        "<html><head><style>p{color:blue}</style></head><body>"
+        "<script>doEvil(); var token = 99;</script>"
+        "<p>Still visible</p></body></html>",
+        encoding="utf-8")
+    _rh_out_l = f._read_html(_rh_l)
+    check("_read_html(2026-07-26回帰再確認): <script>/<style>本文除外は無傷",
+          "doEvil" not in _rh_out_l and "token" not in _rh_out_l
+          and "color" not in _rh_out_l and "blue" not in _rh_out_l
+          and "Still visible" in _rh_out_l)
+
 with _tempfile.TemporaryDirectory() as _ri_dir:
     _ri_root = _pathlib.Path(_ri_dir)
 
