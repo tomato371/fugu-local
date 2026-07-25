@@ -612,6 +612,23 @@ def _search_raw(query: str, max_results: int = None) -> list:
         print("   [警告: ddgs 未インストールのため Instant Answer フォールバック中。"
               "pip install ddgs でフル検索が有効になります]")
         return _ddg_instant(query, max_results)
+    except Exception as e:
+        # 2026-07-26: _resolve_ddgs_class() は `from ddgs import DDGS` /
+        # `from duckduckgo_search import DDGS` を実行するため、そのパッケージの
+        # トップレベル __init__ 由来で ImportError 以外（壊れた/非推奨パッケージの
+        # RuntimeError・OSError、Python バージョンガード、壊れたネイティブ依存等）
+        # も送出しうる。ここを except ImportError だけで受けていると、この
+        # 非ImportError が _search_raw の外（research_search → build_context →
+        # ask_fugu）まで無捕捉で伝播し、本関数のドキュメント契約「失敗時は空リスト
+        # （呼び出し側を止めない）」（上記docstring）と、このコードベースが
+        # イテレーション75/103/111/138で繰り返し守ってきた「呼び出し側を絶対に
+        # 落とさない」不変条件に違反してターン全体を失う。イテレーション83の判断
+        # （解決/実行時の失敗を、事実系クエリで古い知識を返しがちな Instant Answer
+        # フォールバックに倒すと本当の失敗が古い回答でマスクされる）に従い、ここも
+        # Instant Answer へは倒さず [] を返すだけにする。except Exception なので
+        # KeyboardInterrupt/SystemExit は従来通り素通りする。
+        print(f"   [Web検索エラー(解決段階): {e}]")
+        return []
 
     try:
         return _ddg_full(query, max_results)

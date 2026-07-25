@@ -8045,6 +8045,26 @@ try:
     _ws4 = f.web_search("正常系クエリ", max_results=5)
     check("web_search: 正常系はDuckDuckGoヘッダを付与して結果を連結する(既存挙動)",
           _ws4 == "## Web Search Results (DuckDuckGo)\n" + "\n\n".join(_expected_r4))
+
+    # --- (5) 解決段階(_resolve_ddgs_class())が非ImportError例外を送出 (2026-07-26追加) ---
+    #     -> importが本当に失敗したわけではないので、Instant Answerへは誤爆させず、
+    #     従来のクエリ実行時例外と同じく[]を返すだけにする(iter83の判断を踏襲)。
+    def _resolve_raises_runtimeerror():
+        raise RuntimeError("ddgs パッケージ__init__内でのクラッシュ(模擬・非ImportError)")
+
+    f._resolve_ddgs_class = _resolve_raises_runtimeerror
+    f._ddg_instant = _instant_must_not_be_called
+
+    _buf5 = io.StringIO()
+    with contextlib.redirect_stdout(_buf5):
+        _r5 = f._search_raw("解決段階非ImportErrorクエリ", max_results=3)
+    _out5 = _buf5.getvalue()
+
+    check("_search_raw: 解決段階の非ImportErrorは例外を伝播させず[]を返す",
+          _r5 == [])
+    check("_search_raw: 解決段階の非ImportErrorはInstant Answerへ誤爆しない"
+          "(pip install警告を出さない)",
+          "ddgs 未インストール" not in _out5 and "pip install ddgs" not in _out5)
 finally:
     f._resolve_ddgs_class = _orig_resolve_ddgs_sr
     f._ddg_instant = _orig_ddg_instant_sr
