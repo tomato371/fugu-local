@@ -1941,6 +1941,7 @@ def _backend_up(url):
 def generate_image_a1111(prompt, negative=""):
     """AUTOMATIC1111 stable-diffusion-webui の txt2img API で生成し保存パスを返す。"""
     import base64
+    import uuid
     payload = {"prompt": prompt, "negative_prompt": negative,
                "steps": IMAGE_STEPS, "width": IMAGE_WIDTH, "height": IMAGE_HEIGHT}
     data = _http_post_json(f"{A1111_URL}/sdapi/v1/txt2img", payload, IMAGE_TIMEOUT)
@@ -1968,7 +1969,17 @@ def generate_image_a1111(prompt, negative=""):
             # data URI プレフィックスが付く場合があるのでカンマ以降を取る
             blob = base64.b64decode(img.split(",", 1)[-1])
             IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            # 2026-07-25: time.strftime('%Y%m%d_%H%M%S')は秒単位までしか刻まない。
+            # build_pptxはPPTX_MAX_IMAGES=4枚まで本関数を連続呼び出しし、SDXL生成が
+            # 同一秒内に完了すると旧実装のfugu_{ts}.pngは2枚目以降が1枚目と同じ
+            # パスに解決し、後発のout.write_bytes()が先発の画像を無言で上書きして
+            # 消していた。8GB GPUの現行機では数秒かかるため滅多に起きないが、
+            # apply_high_vram_profileが想定する96GB高VRAM環境の高速SDXLでは
+            # 同一秒内の衝突が現実的になる。iter77/139/144と同系統の
+            # 「既に生成できたアーティファクトを無言で失わない」原則に倣い、
+            # uuid4由来の8桁hexを付与して秒精度に依存しない一意性を保証する。
+            uniq = uuid.uuid4().hex[:8]
+            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{uniq}.png"
             out.write_bytes(blob)
             return out
         except Exception:
@@ -2057,7 +2068,16 @@ def generate_image_comfyui(prompt, negative=""):
             except Exception:
                 continue
             IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{filename}"
+            # 2026-07-25: time.strftime('%Y%m%d_%H%M%S')は秒単位までしか刻まない。
+            # ComfyUI側のfilenameは同一seed/同一prefixのSaveImageノードが同一秒内に
+            # 複数回走ると衝突しうる（サーバ再起動でComfyUI内部のカウンタがリセット
+            # される場合を含む）ため、fugu_{ts}_{filename}だけでは一意性が保証
+            # できない。A1111側(generate_image_a1111、同日付コメント参照)と対称の
+            # 同一秒上書き問題であり、iter77/139/144と同じ「既に生成できた
+            # アーティファクトを無言で失わない」原則に倣い、uuid4由来の8桁hexを
+            # ComfyUI側filenameの前に挟んで秒精度に依存しない一意性を保証する。
+            uniq = uuid.uuid4().hex[:8]
+            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{uniq}_{filename}"
             out.write_bytes(blob)
             return out
     return None

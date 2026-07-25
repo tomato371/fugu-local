@@ -11270,6 +11270,140 @@ check("generate_image_a1111: テスト後にf._http_post_jsonが元の状態へ�
 check("generate_image_a1111: テスト後にf.IMAGE_OUT_DIRが元の状態へ復元されている",
       f.IMAGE_OUT_DIR == _orig_a1_out_dir)
 
+# ---------- generate_image_a1111 / generate_image_comfyui: 同一秒ファイル名衝突による
+# 上書き・アーティファクト消失の防止 (2026-07-25) ----------
+# 両保存関数とも保存パスをtime.strftime('%Y%m%d_%H%M%S')という秒精度のタイムスタンプ
+# のみから組み立てていた。generate_image_a1111 (fugu_local.py ~L1971) はfugu_{ts}.png
+# に他の一意化要素が無く、generate_image_comfyui (~L2060) もfugu_{ts}_{filename}で
+# ComfyUI側filenameが同一秒内に重複しうる(同一seed/prefixの再実行やサーバ再起動後の
+# 内部カウンタリセットなど)。build_pptxはPPTX_MAX_IMAGES=4枚まで generate_image() を
+# 連続呼び出しし、返ったPathをimgs[idx]へ格納してスライドへ埋め込む。同一秒内に2回
+# 生成が完了すると、旧実装では2回目のout.write_bytes()が1回目のファイルを無言で
+# 上書きし、既に生成できていた画像を消したままスライドに同じ画像を重複表示していた。
+# これはiter77(良い方を回収する)・iter139/144(壊れたエントリでも後続の有効な
+# アーティファクトを取りこぼさない)と同じ「既に生成できたアーティファクトを無言で
+# 失わない」系列の欠陥である。現行の8GB GPU機ではSDXL生成が数秒かかるため同一秒内
+# 衝突は稀だが、apply_high_vram_profileが想定する96GB高VRAM環境の高速SDXLでは現実的
+# になる。修正はuuid4由来の8桁hex(数字/英小文字のみ、パス区切りや".."を含まない
+# ファイルシステム安全な文字列)をtime.strftime由来の文字列とは独立に採番し、両保存
+# パスへ挟み込むことで秒精度に依存しない一意性を保証する。
+# 以下のテストはf.time.strftimeを定数へ固定(=秒精度タイムスタンプ源を凍結)しつつ
+# 一意化に使うuuidは実物のまま動かし、同一秒内で2回連続生成しても返り値のPathが
+# 別々になり、どちらのファイルも上書きされず両方ディスクに残ることを検証する。
+# f._http_post_json / urllib.request.urlopen のみをモックし、実A1111/ComfyUI/GPU/
+# ネットワーク呼び出しは一切発生させない。f.IMAGE_OUT_DIRはtempfile.TemporaryDirectory
+# に差し替え、テスト後は全てのグローバルをtry/finallyで元に戻す。エントリ走査ロジック
+# (iter139/144のskip-and-recoverループ)・isinstance(data, dict)/isinstance(images, list)
+# ガード・base64デコード・IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)の位置関係・
+# 失敗時にNoneを返す契約には一切触れない。
+
+# --- a1111: 同一秒(time.strftime固定)で2回連続生成しても返り値Pathが別々になり、
+#     1回目のファイルが2回目の書き込みで上書きされない ---
+_a1_td7 = None
+try:
+    _a1_td7 = _a1_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _a1_Path(_a1_td7.name)
+    _orig_a1_strftime = f.time.strftime
+    f.time.strftime = lambda *a, **k: "20260725_120000"
+    try:
+        _a1_img1 = _a1_base64.b64encode(b"PNGDATA-a1111-collision-1").decode("ascii")
+        _a1_img2 = _a1_base64.b64encode(b"PNGDATA-a1111-collision-2").decode("ascii")
+
+        f._http_post_json = lambda url, payload, timeout: {"images": [_a1_img1]}
+        _a1_rc1 = f.generate_image_a1111("prompt A", "")
+        f._http_post_json = lambda url, payload, timeout: {"images": [_a1_img2]}
+        _a1_rc2 = f.generate_image_a1111("prompt B", "")
+
+        check("generate_image_a1111: 同一秒(time.strftime固定)でも2回の生成が別Pathを返す(衝突回避)",
+              _a1_rc1 is not None and _a1_rc2 is not None and _a1_rc1 != _a1_rc2)
+        check("generate_image_a1111: 衝突回避後も両方のファイルがディスク上に存在する",
+              _a1_rc1 is not None and _a1_rc2 is not None
+              and _a1_rc1.exists() and _a1_rc2.exists())
+        check("generate_image_a1111: 1件目のファイルが2件目の書き込みで上書きされていない",
+              _a1_rc1 is not None and _a1_rc1.read_bytes() == b"PNGDATA-a1111-collision-1")
+        check("generate_image_a1111: 2件目のファイルのバイト列も正しい(1件目のデータが漏れていない)",
+              _a1_rc2 is not None and _a1_rc2.read_bytes() == b"PNGDATA-a1111-collision-2")
+        check("generate_image_a1111: 返り値Pathのファイル名がfugu_で始まり.pngで終わる(両方)",
+              _a1_rc1 is not None and _a1_rc1.name.startswith("fugu_")
+              and _a1_rc1.name.endswith(".png")
+              and _a1_rc2 is not None and _a1_rc2.name.startswith("fugu_")
+              and _a1_rc2.name.endswith(".png"))
+        check("generate_image_a1111: 返り値PathはIMAGE_OUT_DIR直下(両方)",
+              _a1_rc1 is not None and _a1_rc1.parent == f.IMAGE_OUT_DIR
+              and _a1_rc2 is not None and _a1_rc2.parent == f.IMAGE_OUT_DIR)
+    finally:
+        f.time.strftime = _orig_a1_strftime
+finally:
+    f._http_post_json = _orig_a1_post_json
+    f.IMAGE_OUT_DIR = _orig_a1_out_dir
+    if _a1_td7 is not None:
+        _a1_td7.cleanup()
+
+# --- comfyui: 同一秒(time.strftime固定)かつComfyUI側filenameも同一(same_name.png)の
+#     まま2回連続生成しても返り値Pathが別々になり、1回目のファイルが上書きされない ---
+_cj_td5 = None
+try:
+    _cj_td5 = _cj_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _cj_Path(_cj_td5.name)
+    f.COMFYUI_CKPT = "dummy-ckpt-preset"
+    _orig_cj_strftime = f.time.strftime
+    f.time.strftime = lambda *a, **k: "20260725_120000"
+    try:
+        _cj_view_calls5 = []
+        f._http_post_json = lambda url, payload, timeout: {"prompt_id": "pid-5a"}
+        urllib.request.urlopen = _make_comfy_urlopen(
+            {"pid-5a": {"outputs": {
+                "9": {"images": [{"filename": "same_name.png", "subfolder": "", "type": "output"}]}
+            }}},
+            {"same_name.png": b"PNGDATA-comfy-collision-1"},
+            _cj_view_calls5,
+        )
+        _cj_rc1 = f.generate_image_comfyui("prompt A", "")
+
+        f._http_post_json = lambda url, payload, timeout: {"prompt_id": "pid-5b"}
+        urllib.request.urlopen = _make_comfy_urlopen(
+            {"pid-5b": {"outputs": {
+                "9": {"images": [{"filename": "same_name.png", "subfolder": "", "type": "output"}]}
+            }}},
+            {"same_name.png": b"PNGDATA-comfy-collision-2"},
+            _cj_view_calls5,
+        )
+        _cj_rc2 = f.generate_image_comfyui("prompt B", "")
+
+        check("generate_image_comfyui: 同一秒+同一ComfyUI filenameでも2回の生成が別Pathを返す(衝突回避)",
+              _cj_rc1 is not None and _cj_rc2 is not None and _cj_rc1 != _cj_rc2)
+        check("generate_image_comfyui: 衝突回避後も両方のファイルがディスク上に存在する",
+              _cj_rc1 is not None and _cj_rc2 is not None
+              and _cj_rc1.exists() and _cj_rc2.exists())
+        check("generate_image_comfyui: 1件目のファイルが2件目の書き込みで上書きされていない",
+              _cj_rc1 is not None and _cj_rc1.read_bytes() == b"PNGDATA-comfy-collision-1")
+        check("generate_image_comfyui: 2件目のファイルのバイト列も正しい(1件目のデータが漏れていない)",
+              _cj_rc2 is not None and _cj_rc2.read_bytes() == b"PNGDATA-comfy-collision-2")
+        check("generate_image_comfyui: 返り値PathのファイルにComfyUI側filenameが引き続き埋め込まれる(両方)",
+              _cj_rc1 is not None and _cj_rc1.name.endswith("_same_name.png")
+              and _cj_rc2 is not None and _cj_rc2.name.endswith("_same_name.png"))
+        check("generate_image_comfyui: 返り値PathはIMAGE_OUT_DIR直下(両方)",
+              _cj_rc1 is not None and _cj_rc1.parent == f.IMAGE_OUT_DIR
+              and _cj_rc2 is not None and _cj_rc2.parent == f.IMAGE_OUT_DIR)
+    finally:
+        f.time.strftime = _orig_cj_strftime
+finally:
+    urllib.request.urlopen = _orig_cj_urlopen
+    f._http_post_json = _orig_cj_post_json
+    f.COMFYUI_CKPT = _orig_cj_ckpt
+    f.IMAGE_OUT_DIR = _orig_cj_out_dir
+    if _cj_td5 is not None:
+        _cj_td5.cleanup()
+
+check("generate_image_a1111/comfyui衝突テスト: テスト後にf.time.strftimeが元の状態へ復元されている",
+      f.time.strftime == _orig_a1_strftime == _orig_cj_strftime)
+check("generate_image_a1111/comfyui衝突テスト: テスト後にurllib.request.urlopenが元の状態へ復元されている",
+      urllib.request.urlopen == _orig_cj_urlopen)
+check("generate_image_a1111/comfyui衝突テスト: テスト後にf._http_post_jsonが元の状態へ復元されている",
+      f._http_post_json == _orig_a1_post_json)
+check("generate_image_a1111/comfyui衝突テスト: テスト後にf.IMAGE_OUT_DIRが元の状態へ復元されている",
+      f.IMAGE_OUT_DIR == _orig_a1_out_dir)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
