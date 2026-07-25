@@ -12194,8 +12194,9 @@ check("normalize_answer: \\left(3, 4\\right) -> (3,4) (順序対、区切り剥�
       f.normalize_answer(r"\left(3, 4\right)") == "(3,4)")
 check("normalize_answer: \\left[2, 5\\right) -> [2,5) (半開区間)",
       f.normalize_answer(r"\left[2, 5\right)") == "[2,5)")
-check("normalize_answer: \\left\\{1, 2\\right\\} -> \\{1,2\\} (エスケープ済み中括弧は保持)",
-      f.normalize_answer(r"\left\{1, 2\right\}") == r"\{1,2\}")
+check("normalize_answer: \\left\\{1, 2\\right\\} -> {1,2} (中括弧デリミタは保持、"
+      "エスケープ綴りはiter166でbareへ正規化)",
+      f.normalize_answer(r"\left\{1, 2\right\}") == "{1,2}")
 check("normalize_answer: \\left\\{1, 2\\right\\} と素の \\{1,2\\} が同一クラスに合流する",
       f.normalize_answer(r"\left\{1, 2\right\}") == f.normalize_answer(r"\{1,2\}"))
 
@@ -12251,6 +12252,70 @@ _left_right_votes = [r"\left(3, 4\right)", "(3,4)", "(3,4)"]
 _lr_top, _lr_count, _lr_classes = f.vote_answers(_left_right_votes)
 check("vote_answers: \\left(3, 4\\right)/(3,4)/(3,4) の3票が単一クラスに集約される(票割れしない)",
       _lr_count == 3 and len(_lr_classes) == 1)
+
+# ---------- normalize_answer: エスケープ済み集合中括弧 \{ \} の綴り正規化 (2026-07-25, iter166) ----------
+# iteration 140/164 は \{/\} を「集合の区切り文字として保持する、剥がさない」と明示的に
+# スコープ外にしていた（区切り文字を残す判断自体は正しい）。しかしそのエスケープの綴り違い
+# （\boxed{\{1,2\}} の '\{1,2\}' と \boxed{{1,2}} の '{1,2}'）は残ったままで、同じ集合値が
+# 別々の投票クラスに分裂していた（自己整合性投票 gotcha #7）。ここでは中括弧そのものは
+# 残したまま、バックスラッシュのエスケープだけを剥がして素の { } に統一する。
+check("normalize_answer: \\{1,2\\} -> {1,2} (中括弧は保持、エスケープ綴りをbareに正規化)",
+      f.normalize_answer(r"\{1,2\}") == "{1,2}")
+check("normalize_answer: \\{1, 2, 3\\} -> {1,2,3} (iter160の数字間カンマ空白除去も後段で継続動作)",
+      f.normalize_answer(r"\{1, 2, 3\}") == "{1,2,3}")
+check("normalize_answer: \\{1,2\\} と素の {1,2} がbyte-for-byteで同一クラスに合流する",
+      f.normalize_answer(r"\{1,2\}") == f.normalize_answer("{1,2}"))
+check("normalize_answer: \\{1, 2, 3\\} と素の {1,2,3} がbyte-for-byteで同一クラスに合流する",
+      f.normalize_answer(r"\{1, 2, 3\}") == f.normalize_answer("{1,2,3}"))
+
+# regression: 削除ではなく置換であることの確認 -- 中括弧自体は残り、素のタプル/スカラーには
+# 誤って一致しない(制約: REPLACE, do not DELETE)。
+check("normalize_answer: \\{1,2\\} の中括弧は削除されず残る(素の1,2への誤併合なし)",
+      f.normalize_answer(r"\{1,2\}") == "{1,2}" and f.normalize_answer(r"\{1,2\}") != "1,2")
+
+
+def _t_escaped_brace_fastpath_equiv(calls):
+    result = f.answers_equivalent(r"\{1,2\}", "{1,2}")
+    check("answers_equivalent: \\{1,2\\} と {1,2} が正規化高速パスで一致(math_verify不使用)",
+          result is True)
+    check("answers_equivalent: エスケープ済み中括弧の併合はmath_verify.parseを一切呼ばない(高速パス経由)",
+          len(calls["parse_args"]) == 0)
+
+
+_run_with_math_verify_stub(None, "parse", _t_escaped_brace_fastpath_equiv)
+
+_escaped_brace_votes = [r"\{1,2\}", "{1,2}", "{1,2}"]
+_eb_top, _eb_count, _eb_classes = f.vote_answers(_escaped_brace_votes)
+check("vote_answers: \\{1,2\\}/{1,2}/{1,2} の3票が単一クラスに集約される(票割れしない)",
+      _eb_count == 3 and len(_eb_classes) == 1)
+
+check("extract_final_answer: \\boxed{\\{1,2\\}} -> {1,2} (boxed math分岐、エスケープ綴り経由)",
+      f.extract_final_answer(r"\boxed{\{1,2\}}", "math") == "{1,2}")
+check("extract_final_answer: \\boxed{{1,2}} -> {1,2} (boxed math分岐、bare綴り経由)",
+      f.extract_final_answer(r"\boxed{{1,2}}", "math") == "{1,2}")
+check("extract_final_answer: エスケープ/bare両ルートが同一の投票トークンに収束する",
+      f.extract_final_answer(r"\boxed{\{1,2\}}", "math") ==
+      f.extract_final_answer(r"\boxed{{1,2}}", "math"))
+
+# regression(バイト単位で不変): 値を持たない区切り文字剥がし(iter140の\(\)/\[\])・
+# \frac 変換(iter122)・\textbf 外殻剥がし(iter23)・\left/\right剥がし(iter164)・
+# 素の値は今回の変更で一切影響を受けない。
+check("normalize_answer: \\(5\\) -> 5 (iter140回帰、over-stripなし)",
+      f.normalize_answer(r"\(5\)") == "5")
+check("normalize_answer: $5$ -> 5 (回帰、over-stripなし)",
+      f.normalize_answer("$5$") == "5")
+check("normalize_answer: \\frac{1}{2} -> 1/2 (iter122回帰、over-stripなし)",
+      f.normalize_answer(r"\frac{1}{2}") == "1/2")
+check("normalize_answer: \\textbf{B} -> B (iter23回帰、over-stripなし)",
+      f.normalize_answer(r"\textbf{B}") == "B")
+check("normalize_answer: \\left(3, 4\\right) -> (3,4) (iter164回帰、over-stripなし)",
+      f.normalize_answer(r"\left(3, 4\right)") == "(3,4)")
+check("normalize_answer: 素のA/5/1/2/50%/-5は不変(over-stripなし)",
+      f.normalize_answer("A") == "A"
+      and f.normalize_answer("5") == "5"
+      and f.normalize_answer("1/2") == "1/2"
+      and f.normalize_answer("50%") == "50%"
+      and f.normalize_answer("-5") == "-5")
 
 print()
 if _FAILS:
