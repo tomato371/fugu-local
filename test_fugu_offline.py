@@ -5159,6 +5159,91 @@ with _tempfile.TemporaryDirectory() as _ri_dir:
     check("_read_ipynb: cells=dictケースの結果に生JSONマーカーが含まれない",
           "cell_type" not in _ri_out_i and "source" not in _ri_out_i)
 
+# ---------- _read_ipynb: cp932(Shift-JIS)デコードラダー (2026-07-25 / iter159) ----------
+# 発端: _read_ipynbは、iteration 94が_read_html/read_file_text汎用テキスト分岐に
+# 導入した_decode_text_bytes()のutf-8→cp932→replaceラダー(上のセクション、
+# iteration 70のerrors="replace"はfugu自身がUTF-8で書いたファイルの読み戻し用の
+# 保険であり他所由来ファイルの元エンコーディングは救済しないという整理も同じ)を
+# 使わない最後のサードパーティファイルリーダーだった。notebookのJSON構造
+# (波括弧・引用符・キー名)はASCIIのみで構成されるため、cp932(Shift-JIS)保存の
+# .ipynb(既知の落とし穴#4のcp932コンソールと同根の環境要因でこのマシンには
+# 普通に存在する)でもjson.loads自体は成功し、iteration 72/113(上のセクション)の
+# セル単位/トップレベル構造ガードも問題なく通過してしまうが、従来の
+# path.read_text(encoding="utf-8", errors="replace")がデコード時点で各セルの
+# 'source'内の日本語をU+FFFDへ全て潰していたため、精度criticalなRAG/--file
+# コンテキストへ文字化けがそのまま注入されていた。ここでは(1) cp932保存
+# notebookのコード/markdown両セルで日本語sourceが正しく復元されること、
+# (2) 通常のUTF-8 notebook(単一文字列source含む)は変更前とバイト単位で完全
+# 一致すること(回帰)、(3) 真に非JSONなnotebookのexceptフォールバックも
+# 再読み込みではなく同一の_decode_text_bytes結果を使うため、そのフォールバック
+# テキスト自体もcp932復元されること、の3点を検証する。iteration 71/72/113の
+# 既存フィクスチャ(直上のセクション、source=None・非str要素混入・非dictセル・
+# 非dictトップレベル・非listなcells)は本変更後も全てutf-8保存のまま変更前と
+# 同じ結果を返すことを直上のテストで既に回帰確認済み。Ollama/ネットワーク
+# 呼び出しは一切不要(すべてtempfile上のオフラインI/O)。
+with _tempfile.TemporaryDirectory() as _rin_dir:
+    _rin_root = _pathlib.Path(_rin_dir)
+
+    # (1) cp932保存のnotebook: コード/markdown両セルの日本語sourceが正しく復元される。
+    #     ensure_ascii=Falseでdumpすることで、JSON文字列中に実際の日本語文字を
+    #     含めた上でcp932へエンコードする(ensure_ascii既定のままだと\uXXXXエスケープ
+    #     のみのASCII文字列になり、cp932マルチバイト列を全く含まないためテストとして
+    #     無意味になる)。
+    _rin_nb_jp = {
+        "cells": [
+            {"cell_type": "code",
+             "source": ["import os\n", "print('こんにちは')  # 日本語コメント"]},
+            {"cell_type": "markdown",
+             "source": ["# 見出し\n", "これは日本語の説明文です。株式会社。"]},
+        ]
+    }
+    _rin_jp_json = json.dumps(_rin_nb_jp, ensure_ascii=False)
+    _rin_jp_path = _rin_root / "sjis.ipynb"
+    _rin_jp_path.write_bytes(_rin_jp_json.encode("cp932"))
+    _rin_jp_out = f._read_ipynb(_rin_jp_path)
+    _rin_jp_expected = (
+        "```python\nimport os\nprint('こんにちは')  # 日本語コメント\n```"
+        "\n\n# 見出し\nこれは日本語の説明文です。株式会社。"
+    )
+    check("_read_ipynb: cp932保存notebookのコード/markdownセルの日本語sourceが正しく復元される",
+          _rin_jp_out == _rin_jp_expected)
+    check("_read_ipynb: cp932保存notebookの復元結果にU+FFFD(文字化け)が含まれない",
+          "�" not in _rin_jp_out)
+
+    # (2) 回帰: 通常のUTF-8 notebook(複数セル・単一文字列source含む)は
+    #     変更前とバイト単位で完全一致する。
+    _rin_nb_utf8 = {
+        "cells": [
+            {"cell_type": "code", "source": ["import sys\n", "print(sys.version)"]},
+            {"cell_type": "markdown", "source": "Plain single-string markdown source."},
+            {"cell_type": "code", "source": "x = 1\ny = 2\nprint(x + y)"},
+        ]
+    }
+    _rin_utf8_path = _rin_root / "utf8.ipynb"
+    _rin_utf8_path.write_text(json.dumps(_rin_nb_utf8), encoding="utf-8")
+    _rin_utf8_out = f._read_ipynb(_rin_utf8_path)
+    _rin_utf8_expected = (
+        "```python\nimport sys\nprint(sys.version)\n```"
+        "\n\nPlain single-string markdown source."
+        "\n\n```python\nx = 1\ny = 2\nprint(x + y)\n```"
+    )
+    check("_read_ipynb: 通常のUTF-8 notebook(単一文字列source含む)は従来通りバイト単位で完全一致(回帰)",
+          _rin_utf8_out == _rin_utf8_expected)
+
+    # (3) 真に非JSONなnotebook(cp932保存の平文): exceptフォールバックが
+    #     path.read_text()での再読み込みではなく、try節冒頭で一度だけ
+    #     _decode_text_bytes()した結果を再利用するため、フォールバックテキスト
+    #     自体もcp932復元される(旧実装なら再読み込み時もutf-8+replaceのままで
+    #     日本語がU+FFFDに化けていた)。
+    _rin_bad_jp_text = "これは有効なJSONではないメモです。{ 壊れています"
+    _rin_bad_path = _rin_root / "sjis_broken.ipynb"
+    _rin_bad_path.write_bytes(_rin_bad_jp_text.encode("cp932"))
+    _rin_bad_out = f._read_ipynb(_rin_bad_path)
+    check("_read_ipynb: 非JSONかつcp932保存のnotebookはフォールバックでも日本語が正しく復元される",
+          _rin_bad_out == _rin_bad_jp_text)
+    check("_read_ipynb: 非JSON cp932フォールバック結果にU+FFFD(文字化け)が含まれない",
+          "�" not in _rin_bad_out)
+
 # ---------- _decode_text_bytes / read_file_text・_read_html cp932フォールバック (2026-07-24) ----------
 # このマシンのコンソールが cp932(Shift-JIS) である既知の落とし穴 #4 と同根の環境要因で、
 # ローカルに保存された非UTF-8(Shift-JIS/cp932)の .txt/.csv/.html 等が普通に存在する。

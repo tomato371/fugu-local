@@ -1204,8 +1204,34 @@ def _read_html(path: Path) -> str:
 
 def _read_ipynb(path: Path) -> str:
     """Jupyter Notebook からコードセルとマークダウンセルを抽出。"""
+    # 2026-07-25: 落とし穴 #4 (cp932コンソール) と同根の環境要因で、ローカルに
+    # 保存された .ipynb がShift-JIS(cp932)保存されていることがある。notebookの
+    # JSON構造（波括弧・引用符・キー名）はすべてASCIIのため、cp932保存の
+    # notebookでもjson.loads自体は成功し、iteration 72/113が導入したセル単位/
+    # トップレベルの構造ガードも問題なく通過してしまう。だが従来の
+    # path.read_text(encoding="utf-8", errors="replace")（本関数の解析用と、
+    # 下のexceptフォールバック用の2箇所で使用）はデコード時点で各セルの
+    # 'source'に含まれる日本語を全てU+FFFD（置換文字）へ潰してから渡して
+    # いたため、json.loadsが成功して構造ガードも通ってもセル内容そのものは
+    # 既に文字化けした状態のまま、精度criticalなRAG/--fileコンテキストへ
+    # 注入されていた（他の多くのリーダーと異なり.ipynbはJSONなので
+    # 「パース自体は成功するのに中身だけ化ける」という気づきにくい劣化）。
+    # iteration 94が_read_html/read_file_text汎用テキスト分岐に導入した
+    # utf-8→cp932→replaceの_decode_text_bytes()ラダーをここにも適用する
+    # （iteration 70のerrors="replace"はfugu自身がUTF-8で書いたファイルの
+    # 読み戻し用の保険であり、他所由来ファイルの元エンコーディングまでは
+    # 救済しないという整理は変わらない）。生バイト列はpath.read_bytes()で
+    # 一度だけ読み、_decode_text_bytes()で一度だけデコードし、そのデコード
+    # 結果をjson.loadsにも、非JSON時のexceptフォールバック（生テキスト
+    # 返却）にも共用する（旧実装のようにexcept節でpath.read_text()を
+    # 再度読み直すことはしない）。iteration 72（セル単位: source文字列/
+    # list[str]/その他の正規化、空白sourceのスキップ、非strリスト要素の
+    # 除外）とiteration 113（トップレベル: 非dictなnbは''へ、非listな
+    # cellsは[]へ強制変換）の構造ガードは、このデコード経路変更とは独立に
+    # 一切変更せずそのまま維持する。
+    raw = _decode_text_bytes(path.read_bytes())
     try:
-        nb = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        nb = json.loads(raw)
         # 2026-07-24: json.loads自体は成功しても、トップレベルがdictでない
         # ケース（例: [{"cell_type": "code"}] のような配列、あるいは裸の数値・
         # 文字列）や、nb["cells"]がtruthyな非list値（例: {"cells": 42} や
@@ -1260,7 +1286,7 @@ def _read_ipynb(path: Path) -> str:
                 parts.append(src)
         return "\n\n".join(parts)
     except Exception:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return raw
 
 
 # テキストとして直接読めない拡張子
