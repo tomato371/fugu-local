@@ -7456,6 +7456,146 @@ check("_score_chunk: 日本語の部分フレーズがチャンク中のより�
 check("_score_chunk: 内容を共有しない無関係な日本語チャンクは引き続き0.0(精度サニティ)",
       f._score_chunk(f._tokenize("東京の人口"), "桜が満開の京都で紅葉を楽しんだ") == 0.0)
 
+# ---------- _get_rag_chunks: モジュールグローバルキャッシュの直接検証（2026-07-26） ----------
+# _get_rag_chunks()(fugu_local.py ~L1531)は_load_rag_chunks()の前段にあるモジュール
+# グローバルキャッシュで、rag_search -> _get_rag_chunks -> build_context という経路を
+# 通じて全proposerに渡るRAGコンテキストの唯一の入口を握っている。挙動は
+# 「dirs != _RAG_DIRS_LOADED を条件にした再読み込み」「list(dirs)によるコピー保持」
+# 「キャッシュそのものを参照で返す」という純粋にステートフルなものだが、この
+# ファイル中のrag_search関連テストは全て_get_rag_chunks自体をlambdaで丸ごと
+# 差し替えて迂回しており(下のrag_searchセクション参照)、キャッシュ層そのものへの
+# 直接テストがこれまで一件も存在しなかった。再読み込み条件がここで壊れると、
+# (a) RAG_DIRSが変わっても古いチャンクを返し続ける(誤った文書がproposerに渡る
+# 精度事故)、(b) 逆に毎ターン再読み込みしてしまい無駄なI/Oに加えiter42/156で
+# ハードニングした1ファイル単位の隔離パスを毎回再発火させる、のどちらかの
+# サイレントな精度劣化に直結する。ここではf._load_rag_chunksを呼び出し回数・
+# 引数を記録するだけの純粋なin-processスタブに差し替え、f._get_rag_chunksを
+# 直接呼び出してキャッシュ契約(再利用/無効化/コピーキー/空リストのキャッシュ)を
+# 固定化する。ディスク・RAG_DIRSには一切触れない。printの文言は
+# contextlib.redirect_stdoutで抑制し、文言自体はアサート対象にしない。
+# 静的レビューでは欠陥は見つからなかったため、これは既存挙動の特性固定化
+# (characterization)であり、意外な挙動が見つかってもここでは修正せず
+# iteration 48/66/71のsurface-don't-fix方針を踏襲して明示するに留める
+# (fugu_local.py自体はこの変更で一切変更していない)。
+
+_orig_ggrc_chunks = f._RAG_CHUNKS
+_orig_ggrc_dirs_loaded = f._RAG_DIRS_LOADED
+_orig_ggrc_load_rag_chunks = f._load_rag_chunks
+
+try:
+    f._RAG_CHUNKS = []
+    f._RAG_DIRS_LOADED = []
+
+    _ggrc_calls = []      # 呼び出しごとに渡されたdirsの内容(コピー)を記録
+    _ggrc_fixtures = []   # 呼び出しごとに返す固定チャンクリストのキュー(FIFO)
+
+    def _ggrc_stub(dirs):
+        _ggrc_calls.append(list(dirs))
+        return _ggrc_fixtures.pop(0)
+
+    f._load_rag_chunks = _ggrc_stub
+
+    # --- 1) 初回ロード: キャッシュ未設定でdirsを渡すとスタブがちょうど1回呼ばれる ---
+    _ggrc_dirs1 = ["dirA", "dirB"]
+    _ggrc_fixture1 = [("dirA/x.txt", "chunk1"), ("dirB/y.txt", "chunk2")]
+    _ggrc_fixtures.append(_ggrc_fixture1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result1 = f._get_rag_chunks(_ggrc_dirs1)
+    check("_get_rag_chunks: 初回ロードでスタブがちょうど1回呼ばれる",
+          len(_ggrc_calls) == 1)
+    check("_get_rag_chunks: 初回ロードの戻り値はスタブの戻り値そのもの(同一オブジェクト)",
+          _ggrc_result1 is _ggrc_fixture1)
+    check("_get_rag_chunks: 初回ロード後_RAG_DIRS_LOADEDは渡したdirsの内容と一致",
+          f._RAG_DIRS_LOADED == _ggrc_dirs1)
+
+    # --- 2) 再利用: 内容が同じでも別オブジェクトのリストを渡すと再ロードされない ---
+    _ggrc_dirs2 = list(_ggrc_dirs1)  # 別オブジェクト、内容は同一
+    check("_get_rag_chunks(自己サニティ): dirs2はdirs1と別オブジェクト",
+          _ggrc_dirs2 is not _ggrc_dirs1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result2 = f._get_rag_chunks(_ggrc_dirs2)
+    check("_get_rag_chunks: 内容が同じ別オブジェクトのdirsでは再ロードされない(呼び出し回数1のまま)",
+          len(_ggrc_calls) == 1)
+    check("_get_rag_chunks: 再利用時は同一キャッシュオブジェクトを参照で返す(値一致ではなくis)",
+          _ggrc_result2 is _ggrc_result1)
+
+    # --- 3) 無効化(要素追加): dirsの内容が変わると再ロードされ、キャッシュが更新される ---
+    _ggrc_dirs3 = ["dirA", "dirB", "dirC"]
+    _ggrc_fixture3 = [("dirC/z.txt", "chunk3")]
+    _ggrc_fixtures.append(_ggrc_fixture3)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result3 = f._get_rag_chunks(_ggrc_dirs3)
+    check("_get_rag_chunks: dirsに要素が増えると再ロードされる(呼び出し回数2)",
+          len(_ggrc_calls) == 2)
+    check("_get_rag_chunks: 無効化後の戻り値は新しいスタブの戻り値そのもの",
+          _ggrc_result3 is _ggrc_fixture3)
+    check("_get_rag_chunks: 無効化後_RAG_CHUNKSも新しいフィクスチャに更新される",
+          f._RAG_CHUNKS is _ggrc_fixture3)
+    check("_get_rag_chunks: 無効化後_RAG_DIRS_LOADEDも新しいdirsの内容に更新される",
+          f._RAG_DIRS_LOADED == _ggrc_dirs3)
+
+    # --- 3b) 無効化(順序違い): 同じ要素でも順序が異なれば別内容として再ロードされる ---
+    _ggrc_dirs3b = ["dirB", "dirA", "dirC"]  # dirs3と要素は同じだが順序が異なる
+    _ggrc_fixture3b = [("dirB/w.txt", "chunk3b")]
+    _ggrc_fixtures.append(_ggrc_fixture3b)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result3b = f._get_rag_chunks(_ggrc_dirs3b)
+    check("_get_rag_chunks: 同じ要素でも順序が異なれば再ロードされる(呼び出し回数3)",
+          len(_ggrc_calls) == 3)
+    check("_get_rag_chunks: 順序違いによる無効化後の戻り値も新しいフィクスチャそのもの",
+          _ggrc_result3b is _ggrc_fixture3b)
+
+    # --- 4) コピーキー契約: ロード後に呼び出し元のdirsリストを変更しても、
+    #        以後の「変更前と同内容の別オブジェクト」呼び出しは誤って再ロードを
+    #        誘発しない(`_RAG_DIRS_LOADED = list(dirs)`でコピーを保持している
+    #        契約のロック。もし単に`= dirs`なら下のcheckは呼び出し回数5で落ちる) ---
+    _ggrc_dirs4 = ["dirX"]
+    _ggrc_fixture4 = [("dirX/a.txt", "chunk4")]
+    _ggrc_fixtures.append(_ggrc_fixture4)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result4 = f._get_rag_chunks(_ggrc_dirs4)
+    check("_get_rag_chunks(コピーキー契約, 準備): ロードされる(呼び出し回数4)",
+          len(_ggrc_calls) == 4)
+    _ggrc_dirs4.append("dirY_mutated_after_load")  # 呼び出し元のリストを事後に変更
+    _ggrc_dirs4_fresh = ["dirX"]  # 変更前と同内容の、別の新しいリストオブジェクト
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result4b = f._get_rag_chunks(_ggrc_dirs4_fresh)
+    check("_get_rag_chunks: ロード後に元のdirsリストを変更しても、"
+          "同内容の別リストでの呼び出しは再ロードを誘発しない(コピー保持の証拠)",
+          len(_ggrc_calls) == 4)
+    check("_get_rag_chunks: コピーキー契約下でも再利用時は同一キャッシュオブジェクトを返す",
+          _ggrc_result4b is _ggrc_result4)
+
+    # --- 5) 空ロードのキャッシュ: スタブが空リストを返すディレクトリでも、以後の
+    #        同内容呼び出しで再ロードされない(空/0ファイルディレクトリを毎ターン
+    #        再スキャンしない契約のロック) ---
+    _ggrc_dirs5 = ["dirEmpty"]
+    _ggrc_fixtures.append([])
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result5 = f._get_rag_chunks(_ggrc_dirs5)
+    check("_get_rag_chunks(空ロード, 準備): 空リストで初回ロードされる(呼び出し回数5)",
+          len(_ggrc_calls) == 5)
+    check("_get_rag_chunks: 空ディレクトリのロード結果は空リスト", _ggrc_result5 == [])
+    _ggrc_dirs5_again = ["dirEmpty"]  # 別オブジェクト、内容は同一
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ggrc_result5b = f._get_rag_chunks(_ggrc_dirs5_again)
+    check("_get_rag_chunks: 空リストがキャッシュされ、同内容の再呼び出しでは再ロードされない",
+          len(_ggrc_calls) == 5)
+    check("_get_rag_chunks: 空リストキャッシュの再利用時も同一オブジェクトを返す(is)",
+          _ggrc_result5b is _ggrc_result5)
+
+finally:
+    f._RAG_CHUNKS = _orig_ggrc_chunks
+    f._RAG_DIRS_LOADED = _orig_ggrc_dirs_loaded
+    f._load_rag_chunks = _orig_ggrc_load_rag_chunks
+
+check("_get_rag_chunks: テスト後に_RAG_CHUNKSが元の状態(同一オブジェクト)へ復元されている",
+      f._RAG_CHUNKS is _orig_ggrc_chunks)
+check("_get_rag_chunks: テスト後に_RAG_DIRS_LOADEDが元の状態(同一オブジェクト)へ復元されている",
+      f._RAG_DIRS_LOADED is _orig_ggrc_dirs_loaded)
+check("_get_rag_chunks: テスト後にf._load_rag_chunksが元の状態へ復元されている",
+      f._load_rag_chunks == _orig_ggrc_load_rag_chunks)
+
 # ---------- rag_search: score>0のみ抽出（2026-07-22） ----------
 # 以前は top = scored[:top_k] のうち先頭(best)が0でなければ丸ごと返しており、
 # top_k内にキーワード的に無関係(score==0)なチャンクが混ざっていても
