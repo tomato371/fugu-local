@@ -1944,14 +1944,36 @@ def generate_image_a1111(prompt, negative=""):
     payload = {"prompt": prompt, "negative_prompt": negative,
                "steps": IMAGE_STEPS, "width": IMAGE_WIDTH, "height": IMAGE_HEIGHT}
     data = _http_post_json(f"{A1111_URL}/sdapi/v1/txt2img", payload, IMAGE_TIMEOUT)
-    images = data.get("images") or []
-    if not images:
+    # 2026-07-25 (iter144): iter139でComfyUI側(generate_image_comfyui)のoutputs/image
+    # エントリ走査に施したskip-and-recoverと対称の穴がこちら(A1111側)にも残っていた。
+    # data.get("images")はdata自体がdictである前提、images[0]はimagesがnon-emptyな
+    # listである前提、images[0].split(",", 1)は先頭要素がstrである前提で、いずれも
+    # 無保証。非dictなdata・truthyだが非listなimages・非str/空/デコード不能な先頭
+    # エントリはAttributeError/TypeError/binascii.Errorを送出し、呼び出し元
+    # generate_imageの外側except Exceptionまで伝播、後続に有効な画像が残っていても
+    # 生成結果ごと握り潰してNoneになっていた。iter103/111/112/113/138（非list/非dict
+    # の強制truthy変換に頼らない既定値フォールバックとentry単位skip）と同じ作法に
+    # 倣い、dataが非dictならNone、imagesが非listなら[]へ矯正し、先頭決め打ちではなく
+    # リストを走査して非str/空/デコードまたは書き込み失敗エントリを1件ずつskipして
+    # 後続の有効な画像を回収する。
+    if not isinstance(data, dict):
         return None
-    IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}.png"
-    # data URI プレフィックスが付く場合があるのでカンマ以降を取る
-    out.write_bytes(base64.b64decode(images[0].split(",", 1)[-1]))
-    return out
+    images = data.get("images")
+    if not isinstance(images, list):
+        images = []
+    for img in images:
+        if not isinstance(img, str) or not img:
+            continue
+        try:
+            # data URI プレフィックスが付く場合があるのでカンマ以降を取る
+            blob = base64.b64decode(img.split(",", 1)[-1])
+            IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            out.write_bytes(blob)
+            return out
+        except Exception:
+            continue
+    return None
 
 
 def generate_image_comfyui(prompt, negative=""):

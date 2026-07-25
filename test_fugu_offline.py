@@ -10886,6 +10886,184 @@ check("generate_image_comfyui: テスト後にf.COMFYUI_CKPTが元の状態へ�
 check("generate_image_comfyui: テスト後にf.IMAGE_OUT_DIRが元の状態へ復元されている",
       f.IMAGE_OUT_DIR == _orig_cj_out_dir)
 
+# ---------- generate_image_a1111: 壊れたtxt2imgレスポンスのskip-and-recover (2026-07-25 / iter144) ----------
+# generate_image_a1111 (fugu_local.py ~L1941-1976) の txt2img JSONレスポンス処理は、
+# iter139でComfyUI側(generate_image_comfyui)のoutputs/imageエントリ走査に施した
+# skip-and-recoverと対称の穴がこちら(A1111側)にも残っていた。data.get("images")は
+# dataがdictである前提、images[0]はimagesがnon-emptyなlistである前提、
+# images[0].split(",", 1)は先頭要素がstrである前提で、いずれも無保証だった。
+# 非dictなdata・truthyだが非listなimages・非str/空/デコード不能な先頭エントリは
+# AttributeError/TypeError/binascii.Errorを送出し、呼び出し元generate_imageの外側
+# except Exceptionまで伝播、後続に有効な画像が残っていても生成結果ごと握り潰して
+# Noneになっていた。iter103/111/112/113/138（非list/非dictの強制truthy変換に
+# 頼らない既定値フォールバックとentry単位skip）・iter139(ComfyUI側の同型修正)と
+# 同じ作法の回帰防止テスト。generate_image_a1111はこれまで直接のオフラインカバ
+# レッジが0件（iter139のテストノート通り、iter139はComfyUI側のみに意図的に限定
+# していた）だったため、ここで初めて直接テストを追加しカバレッジの穴を塞ぐ。
+# f._http_post_jsonのみをモックし、実A1111/ネットワーク呼び出しは一切発生させ
+# ない。f.IMAGE_OUT_DIRをtempfile.TemporaryDirectoryにして実ファイルシステムへの
+# 書き込みを回避する。_http_post_json自体・generate_image/generate_image_comfyui/
+# _detect_backend/_backend_upには一切触れない。
+
+import base64 as _a1_base64
+import tempfile as _a1_tempfile
+from pathlib import Path as _a1_Path
+
+_orig_a1_post_json = f._http_post_json
+_orig_a1_out_dir = f.IMAGE_OUT_DIR
+
+# --- (1) dataが非dict(list/文字列/数値/None) -> 例外を出さずNoneを返す ---
+_a1_td1 = None
+try:
+    _a1_td1 = _a1_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _a1_Path(_a1_td1.name)
+    for _bad_data in ([1, 2, 3], "not-a-dict", 12345, None):
+        f._http_post_json = lambda url, payload, timeout, _v=_bad_data: _v
+        _a1_exc1 = None
+        try:
+            _a1_r1 = f.generate_image_a1111("a cat", "blurry")
+        except Exception as _e:
+            _a1_exc1 = _e
+            _a1_r1 = "__RAISED__"
+        check(f"generate_image_a1111: dataが非dict({type(_bad_data).__name__})で例外を送出せずNone",
+              _a1_exc1 is None and _a1_r1 is None)
+finally:
+    f._http_post_json = _orig_a1_post_json
+    f.IMAGE_OUT_DIR = _orig_a1_out_dir
+    if _a1_td1 is not None:
+        _a1_td1.cleanup()
+
+# --- (2) imagesがtruthyだが非list(dict/文字列/数値) -> 例外を出さずNoneを返す ---
+_a1_td2 = None
+try:
+    _a1_td2 = _a1_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _a1_Path(_a1_td2.name)
+    for _bad_images in ({"0": "x"}, "just-a-string", 999):
+        f._http_post_json = lambda url, payload, timeout, _v=_bad_images: {"images": _v}
+        _a1_exc2 = None
+        try:
+            _a1_r2 = f.generate_image_a1111("prompt", "")
+        except Exception as _e:
+            _a1_exc2 = _e
+            _a1_r2 = "__RAISED__"
+        check(f"generate_image_a1111: imagesがtruthyな非list({type(_bad_images).__name__})で例外を送出せずNone",
+              _a1_exc2 is None and _a1_r2 is None)
+finally:
+    f._http_post_json = _orig_a1_post_json
+    f.IMAGE_OUT_DIR = _orig_a1_out_dir
+    if _a1_td2 is not None:
+        _a1_td2.cleanup()
+
+# --- (3) 先頭エントリが壊れている(非str/空/デコード不能)が2件目が有効なbase64 ->
+#     2件目を回収してPathを返し、書き込まれたバイト列も一致する ---
+_a1_valid_b64 = _a1_base64.b64encode(b"PNGDATA-a1111-valid").decode("ascii")
+_a1_bad_firsts = [None, 123, {"x": 1}, [], "", "abc"]
+_a1_td3 = None
+try:
+    _a1_td3 = _a1_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _a1_Path(_a1_td3.name)
+    for _bad_first in _a1_bad_firsts:
+        f._http_post_json = lambda url, payload, timeout, _v=_bad_first: {
+            "images": [_v, _a1_valid_b64]
+        }
+        _a1_r3 = f.generate_image_a1111("prompt", "")
+        check(f"generate_image_a1111: 壊れた先頭エントリ({_bad_first!r})を飛ばし2件目を回収(Pathを返す)",
+              _a1_r3 is not None and isinstance(_a1_r3, _a1_Path))
+        check(f"generate_image_a1111: 回収したPathのバイト列が2件目のデコード結果と一致({_bad_first!r})",
+              _a1_r3 is not None and _a1_r3.read_bytes() == b"PNGDATA-a1111-valid")
+    # 先頭が壊れていて、2件目がdata URIプレフィックス付きでも回収できる
+    f._http_post_json = lambda url, payload, timeout: {
+        "images": [None, f"data:image/png;base64,{_a1_valid_b64}"]
+    }
+    _a1_r3b = f.generate_image_a1111("prompt", "")
+    check("generate_image_a1111: 壊れた先頭エントリを飛ばしdata URIプレフィックス付き2件目も回収できる",
+          _a1_r3b is not None and _a1_r3b.read_bytes() == b"PNGDATA-a1111-valid")
+finally:
+    f._http_post_json = _orig_a1_post_json
+    f.IMAGE_OUT_DIR = _orig_a1_out_dir
+    if _a1_td3 is not None:
+        _a1_td3.cleanup()
+
+# --- (4) 回帰: 全エントリが壊れている(非str/空/デコード不能) -> 例外を送出せずNoneを
+#     返し、IMAGE_OUT_DIR配下に空の書き込みも発生しない ---
+_a1_td4 = None
+try:
+    _a1_td4 = _a1_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _a1_Path(_a1_td4.name)
+    f._http_post_json = lambda url, payload, timeout: {
+        "images": [None, 123, {}, [], "", "abc"]
+    }
+    _a1_exc4 = None
+    try:
+        _a1_r4 = f.generate_image_a1111("prompt", "")
+    except Exception as _e:
+        _a1_exc4 = _e
+        _a1_r4 = "__RAISED__"
+    check("generate_image_a1111: 全エントリ壊れていても例外を送出しない(回帰)",
+          _a1_exc4 is None)
+    check("generate_image_a1111: 全エントリ壊れていればNoneを返す(回帰)",
+          _a1_r4 is None)
+    check("generate_image_a1111: 全エントリ壊れていてもIMAGE_OUT_DIR配下にファイルが書き込まれない",
+          list(_a1_Path(_a1_td4.name).iterdir()) == [])
+finally:
+    f._http_post_json = _orig_a1_post_json
+    f.IMAGE_OUT_DIR = _orig_a1_out_dir
+    if _a1_td4 is not None:
+        _a1_td4.cleanup()
+
+# --- (5) 回帰: 単一の正常なbase64エントリ(data URIプレフィックスあり/なし)では従来通り
+#     Pathを返し、書き込まれたバイト列もデコード結果とバイト単位で一致する ---
+_a1_td5 = None
+try:
+    _a1_td5 = _a1_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _a1_Path(_a1_td5.name)
+    _a1_solo_b64 = _a1_base64.b64encode(b"PNGDATA-a1111-solo").decode("ascii")
+
+    f._http_post_json = lambda url, payload, timeout: {"images": [_a1_solo_b64]}
+    _a1_r5a = f.generate_image_a1111("solo prompt", "neg")
+    check("generate_image_a1111: 単一正常エントリ(プレフィックスなし)の回帰確認(Pathを返す)",
+          _a1_r5a is not None and isinstance(_a1_r5a, _a1_Path))
+    check("generate_image_a1111: 単一正常エントリ(プレフィックスなし)のバイト列一致(回帰)",
+          _a1_r5a is not None and _a1_r5a.read_bytes() == b"PNGDATA-a1111-solo")
+    check("generate_image_a1111: 単一正常エントリの保存先ディレクトリがIMAGE_OUT_DIR配下(回帰)",
+          _a1_r5a is not None and _a1_r5a.parent == f.IMAGE_OUT_DIR)
+
+    f._http_post_json = lambda url, payload, timeout: {
+        "images": [f"data:image/png;base64,{_a1_solo_b64}"]
+    }
+    _a1_r5b = f.generate_image_a1111("solo prompt", "neg")
+    check("generate_image_a1111: 単一正常エントリ(data URIプレフィックスあり)の回帰確認(Pathを返す)",
+          _a1_r5b is not None and isinstance(_a1_r5b, _a1_Path))
+    check("generate_image_a1111: 単一正常エントリ(data URIプレフィックスあり)のバイト列一致(回帰)",
+          _a1_r5b is not None and _a1_r5b.read_bytes() == b"PNGDATA-a1111-solo")
+finally:
+    f._http_post_json = _orig_a1_post_json
+    f.IMAGE_OUT_DIR = _orig_a1_out_dir
+    if _a1_td5 is not None:
+        _a1_td5.cleanup()
+
+# --- (6) 回帰: imagesが空リスト/キー自体が欠落 -> Noneを返す ---
+_a1_td6 = None
+try:
+    _a1_td6 = _a1_tempfile.TemporaryDirectory()
+    f.IMAGE_OUT_DIR = _a1_Path(_a1_td6.name)
+    f._http_post_json = lambda url, payload, timeout: {"images": []}
+    check("generate_image_a1111: imagesが空リストならNoneを返す(回帰)",
+          f.generate_image_a1111("prompt", "") is None)
+    f._http_post_json = lambda url, payload, timeout: {}
+    check("generate_image_a1111: imagesキー自体が欠落していればNoneを返す(回帰)",
+          f.generate_image_a1111("prompt", "") is None)
+finally:
+    f._http_post_json = _orig_a1_post_json
+    f.IMAGE_OUT_DIR = _orig_a1_out_dir
+    if _a1_td6 is not None:
+        _a1_td6.cleanup()
+
+check("generate_image_a1111: テスト後にf._http_post_jsonが元の状態へ復元されている",
+      f._http_post_json == _orig_a1_post_json)
+check("generate_image_a1111: テスト後にf.IMAGE_OUT_DIRが元の状態へ復元されている",
+      f.IMAGE_OUT_DIR == _orig_a1_out_dir)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
