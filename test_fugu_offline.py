@@ -5511,6 +5511,162 @@ with _tempfile.TemporaryDirectory() as _rpn_dir:
 check("_read_pptx: ノートテスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
       ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
 
+# ----- _pptx_shape_texts: 直接単体テスト (2026-07-25) -----
+# 背景: カバレッジ調査により_pptx_shape_texts(fugu_local.py:997-1026)への直接の
+# テスト参照が皆無であることが判明した。上のiter87テストは_read_pptx経由の間接
+# テストで非結合2x2表・グループ・ネストしたグループのみをカバーしており、表の
+# 水平方向マージ(gridSpan相当)セルの経路は未検証のまま残っていた。_read_docxの
+# 表処理はiter91で水平マージセルの重複排除(id(getattr(c,"_tc",None))による
+# トラッキング)が入ったが、本関数のdocstringにある「_read_docxの表取り扱い
+# (L708-710)と同じ規約」という一文は現在の行番号(iter93以降の本文順序抽出化で
+# _table_rows_textはL806-839へ移動済み)とズレて久しく、かつiter91の重複排除が
+# 本関数側にも必要かは当時から未検証だった。python-docxは水平マージされた全ての
+# グリッド座標で同一の_Cellオブジェクトを共有するためc.textが重複するが、
+# python-pptxの仕様はこれと異なる: マージ起点セル(is_merge_origin=True)のみが
+# テキストを保持し、被マージセル(is_spanned=True)の.textは空文字列を返す。これは
+# 本タスク実装時に実際にpython-pptx 1.0.2を動かして実測したものであり、推測では
+# ない(下のexpected値はすべて実行結果から採取した)。そのためタブ結合してもマージ
+# 起点セルのテキストが重複することはなく、_read_docxのiter91のような重複排除
+# ロジックはpython-pptx側には不要と判明した。よってfugu_local.py自体は変更せず、
+# 以下は確認できた挙動を特性テストとして固定するものである
+# (iter48/66/71と同じ「バグではなく仕様を実測確認した上でテストに固定する」方針)。
+# _pptx_shape_texts(shape)を_read_pptx経由ではなく直接呼び出し、(a)平文テキスト
+# ボックス、(b)空白のみ/空文字のテキストボックス、(c)非結合2x2表(空白行スキップ・
+# セル順序保持)、(d)水平マージされたヘッダーセルを持つ表(マージ領域のテキストが
+# 重複しないことを直接呼び出し・_read_pptx経由のデッキ出力の両方で確認)、
+# (e)ネストしたグループを含むグループシェイプ(再帰・シェイプ追加順の保持)、
+# (f)テキスト/表/グループのいずれでもないシェイプ(画像)、の6パターンを検証する。
+try:
+    import pptx as _pst_probe
+    _HAS_PPTX_PST = True
+except ImportError:
+    _HAS_PPTX_PST = False
+
+if _HAS_PPTX_PST:
+    from pptx.util import Inches as _Inches_pst
+
+    _pst_prs = _pst_probe.Presentation()
+    _pst_blank = _pst_prs.slide_layouts[6]
+    _pst_slide = _pst_prs.slides.add_slide(_pst_blank)
+
+    # (a) 平文テキストボックス(非空)
+    _pst_tb_a = _pst_slide.shapes.add_textbox(
+        _Inches_pst(1), _Inches_pst(1), _Inches_pst(2), _Inches_pst(1))
+    _pst_tb_a.text_frame.text = "Hello Text"
+    check("_pptx_shape_texts: 平文テキストボックス(非空)はテキスト1件のリストを返す",
+          f._pptx_shape_texts(_pst_tb_a) == ["Hello Text"])
+
+    # (b) 空白のみ/空文字のテキストボックスは空リスト
+    _pst_tb_b1 = _pst_slide.shapes.add_textbox(
+        _Inches_pst(1), _Inches_pst(2), _Inches_pst(2), _Inches_pst(1))
+    _pst_tb_b1.text_frame.text = "   "
+    check("_pptx_shape_texts: 空白のみのテキストボックスは空リスト",
+          f._pptx_shape_texts(_pst_tb_b1) == [])
+
+    _pst_tb_b2 = _pst_slide.shapes.add_textbox(
+        _Inches_pst(1), _Inches_pst(3), _Inches_pst(2), _Inches_pst(1))
+    _pst_tb_b2.text_frame.text = ""
+    check("_pptx_shape_texts: 空文字のテキストボックスは空リスト",
+          f._pptx_shape_texts(_pst_tb_b2) == [])
+
+    # (c) 非結合3x2表: 空白行(2行目)はスキップされ、セル順序はそのまま保持される
+    _pst_gf_c = _pst_slide.shapes.add_table(
+        3, 2, _Inches_pst(1), _Inches_pst(4), _Inches_pst(4), _Inches_pst(2))
+    _pst_tbl_c = _pst_gf_c.table
+    _pst_tbl_c.cell(0, 0).text = "A1"
+    _pst_tbl_c.cell(0, 1).text = "B1"
+    _pst_tbl_c.cell(1, 0).text = " "   # 空白のみ
+    _pst_tbl_c.cell(1, 1).text = ""    # 空文字
+    _pst_tbl_c.cell(2, 0).text = "C1"
+    _pst_tbl_c.cell(2, 1).text = "D1"
+    check("_pptx_shape_texts: 非結合3x2表は空白行(2行目)をスキップし、"
+          "タブ結合された行のみをセル順序を保ったまま返す",
+          f._pptx_shape_texts(_pst_gf_c) == ["A1\tB1", "C1\tD1"])
+
+    # (d) 水平マージ(2列にまたがるヘッダーセル)を持つ表
+    # python-pptxのTable.cell(r,c).merge()は起点セル(is_merge_origin=True)にのみ
+    # テキストを保持し、被マージセル(is_spanned=True)の.textは空文字列を返す
+    # (python-docxが両座標で同一_Cellを共有しc.textが重複するのとは異なる挙動。
+    # 実測値をそのままexpectedにしている)。そのためタブ結合してもマージ起点セルの
+    # テキストが重複することはない。
+    _pst_gf_d = _pst_slide.shapes.add_table(
+        2, 2, _Inches_pst(1), _Inches_pst(7), _Inches_pst(4), _Inches_pst(2))
+    _pst_tbl_d = _pst_gf_d.table
+    _pst_tbl_d.cell(0, 0).merge(_pst_tbl_d.cell(0, 1))
+    _pst_tbl_d.cell(0, 0).text = "Header"
+    _pst_tbl_d.cell(1, 0).text = "R1C1"
+    _pst_tbl_d.cell(1, 1).text = "R1C2"
+    _pst_out_d = f._pptx_shape_texts(_pst_gf_d)
+    check("_pptx_shape_texts: 水平マージされたヘッダーセルを含む表からの直接呼び出し"
+          "結果(実測: マージ起点セル'Header'+空文字の被マージセルがタブ結合される)",
+          _pst_out_d == ["Header\t", "R1C1\tR1C2"])
+    check("_pptx_shape_texts: 水平マージ領域のテキスト'Header'は直接呼び出し結果"
+          "全体でちょうど1回しか出現しない(python-docx側iter91が対処した重複は"
+          "python-pptxでは発生しない=特性テストとして固定)",
+          "".join(_pst_out_d).count("Header") == 1)
+    check("_pptx_shape_texts: マージ行に続く非マージ行(R1C1/R1C2)はタブ結合のまま"
+          "影響を受けない",
+          _pst_out_d[1] == "R1C1\tR1C2")
+
+    # (d-2) 同じマージ表を実ファイルに保存し、_read_pptx経由のデッキ全体出力でも
+    # 'Header'がちょうど1回しか出現しないことを確認する(受け入れ基準(d)の
+    # 「デッキ出力全体で1回のみ」を直接呼び出しだけでなくエンドツーエンドでも保証)。
+    with _tempfile.TemporaryDirectory() as _pstd_dir:
+        _pstd_root = _pathlib.Path(_pstd_dir)
+        _pstd_path = _pstd_root / "merged_table.pptx"
+        _pstd_prs = _pst_probe.Presentation()
+        _pstd_blank = _pstd_prs.slide_layouts[6]
+        _pstd_slide = _pstd_prs.slides.add_slide(_pstd_blank)
+        _pstd_gf = _pstd_slide.shapes.add_table(
+            2, 2, _Inches_pst(1), _Inches_pst(1), _Inches_pst(4), _Inches_pst(2))
+        _pstd_tbl = _pstd_gf.table
+        _pstd_tbl.cell(0, 0).merge(_pstd_tbl.cell(0, 1))
+        _pstd_tbl.cell(0, 0).text = "Header"
+        _pstd_tbl.cell(1, 0).text = "R1C1"
+        _pstd_tbl.cell(1, 1).text = "R1C2"
+        _pstd_prs.save(str(_pstd_path))
+
+        _pstd_out = f._read_pptx(_pstd_path)
+        check("_read_pptx: 水平マージ表を含むデッキ全体の出力で'Header'はちょうど1回"
+              "しか出現しない(重複なし、直接呼び出しテスト(d)と整合)",
+              _pstd_out.count("Header") == 1)
+        check("_read_pptx: 水平マージ表を含むデッキ全体の出力がbyte-for-byte一致"
+              "(マージ起点セル+空文字の被マージセルをタブ結合)",
+              _pstd_out == "[Slide 1]\n" + "\n".join(["Header\t", "R1C1\tR1C2"]))
+
+    # (e) グループシェイプ + ネストしたグループ: 再帰してもシェイプ追加順が保たれる
+    _pst_grp_e = _pst_slide.shapes.add_group_shape()
+    _pst_tb_e1 = _pst_grp_e.shapes.add_textbox(
+        _Inches_pst(1), _Inches_pst(1), _Inches_pst(2), _Inches_pst(1))
+    _pst_tb_e1.text_frame.text = "First"
+    _pst_nested_e = _pst_grp_e.shapes.add_group_shape()
+    _pst_tb_e2 = _pst_nested_e.shapes.add_textbox(
+        _Inches_pst(1), _Inches_pst(2), _Inches_pst(2), _Inches_pst(1))
+    _pst_tb_e2.text_frame.text = "Nested"
+    _pst_tb_e3 = _pst_grp_e.shapes.add_textbox(
+        _Inches_pst(1), _Inches_pst(3), _Inches_pst(2), _Inches_pst(1))
+    _pst_tb_e3.text_frame.text = "Third"
+    check("_pptx_shape_texts: グループ+ネストしたグループはシェイプ追加順"
+          "(First, ネスト内Nested, Third)を保ったまま再帰的に抽出する",
+          f._pptx_shape_texts(_pst_grp_e) == ["First", "Nested", "Third"])
+
+    # (f) テキスト/表/グループのいずれでもないシェイプ(画像)は空リスト
+    import base64 as _base64_pst
+
+    _pst_png_f = _base64_pst.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY"
+        "42YAAAAASUVORK5CYII="
+    )
+    _pst_pic_f = _pst_slide.shapes.add_picture(
+        io.BytesIO(_pst_png_f), _Inches_pst(5), _Inches_pst(5))
+    check("_pptx_shape_texts: 画像シェイプ(text/table/groupのいずれも持たない)は"
+          "空リスト", f._pptx_shape_texts(_pst_pic_f) == [])
+else:
+    print("   [SKIP] python-pptx未インストールのため_pptx_shape_texts直接テストをスキップ")
+
+check("_pptx_shape_texts: テスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
+      ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
+
 # ----- _read_docx -----
 try:
     import docx as _docx_probe_rd
