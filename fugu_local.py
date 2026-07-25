@@ -3107,8 +3107,21 @@ def normalize_answer(ans):
     m = _frac_re.match(s)
     if m:
         sign, num, den = m.group(1), m.group(2), m.group(3)
-        neg = (sign == "-") ^ num.startswith("-")
+        # 2026-07-25: iteration 122 は分子・先頭の符号だけを neg へ XOR しており、
+        # 分母の符号は無視して den をそのまま埋め込んでいた（同コメント末尾
+        # 「numerator/leading sign」限定のスコープ通り）。しかし _frac_re の分母グループ
+        # は (-?\d+...) で先頭マイナスを許容するため、\frac{1}{-2}（=-1/2）は
+        # "1/-2" に、\frac{-1}{-2}（=+1/2）は "-1/-2" になってしまう。Fraction() は
+        # 分母に符号が付いた文字列を受け付けないため、これらは下の Fraction 高速パスに
+        # 乗れずすり抜け、-1/2・\frac{-1}{2}・-0.5 という「素直な」表記の票とは別の
+        # 投票クラスに分裂して自己整合性投票（gotcha #7）の票を薄める。iteration
+        # 13/22/24/30/78/122/134/136/140 と同系統の「ファストパスで拾えない票を拾う」
+        # 修正として、分母の符号も neg へ XOR してから den から取り除く。正の分母
+        # （den.startswith("-") が False）の場合は lstrip が no-op のため、既存の
+        # iteration 122/134/136/140 の正規化結果は一切変わらない。
+        neg = (sign == "-") ^ num.startswith("-") ^ den.startswith("-")
         num = num.lstrip("-")
+        den = den.lstrip("-")
         s = f"{'-' if neg else ''}{num}/{den}"
     return s
 

@@ -10411,6 +10411,56 @@ def _t_frac_fastpath_equiv(calls):
 
 _run_with_math_verify_stub(None, "parse", _t_frac_fastpath_equiv)
 
+# 2026-07-25: iteration 122 の \frac{a}{b} 正規化（すぐ上のブロック）は分子・先頭の
+# 符号だけを neg へ XOR しており（コメントに明記の通りスコープを numerator/leading
+# sign に限定）、分母の符号は無視して den をそのまま埋め込んでいた。だが _frac_re の
+# 分母グループ (-?\d+(?:\.\d+)?) は先頭マイナスを許容するため、\frac{1}{-2}（=-1/2）は
+# "1/-2" に、\frac{-1}{-2}（=+1/2）は "-1/-2" になってしまい、Fraction() は分母に符号が
+# 付いた文字列を拒否するのでどちらも下の Fraction 高速パスに乗れずすり抜け、-1/2・
+# \frac{-1}{2}・-0.5 という「素直な」表記の票とは別の投票クラスに分裂して自己整合性投票
+# （gotcha #7）の票を薄めていた。iteration 13/22/24/30/78/122/134/136/140 と同系統の
+# 「ファストパスで拾えない票を拾う」修正として、分母の符号も neg へ折り込んでから den から
+# 取り除く（正の分母では den.startswith("-") が False で lstrip("-") はno-opなので、
+# 上の iteration 122/134/136/140 の既存挙動はバイト単位で不変のまま）。
+check("normalize_answer: \\frac{1}{-2} -> -1/2 (分母の符号をnegへ折り込む)",
+      f.normalize_answer(r"\frac{1}{-2}") == "-1/2")
+check("normalize_answer: \\frac{-1}{-2} -> 1/2 (分子・分母の符号が相殺)",
+      f.normalize_answer(r"\frac{-1}{-2}") == "1/2")
+check("normalize_answer: \\frac{3}{-4} -> -3/4",
+      f.normalize_answer(r"\frac{3}{-4}") == "-3/4")
+check("normalize_answer: \\dfrac{1}{-2} -> -1/2 ([dt]?fracバリアント)",
+      f.normalize_answer(r"\dfrac{1}{-2}") == "-1/2")
+check("normalize_answer: \\tfrac{5}{-6} -> -5/6 ([dt]?fracバリアント)",
+      f.normalize_answer(r"\tfrac{5}{-6}") == "-5/6")
+# 回帰: 正の分母の既存挙動はバイト単位で不変（den.startswith("-") が False のため
+# den.lstrip("-") はno-op）。iteration 122/134/136/140 のテストはこのブロックとは別に
+# そのまま残しており、ここでは変更前と同じ入出力を重ねて確認する。
+check("normalize_answer: 分母符号折り込み後も正の分母は不変(1)",
+      f.normalize_answer(r"\frac{1}{2}") == "1/2")
+check("normalize_answer: 分母符号折り込み後も正の分母は不変(2)",
+      f.normalize_answer(r"-\frac{1}{2}") == "-1/2")
+check("normalize_answer: 分母符号折り込み後も正の分母は不変(3)",
+      f.normalize_answer(r"\frac{-1}{2}") == "-1/2")
+
+
+def _t_neg_den_frac_fastpath_equiv(calls):
+    result_a = f.answers_equivalent(r"\frac{1}{-2}", "-1/2")
+    result_b = f.answers_equivalent(r"\frac{1}{-2}", "-0.5")
+    check("answers_equivalent: \\frac{1}{-2} と -1/2 がFractionファストパスで一致(math_verify不使用)",
+          result_a is True)
+    check("answers_equivalent: \\frac{1}{-2} と -0.5 がFractionファストパスで一致(math_verify不使用)",
+          result_b is True)
+    check("answers_equivalent: 負の分母frac一致判定はmath_verify.parseを一切呼ばない(高速パス経由)",
+          len(calls["parse_args"]) == 0)
+
+
+_run_with_math_verify_stub(None, "parse", _t_neg_den_frac_fastpath_equiv)
+
+_neg_den_votes = [r"\frac{1}{-2}", "-1/2", "-0.5"]
+_neg_den_top, _neg_den_count, _neg_den_classes = f.vote_answers(_neg_den_votes)
+check("vote_answers: \\frac{1}{-2}/-1/2/-0.5 の3票が単一クラスに集約される(票割れしない)",
+      _neg_den_count == 3 and len(_neg_den_classes) == 1)
+
 # ---------- _read_docx/_read_pptx: Document()/Presentation()の実行時例外もクラッシュせず
 # notice文字列に劣化させる (2026-07-24 / iter123) ----------
 # iter83(_read_pdf)/iter84(_read_excel)が確立した「except ImportErrorだけでは
