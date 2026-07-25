@@ -13287,17 +13287,23 @@ check("normalize_answer: 素のA/5/1/2/50%/-5は不変(over-stripなし)",
 #
 # 副次的に判明した特性(表面化のみ・修正はしない。iters 66/71/110のsurface-don't-fix
 # 方針に従う):
-#  (a) --out はインタラクティブ分岐(質問なし+isatty、L5172のrepl()呼び出し)には
-#      一切転送されない。main()がrepl()へ渡す引数はuse_search/rag_dirs/history_file
-#      の3つだけで、repl()自身のシグネチャにもout_file引数が無いため、
-#      `--out result.md` を質問なしで指定しても黙って無視される(エラー・警告なし)。
+#  (a) [2026-07-26 iteration 186で対応済み] --out はインタラクティブ分岐(質問なし+
+#      isatty、L5171-5172のrepl()呼び出し)には一切転送されない。main()がrepl()へ渡す
+#      引数はuse_search/rag_dirs/history_fileの3つだけで、repl()自身のシグネチャにも
+#      out_file引数が無いため、`--out result.md` を質問なしで指定してもrepl()自体には
+#      依然として転送されない(この設計・repl()の引数は変更しない)。iteration 185時点
+#      ではこれがエラーにも警告にもならず完全に黙って無視されていたが、iteration 186で
+#      この分岐にのみ「--outは対話モードでは無視される」旨とsave <path>コマンドへの
+#      誘導を表示するcp932安全な警告printを追加し、可視化した
+#      (surface-don't-swallow方針、gotcha #8の精神)。下のテスト(10)/(10b)を参照。
 #  (b) パイプ入力(stdin)分岐(L5177)のask_fugu呼び出しはoffice_attachedを明示的に
 #      渡さない(ask_fugu側の既定値Falseに暗黙依存)。--fileを経ない経路なので実害は
 #      無いが、--file経路(常にoffice_attachedを明示するL5170)とは非対称なキーワード
 #      渡し方になっている。
 #  (c) --fileのテキストはサイズ上限が一切無く、抽出結果がどれだけ長くてもnum_ctxを
 #      意識したトランケートをせずそのままask_fugu(question=...)へ渡す。
-# いずれもmain()自体には手を入れない。
+# (b)(c)はmain()自体には手を入れない。(a)はiteration 186で対話分岐に警告printを
+# 1文追加したのみで、質問経路・パイプ入力経路・repl()呼び出しの引数は一切変更していない。
 import tempfile as _cli_tempfile
 
 _orig_cli_setup = f.setup
@@ -13329,11 +13335,29 @@ class _CliFakeStdin:
         return self._text
 
 
+class _CliRunResult:
+    """_cli_run()の戻り値。(ask_calls, repl_calls, load_hist_calls)の3要素タプルとして
+    アンパック可能(__iter__)にしつつ、2026-07-26 iteration 186で追加した.stdout属性で
+    捕捉した標準出力全文にもアクセスできるようにする(--out無視警告の文言アサート用)。
+    既存(iteration 185)の `a, b, c = _cli_run(...)` という呼び出し側コードは変更不要。"""
+    def __init__(self, ask_calls, repl_calls, load_hist_calls, stdout_text):
+        self.ask_calls = ask_calls
+        self.repl_calls = repl_calls
+        self.load_hist_calls = load_hist_calls
+        self.stdout = stdout_text
+
+    def __iter__(self):
+        return iter((self.ask_calls, self.repl_calls, self.load_hist_calls))
+
+
 def _cli_run(argv_tail, stdin_isatty=True, stdin_text="", history_return=()):
-    """main()を1回駆動し (ask_fugu呼び出し記録, repl呼び出し記録,
-    load_history_file呼び出し記録) のタプルを返す。sys.argv/sys.stdinは呼び出し内で
-    復元する(main()内の例外有無に関わらず)。標準出力はcontextlib.redirect_stdoutで
-    抑制する(文言はアサート対象にしない)。"""
+    """main()を1回駆動し _CliRunResult (ask_fugu呼び出し記録, repl呼び出し記録,
+    load_history_file呼び出し記録, 捕捉した標準出力全文) を返す。sys.argv/sys.stdinは
+    呼び出し内で復元する(main()内の例外有無に関わらず)。標準出力はcontextlib.
+    redirect_stdoutで捕捉し、戻り値の.stdout属性から参照できる
+    (2026-07-26 iteration 186: --out無視警告の文言をアサートするために追加。
+    従来のask_calls/repl_calls/load_hist_callsの3要素タプルとしてのアンパックは
+    _CliRunResult.__iter__により従来通り動作する)。"""
     ask_calls = []
     repl_calls = []
     load_hist_calls = []
@@ -13354,13 +13378,14 @@ def _cli_run(argv_tail, stdin_isatty=True, stdin_text="", history_return=()):
     f.load_history_file = _fake_load_history
     sys.argv = ["fugu_local.py"] + list(argv_tail)
     sys.stdin = _CliFakeStdin(stdin_isatty, stdin_text)
+    _stdout_buf = io.StringIO()
     try:
-        with contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(_stdout_buf):
             f.main()
     finally:
         sys.argv = _orig_cli_argv
         sys.stdin = _orig_cli_stdin
-    return ask_calls, repl_calls, load_hist_calls
+    return _CliRunResult(ask_calls, repl_calls, load_hist_calls, _stdout_buf.getvalue())
 
 
 try:
@@ -13462,9 +13487,16 @@ try:
     # --- (6) --out <path> + 位置引数の質問: out_fileがそのままask_fuguへ転送される ---
     f.SESSION_SAVE = True
     f._HISTORY = []
-    _ask6, _repl6, _lh6 = _cli_run(["質問6", "--out", "result.md"])
+    _res6 = _cli_run(["質問6", "--out", "result.md"])
+    _ask6, _repl6, _lh6 = _res6
     check("main: --outの値がask_fuguのout_fileへ転送される",
           bool(_ask6) and _ask6[0]["kwargs"].get("out_file") == "result.md")
+    # 2026-07-26 iteration 186 回帰確認: --out+質問ありの経路は今回の変更対象外
+    # (対話分岐のみに警告を追加した)ため、replは呼ばれず、対話分岐限定の
+    # --out無視警告も出ないはず。
+    check("main(iter186回帰): --out+質問ありではreplは呼ばれない", len(_repl6) == 0)
+    check("main(iter186回帰): --out+質問ありでは対話分岐の--out無視警告は出ない",
+          "[警告]" not in _res6.stdout)
 
     # --- (7) --search + --rag a b: use_search=True, rag_dirs=['a','b'] ---
     f.SESSION_SAVE = True
@@ -13515,16 +13547,41 @@ try:
 
     # --- (10) 質問なし + stdin.isatty()=True: replが(use_search, rag_dirs, history_file)
     #          の3引数のみで1回呼ばれ、ask_fuguは呼ばれない。
-    #          特性(a)の確認: --outを付けてもrepl呼び出しには一切現れない ---
+    #          特性(a)の確認: --outを付けてもrepl()呼び出し自体には一切現れない
+    #          (repl()のシグネチャ・呼び出し引数は変更しない、という設計判断は不変)。
+    #          2026-07-26 iteration 186: この場合のみ「--outは対話モードでは無視される」
+    #          旨とsaveコマンドへの誘導を表示する警告が標準出力に出るようになった
+    #          (repl()呼び出し自体・ask_fuguが呼ばれないことは従来通り) ---
     f.SESSION_SAVE = True
     f._HISTORY = []
-    _ask10, _repl10, _lh10 = _cli_run(["--out", "ignored_output.md"], stdin_isatty=True)
+    _res10 = _cli_run(["--out", "ignored_output.md"], stdin_isatty=True)
+    _ask10, _repl10, _lh10 = _res10
     check("main: 質問なし+isatty()=Trueならreplが1回だけ呼ばれる", len(_repl10) == 1)
     check("main: 質問なし+isatty()=Trueならask_fuguは呼ばれない", len(_ask10) == 0)
     check("main: repl呼び出しの引数はuse_search/rag_dirs/history_fileの3つだけ",
           bool(_repl10) and set(_repl10[0].keys()) == {"use_search", "rag_dirs", "history_file"})
-    check("main(特性化・a): --outを指定してもrepl呼び出しにout_fileは現れない(黙って無視される)",
+    check("main(特性・a): --outを指定してもrepl()呼び出しにout_fileは現れない"
+          "(repl()自体は変更しない設計)",
           bool(_repl10) and "out_file" not in _repl10[0])
+    check("main(iter186): --out指定+対話モードでは--out無視の警告がstdoutに出る",
+          "--out" in _res10.stdout and "ignored_output.md" in _res10.stdout)
+    check("main(iter186): 警告はsaveコマンドへの誘導を含む", "save" in _res10.stdout)
+
+    # --- (10b) 質問なし + stdin.isatty()=True + --out無し: (10)と同じくreplは3引数
+    #           のみで1回呼ばれるが、--outを指定していないので警告は出ない(回帰確認、
+    #           iteration 186で追加した警告がargs.outの真偽値で正しくガードされている
+    #           ことの確認) ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _res10b = _cli_run([], stdin_isatty=True)
+    _ask10b, _repl10b, _lh10b = _res10b
+    check("main(iter186回帰): --out無し+質問なし+isatty()=Trueでもreplが1回だけ呼ばれる",
+          len(_repl10b) == 1)
+    check("main(iter186回帰): --out無し+質問なし+isatty()=Trueならreplの引数は3つだけ",
+          bool(_repl10b)
+          and set(_repl10b[0].keys()) == {"use_search", "rag_dirs", "history_file"})
+    check("main(iter186回帰): --out無しの対話分岐では--out無視警告は出ない",
+          "[警告]" not in _res10b.stdout)
 
     # --- (11) 質問なし + stdin.isatty()=False + read()が非空文字列を返す:
     #          stripされた文字列がask_fuguのquestionになる。
@@ -13539,6 +13596,23 @@ try:
     check("main: パイプ入力経路ではreplは呼ばれない", len(_repl11) == 0)
     check("main(特性化・b): パイプ入力経路のask_fugu呼び出しはoffice_attachedを明示しない",
           bool(_ask11) and "office_attached" not in _ask11[0]["kwargs"])
+
+    # --- (11b) --out指定 + パイプ入力(isatty()=False)で非空: 質問経路(6)と同様に
+    #           out_fileがそのままask_fuguへ転送される。2026-07-26 iteration 186の
+    #           対話分岐限定の警告追加が、他の分岐(パイプ入力)には一切影響しない
+    #           ことの回帰確認 ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _res11b = _cli_run(["--out", "x.md"], stdin_isatty=False,
+                        stdin_text="パイプ入力+out質問\n")
+    _ask11b, _repl11b, _lh11b = _res11b
+    check("main(iter186回帰): --out+パイプ入力ではask_fuguが1回呼ばれる",
+          len(_ask11b) == 1)
+    check("main(iter186回帰): --out+パイプ入力ではout_fileがそのまま転送される",
+          bool(_ask11b) and _ask11b[0]["kwargs"].get("out_file") == "x.md")
+    check("main(iter186回帰): --out+パイプ入力ではreplは呼ばれない", len(_repl11b) == 0)
+    check("main(iter186回帰): --out+パイプ入力では対話分岐限定の警告は出ない",
+          "[警告]" not in _res11b.stdout)
 
     # --- (12) 質問なし + stdin.isatty()=False + read()が空/空白のみ:
     #          「質問が入力されませんでした」経路を通り、ask_fugu/replとも呼ばれない ---

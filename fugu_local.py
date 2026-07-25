@@ -5169,6 +5169,18 @@ def main():
                  rag_dirs=rag_dirs, out_file=args.out, history_file=hfile,
                  office_attached=office_attached)
     elif sys.stdin.isatty():
+        # 2026-07-26: iteration 185 で表面化した特性(a) ―― --out はこの対話分岐(repl())
+        # には一切転送されず、repl()自身にもout_fileパラメータが無い設計のため、
+        # `--out result.md` を質問なしで指定すると黙って無視されていた(エラー・警告なし)。
+        # repl()にout_fileを追加してターン毎に自動保存する案は「どのターンを保存するか・
+        # 上書きか追記か」が曖昧なため見送り(対話中の `save <path>` コマンドで既に手動
+        # エクスポート可能)。surface-don't-swallow方針(gotcha #8, iters 66/71/110)に
+        # 従い、ここでは無視される旨を可視化する警告のみ追加する
+        # (repl()呼び出し自体・引数は不変のまま)。
+        if args.out:
+            print(f"[警告] --out {args.out} は対話モードでは無視されます。"
+                  f"回答を保存するには対話中に `save {args.out}` のように"
+                  f"saveコマンドを使ってください。")
         repl(use_search=args.search, rag_dirs=rag_dirs, history_file=hfile)
     else:
         # パイプ入力: stdin を質問として読む
