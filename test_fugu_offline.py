@@ -1453,6 +1453,173 @@ check("arb-eq: '0.5' の票数は '2' クラスと同じ(旧'1/2'の真の票数
 check("arb-eq: 票の合計が実際の有効票数と一致する(水増しなし)",
       _res_arb_eq is not None and sum(_res_arb_eq["votes"].values()) == _valid_votes_eq)
 
+# ---------- 2026-07-25 (iteration 169): _arbitrate のrep選出にCoT>PoT優先を適用 ----------
+# 従来の _arbitrate は、タイ候補ごとに samples を先頭から走査して canon と
+# answers_equivalent な最初のサンプルをそのまま裁定役へ見せていた(単純な最初の一致)。
+# add_batch(~L3731-3738)は各バッチの末尾にそのバッチのPoTサンプルを1件追加するため、
+# 「バッチ1のPoTサンプル」が「バッチ2以降のCoTサンプル」より samples 内で先に並ぶ。
+# その結果、同じ答えに後から自然言語のCoT推論が存在していても、先に並んだPoT実行結果
+# (コード＋'[PoT execution output]')の方が「代表解答」として裁定役に渡ってしまい、
+# 「各候補の誤りを指摘せよ」という裁定役への指示に対して弱い入力になっていた。
+# _representative_text(iteration 2/55, L3594)はユーザー向け代表解答の選出で全く同じ
+# 状況をCoT優先(リスト順序に非依存)で既に解決済みで、L3471-3472のコメントは
+# 「_arbitrate のrep選出はそれとは別contract」と明記していた。ここではその契約が
+# _arbitrate側にも揃ったことを直接ロックする。_arbitrate を直接叩き、f.ask をモックして
+# label=='arbiter'呼び出しに渡されたプロンプト文字列を捕捉する(cap テストと同じ手法)。
+def _arbrep_sample(answer, text, pot=False, model="m1"):
+    return {"answer": answer, "text": text, "pot": pot, "model": model}
+
+
+_orig_installed_rep = f.installed_models
+_orig_arbiter_model_rep = f.ARBITER_MODEL
+_orig_reasoning_rep = f.REASONING_MODELS
+_orig_props_rep = f.PROPOSERS
+
+
+def _fake_installed_rep():
+    return ["m1"]
+
+
+def _make_fake_ask_arb_rep(prompts_out, boxed="1"):
+    def _fake(model, messages, temperature, think=None, fmt=None,
+              label=None, num_predict=None, num_ctx=None):
+        if label == "arbiter":
+            prompts_out.append(messages[0]["content"])
+            return f"ARBITER_REP_TEST \\boxed{{{boxed}}}"
+        return f"\\boxed{{{boxed}}}"
+    return _fake
+
+
+# (1) 順序非依存の主眼のテスト: タイ候補'1'について、samples内で先に並ぶのはPoT一致
+#     サンプル(コード+'[PoT execution output]')、後から並ぶのがCoT一致サンプル。
+#     裁定役に渡るのは後続のCoTテキストであり、先行PoTサンプルの本文ではないこと。
+#     もう一方のタイ候補'2'は最初の一致がCoTのままなので、そちらのrepは変化しない。
+_rep1_samples = [
+    _arbrep_sample("1", "def solve():\n    return 21*2\n\n[PoT execution output]\n42", pot=True),
+    _arbrep_sample("2", "COT_REASONING_FOR_2", pot=False),
+    _arbrep_sample("1", "COT_REASONING_FOR_1_LATER", pot=False),
+]
+_rep1_classes = [["1", 2], ["2", 2]]
+_rep1_prompts = []
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_rep
+    f.ask = _make_fake_ask_arb_rep(_rep1_prompts)
+    _rep1_result = f._arbitrate("test question", "math", _rep1_samples, _rep1_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_rep
+    f.REASONING_MODELS = _orig_reasoning_rep
+    f.ARBITER_MODEL = _orig_arbiter_model_rep
+    f.installed_models = _orig_installed_rep
+
+_rep1_prompt = _rep1_prompts[0] if _rep1_prompts else ""
+check("arb-rep: 後続CoT一致サンプルのテキストが裁定役プロンプトに含まれる(順序非依存)",
+      "COT_REASONING_FOR_1_LATER" in _rep1_prompt)
+check("arb-rep: 先行PoT一致サンプルの本文([PoT execution output])はそのタイ候補のrepとして渡らない",
+      "[PoT execution output]" not in _rep1_prompt
+      and "def solve():" not in _rep1_prompt)
+check("arb-rep: 別タイ候補('2')のrepは影響を受けず従来通りCoTテキストのまま",
+      "COT_REASONING_FOR_2" in _rep1_prompt)
+check("arb-rep: 有効な(answer, text)タプルを返す(既存契約維持)",
+      _rep1_result is not None and _rep1_result[0] == "1")
+
+# (2) 回帰テスト: 各タイ候補の最初の一致サンプルが既にCoTである通常ケースでは、
+#     裁定役プロンプトに埋め込まれるテキストが変更前(最初の一致をそのまま採用)と
+#     バイト単位で同一であること。
+_rep2_samples = [
+    _arbrep_sample("1", "COT_TEXT_1", pot=False),
+    _arbrep_sample("2", "COT_TEXT_2", pot=False),
+]
+_rep2_classes = [["1", 2], ["2", 2]]
+_rep2_prompts = []
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_rep
+    f.ask = _make_fake_ask_arb_rep(_rep2_prompts)
+    _rep2_result = f._arbitrate("test question", "math", _rep2_samples, _rep2_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_rep
+    f.REASONING_MODELS = _orig_reasoning_rep
+    f.ARBITER_MODEL = _orig_arbiter_model_rep
+    f.installed_models = _orig_installed_rep
+
+_rep2_prompt = _rep2_prompts[0] if _rep2_prompts else ""
+_rep2_expected_listing = (
+    "### Candidate A (final answer: 1)\nCOT_TEXT_1\n\n"
+    "### Candidate B (final answer: 2)\nCOT_TEXT_2")
+check("arb-rep: 各候補の最初の一致が既にCoTの通常ケースは変更前と同一のlistingになる(回帰ピン)",
+      _rep2_expected_listing in _rep2_prompt)
+check("arb-rep: 通常ケースでも有効な(answer, text)タプルを返す",
+      _rep2_result is not None and _rep2_result[0] == "1")
+
+# (3) PoT-onlyフォールバック回帰: タイ候補の一致サンプルがPoTしか無い場合、
+#     そのPoTサンプルのテキストがそのまま提示され、候補が脱落したり空文字列に
+#     なったりしないこと。
+_rep3_samples = [
+    _arbrep_sample("1", "POT_ONLY_TEXT_FOR_1", pot=True),
+    _arbrep_sample("2", "COT_TEXT_FOR_2", pot=False),
+]
+_rep3_classes = [["1", 2], ["2", 2]]
+_rep3_prompts = []
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_rep
+    f.ask = _make_fake_ask_arb_rep(_rep3_prompts)
+    _rep3_result = f._arbitrate("test question", "math", _rep3_samples, _rep3_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_rep
+    f.REASONING_MODELS = _orig_reasoning_rep
+    f.ARBITER_MODEL = _orig_arbiter_model_rep
+    f.installed_models = _orig_installed_rep
+
+_rep3_prompt = _rep3_prompts[0] if _rep3_prompts else ""
+check("arb-rep: CoT一致が無い候補はPoT一致サンプルのテキストがそのまま提示される(脱落しない)",
+      "POT_ONLY_TEXT_FOR_1" in _rep3_prompt and "final answer: 1" in _rep3_prompt)
+check("arb-rep: PoT-onlyフォールバック時も有効な(answer, text)タプルを返す",
+      _rep3_result is not None)
+
+# (4) 同値判定ガード: タイ候補'0.5'に一致するのは文字列としては異なる'1/2'の
+#     サンプルのみ(answers_equivalent経由でFraction高速パス一致)。無関係な
+#     敗者候補('7')のテキストが紛れ込まないこと、別タイ候補('3')は完全一致のまま
+#     であることも合わせて確認する。
+_rep4_samples = [
+    _arbrep_sample("7", "LOSER_TEXT_7", pot=False),
+    _arbrep_sample("1/2", "EQUIV_MATCH_TEXT_FOR_HALF", pot=False),
+    _arbrep_sample("3", "OTHER_TIED_TEXT_3", pot=False),
+]
+_rep4_classes = [["0.5", 2], ["3", 2]]
+_rep4_prompts = []
+try:
+    f.PROPOSERS = ["m1"]
+    f.REASONING_MODELS = ["m1"]
+    f.ARBITER_MODEL = None
+    f.installed_models = _fake_installed_rep
+    f.ask = _make_fake_ask_arb_rep(_rep4_prompts)
+    _rep4_result = f._arbitrate("test question", "math", _rep4_samples, _rep4_classes)
+finally:
+    f.ask = _orig_ask2
+    f.PROPOSERS = _orig_props_rep
+    f.REASONING_MODELS = _orig_reasoning_rep
+    f.ARBITER_MODEL = _orig_arbiter_model_rep
+    f.installed_models = _orig_installed_rep
+
+_rep4_prompt = _rep4_prompts[0] if _rep4_prompts else ""
+check("arb-rep: 候補'0.5'のrepは文字列が異なる同値サンプル('1/2')から選ばれる(answers_equivalent経由)",
+      "EQUIV_MATCH_TEXT_FOR_HALF" in _rep4_prompt and "final answer: 0.5" in _rep4_prompt)
+check("arb-rep: 無関係な敗者候補('7')のテキストは紛れ込まない",
+      "LOSER_TEXT_7" not in _rep4_prompt)
+check("arb-rep: 別タイ候補('3')は完全一致のテキストのまま",
+      "OTHER_TIED_TEXT_3" in _rep4_prompt)
+
 # ---------- 2026-07-22: N択拮抗で _arbitrate が classes[:2] に打ち切らないこと ----------
 # 上位2クラスが同数(classes[0][1]==classes[1][1])で拮抗判定が発火する状況は、実際には
 # 3クラス以上が同数タイになるケース(例: 票数 [k,k,k])も含みうる。従来の _arbitrate は

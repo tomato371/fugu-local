@@ -3637,12 +3637,27 @@ def _arbitrate(question, task_type, samples, classes):
         tied = tied[:ARBITRATE_MAX_CANDIDATES]
         omitted_desc = ", ".join(str(c[0]) for c in omitted)
         print(f"   [SC] {len(omitted)}件の同数タイ候補は上限のため裁定役に提示されません: {omitted_desc}")
+    # 2026-07-25: 従来はタイ候補ごとに samples を先頭から走査し、canon と
+    # answers_equivalent な最初のサンプルをそのまま裁定役へ見せていた(下のfor内break)。
+    # add_batch(~L3731-3738)は各バッチの末尾でそのバッチのPoTサンプルを1件だけ追加する
+    # ため、samples内では「あるバッチのPoTサンプル」が「後続バッチのCoTサンプル」より
+    # 先に並ぶ。その結果、同じ答えにCoT一致サンプルが後から存在していても、先に並んだ
+    # PoTサンプルの方(コード＋'[PoT execution output]'という実行結果ブロック)がそのまま
+    # 「代表解答」として裁定役に渡り、「各候補の誤りを指摘して裁定せよ」という指示に対し
+    # 自然言語の思考過程ではなくコードしか見せられない弱い入力になっていた。
+    # _representative_text(iteration 2/55, L3594)はユーザー向け代表解答の選出で全く同じ
+    # 状況をCoT優先(pot=Falseを優先、無ければ最初に一致したPoT、リスト順序に非依存)で
+    # 既に解決しており、L3471-3472のコメントが指摘する通り _arbitrate 側のrep選出は
+    # それとは無関係な別contractのまま放置されていた。ここでも同じCoT>PoT優先を適用する。
+    # _representative_text の「一致なし→全サンプル中最長」フォールバックはここでは
+    # 発火しえない: tied の各 canon は vote_answers/classes 経由でsamples中の実在の
+    # answerそのものから作られたクラス代表であり、必ず>=1件のanswers_equivalentな
+    # サンプルが存在するため(不一致候補やその場しのぎの最長テキストが紛れ込むことはない)。
+    # strip_thinkと[:3000]切り詰め(num_ctx保護、gotcha #2)は選ばれたテキストへ従来通り適用する。
     reps = []
     for canon, _cnt in tied:
-        for s in samples:
-            if s["answer"] and answers_equivalent(s["answer"], canon):
-                reps.append((canon, strip_think(s["text"] or "")[:3000]))
-                break
+        rep_text = _representative_text(samples, canon)
+        reps.append((canon, strip_think(rep_text or "")[:3000]))
     listing = "\n\n".join(
         f"### Candidate {chr(ord('A') + i)} (final answer: {c})\n{t}"
         for i, (c, t) in enumerate(reps))
