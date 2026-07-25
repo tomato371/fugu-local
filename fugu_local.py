@@ -1361,11 +1361,28 @@ def _load_rag_chunks(dirs: list) -> list:
             if not text or _is_lib_missing_notice(text):
                 continue
             # チャンク分割（オーバーラップ付き）
+            # 2026-07-25: RAG_CHUNK_CHARS/RAG_CHUNK_OVERLAP は上（L268-269）で
+            # 「チャンクサイズ」「オーバーラップ文字数」と明記された調整可能な
+            # モジュール定数。従来は step を
+            # `start += RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP` と直接計算しており、
+            # 将来だれかがオーバーラップを厚くしようとして
+            # RAG_CHUNK_OVERLAP >= RAG_CHUNK_CHARS に設定すると step が 0 以下になり、
+            # `while start < len(text)` の start が二度と前進しないまま chunks へ
+            # 追記し続ける無限ループ（ハング）になる。これは
+            # _load_rag_chunks -> _get_rag_chunks -> rag_search -> build_context に
+            # 直結しており、以後すべての質問で応答が一切返らなくなる、"遅い"より
+            # 悪い完全なフリーズになる。iter 111 (plan_pptx_images の非list ガード)・
+            # iter 132 (_resolve_proposer の非ハッシュ可能値ガード) と同じ
+            # 「発生確率は低いが起きれば致命的」クラスの防御として、step を
+            # 最低1文字分の前進に固定する。既定値(100 < 600)では
+            # max(1, 500) == 500 となり、従来のチャンク境界・オーバーラップ・
+            # 個数・順序は一切変わらない（strict no-op）。
             start = 0
+            step = max(1, RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP)
             while start < len(text):
                 end = start + RAG_CHUNK_CHARS
                 chunks.append((str(fp), text[start:end]))
-                start += RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP
+                start += step
     return chunks
 
 

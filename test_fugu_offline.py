@@ -4752,6 +4752,98 @@ if _HAS_OPENPYXL2:
 else:
     print("   [SKIP] openpyxl未インストールのため実.xlsx破損読み込みテストをスキップ")
 
+# ---------- _load_rag_chunks: 非正値step(RAG_CHUNK_OVERLAP>=RAG_CHUNK_CHARS)による
+# 無限ループガード (2026-07-25) ----------
+# RAG_CHUNK_CHARS/RAG_CHUNK_OVERLAP は本ファイル上部でチューニング可能なモジュール
+# 定数として明記されている。RAG_CHUNK_OVERLAP >= RAG_CHUNK_CHARS に設定されると、
+# 従来のコード（start += RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP）は非正値のstepを
+# 生み、while start < len(text) のstartが二度と前進せず無限ループ（ハング）に
+# なっていた。fugu_local.py側の修正は
+# `step = max(1, RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP)` によるクランプ。
+# ここではRAG_CHUNK_CHARS/RAG_CHUNK_OVERLAPを一時的に書き換えて検証するため、
+# 既存の慣習に倣いtry/finallyで必ず既定値へ復元する（復元しないと後続の
+# iter37/42 RAG回帰テストが既定値を前提に壊れる）。
+_orig_rag_chunk_chars = f.RAG_CHUNK_CHARS
+_orig_rag_chunk_overlap = f.RAG_CHUNK_OVERLAP
+
+# (a) 既定値でのクランプが厳密にno-opであること（RAG_CHUNK_OVERLAP < RAG_CHUNK_CHARS
+#     のとき max(1, positive) == positive）。
+check("_load_rag_chunks: 既定値(600/100)ではクランプ後のstepが従来通りRAG_CHUNK_CHARS-RAG_CHUNK_OVERLAP(=500)と一致",
+      max(1, f.RAG_CHUNK_CHARS - f.RAG_CHUNK_OVERLAP) == f.RAG_CHUNK_CHARS - f.RAG_CHUNK_OVERLAP == 500)
+
+# (b) 有効な設定(オーバーラップ<チャンクサイズ)での回帰: 手計算した期待チャンクと
+#     バイト単位で一致すること。既存のiter37/42テストとは独立に、生成式を使わず
+#     文字列リテラルで期待値を書き下す。RAG_CHUNK_CHARS=10, RAG_CHUNK_OVERLAP=4
+#     (step=6)、text="ABCDEFGHIJKLMNOP"(16文字)の場合:
+#       start=0  -> text[0:10]  = "ABCDEFGHIJ"
+#       start=6  -> text[6:16]  = "GHIJKLMNOP"
+#       start=12 -> text[12:22] = "MNOP"（len=16のため実際は[12:16]相当）
+#       start=18 -> 18 < 16 は偽なので終了
+try:
+    f.RAG_CHUNK_CHARS = 10
+    f.RAG_CHUNK_OVERLAP = 4
+    with _tempfile.TemporaryDirectory() as _rag_dir6:
+        _rag_root6 = _pathlib.Path(_rag_dir6)
+        _text6 = "ABCDEFGHIJKLMNOP"
+        (_rag_root6 / "small.txt").write_text(_text6, encoding="utf-8")
+        _rag_chunks6 = f._load_rag_chunks([str(_rag_root6)])
+    _chunk_texts6 = [c for (_p6, c) in _rag_chunks6]
+    check("_load_rag_chunks: 有効config(overlap<chars)での手計算チャンクとバイト単位一致",
+          _chunk_texts6 == ["ABCDEFGHIJ", "GHIJKLMNOP", "MNOP"])
+finally:
+    f.RAG_CHUNK_CHARS = _orig_rag_chunk_chars
+    f.RAG_CHUNK_OVERLAP = _orig_rag_chunk_overlap
+
+# (c) 誤設定(RAG_CHUNK_OVERLAP == RAG_CHUNK_CHARS、stepが0になるケース)でも
+#     有限かつ完結すること（クランプが無ければここでテストプロセスごと無限ループに
+#     なり、以下には絶対に到達しない＝到達できていること自体が検証）。
+try:
+    f.RAG_CHUNK_CHARS = 5
+    f.RAG_CHUNK_OVERLAP = 5
+    with _tempfile.TemporaryDirectory() as _rag_dir7:
+        _rag_root7 = _pathlib.Path(_rag_dir7)
+        _text7 = "ABCDEFGHIJKL"  # 12文字
+        (_rag_root7 / "eq.txt").write_text(_text7, encoding="utf-8")
+        _rag_chunks7 = f._load_rag_chunks([str(_rag_root7)])
+    check("_load_rag_chunks: RAG_CHUNK_OVERLAP==RAG_CHUNK_CHARS(step=0would-be)でもハングせず到達",
+          True)
+    check("_load_rag_chunks: RAG_CHUNK_OVERLAP==RAG_CHUNK_CHARSでもチャンク数は有限かつlen(text)以下",
+          0 < len(_rag_chunks7) <= len(_text7))
+finally:
+    f.RAG_CHUNK_CHARS = _orig_rag_chunk_chars
+    f.RAG_CHUNK_OVERLAP = _orig_rag_chunk_overlap
+
+# (d) 誤設定(RAG_CHUNK_OVERLAP > RAG_CHUNK_CHARS、stepが負になるケース)でも
+#     同様に有限かつ完結すること。
+try:
+    f.RAG_CHUNK_CHARS = 600
+    f.RAG_CHUNK_OVERLAP = 700
+    with _tempfile.TemporaryDirectory() as _rag_dir8:
+        _rag_root8 = _pathlib.Path(_rag_dir8)
+        _text8 = "x" * 50
+        (_rag_root8 / "over.txt").write_text(_text8, encoding="utf-8")
+        _rag_chunks8 = f._load_rag_chunks([str(_rag_root8)])
+    check("_load_rag_chunks: RAG_CHUNK_OVERLAP>RAG_CHUNK_CHARS(step負would-be)でもハングせず到達",
+          True)
+    check("_load_rag_chunks: RAG_CHUNK_OVERLAP>RAG_CHUNK_CHARSでもチャンク数は有限かつlen(text)以下",
+          0 < len(_rag_chunks8) <= len(_text8))
+finally:
+    f.RAG_CHUNK_CHARS = _orig_rag_chunk_chars
+    f.RAG_CHUNK_OVERLAP = _orig_rag_chunk_overlap
+
+# (e) 空ファイル(0バイト)は従来通りチャンク0件（`while start < len(text)` は
+#     text=""のとき即偽になるため、このクランプ変更でも挙動は変わらない）。
+with _tempfile.TemporaryDirectory() as _rag_dir9:
+    _rag_root9 = _pathlib.Path(_rag_dir9)
+    (_rag_root9 / "empty.txt").write_text("", encoding="utf-8")
+    _rag_chunks9 = f._load_rag_chunks([str(_rag_root9)])
+check("_load_rag_chunks: 空ファイル(0バイト)はチャンク0件のまま(クランプの影響を受けない)",
+      _rag_chunks9 == [])
+
+# (f) 設定復元の確認: 既定値(600/100)に戻っていること（後続テストへの汚染防止）。
+check("_load_rag_chunks: RAG_CHUNK_CHARS/RAG_CHUNK_OVERLAPが既定値に復元されている",
+      f.RAG_CHUNK_CHARS == _orig_rag_chunk_chars and f.RAG_CHUNK_OVERLAP == _orig_rag_chunk_overlap)
+
 # ---------- read_file_text: ディスパッチ例外を握りつぶして""を返す (2026-07-23 / iter53) ----------
 # _read_pdf/_read_docx/_read_excel/_read_pptx/_read_html は import 文と実パース処理を
 # 同じ try/except ImportError で包んでいるため、ライブラリ自体は入っているがファイルが
