@@ -11153,6 +11153,53 @@ _neg_den_top, _neg_den_count, _neg_den_classes = f.vote_answers(_neg_den_votes)
 check("vote_answers: \\frac{1}{-2}/-1/2/-0.5 の3票が単一クラスに集約される(票割れしない)",
       _neg_den_count == 3 and len(_neg_den_classes) == 1)
 
+# ---------- normalize_answer: 数字に挟まれたカンマの直後の空白除去 (2026-07-25) ----------
+# (3, 4) と (3,4) は同じ順序対/区間/座標値だが、上の桁区切り正規表現
+# (?<=\d),\s*(?=\d{3}\b) はカンマ直後にちょうど3桁が続く場合しか吸収しないため
+# ("4)" は \d{3} に一致しない)、このままでは2つの投票クラスに分裂する
+# (na.lower()/Fraction高速パス不通過 -> gotcha #6 のmath_verifyフォールバックに依存、
+# gotcha #7 の自己整合性投票が最も嫌う票割れ)。iteration 13/22/24/30/78/122/134/136/
+# 140/148 と同系統の「ファストパスで拾えない票を拾う」姉妹修正。
+check("normalize_answer: (3, 4) -> (3,4) (順序対の空白除去)",
+      f.normalize_answer("(3, 4)") == "(3,4)")
+check("normalize_answer: [2, 5) -> [2,5) (区間の空白除去)",
+      f.normalize_answer("[2, 5)") == "[2,5)")
+check("normalize_answer: 1, 2 -> 1,2",
+      f.normalize_answer("1, 2") == "1,2")
+check("normalize_answer: 3.14, 2.71 -> 3.14,2.71 (小数点混じりでも数字境界で判定)",
+      f.normalize_answer("3.14, 2.71") == "3.14,2.71")
+check("normalize_answer: 既に空白除去済みの(3,4)は不変(冪等性)",
+      f.normalize_answer("(3,4)") == "(3,4)")
+# 桁区切り回帰: 新ルールが上の桁区切り除去 (12, 345 -> 12345) を妨げないこと
+check("normalize_answer: 桁区切り回帰 1,234 -> 1234 (新ルールと非干渉)",
+      f.normalize_answer("1,234") == "1234")
+check("normalize_answer: 桁区切り回帰 12, 345 -> 12345 (新ルールと非干渉)",
+      f.normalize_answer("12, 345") == "12345")
+# 散文/記号的カンマの安全性: 数字に挟まれていないカンマは対象外のまま
+check("normalize_answer: 散文カンマ'yes, it is'は不変(数字に挟まれていない)",
+      f.normalize_answer("yes, it is") == "yes, it is")
+check("normalize_answer: 記号的タプル(x, y)は不変(数字に挟まれていない)",
+      f.normalize_answer("(x, y)") == "(x, y)")
+# 末尾カンマ回帰(iteration 22): 末尾の','は引き続き除去される
+check("normalize_answer: 末尾カンマ回帰 42, -> 42 (新ルールと非干渉)",
+      f.normalize_answer("42,") == "42")
+
+
+def _t_tuple_comma_fastpath_equiv(calls):
+    result = f.answers_equivalent("(3, 4)", "(3,4)")
+    check("answers_equivalent: (3, 4) と (3,4) が正規化高速パスで一致(math_verify不使用)",
+          result is True)
+    check("answers_equivalent: 順序対の一致判定はmath_verify.parseを一切呼ばない(高速パス経由)",
+          len(calls["parse_args"]) == 0)
+
+
+_run_with_math_verify_stub(None, "parse", _t_tuple_comma_fastpath_equiv)
+
+_tuple_comma_votes = ["(3, 4)", "(3,4)", "(3,4)"]
+_tuple_comma_top, _tuple_comma_count, _tuple_comma_classes = f.vote_answers(_tuple_comma_votes)
+check("vote_answers: (3, 4)/(3,4)/(3,4) の3票が単一クラスに集約される(票割れしない)",
+      _tuple_comma_count == 3 and len(_tuple_comma_classes) == 1)
+
 # ---------- _read_docx/_read_pptx: Document()/Presentation()の実行時例外もクラッシュせず
 # notice文字列に劣化させる (2026-07-24 / iter123) ----------
 # iter83(_read_pdf)/iter84(_read_excel)が確立した「except ImportErrorだけでは
