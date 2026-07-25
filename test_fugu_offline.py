@@ -13745,8 +13745,13 @@ try:
     check("main: --fileの抽出結果が空白のみでもreplは呼ばれない", len(_repl5) == 0)
 
     # --- (c) 副次的に判明した特性: --fileのテキストにサイズ上限が無いことの特性化 ---
-    # 修正はしない(surface, don't fix)。num_ctx対応のトランケートが将来必要になった
-    # 場合に備え、現状は「何文字あっても丸ごと通す」契約をここで固定しておく。
+    # 2026-07-26 iteration 192で対応: トランケート自体はしない(surface, don't fix。
+    # gotcha #7と同じ精度優先の思想)。「何文字あっても丸ごと通す」契約は不変のまま
+    # 固定するが、抽出テキストがMODEL_NUM_CTXを超える場合に限り、main()の--file分岐
+    # (ask_fugu呼び出しの直前)でnum_ctxオーバーフローの恐れを知らせる警告printを
+    # 追加した。以下でその警告の有無と、質問本文・各種kwargsが一切変化しない
+    # ことの双方を検証する(詳細な閾値境界・小ファイル・他分岐への無影響は
+    # 直後の(iter192-a/b/c)ブロックで追加検証する)。
     f.SESSION_SAVE = True
     f._HISTORY = []
     with _cli_tempfile.TemporaryDirectory() as _cli_dir_big:
@@ -13754,10 +13759,99 @@ try:
         _cli_big_fp.write_text("placeholder", encoding="utf-8")
         _cli_big_text = "A" * 50000
         f.read_file_text = lambda path: _cli_big_text
-        _ask_big, _repl_big, _lh_big = _cli_run(["--file", str(_cli_big_fp)])
+        _res_big = _cli_run(["--file", str(_cli_big_fp)])
+    _ask_big, _repl_big, _lh_big = _res_big
     check("main(特性化・c): --fileの抽出テキストはサイズ上限なしで丸ごとquestionになる",
           bool(_ask_big) and len(_ask_big[0]["question"]) == 50000
           and _ask_big[0]["question"] == _cli_big_text)
+    check("main(iter192): 50000文字(>MODEL_NUM_CTX)の--fileはoverflow警告を出す",
+          "警告" in _res_big.stdout and "big.txt" in _res_big.stdout)
+    check("main(iter192): overflow警告はnum_ctxの値に言及する",
+          str(f.MODEL_NUM_CTX) in _res_big.stdout)
+    check("main(iter192): overflow警告があってもoffice_attachedは変化しない(.txtなのでFalse)",
+          bool(_ask_big) and _ask_big[0]["kwargs"].get("office_attached") is False)
+
+    # --- (iter192-a) 閾値の境界確認: MODEL_NUM_CTX+1文字なら警告、ちょうど
+    #     MODEL_NUM_CTX文字(境界そのもの)なら警告なし(len(text) > MODEL_NUM_CTXという
+    #     厳密な不等号の実装を直接検証する) ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir_over:
+        _cli_over_fp = f.Path(_cli_dir_over) / "over.txt"
+        _cli_over_fp.write_text("placeholder", encoding="utf-8")
+        _cli_over_text = "B" * (f.MODEL_NUM_CTX + 1)
+        f.read_file_text = lambda path: _cli_over_text
+        _res_over = _cli_run(["--file", str(_cli_over_fp)])
+    check("main(iter192): MODEL_NUM_CTX+1文字ならoverflow警告が出る",
+          "警告" in _res_over.stdout and "over.txt" in _res_over.stdout)
+    check("main(iter192): 境界を超えても抽出テキストは全文そのままquestionに渡る",
+          bool(_res_over.ask_calls)
+          and _res_over.ask_calls[0]["question"] == _cli_over_text)
+
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir_eq:
+        _cli_eq_fp = f.Path(_cli_dir_eq) / "eq.txt"
+        _cli_eq_fp.write_text("placeholder", encoding="utf-8")
+        _cli_eq_text = "C" * f.MODEL_NUM_CTX
+        f.read_file_text = lambda path: _cli_eq_text
+        _res_eq = _cli_run(["--file", str(_cli_eq_fp)])
+    check("main(iter192): ちょうどMODEL_NUM_CTX文字(境界=超えていない)なら警告なし",
+          "警告" not in _res_eq.stdout)
+    check("main(iter192): 境界ちょうどでも質問本文は従来通り全文渡る",
+          bool(_res_eq.ask_calls) and _res_eq.ask_calls[0]["question"] == _cli_eq_text)
+
+    # --- (iter192-b) 小さいファイル: 警告が出ず、挙動はbyte-for-byteで従来通り ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir_small:
+        _cli_small_fp = f.Path(_cli_dir_small) / "small.txt"
+        _cli_small_fp.write_text("placeholder", encoding="utf-8")
+        _cli_small_text = "  小さいファイルの本文です  \n"
+        f.read_file_text = lambda path: _cli_small_text
+        _res_small = _cli_run(["--file", str(_cli_small_fp)])
+    _ask_small, _repl_small, _lh_small = _res_small
+    check("main(iter192): 小さい--fileはoverflow警告が出ない", "警告" not in _res_small.stdout)
+    check("main(iter192): 小さい--fileの質問は従来通りstripされた本文(挙動不変)",
+          bool(_ask_small) and _ask_small[0]["question"] == "小さいファイルの本文です")
+    check("main(iter192): 小さい--fileでもreplは呼ばれない", len(_repl_small) == 0)
+
+    # --- (iter192-c) 警告は"print"のみであり、out_file / history_file / office_attached
+    #     の転送やルーティング・repl呼び出し有無には一切影響しない(control flow不変)
+    #     ことの確認。Office拡張子 + --out + --session を同時指定した大容量ファイルで検証 ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir_office_big:
+        _cli_office_big_fp = f.Path(_cli_dir_office_big) / "bigdoc.pdf"
+        _cli_office_big_fp.write_bytes(b"placeholder")
+        _cli_office_big_text = "D" * 50000
+        f.read_file_text = lambda path: _cli_office_big_text
+        _res_office_big = _cli_run(["--file", str(_cli_office_big_fp),
+                                     "--out", "out192.md", "--session", "sess192.json"])
+    _ask_ob, _repl_ob, _lh_ob = _res_office_big
+    check("main(iter192-c): overflow警告があってもask_fuguは1回だけ呼ばれる(control flow不変)",
+          len(_ask_ob) == 1)
+    check("main(iter192-c): overflow警告があってもoffice_attachedはTrueのまま(.pdf)",
+          bool(_ask_ob) and _ask_ob[0]["kwargs"].get("office_attached") is True)
+    check("main(iter192-c): overflow警告があってもout_fileはそのままask_fuguへ転送される",
+          bool(_ask_ob) and _ask_ob[0]["kwargs"].get("out_file") == "out192.md")
+    check("main(iter192-c): overflow警告があってもhistory_fileはPath化されて転送される",
+          bool(_ask_ob) and _ask_ob[0]["kwargs"].get("history_file") == f.Path("sess192.json"))
+    check("main(iter192-c): overflow警告があってもreplは呼ばれない", len(_repl_ob) == 0)
+    check("main(iter192-c): overflow警告付きでも抽出テキスト全文がそのままquestionになる",
+          bool(_ask_ob) and _ask_ob[0]["question"] == _cli_office_big_text)
+
+    def _iter192_cp932_ok(s):
+        """文字列がcp932(Windowsコンソールの既知の落とし穴#4)へ例外なくエンコード
+        できるかを確認するだけのヘルパー。encode自体が失敗したら偽を返す(送出しない)。"""
+        try:
+            s.encode("cp932")
+            return True
+        except UnicodeEncodeError:
+            return False
+
+    check("main(iter192): overflow警告文を含む標準出力全体がcp932でエンコード可能(gotcha #4)",
+          _iter192_cp932_ok(_res_office_big.stdout))
 
     # --- (6) --out <path> + 位置引数の質問: out_fileがそのままask_fuguへ転送される ---
     f.SESSION_SAVE = True
