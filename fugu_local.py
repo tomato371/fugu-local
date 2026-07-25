@@ -2766,6 +2766,58 @@ def _apply_tasktype_guardrails(question, plan):
     return plan
 
 
+# 2026-07-26: Office 添付ファイル(.docx/.xlsx/.pdf 等)の決定的ガードレール。
+# CONDUCTOR_SYS の【特殊ルーティング指示】3(本ファイル 2547-2548 行目)は
+# 「Office ファイルが添付されその解説・分析を求めている場合は、必ず mode='moa' とし
+# selected_proposers に必ず 'Proposer C' を含めて主軸に据えること」を明記し、
+# conduct() はさらに自然文のヒント（'[注記] ... 特殊ルーティング指示 #2 ...'、
+# conduct() 内 hint 変数）まで添えている。だが本ファイル各所のガードレール群
+# ―― PPTX/画像出力形態は _apply_routing_guardrails（iter 36）、コード/証明の
+# single→moa 格上げは _apply_accuracy_guardrails（iter 97）、task_type 誤分類補正は
+# 直上の _apply_tasktype_guardrails（iter 64、二重JSON失敗フォールバックにも適用）
+# ―― が繰り返し記録している通り、小型 Conductor(qwen3:4b) はプロンプト中の
+# ルーティング指示文を取りこぼすことが実測されている。office_attached は
+# これまで conduct() のヒント文言生成以外に一切参照されておらず（grep 済み）、
+# Conductor がヒントを無視すると .docx/.xlsx/.pdf 添付の解説・分析タスクが
+# mode='single' のまま単一の非専門モデルへ回されたり、RAG/Office 文書専門家
+# gemma4:26b (Proposer C) が selected_proposers から抜け落ちたまま実行される
+# ――このフラグが守るはずの文書解析経路そのものがサイレントに劣化する。
+# 他のガードレール群と同じ「プロンプトのヒントとは別に、フラグ/キーワードで
+# 決定的に確定させる」作法（belt-and-suspenders）に倣い、office_attached を
+# 直接の決定的シグナルとして mode='moa' を強制し、導入済みであれば
+# Proposer C を主軸(先頭)に確実に加える。プロンプトのヒント自体は削らない
+# （二重の安全網として両方を維持する）。
+def _apply_office_guardrail(plan, office_attached):
+    """office_attached=True を決定的ガードレールとして扱う。
+    mode='moa' を強制し、導入済みなら Proposer C (PERSONA_MODELS 由来の実モデル名)を
+    selected_proposers の先頭に確実に加える(重複排除・4件上限は validate_plan の
+    models[:4] と揃える)。office_attached=False は完全な no-op（plan を一切変更しない）。
+    image_only=True の画像専用プランは _apply_accuracy_guardrails と同じ理由で
+    テキスト側 MoA 強制の対象外（画像だけの回答にテキストパネルを割り当てても無意味）。
+    べき等: 2回適用しても mode/selected_proposers/reason は変化しない。"""
+    if not office_attached:
+        return plan
+    if plan.get("image_only"):
+        return plan
+    plan["mode"] = "moa"
+    tag = "[guardrail: office→moa+ProposerC] "
+    reason = str(plan.get("reason", ""))
+    if not reason.startswith(tag):
+        plan["reason"] = tag + reason
+    c_model = PERSONA_MODELS.get("Proposer C")
+    if c_model and c_model in PROPOSERS:
+        models = list(plan.get("selected_proposers") or [])
+        if c_model in models:
+            models.remove(c_model)
+        models.insert(0, c_model)
+        deduped = []
+        for m in models:
+            if m not in deduped:
+                deduped.append(m)
+        plan["selected_proposers"] = deduped[:4]
+    return plan
+
+
 def default_plan():
     return {
         "mode": "moa",
@@ -2889,6 +2941,7 @@ def conduct(question, history=None, office_attached=False):
         plan = extract_json(raw)
     plan = _apply_routing_guardrails(question, validate_plan(plan))
     plan = _apply_accuracy_guardrails(question, plan)
+    plan = _apply_office_guardrail(plan, office_attached)
     return _apply_tasktype_guardrails(question, plan), raw
 
 

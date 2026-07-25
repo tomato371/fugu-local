@@ -4,6 +4,7 @@ fugu_local / eval_fugu の純粋ロジック（プラン検証・JSON抽出・�
 アグリゲータのフォールバック・採点関数）を合成入力で検証する。
 """
 import contextlib
+import copy
 import io
 import json
 import sys
@@ -382,6 +383,95 @@ check("route: make_pptx かつ image_only が同時にTrueにはならない",
       not (_r["make_pptx"] and _r["image_only"]))
 f.PROPOSERS = _op_persona
 
+# ---------- Office添付ガードレール (_apply_office_guardrail, 2026-07-26追加) ----------
+# CONDUCTOR_SYS 特殊ルーティング指示3 と conduct() の自然文ヒント（下の conduct() 節にある
+# office_attached ヒント文言テスト参照）はプロンプトのみの安全網であり、他のガードレール
+# (_apply_routing_guardrails/_apply_accuracy_guardrails/_apply_tasktype_guardrails)と同様に
+# 小型 Conductor がヒントを無視しても結果が変わらないことを、決定的ガードレール単体で
+# (f.PROPOSERS を mutate/restore する try/finally の中で) 検証する。
+# PERSONA_MODELS['Proposer C'] 経由でモデル名を参照し、'gemma4:26b' を直接ハードコードしない。
+_office_c_model = f.PERSONA_MODELS["Proposer C"]
+_orig_props_office = f.PROPOSERS
+
+
+def _office_plan(**overrides):
+    plan = {"mode": "single", "task_type": "knowledge",
+            "selected_proposers": ["some-other-model"], "rounds": 1,
+            "use_image_generation": False, "image_only": False, "make_pptx": False,
+            "search_required": False, "reason": "r", "_fallback": False}
+    plan.update(overrides)
+    return plan
+
+
+try:
+    f.PROPOSERS = ["some-other-model", _office_c_model, "another-model"]
+
+    # (1) office_attached=False は完全な no-op(呼び出し前のdeep copyとbyte-for-byte一致)
+    _p_off = _office_plan()
+    _p_off_snapshot = copy.deepcopy(_p_off)
+    _r_off = f._apply_office_guardrail(_p_off, False)
+    check("office guard: office_attached=Falseはplanを一切変更しない(no-op)",
+          _r_off == _p_off_snapshot and _p_off == _p_off_snapshot)
+
+    # (2) office_attached=True・Proposer C導入済み・mode='single'でCが未選択
+    #     -> moaへ格上げしProposer Cのモデルを注入する
+    _p_on = _office_plan(mode="single", selected_proposers=["some-other-model"])
+    _r_on = f._apply_office_guardrail(_p_on, True)
+    check("office guard: office_attached=Trueでmode='moa'へ強制",
+          _r_on["mode"] == "moa")
+    check("office guard: 導入済みならProposer Cのモデルがselected_proposersに含まれる",
+          _office_c_model in _r_on["selected_proposers"])
+
+    # 冪等性: 同じplanに2回目を適用しても結果(mode/selected_proposers/reason)が変わらない
+    _r_on_2 = f._apply_office_guardrail(_r_on, True)
+    check("office guard: 2回適用しても結果は不変(冪等)",
+          _r_on_2["mode"] == "moa"
+          and _r_on_2["selected_proposers"] == _r_on["selected_proposers"]
+          and _r_on_2["reason"] == _r_on["reason"])
+
+    # (3) office_attached=True・Proposer Cのモデルが未導入(PROPOSERSに存在しない)
+    #     -> mode='moa'へは強制するが例外を出さず、Cは注入しない(未導入モデルへは絶対に
+    #     ルーティングしない = PPTX/精度ガードレールと同じ PROPOSERS 参照パターン)
+    f.PROPOSERS = ["some-other-model", "another-model"]  # Proposer Cのモデルは未導入
+    _p_noc = _office_plan(mode="single", selected_proposers=["some-other-model"])
+    _r_noc = f._apply_office_guardrail(_p_noc, True)
+    check("office guard: Proposer C未導入でも例外を出さずmode='moa'へ強制",
+          _r_noc["mode"] == "moa")
+    check("office guard: Proposer C未導入ならselected_proposersは非空のまま・Cは注入されない",
+          bool(_r_noc["selected_proposers"]) and _office_c_model not in _r_noc["selected_proposers"])
+    f.PROPOSERS = ["some-other-model", _office_c_model, "another-model"]
+
+    # (4) image_only=True は no-op(mode/image_only/selected_proposersとも不変。
+    #     _apply_accuracy_guardrails の image_only 早期returnと同じ理由:
+    #     画像のみの回答にテキストパネルを割り当てても無意味なため)
+    _p_img = _office_plan(mode="single", image_only=True,
+                           selected_proposers=["some-other-model"])
+    _p_img_snapshot = copy.deepcopy(_p_img)
+    _r_img = f._apply_office_guardrail(_p_img, True)
+    check("office guard: image_only=Trueはno-op(mode/image_only/selected_proposers不変)",
+          _r_img["mode"] == _p_img_snapshot["mode"]
+          and _r_img["image_only"] == _p_img_snapshot["image_only"]
+          and _r_img["selected_proposers"] == _p_img_snapshot["selected_proposers"])
+
+    # (5) selected_proposersが既に4件(Proposer C含まず)・Cは導入済み
+    #     -> Proposer Cが主軸(先頭)に立ち、4件上限を超えず・重複無し・2回適用しても
+    #     同じリスト(冪等)。validate_plan の models[:4] 上限と揃える。
+    f.PROPOSERS = ["m1", "m2", "m3", "m4", _office_c_model]
+    _p_full = _office_plan(mode="moa", selected_proposers=["m1", "m2", "m3", "m4"])
+    _r_full = f._apply_office_guardrail(_p_full, True)
+    check("office guard: 4件満杯でもProposer Cが主軸(先頭)に立つ",
+          _r_full["selected_proposers"][0] == _office_c_model)
+    check("office guard: 4件上限を超えない", len(_r_full["selected_proposers"]) <= 4)
+    check("office guard: 重複無し",
+          len(_r_full["selected_proposers"]) == len(set(_r_full["selected_proposers"])))
+    _r_full_2 = f._apply_office_guardrail(_r_full, True)
+    check("office guard: 4件満杯ケースも2回適用で同じリスト(冪等)",
+          _r_full_2["selected_proposers"] == _r_full["selected_proposers"])
+finally:
+    f.PROPOSERS = _orig_props_office
+check("office guard: テスト後にPROPOSERSが元へ復元されている",
+      f.PROPOSERS == _orig_props_office)
+
 # ---------- conduct(): プランオーケストレーション ----------
 # conduct() は f.ask のみをモックし、extract_json/validate_plan/_apply_*_guardrails/
 # build_proposer_desc は実物をそのまま通す（本物の合成ロジックを検証するため）。
@@ -496,6 +586,35 @@ finally:
 check("conduct: パワポ要求はraw planの中身に関わらずmake_pptx+moa+image_only=Falseに確定",
       _plan_pptx["make_pptx"] is True and _plan_pptx["mode"] == "moa"
       and _plan_pptx["image_only"] is False)
+
+# --- Office添付ガードレール: conduct()の最終returnにも反映される(_apply_office_guardrail、
+#     2026-07-26追加)。ここでは f.ask のみをモックし、Conductor が CONDUCTOR_SYS 特殊
+#     ルーティング指示3/conduct()の自然文ヒントを無視してmode='single'かつProposer C不在の
+#     rawプランを返した想定で、conduct()の最終出力が決定的ガードレールで補正されることを見る。 ---
+try:
+    _resp_office_guard = _valid_plan_json(mode="single", task_type="knowledge",
+                                           selected_proposers=["Proposer A"],
+                                           reason="raw single, ignores office hint")
+    f.ask, _calls_office_guard = _make_conduct_ask([_resp_office_guard])
+    _plan_office_guard, _ = f.conduct("この契約書を分析して", office_attached=True)
+finally:
+    f.ask = _orig_ask_conduct
+check("conduct: office_attached=TrueならConductorがsingleを返してもmoaへ強制される",
+      _plan_office_guard["mode"] == "moa")
+check("conduct: office_attached=TrueならProposer Cのモデルが最終planに含まれる",
+      f.PERSONA_MODELS["Proposer C"] in _plan_office_guard["selected_proposers"])
+
+try:
+    _resp_no_office_guard = _valid_plan_json(mode="single", task_type="knowledge",
+                                              selected_proposers=["Proposer A"],
+                                              reason="raw single, no office")
+    f.ask, _calls_no_office_guard = _make_conduct_ask([_resp_no_office_guard])
+    _plan_no_office_guard, _ = f.conduct("この契約書を分析して", office_attached=False)
+finally:
+    f.ask = _orig_ask_conduct
+check("conduct: office_attached=Falseならsingleのまま"
+      "(このガードレールはoffice_attached=Falseの通常planにmoaを強制しない)",
+      _plan_no_office_guard["mode"] == "single")
 
 # --- プロンプト構築: office_attached のヒント文言 ---
 try:
