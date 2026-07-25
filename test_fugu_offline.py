@@ -13268,6 +13268,310 @@ check("normalize_answer: 素のA/5/1/2/50%/-5は不変(over-stripなし)",
       and f.normalize_answer("50%") == "50%"
       and f.normalize_answer("-5") == "-5")
 
+# ---------- main(): CLI引数解析 / 質問ソース解決 / office_attached ルーティング ----------
+# 2026-07-26: main() (fugu_local.py ~L5093) は本スクリプト唯一のエントリポイントだが
+# これまで直接のオフラインテストが無かった。--file/--rag/--search によるコンテキスト
+# 注入の有無、office_attached (Office文書→Proposer C 主軸ルーティング) の設定、
+# --session/--no-history による履歴の読み込み・永続化制御など、精度に直結する分岐を
+# 多数抱える「配線」部分であり、抽出/投票/reader/saver/plan/history/search の各経路は
+# 既に厳密にテスト済みなのに main() だけが手つかずだった、という純粋なカバレッジの
+# 空白を埋める。sys.argv を実際に差し替えて argparse の解析経路ごと駆動する
+# (parse_args 自体は本物を使い、再実装はしない)。
+#
+# モック対象: f.setup (実サーバー疎通を避け True 固定)、f.ask_fugu / f.repl
+# (実パイプライン・モデル呼び出しを避ける)、f.load_history_file (実
+# ~/.fugu_history.json / HISTORY_FILE には一切触れずフェイク履歴を返す)、
+# --file 系のみ f.read_file_text (python-docx/openpyxl/pdfplumber 等の実ライブラリに
+# 依存しないよう固定文字列を返す)。SESSION_SAVE / _HISTORY / RAG_DIRS / sys.argv /
+# sys.stdin はブロック終了後にまとめて元の状態へ復元し、復元自体もアサートする。
+#
+# 副次的に判明した特性(表面化のみ・修正はしない。iters 66/71/110のsurface-don't-fix
+# 方針に従う):
+#  (a) --out はインタラクティブ分岐(質問なし+isatty、L5172のrepl()呼び出し)には
+#      一切転送されない。main()がrepl()へ渡す引数はuse_search/rag_dirs/history_file
+#      の3つだけで、repl()自身のシグネチャにもout_file引数が無いため、
+#      `--out result.md` を質問なしで指定しても黙って無視される(エラー・警告なし)。
+#  (b) パイプ入力(stdin)分岐(L5177)のask_fugu呼び出しはoffice_attachedを明示的に
+#      渡さない(ask_fugu側の既定値Falseに暗黙依存)。--fileを経ない経路なので実害は
+#      無いが、--file経路(常にoffice_attachedを明示するL5170)とは非対称なキーワード
+#      渡し方になっている。
+#  (c) --fileのテキストはサイズ上限が一切無く、抽出結果がどれだけ長くてもnum_ctxを
+#      意識したトランケートをせずそのままask_fugu(question=...)へ渡す。
+# いずれもmain()自体には手を入れない。
+import tempfile as _cli_tempfile
+
+_orig_cli_setup = f.setup
+_orig_cli_ask_fugu = f.ask_fugu
+_orig_cli_repl = f.repl
+_orig_cli_load_history = f.load_history_file
+_orig_cli_read_file_text = f.read_file_text
+_orig_cli_session_save = f.SESSION_SAVE
+_orig_cli_history = f._HISTORY
+_orig_cli_rag_dirs = f.RAG_DIRS
+_orig_cli_argv = sys.argv
+_orig_cli_stdin = sys.stdin
+
+# fugu_local.py L5148 の _OFFICE_SUFFIXES はmain()内ローカル変数でモジュールからは
+# 参照できないため、同じリテラルをテスト側でも直接保持する(ソース確認済み)。
+_CLI_OFFICE_SUFFIXES = (".docx", ".doc", ".xlsx", ".xls", ".pdf", ".pptx", ".ppt")
+
+
+class _CliFakeStdin:
+    """sys.stdin を置き換える最小フェイク。isatty()/read()のみ提供する。"""
+    def __init__(self, isatty, text=""):
+        self._isatty = isatty
+        self._text = text
+
+    def isatty(self):
+        return self._isatty
+
+    def read(self):
+        return self._text
+
+
+def _cli_run(argv_tail, stdin_isatty=True, stdin_text="", history_return=()):
+    """main()を1回駆動し (ask_fugu呼び出し記録, repl呼び出し記録,
+    load_history_file呼び出し記録) のタプルを返す。sys.argv/sys.stdinは呼び出し内で
+    復元する(main()内の例外有無に関わらず)。標準出力はcontextlib.redirect_stdoutで
+    抑制する(文言はアサート対象にしない)。"""
+    ask_calls = []
+    repl_calls = []
+    load_hist_calls = []
+
+    def _fake_ask_fugu(question, **kwargs):
+        ask_calls.append({"question": question, "kwargs": kwargs})
+
+    def _fake_repl(**kwargs):
+        repl_calls.append(kwargs)
+
+    def _fake_load_history(path):
+        load_hist_calls.append(path)
+        return list(history_return)
+
+    f.setup = lambda: True
+    f.ask_fugu = _fake_ask_fugu
+    f.repl = _fake_repl
+    f.load_history_file = _fake_load_history
+    sys.argv = ["fugu_local.py"] + list(argv_tail)
+    sys.stdin = _CliFakeStdin(stdin_isatty, stdin_text)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            f.main()
+    finally:
+        sys.argv = _orig_cli_argv
+        sys.stdin = _orig_cli_stdin
+    return ask_calls, repl_calls, load_hist_calls
+
+
+try:
+    f.RAG_DIRS = []
+
+    # --- (1) 位置引数のみの質問: 素の質問文がそのままask_fuguへ渡り、replは呼ばれない ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask1, _repl1, _lh1 = _cli_run(["これはテスト質問です"])
+    check("main: 位置引数の質問はask_fuguに1回だけ渡る", len(_ask1) == 1)
+    check("main: 位置引数の質問文がそのまま渡る(strip等の加工なし)",
+          bool(_ask1) and _ask1[0]["question"] == "これはテスト質問です")
+    check("main: use_searchの既定はFalse",
+          bool(_ask1) and _ask1[0]["kwargs"].get("use_search") is False)
+    check("main: --rag無し/RAG_DIRS空ならrag_dirsはNone",
+          bool(_ask1) and _ask1[0]["kwargs"].get("rag_dirs") is None)
+    check("main: --out無しならout_fileはNone",
+          bool(_ask1) and _ask1[0]["kwargs"].get("out_file") is None)
+    check("main: --session無しならhistory_fileはHISTORY_FILE",
+          bool(_ask1) and _ask1[0]["kwargs"].get("history_file") == f.HISTORY_FILE)
+    check("main: --file無しの経路ではoffice_attachedはFalse",
+          bool(_ask1) and _ask1[0]["kwargs"].get("office_attached") is False)
+    check("main: 質問がある場合replは呼ばれない", len(_repl1) == 0)
+    check("main: --no-history無しならload_history_fileが1回呼ばれる", len(_lh1) == 1)
+    check("main: load_history_fileにHISTORY_FILEが渡る",
+          bool(_lh1) and _lh1[0] == f.HISTORY_FILE)
+
+    # --- (2) --file <.txt>: read_file_textの戻り値がstripされてquestionになり、
+    #         .txtはOffice拡張子ではないのでoffice_attachedはFalse ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir2:
+        _cli_txt = f.Path(_cli_dir2) / "task.txt"
+        _cli_txt.write_text("placeholder", encoding="utf-8")
+        f.read_file_text = lambda path: "  body text  \n"
+        _ask2, _repl2, _lh2 = _cli_run(["--file", str(_cli_txt)])
+    check("main: --file(.txt)の質問はread_file_textの戻り値をstripしたもの",
+          bool(_ask2) and _ask2[0]["question"] == "body text")
+    check("main: --file(.txt)はOffice拡張子でないのでoffice_attachedはFalse",
+          bool(_ask2) and _ask2[0]["kwargs"].get("office_attached") is False)
+    check("main: --fileの質問経路でもreplは呼ばれない", len(_repl2) == 0)
+
+    # --- (3) --file <Office拡張子>: office_attachedがTrueになる(全_CLI_OFFICE_SUFFIXES) ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _office_results = {}
+    for _suf in _CLI_OFFICE_SUFFIXES:
+        with _cli_tempfile.TemporaryDirectory() as _cli_dir3:
+            _cli_office_fp = f.Path(_cli_dir3) / ("doc" + _suf)
+            _cli_office_fp.write_bytes(b"placeholder")
+            f.read_file_text = lambda path: "Office文書の本文です"
+            _ask3, _repl3, _lh3 = _cli_run(["--file", str(_cli_office_fp)])
+        _office_results[_suf] = (_ask3, _repl3)
+    check("main: 全Office拡張子でask_fuguが1回呼ばれる",
+          all(len(a) == 1 for a, r in _office_results.values()))
+    check("main: 全Office拡張子でoffice_attachedがTrueになる",
+          all(a[0]["kwargs"].get("office_attached") is True
+              for a, r in _office_results.values()))
+    check("main: 全Office拡張子でreplは呼ばれない",
+          all(len(r) == 0 for a, r in _office_results.values()))
+
+    # --- (4) --file <存在しないパス>: 早期returnし、ask_fugu/replとも呼ばれない ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir4:
+        _cli_missing = f.Path(_cli_dir4) / "does_not_exist.txt"
+        f.read_file_text = lambda path: "呼ばれないはず"
+        _ask4, _repl4, _lh4 = _cli_run(["--file", str(_cli_missing)])
+    check("main: --fileが存在しないパスならask_fuguは呼ばれない(早期return)", len(_ask4) == 0)
+    check("main: --fileが存在しないパスならreplも呼ばれない", len(_repl4) == 0)
+
+    # --- (5) --file <存在するが抽出結果が空/空白のみ>: 早期returnし、ask_fuguは呼ばれない ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir5:
+        _cli_empty = f.Path(_cli_dir5) / "empty.txt"
+        _cli_empty.write_text("placeholder", encoding="utf-8")
+        f.read_file_text = lambda path: "   \n  "
+        _ask5, _repl5, _lh5 = _cli_run(["--file", str(_cli_empty)])
+    check("main: --fileの抽出結果が空白のみならask_fuguは呼ばれない(抽出失敗の早期return)",
+          len(_ask5) == 0)
+    check("main: --fileの抽出結果が空白のみでもreplは呼ばれない", len(_repl5) == 0)
+
+    # --- (c) 副次的に判明した特性: --fileのテキストにサイズ上限が無いことの特性化 ---
+    # 修正はしない(surface, don't fix)。num_ctx対応のトランケートが将来必要になった
+    # 場合に備え、現状は「何文字あっても丸ごと通す」契約をここで固定しておく。
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    with _cli_tempfile.TemporaryDirectory() as _cli_dir_big:
+        _cli_big_fp = f.Path(_cli_dir_big) / "big.txt"
+        _cli_big_fp.write_text("placeholder", encoding="utf-8")
+        _cli_big_text = "A" * 50000
+        f.read_file_text = lambda path: _cli_big_text
+        _ask_big, _repl_big, _lh_big = _cli_run(["--file", str(_cli_big_fp)])
+    check("main(特性化・c): --fileの抽出テキストはサイズ上限なしで丸ごとquestionになる",
+          bool(_ask_big) and len(_ask_big[0]["question"]) == 50000
+          and _ask_big[0]["question"] == _cli_big_text)
+
+    # --- (6) --out <path> + 位置引数の質問: out_fileがそのままask_fuguへ転送される ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask6, _repl6, _lh6 = _cli_run(["質問6", "--out", "result.md"])
+    check("main: --outの値がask_fuguのout_fileへ転送される",
+          bool(_ask6) and _ask6[0]["kwargs"].get("out_file") == "result.md")
+
+    # --- (7) --search + --rag a b: use_search=True, rag_dirs=['a','b'] ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask7, _repl7, _lh7 = _cli_run(["質問7", "--search", "--rag", "a", "b"])
+    check("main: --searchでuse_search=Trueがask_fuguへ渡る",
+          bool(_ask7) and _ask7[0]["kwargs"].get("use_search") is True)
+    check("main: --rag a b でrag_dirs=['a','b']がask_fuguへ渡る",
+          bool(_ask7) and _ask7[0]["kwargs"].get("rag_dirs") == ["a", "b"])
+
+    # --- (8a) --no-history: SESSION_SAVE=Falseになり、load_history_fileは呼ばれず、
+    #          _HISTORYも書き換わらない(elseブランチ自体がスキップされるため) ---
+    f.SESSION_SAVE = True
+    f._HISTORY = ["sentinel_no_history_untouched"]
+    _ask8a, _repl8a, _lh8a = _cli_run(["--no-history", "質問8a"])
+    check("main: --no-historyでSESSION_SAVEがFalseになる", f.SESSION_SAVE is False)
+    check("main: --no-historyならload_history_fileは呼ばれない", len(_lh8a) == 0)
+    check("main: --no-historyなら_HISTORYは書き換わらない(elseブランチ丸ごとスキップ)",
+          f._HISTORY == ["sentinel_no_history_untouched"])
+    check("main: --no-historyでもask_fuguは通常通り呼ばれる", len(_ask8a) == 1)
+
+    # --- (8b) --no-history無し: load_history_fileが呼ばれ、戻り値がそのまま_HISTORYになる ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _fake_hist_8b = [{"role": "user", "content": "以前の質問"},
+                     {"role": "assistant", "content": "以前の回答"}]
+    _ask8b, _repl8b, _lh8b = _cli_run(["質問8b"], history_return=_fake_hist_8b)
+    check("main: --no-history無しならload_history_fileが呼ばれる", len(_lh8b) == 1)
+    check("main: load_history_fileの戻り値がそのまま_HISTORYになる",
+          f._HISTORY == _fake_hist_8b)
+
+    # --- (9) --session <path>: hfile==Path(path)がload_history_file/ask_fugu双方に
+    #         forwardされる(対話分岐ではreplにも渡る) ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask9, _repl9, _lh9 = _cli_run(["質問9", "--session", "custom_session.json"])
+    check("main: --sessionの値がPath化されてload_history_fileへ渡る",
+          bool(_lh9) and _lh9[0] == f.Path("custom_session.json"))
+    check("main: --sessionの値がPath化されてask_fuguのhistory_fileへ渡る",
+          bool(_ask9) and _ask9[0]["kwargs"].get("history_file") == f.Path("custom_session.json"))
+
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask9i, _repl9i, _lh9i = _cli_run(["--session", "custom_session2.json"],
+                                       stdin_isatty=True)
+    check("main: 質問なし+isatty()でのreplにも--sessionのPathがhistory_fileとして渡る",
+          bool(_repl9i) and _repl9i[0].get("history_file") == f.Path("custom_session2.json"))
+
+    # --- (10) 質問なし + stdin.isatty()=True: replが(use_search, rag_dirs, history_file)
+    #          の3引数のみで1回呼ばれ、ask_fuguは呼ばれない。
+    #          特性(a)の確認: --outを付けてもrepl呼び出しには一切現れない ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask10, _repl10, _lh10 = _cli_run(["--out", "ignored_output.md"], stdin_isatty=True)
+    check("main: 質問なし+isatty()=Trueならreplが1回だけ呼ばれる", len(_repl10) == 1)
+    check("main: 質問なし+isatty()=Trueならask_fuguは呼ばれない", len(_ask10) == 0)
+    check("main: repl呼び出しの引数はuse_search/rag_dirs/history_fileの3つだけ",
+          bool(_repl10) and set(_repl10[0].keys()) == {"use_search", "rag_dirs", "history_file"})
+    check("main(特性化・a): --outを指定してもrepl呼び出しにout_fileは現れない(黙って無視される)",
+          bool(_repl10) and "out_file" not in _repl10[0])
+
+    # --- (11) 質問なし + stdin.isatty()=False + read()が非空文字列を返す:
+    #          stripされた文字列がask_fuguのquestionになる。
+    #          特性(b)の確認: この経路のask_fugu呼び出しにはoffice_attachedキーワード
+    #          自体が渡されない(ask_fugu側の既定Falseに暗黙依存) ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask11, _repl11, _lh11 = _cli_run([], stdin_isatty=False,
+                                       stdin_text="  パイプ入力の質問です  \n")
+    check("main: パイプ入力はstripされてask_fuguのquestionになる",
+          bool(_ask11) and _ask11[0]["question"] == "パイプ入力の質問です")
+    check("main: パイプ入力経路ではreplは呼ばれない", len(_repl11) == 0)
+    check("main(特性化・b): パイプ入力経路のask_fugu呼び出しはoffice_attachedを明示しない",
+          bool(_ask11) and "office_attached" not in _ask11[0]["kwargs"])
+
+    # --- (12) 質問なし + stdin.isatty()=False + read()が空/空白のみ:
+    #          「質問が入力されませんでした」経路を通り、ask_fugu/replとも呼ばれない ---
+    f.SESSION_SAVE = True
+    f._HISTORY = []
+    _ask12, _repl12, _lh12 = _cli_run([], stdin_isatty=False, stdin_text="   \n  ")
+    check("main: 空/空白のみのパイプ入力ならask_fuguは呼ばれない", len(_ask12) == 0)
+    check("main: 空/空白のみのパイプ入力ならreplも呼ばれない", len(_repl12) == 0)
+finally:
+    f.setup = _orig_cli_setup
+    f.ask_fugu = _orig_cli_ask_fugu
+    f.repl = _orig_cli_repl
+    f.load_history_file = _orig_cli_load_history
+    f.read_file_text = _orig_cli_read_file_text
+    f.SESSION_SAVE = _orig_cli_session_save
+    f._HISTORY = _orig_cli_history
+    f.RAG_DIRS = _orig_cli_rag_dirs
+    sys.argv = _orig_cli_argv
+    sys.stdin = _orig_cli_stdin
+
+check("main: テスト後にf.setupが復元されている", f.setup is _orig_cli_setup)
+check("main: テスト後にf.ask_fuguが復元されている", f.ask_fugu is _orig_cli_ask_fugu)
+check("main: テスト後にf.replが復元されている", f.repl is _orig_cli_repl)
+check("main: テスト後にf.load_history_fileが復元されている",
+      f.load_history_file is _orig_cli_load_history)
+check("main: テスト後にf.read_file_textが復元されている",
+      f.read_file_text is _orig_cli_read_file_text)
+check("main: テスト後にSESSION_SAVEが復元されている", f.SESSION_SAVE == _orig_cli_session_save)
+check("main: テスト後に_HISTORYが復元されている", f._HISTORY == _orig_cli_history)
+check("main: テスト後にRAG_DIRSが復元されている", f.RAG_DIRS == _orig_cli_rag_dirs)
+check("main: テスト後にsys.argvが復元されている", sys.argv == _orig_cli_argv)
+check("main: テスト後にsys.stdinが復元されている", sys.stdin is _orig_cli_stdin)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
