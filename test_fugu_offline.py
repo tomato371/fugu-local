@@ -6193,6 +6193,117 @@ else:
 check("_pptx_shape_texts: テスト後にsys.modulesの'pptx'エントリが元通り解決可能(復元確認)",
       ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
 
+# ----- _pptx_shape_texts: ネストグループ再帰の深さ上限 (2026-07-26) -----
+# 背景: _pptx_shape_texts(iter87, 上のブロック)はグループシェイプへ
+# `elif hasattr(sh, "shapes"): for sub in sh.shapes: out.extend(_pptx_shape_texts(sub))`
+# で無条件に再帰しており、病的/破損した<p:grpSp>の異常に深いネスト連鎖を与えると
+# sys.recursionlimitを超えてRecursionErrorを送出しうる。_read_pptx側のtry節は
+# import pptx失敗によるImportErrorしか捕捉していないため、このRecursionErrorは
+# そのまま外へ伝播し、read_file_text(iter53)・_load_rag_chunks(iter42)の広い
+# except Exceptionガードに握りつぶされて、PowerPointファイル全体がRAG/--file
+# コンテキストから無言で丸ごと脱落する(iter87が救済した「表/グループ内容が静かに
+# 読み飛ばされる」精度事故と同じ害のクラス)。本タスクはiter157(_read_docxの
+# ネスト表再帰への深さ上限_DOCX_NESTED_TABLE_MAX_DEPTH)と同じ方針で、
+# _pptx_shape_textsに_depth引数と module-level の _PPTX_GROUP_MAX_DEPTH を追加した。
+# 上のiter87/iter25(2026-07-25)テストは実python-pptxオブジェクトに依存しており
+# python-pptx未インストール環境ではスキップされてしまうため、ここではダック
+# タイピングの疑似シェイプ(.textを持つ葉/.shapesを持つグループ/has_table+
+# .table.rowsを持つ表)だけで構成し、python-pptxの有無に関わらず必ず実行される。
+
+
+class _FakePptxTextShape:
+    """.textだけを持つ葉シェイプ(平文テキストボックス相当)のダックタイピング版。"""
+
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakePptxGroupShape:
+    """.shapesだけを持つグループシェイプ相当のダックタイピング版
+    (.textも.has_tableも持たない=python-pptxのGroupShapeの実挙動どおり)。"""
+
+    def __init__(self, shapes):
+        self.shapes = shapes
+
+
+class _FakePptxCell:
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakePptxRow:
+    def __init__(self, cell_texts):
+        self.cells = [_FakePptxCell(t) for t in cell_texts]
+
+
+class _FakePptxTable:
+    def __init__(self, rows):
+        self.rows = [_FakePptxRow(r) for r in rows]
+
+
+class _FakePptxTableShape:
+    """has_table=True + .table.rows/.cells だけを持つ表シェイプ相当
+    (.textは持たない=python-pptxのGraphicFrameの実挙動どおり)。"""
+
+    has_table = True
+
+    def __init__(self, rows):
+        self.table = _FakePptxTable(rows)
+
+
+# (1) 単一の非グループシェイプ(平文.text)/空白のみ・空文字の.textは従来どおり。
+check("_pptx_shape_texts: ダックタイピング版の平文テキストシェイプはテキスト1件のリスト",
+      f._pptx_shape_texts(_FakePptxTextShape("Hello Fake")) == ["Hello Fake"])
+check("_pptx_shape_texts: ダックタイピング版の空白のみ.textは空リスト",
+      f._pptx_shape_texts(_FakePptxTextShape("   ")) == [])
+check("_pptx_shape_texts: ダックタイピング版の空文字.textは空リスト",
+      f._pptx_shape_texts(_FakePptxTextShape("")) == [])
+
+# (2) cap以下(深さ3)のネストグループ+テキストボックス混在は変更前の実装と
+# byte-for-byte同一の出力(シェイプ追加順)を返す。
+_ppwc_inner = _FakePptxGroupShape([_FakePptxTextShape("Nested2")])
+_ppwc_mid = _FakePptxGroupShape([_FakePptxTextShape("Nested1"), _ppwc_inner])
+_ppwc_top = _FakePptxGroupShape(
+    [_FakePptxTextShape("First"), _ppwc_mid, _FakePptxTextShape("Third")])
+check("_pptx_shape_texts: cap以下(深さ3)のネストグループはシェイプ追加順で"
+      "byte-for-byte一致(First, Nested1, Nested2, Third)",
+      f._pptx_shape_texts(_ppwc_top) == ["First", "Nested1", "Nested2", "Third"])
+
+# (3) cap以下のグループ内にネストした表シェイプはhas_table分岐がそのまま働き、
+# タブ結合された行が抽出される(_depth引数の追加はhas_table分岐を一切変更しない)。
+_ppwc_table_shape = _FakePptxTableShape([["A1", "B1"], ["C1", "D1"]])
+_ppwc_group_with_table = _FakePptxGroupShape(
+    [_FakePptxTextShape("Before"), _ppwc_table_shape])
+check("_pptx_shape_texts: cap以下のグループ内にネストした表もタブ結合行として抽出される",
+      f._pptx_shape_texts(_ppwc_group_with_table) == ["Before", "A1\tB1", "C1\tD1"])
+
+# (4) capを超える病的ネスト(cap+10段)でもRecursionErrorを送出せず、
+# 深さ<= capのテキストは救済され、それより深いテキストは打ち切られる。
+_ppgd_cap = f._PPTX_GROUP_MAX_DEPTH
+_ppgd_chain_depth = _ppgd_cap + 10
+_ppgd_node = _FakePptxTextShape(f"T{_ppgd_chain_depth}")
+for _ppgd_i in range(_ppgd_chain_depth - 1, -1, -1):
+    _ppgd_node = _FakePptxGroupShape(
+        [_FakePptxTextShape(f"T{_ppgd_i}"), _ppgd_node])
+
+_ppgd_exc = None
+try:
+    _ppgd_out = f._pptx_shape_texts(_ppgd_node)
+except Exception as _ppgd_e:
+    _ppgd_exc = _ppgd_e
+    _ppgd_out = None
+
+check(f"_pptx_shape_texts: cap({_ppgd_cap})+10段の病的ネストグループでも"
+      "RecursionErrorを送出しない",
+      _ppgd_exc is None)
+check("_pptx_shape_texts: 病的ネストでも浅い階層(T0)のテキストは救済される",
+      _ppgd_out is not None and "T0" in _ppgd_out)
+check("_pptx_shape_texts: capを超える深さの最深部テキストは打ち切られ含まれない",
+      _ppgd_out is not None and f"T{_ppgd_chain_depth}" not in _ppgd_out)
+check("_pptx_shape_texts: 病的ネストでも深さ<=cap-1のテキストはT0,T1,...の"
+      "追加順(昇順)のままcap件だけ救済される(それ以深は静かに打ち切り)",
+      _ppgd_out is not None and _ppgd_out == [f"T{_i}" for _i in range(_ppgd_cap)])
+
 # ----- _read_docx -----
 try:
     import docx as _docx_probe_rd

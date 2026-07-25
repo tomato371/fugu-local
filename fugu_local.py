@@ -1064,7 +1064,28 @@ def _read_excel(path: Path) -> str:
     return f"[Excel: {path.name} — openpyxl or pandas が必要: pip install openpyxl]"
 
 
-def _pptx_shape_texts(sh) -> list:
+# 2026-07-26: グループシェイプ(GroupShape)のネスト再帰に上限を設ける。iter157で
+# 姉妹関数_read_docxのネスト表再帰(L847の_DOCX_NESTED_TABLE_MAX_DEPTH)に加えた
+# 深さ上限と同じ理由で、こちらは`elif hasattr(sh, "shapes"): for sub in sh.shapes:
+# out.extend(_pptx_shape_texts(sub))`が無制限に自身を呼び直す構造になっており、
+# 病的/破損した<p:grpSp>の異常に深いネスト連鎖(あるいは自己参照的な構造)を
+# 与えられるとPythonのsys.recursionlimitを超えてRecursionErrorを送出しうる。
+# _read_pptx側のtry節はimport pptx失敗によるImportErrorしか捕捉していないため
+# (L1101-1117)、このRecursionErrorはそのまま_read_pptxの外へ伝播し、
+# read_file_text(iter53)・_load_rag_chunks(iter42)の広いexcept Exceptionガードに
+# 握りつぶされて、PowerPointファイル全体がRAG/--fileコンテキストから無言で
+# 丸ごと脱落する。これはiter87が救済した「表/グループ内容が静かに読み飛ばされる」
+# 精度事故と同じ害のクラスであり、精度優先・時間は気にしないの方針に反する。
+# 上限はiter157の6(表ネストは実務上ほぼ無い)より大幅に緩い50を採用する:
+# 実在するPPTXの図解グループは数階層程度しかネストしないため、この上限が現実の
+# デッキを切り詰めることは実質無い一方、sys.recursionlimit(既定1000)には
+# 十分な余裕を残す。上限に達した時点でそれ以上は再帰せず静かに打ち切る
+# (iter157と同じ方針。bare exceptは使わずKeyboardInterrupt/SystemExitも
+# そもそも送出していないので握りつぶす対象にならない)。
+_PPTX_GROUP_MAX_DEPTH = 50
+
+
+def _pptx_shape_texts(sh, _depth=0) -> list:
     """PPTXの1シェイプから抽出できるテキスト断片を出現順のリストで返す。
     2026-07-24 (iter87): python-pptxの表シェイプ(GraphicFrame)とグループシェイプ
     (GroupShape)には `.text` 属性そのものが存在しない（hasattr(sh, "text") が False
@@ -1081,7 +1102,10 @@ def _pptx_shape_texts(sh) -> list:
     _read_docxの表取り扱い(L708-710)と同じ規約でセルをタブ結合・行を改行結合する。
     グループはGroupShapeが`.text`を持たず`.shapes`だけを持つことをhasattr()で
     ダックタイピング判定し、ネストしたグループにも再帰する。他シェイプ種別に無い
-    属性を無条件で呼ぶと例外になるため、必ずgetattr/hasattrで存在確認してから読む。"""
+    属性を無条件で呼ぶと例外になるため、必ずgetattr/hasattrで存在確認してから読む。
+    2026-07-26: 上の_PPTX_GROUP_MAX_DEPTHの説明どおり、_depthが上限に達したら
+    それ以上グループの中へは再帰しない(現実的な深さのデッキは全く影響を受けず、
+    病的に深いデッキだけがRecursionErrorでの全体脱落から部分抽出に縮退する)。"""
     out = []
     if hasattr(sh, "text") and sh.text.strip():
         out.append(sh.text)
@@ -1091,8 +1115,9 @@ def _pptx_shape_texts(sh) -> list:
             if row_text.strip():
                 out.append(row_text)
     elif hasattr(sh, "shapes"):
-        for sub in sh.shapes:
-            out.extend(_pptx_shape_texts(sub))
+        if _depth < _PPTX_GROUP_MAX_DEPTH:
+            for sub in sh.shapes:
+                out.extend(_pptx_shape_texts(sub, _depth + 1))
     return out
 
 
