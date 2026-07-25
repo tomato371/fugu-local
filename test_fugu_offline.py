@@ -8404,6 +8404,101 @@ try:
         f._search_raw = _orig_search_raw_rs
         f.ask = _orig_ask_rs
 
+    # --- (J) 2026-07-25: greedy first-fit パッキング — 途中の1件が SEARCH_CONTEXT_CHARS
+    #     を超えていても、そこで break せず、それより後ろの小さく収まる結果は捨てずに拾う
+    #     (採用順は維持)。イテレーション38の特性テスト(H)が発見した「巨大な1件が他の
+    #     収集済み事実を握り潰す」問題のうち、イテレーション39では「先頭1件だけが単独で
+    #     超過する」サブケースのみ対処され、「途中の1件が超過するとそれ以降が"全部"
+    #     捨てられる」根本原因は未修正のまま残っていた回帰テスト。
+    def _rs_pad_item(label, source_url, total_len, filler="Q"):
+        """dedup用のSource URLを保ったまま、item全体をtotal_len文字ちょうどに
+        パディングするテスト用ヘルパー(手計算での文字数ズレを避けるため)。"""
+        head = f"[{label}]\n"
+        tail = f"\nSource: {source_url}"
+        pad_len = total_len - len(head) - len(tail)
+        assert pad_len >= 0, "テスト用itemのtotal_lenが短すぎる"
+        return head + (filler * pad_len) + tail
+
+    _itemJ_a = "[Ja]\nsmall first result\nSource: http://example.com/ja"
+    _itemJ_b = _rs_pad_item("Jb", "http://example.com/jb", f.SEARCH_CONTEXT_CHARS + 500)
+    _itemJ_c = "[Jc]\nsmall third result\nSource: http://example.com/jc"
+    _searchJ_calls = []
+    _askJ_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"Greedy Skip Middle Query": [_itemJ_a, _itemJ_b, _itemJ_c]},
+            _searchJ_calls, max_calls=1)
+        f.ask = _rs_ask_factory([{"sufficient": True, "missing": "", "queries": []}],
+                                 _askJ_calls)
+        _resJ = f.research_search("Greedy Skip Middle Query")
+        check("research_search: (J)中間の結果が上限超過でも前後の小さい結果は両方注入される",
+              "http://example.com/ja" in _resJ and "http://example.com/jc" in _resJ)
+        check("research_search: (J)上限超過した中間結果はbodyに含まれない",
+              "http://example.com/jb" not in _resJ)
+        check("research_search: (J)採用された結果の順序は元の順序のまま維持される"
+              "(1番目の結果が3番目の結果より前に出現する)",
+              _resJ.index("http://example.com/ja") < _resJ.index("http://example.com/jc"))
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (K) 2026-07-25: 単体では上限に収まる小さな結果でも、その前の結果群で既に
+    #     予算の大半が埋まっていれば(残り予算に収まらないため)スキップされ、かつ
+    #     最終bodyの長さがSEARCH_CONTEXT_CHARSを("\n\n"区切りのスラック分を除いて)
+    #     超えないことを固定化する。スキップ後も走査は続くため、続く十分に小さい結果は
+    #     引き続き拾われる(greedy first-fitの核: skipはbreakではない)。
+    _itemK_a = _rs_pad_item("Ka", "http://example.com/ka", f.SEARCH_CONTEXT_CHARS - 100)
+    _itemK_b = _rs_pad_item("Kb", "http://example.com/kb", 150)  # 単体ならCHARSに余裕で収まる
+    _itemK_c = _rs_pad_item("Kc", "http://example.com/kc", 50)   # Ka採用後の残り予算には収まる
+    _searchK_calls = []
+    _askK_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"Greedy Budget Fill Query": [_itemK_a, _itemK_b, _itemK_c]},
+            _searchK_calls, max_calls=1)
+        f.ask = _rs_ask_factory([{"sufficient": True, "missing": "", "queries": []}],
+                                 _askK_calls)
+        _resK = f.research_search("Greedy Budget Fill Query")
+        check("research_search: (K)先に予算の大半を占めた結果は採用される",
+              "http://example.com/ka" in _resK)
+        check("research_search: (K)単体ならCHARSに収まる結果でも残り予算不足ならスキップされる",
+              "http://example.com/kb" not in _resK)
+        check("research_search: (K)スキップ後も走査は続き、残り予算に収まる後続結果は採用される",
+              "http://example.com/kc" in _resK)
+        # ヘッダー（日付行＋固定の注意書き段落）は本文の一部ではないため、実際に注入
+        # された検索結果本文（先頭は必ず itemK_a の "[Ka]"）以降だけを取り出して測る。
+        _bodyK = _resK[_resK.index("[Ka]"):]
+        check("research_search: (K)最終bodyの長さがSEARCH_CONTEXT_CHARSを"
+              "(\"\\n\\n\"区切りのスラック分を除いて)超えない",
+              len(_bodyK.strip()) <= f.SEARCH_CONTEXT_CHARS + 2)
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
+    # --- (L) 回帰: 全結果が小さく何も上限超過しないケースは、変更前と同じく
+    #     全件を元の順序のまま連結する(body組み立てロジックの挙動は不変)。
+    _itemL1 = "[L1]\nfirst small item\nSource: http://example.com/l1"
+    _itemL2 = "[L2]\nsecond small item\nSource: http://example.com/l2"
+    _itemL3 = "[L3]\nthird small item\nSource: http://example.com/l3"
+    _searchL_calls = []
+    _askL_calls = []
+    try:
+        f._search_raw = _rs_search_factory(
+            {"All Small Query": [_itemL1, _itemL2, _itemL3]}, _searchL_calls, max_calls=1)
+        f.ask = _rs_ask_factory([{"sufficient": True, "missing": "", "queries": []}],
+                                 _askL_calls)
+        _resL = f.research_search("All Small Query")
+        _expected_body_l = _itemL1 + "\n\n" + _itemL2 + "\n\n" + _itemL3
+        _headerL = f"## Web Search Results (取得日: {f.time.strftime('%Y-%m-%d')})"
+        check("research_search: (L)結果ありなら取得日入りヘッダーが付与される(既存挙動)",
+              _resL.startswith(_headerL))
+        check("research_search: (L)全件が小さければ元の順序のまま連結される"
+              "(変更前とbyte-for-byte同一の本文)",
+              _resL.endswith(_expected_body_l))
+    finally:
+        f._search_raw = _orig_search_raw_rs
+        f.ask = _orig_ask_rs
+
 finally:
     f._search_raw = _orig_search_raw_rs
     f.ask = _orig_ask_rs
