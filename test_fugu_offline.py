@@ -15234,6 +15234,322 @@ check("main: テスト後にRAG_DIRSが復元されている", f.RAG_DIRS == _or
 check("main: テスト後にsys.argvが復元されている", sys.argv == _orig_cli_argv)
 check("main: テスト後にsys.stdinが復元されている", sys.stdin is _orig_cli_stdin)
 
+# ---------- repl(): 対話コマンドループ (exit/quit/reset/search on|off/save/空行/EOF) ----------
+# repl() (L5382-5431) は対話モードの唯一のエントリポイントだが、save_history_file単体
+# (会話履歴永続化セクション)とmain()からのrepl()ディスパッチ有無(iteration 185/186、
+# 直上のmain()セクション)以外、ループ本体のコマンド解析と毎ターンの
+# ask_fugu(q, use_search=..., rag_dirs=..., history_file=hfile)呼び出しには一度も
+# 直接のテストが無かった。resetの永続化・search on/offのトグル伝播・history_fileの
+# 転送はいずれも複数ターン会話の文脈維持に直結する精度クリティカルな経路であり、
+# ここが壊れても他のテストでは検知できない。ここではrepl()を直接駆動し、
+# コマンド分岐とask_fuguへの引数伝播を固定する。
+#
+# builtins.input を有限のスクリプト応答フェイクに差し替え、尽きたら明示的に
+# EOFErrorを送出させることでループの終了を必ず保証する(ハング防止)。
+# f.ask_fugu/f.save_history_fileは呼び出し記録フェイクに差し替え、本物の
+# Ollama/conduct/ネットワークには一切触れない。urllib.request.urlopenと
+# f.subprocess.runは「呼ばれたら即AssertionError」の番人に差し替える
+# (gotcha #8 / iteration 38・76・104のtripwire流儀を踏襲)。全呼び出しでrepl()には
+# 明示的な一時history_file=を渡し、本物の ~/.fugu_history.json (f.HISTORY_FILE) が
+# テスト前後で一切作成/変更されないことも確認する。
+# 触れないもの: 実際のOllama通信(/api/chat・num_ctx固定・thinkリトライ)、
+# cp932 reconfigure、OLLAMA_MAX_LOADED_MODELS、math_verifyタイムアウト引数、
+# solve_verifiableのSC投票内部ロジックはいずれも本セクションでは呼び出さない
+# (ask_fugu自体を丸ごとフェイクに差し替えているため、その内部は素通りする)。
+#
+# 重要(surface-don't-fix, iteration 48/66/71/110/185の流儀を踏襲): 'save <path>'
+# 分岐(L5419-5429)には2つの特性化(未修正のまま固定)がある。
+#   (a) 末尾スペース無しの素の'save'(4文字)は low.startswith("save ")(5文字、
+#       末尾スペース必須)に一致せず、コマンドとして扱われないままループ末尾の
+#       ask_fugu(q, ...)へ落ちる。つまり'save'という文字列そのものを質問として
+#       通常のMoAパイプラインに渡してしまう。
+#   (b) さらに、'save '(末尾スペースのみ、パス無しのつもり)を入力しても、
+#       repl()の先頭で q = input(...).strip() が入力全体を丸ごとstripする
+#       ため、末尾の空白だけの"save "は判定前に"save"(4文字)へ潰れてしまう。
+#       結果としてL5421-5423の「保存先パスを指定してください」ガイダンス分岐
+#       (q[5:].strip()が空文字になる経路)は、qが既にstrip済みである
+#       (=末尾に空白を残せない)という不変条件と数学的に両立せず、実際の
+#       input()経由では到達不能である。q[5:]が全て空白文字ならそれらは
+#       qの末尾の連続部分でもあるため、先頭のstrip()で既に除去されているはずだ、
+#       という一般的な理由による(空白の種類・個数・全角スペース・タブ等の
+#       個別ケースで実測検証済み、いずれも結局bare 'save'と同じ(a)の経路に
+#       収束する)。どちらもrepl()自体は変更せず、実際に観測される挙動を
+#       そのまま固定する。人間のレビュー向けに明示コメントする。
+import builtins as _repl_builtins
+import tempfile as _repl_tempfile
+
+_orig_repl_input = _repl_builtins.input
+_orig_repl_ask_fugu = f.ask_fugu
+_orig_repl_save_history_file = f.save_history_file
+_orig_repl_history = f._HISTORY
+_orig_repl_urlopen = urllib.request.urlopen
+_orig_repl_subprocess_run = f.subprocess.run
+
+_repl_real_hist_path = f.HISTORY_FILE
+_repl_real_hist_existed_before = _repl_real_hist_path.exists()
+_repl_real_hist_bytes_before = (
+    _repl_real_hist_path.read_bytes() if _repl_real_hist_existed_before else None)
+
+
+def _repl_no_network_urlopen(*a, **k):
+    raise AssertionError("repl: モック漏れで実urlopen(ネットワーク)が呼ばれた")
+
+
+def _repl_no_subprocess_run(*a, **k):
+    raise AssertionError("repl: モック漏れで実subprocess.runが呼ばれた")
+
+
+def _repl_make_scripted_input(script):
+    """有限のスクリプト応答を順に返すinput()フェイク。尽きたら明示的にEOFErrorを
+    送出しループの終了を保証する('finite scripted iterator whose exhaustion
+    raises EOFError'の要件)。script中の要素がBaseExceptionのクラスまたは
+    インスタンスならそれをそのまま送出する(KeyboardInterrupt注入用)。"""
+    _it = iter(list(script))
+
+    def _fake_input(prompt=""):
+        try:
+            item = next(_it)
+        except StopIteration:
+            raise EOFError("repl test: scripted input exhausted")
+        if isinstance(item, BaseException):
+            raise item
+        if isinstance(item, type) and issubclass(item, BaseException):
+            raise item()
+        return item
+
+    return _fake_input
+
+
+_repl_ask_calls = []
+_repl_save_calls = []
+
+
+def _repl_fake_ask_fugu(question, **kwargs):
+    _repl_ask_calls.append({"question": question, "kwargs": kwargs})
+    return "FAKE_ANSWER"
+
+
+def _repl_fake_save_history_file(*args, **kwargs):
+    _repl_save_calls.append({"args": args, "kwargs": kwargs})
+    return True
+
+
+def _repl_run(script, **repl_kwargs):
+    """input()を有限スクリプトのフェイクに差し替えてf.repl(**repl_kwargs)を1回
+    駆動する。呼び出し前に_repl_ask_calls/_repl_save_callsをクリアしてから実行し、
+    (ask_calls, save_calls, stdout_text, raised_exc)を返す(raised_excは
+    repl()内で捕捉されず外に漏れた例外。Noneなら伝播なし)。f.ask_fugu/
+    f.save_history_file自体の差し替えは、この関数を呼ぶtry節側で一度だけ行う。"""
+    _repl_ask_calls.clear()
+    _repl_save_calls.clear()
+    _repl_builtins.input = _repl_make_scripted_input(script)
+    _stdout_buf = io.StringIO()
+    raised_exc = None
+    try:
+        with contextlib.redirect_stdout(_stdout_buf):
+            f.repl(**repl_kwargs)
+    except BaseException as _e:
+        raised_exc = _e
+    return (list(_repl_ask_calls), list(_repl_save_calls),
+            _stdout_buf.getvalue(), raised_exc)
+
+
+try:
+    f.ask_fugu = _repl_fake_ask_fugu
+    f.save_history_file = _repl_fake_save_history_file
+    urllib.request.urlopen = _repl_no_network_urlopen
+    f.subprocess.run = _repl_no_subprocess_run
+
+    with _repl_tempfile.TemporaryDirectory() as _repl_dir:
+        _repl_hfile = f.Path(_repl_dir) / "repl_history.json"
+
+        # --- (1) exit/quit(小文字)は即終了し、ask_fuguは呼ばれない ---
+        for _cmd in ("exit", "quit"):
+            f._HISTORY = []
+            _ask, _save, _out, _exc = _repl_run([_cmd], history_file=_repl_hfile)
+            check(f"repl: '{_cmd}'は即座にループを終了しask_fuguを呼ばない", len(_ask) == 0)
+            check(f"repl: '{_cmd}'はrepl()内で例外を送出しない(外に伝播しない)", _exc is None)
+
+        # --- (1b) 大文字小文字混在でも同様(low = q.lower()での判定のため) ---
+        for _cmd in ("EXIT", "Quit", "QUIT", "eXiT"):
+            f._HISTORY = []
+            _ask, _save, _out, _exc = _repl_run([_cmd], history_file=_repl_hfile)
+            check(f"repl: 大文字小文字混在'{_cmd}'もask_fuguを呼ばずに終了する",
+                  len(_ask) == 0 and _exc is None)
+
+        # --- (2) 空/空白のみの入力はask_fuguを呼ばずスキップし、次の入力へ進む ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run(["   ", "\t", "", "exit"],
+                                             history_file=_repl_hfile)
+        check("repl: 空/空白のみの入力はすべてスキップされask_fuguは呼ばれない",
+              len(_ask) == 0)
+        check("repl: 空白スキップ後も例外なく'exit'まで到達しループが終了する",
+              _exc is None)
+
+        # --- (3) reset: _HISTORYを同一オブジェクトのまま空にし、save_history_fileを
+        #         path=hfileでちょうど1回、force=Trueを渡さずに呼ぶ ---
+        f._HISTORY = [{"role": "user", "content": "以前の質問"},
+                      {"role": "assistant", "content": "以前の回答"}]
+        _hist_ref_before = f._HISTORY
+        _hist_id_before = id(f._HISTORY)
+        _ask, _save, _out, _exc = _repl_run(["reset", "exit"], history_file=_repl_hfile)
+        check("repl: resetは_HISTORYを同一オブジェクトのまま(id不変)空にする",
+              id(f._HISTORY) == _hist_id_before)
+        check("repl: reset後、_HISTORY(同一オブジェクト参照)の中身が空リストになる",
+              f._HISTORY == [] and _hist_ref_before == [])
+        check("repl: resetはask_fuguを呼ばない", len(_ask) == 0)
+        check("repl: resetはsave_history_fileをちょうど1回呼ぶ", len(_save) == 1)
+        check("repl: resetのsave_history_file呼び出しは_HISTORYそのもの"
+              "(同一オブジェクト)を第1引数として渡す",
+              bool(_save) and _save[0]["args"]
+              and _save[0]["args"][0] is f._HISTORY)
+        check("repl: resetのsave_history_file呼び出しはpath=hfileを渡す",
+              bool(_save) and _save[0]["kwargs"].get("path") == _repl_hfile)
+        check("repl: resetのsave_history_file呼び出しはforce=Trueを渡さない"
+              "(既存のforce=False既定でのno-op可能な仕様を変えない、既知仕様の固定。"
+              "force=Trueへ強制するのはこのイテレーションの対象外)",
+              bool(_save) and "force" not in _save[0]["kwargs"])
+        check("repl: reset実行後にクリア完了メッセージが出力される", "クリア" in _out)
+
+        # --- (4) search on/off: 複数ターンにまたがってトグル状態が保持される ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run(
+            ["search on", "質問A", "search off", "質問B", "search on", "質問C", "exit"],
+            use_search=False, rag_dirs=None, history_file=_repl_hfile)
+        check("repl: search on/off/onを挟んだ3つの質問でask_fuguが3回呼ばれる",
+              len(_ask) == 3)
+        check("repl: 'search on'直後の質問はuse_search=Trueでディスパッチされる",
+              len(_ask) == 3 and _ask[0]["kwargs"].get("use_search") is True)
+        check("repl: 'search off'直後の質問はuse_search=Falseに戻る",
+              len(_ask) == 3 and _ask[1]["kwargs"].get("use_search") is False)
+        check("repl: 再度'search on'した質問はuse_search=Trueに戻る"
+              "(トグル状態はセッション内の複数ターン間で保持される)",
+              len(_ask) == 3 and _ask[2]["kwargs"].get("use_search") is True)
+        check("repl: search on/offのON/OFF表示がそれぞれ出力される",
+              "ON" in _out and "OFF" in _out)
+
+        # --- (5) 通常の質問: ask_fuguをちょうど1回、question+
+        #         use_search/rag_dirs/history_fileのみのkwargsで呼ぶ
+        #         (out_file/office_attachedは渡さない、iteration 186設計の固定) ---
+        f._HISTORY = []
+        _rag_dirs_e = ["dirA", "dirB"]
+        _ask, _save, _out, _exc = _repl_run(
+            ["これは通常の質問です", "exit"],
+            use_search=True, rag_dirs=_rag_dirs_e, history_file=_repl_hfile)
+        check("repl: 通常の質問はask_fuguをちょうど1回呼ぶ", len(_ask) == 1)
+        check("repl: 質問文がそのまま(加工なしで)ask_fuguへ渡る",
+              bool(_ask) and _ask[0]["question"] == "これは通常の質問です")
+        check("repl: kwargsはuse_search/rag_dirs/history_fileの3つだけ",
+              bool(_ask)
+              and set(_ask[0]["kwargs"].keys()) == {"use_search", "rag_dirs", "history_file"})
+        check("repl: use_searchはrepl()呼び出し時点の現在のトグル値と一致する",
+              bool(_ask) and _ask[0]["kwargs"].get("use_search") is True)
+        check("repl: rag_dirsはrepl()に渡したrag_dirsがそのまま渡る(同一オブジェクト)",
+              bool(_ask) and _ask[0]["kwargs"].get("rag_dirs") is _rag_dirs_e)
+        check("repl: history_fileは明示的に渡した一時ファイルパスがそのまま渡る",
+              bool(_ask) and _ask[0]["kwargs"].get("history_file") == _repl_hfile)
+
+        # --- (6) save <path>: 大文字小文字混在パスがそのまま(q[5:]、lowerされたlowでは
+        #         ない)保持されforce=Trueで保存される ---
+        f._HISTORY = [{"role": "user", "content": "保存対象"}]
+        _ask, _save, _out, _exc = _repl_run(["save MixedCase/Path.json", "exit"],
+                                             history_file=_repl_hfile)
+        check("repl: 'save <path>'はask_fuguを呼ばない", len(_ask) == 0)
+        check("repl: 'save <path>'はsave_history_fileをちょうど1回呼ぶ", len(_save) == 1)
+        check("repl: saveコマンドのpathは大文字小文字をそのまま保持する"
+              "(元のqから切り出す。lower()されたlowからではない。f.Path()での比較は"
+              "Windows上でのセパレータ正規化(/ -> \\)を許容しつつ大文字小文字の"
+              "保持だけを見る)",
+              bool(_save)
+              and _save[0]["kwargs"].get("path") == f.Path("MixedCase/Path.json")
+              and "MixedCase" in str(_save[0]["kwargs"].get("path"))
+              and "mixedcase" not in str(_save[0]["kwargs"].get("path")))
+        check("repl: saveコマンドはforce=Trueで呼ぶ",
+              bool(_save) and _save[0]["kwargs"].get("force") is True)
+        check("repl: save成功メッセージにパスの大文字小文字を保持したまま出力される",
+              "MixedCase/Path.json" in _out)
+
+        # --- (7a) 特性化(未修正、要人間レビュー): 末尾スペース無しの素の'save'は
+        #          コマンドとして認識されず、ask_fuguへの通常質問ディスパッチに落ちる ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run(["save", "exit"], history_file=_repl_hfile)
+        check("repl(特性化・未修正): 末尾スペース無しの素の'save'はどのコマンドにも"
+              "一致せずask_fuguへの通常質問ディスパッチに落ちる"
+              "(save_history_fileは呼ばれない。要人間レビュー、このイテレーションでは"
+              "repl()自体を変更しない)",
+              len(_ask) == 1 and _ask[0]["question"] == "save" and len(_save) == 0)
+
+        # --- (7b) 特性化(未修正、要人間レビュー): 'save '(末尾スペースのみ、パス無しの
+        #          つもり)は、repl()冒頭のq = input(...).strip()で入力全体が丸ごと
+        #          stripされるため"save"(4文字)へ潰れてから判定される。したがって
+        #          L5421-5423の「保存先パスを指定してください」ガイダンス分岐
+        #          (q[5:].strip()が空文字になる経路)には実際のinput()経由では
+        #          到達不能である(qは既にstrip済み=末尾に空白を残せないため、
+        #          q[5:]が全て空白ということはそれがqの末尾の連続部分でもあり、
+        #          最初のstrip()で既に除去されているはずだ、という理由。空白の種類・
+        #          個数・全角スペース・タブでも同様であることを実測確認済み)。
+        #          結局(7a)と同じbare 'save'の経路に収束し、ガイダンス行は出力されず、
+        #          forced save(save_history_file(..., force=True))も呼ばれない ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run(["save ", "exit"], history_file=_repl_hfile)
+        check("repl(特性化・未修正): 'save '(末尾スペースのみ)は外側のstrip()で"
+              "'save'に潰れ、空パス案内のガイダンス分岐には到達しない"
+              "(数学的に到達不能なデッドコード、要人間レビュー)",
+              "保存先パスを指定してください" not in _out)
+        check("repl(特性化・未修正): 'save '(末尾スペースのみ)も結局bare 'save'と"
+              "同じask_fuguディスパッチに落ちる",
+              len(_ask) == 1 and _ask[0]["question"] == "save")
+        check("repl(特性化・未修正): 'save '(末尾スペースのみ)でもforced save"
+              "(save_history_file)は呼ばれない", len(_save) == 0)
+
+        # --- (8) EOFError/KeyboardInterrupt はrepl()の外へ伝播せず、クリーンに終了する ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run([EOFError], history_file=_repl_hfile)
+        check("repl: input()からのEOFErrorはrepl()の外へ伝播しない", _exc is None)
+        check("repl: EOFError発生時はask_fuguを呼ばない", len(_ask) == 0)
+        check("repl: EOFError発生時に終了メッセージが出力される", "終了します" in _out)
+
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run([KeyboardInterrupt], history_file=_repl_hfile)
+        check("repl: input()からのKeyboardInterruptはrepl()の外へ伝播しない", _exc is None)
+        check("repl: KeyboardInterrupt発生時はask_fuguを呼ばない", len(_ask) == 0)
+        check("repl: KeyboardInterrupt発生時にも終了メッセージが出力される",
+              "終了します" in _out)
+
+        # --- (8b) 'exit'を打たずスクリプトが尽きた場合も、自動送出されるEOFErrorで
+        #          クリーンに終了する(全シナリオ共通のハング防止機構そのものの確認) ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run(["質問のみ、exitなし"], history_file=_repl_hfile)
+        check("repl: スクリプト尽き(自動EOFError)でもrepl()は例外を送出しない",
+              _exc is None)
+        check("repl: スクリプトが尽きる前の質問は通常通りask_fuguへ渡る",
+              len(_ask) == 1 and _ask[0]["question"] == "質問のみ、exitなし")
+
+finally:
+    _repl_builtins.input = _orig_repl_input
+    f.ask_fugu = _orig_repl_ask_fugu
+    f.save_history_file = _orig_repl_save_history_file
+    f._HISTORY = _orig_repl_history
+    urllib.request.urlopen = _orig_repl_urlopen
+    f.subprocess.run = _orig_repl_subprocess_run
+
+check("repl: テスト後にbuiltins.inputが復元されている", _repl_builtins.input is _orig_repl_input)
+check("repl: テスト後にf.ask_fuguが復元されている", f.ask_fugu is _orig_repl_ask_fugu)
+check("repl: テスト後にf.save_history_fileが復元されている",
+      f.save_history_file is _orig_repl_save_history_file)
+check("repl: テスト後にf._HISTORYが復元されている", f._HISTORY == _orig_repl_history)
+check("repl: テスト後にurllib.request.urlopenが復元されている",
+      urllib.request.urlopen == _orig_repl_urlopen)
+check("repl: テスト後にf.subprocess.runが復元されている",
+      f.subprocess.run == _orig_repl_subprocess_run)
+check("repl: 実履歴ファイル(~/.fugu_history.json)はテスト前後で存在状態が変化しない"
+      "(全呼び出しに明示的な一時history_file=を渡し、save_history_file自体もフェイクの"
+      "ため一切触れていないはず)",
+      _repl_real_hist_path.exists() == _repl_real_hist_existed_before)
+if _repl_real_hist_existed_before:
+    check("repl: 実履歴ファイルの内容もテスト前後でバイト単位不変",
+          _repl_real_hist_path.read_bytes() == _repl_real_hist_bytes_before)
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
