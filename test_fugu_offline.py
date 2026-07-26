@@ -6528,6 +6528,155 @@ check("_pptx_shape_texts: 病的ネストでも深さ<=cap-1のテキストはT0
       "追加順(昇順)のままcap件だけ救済される(それ以深は静かに打ち切り)",
       _ppgd_out is not None and _ppgd_out == [f"T{_i}" for _i in range(_ppgd_cap)])
 
+# ----- _read_pptx: 1シェイプ単位の抽出単離 (2026-07-26) -----
+# 背景: fugu_local.py側の_read_pptxコメントの通り、_pptx_shape_texts内部の
+# hasattr(sh, "text")/getattr(sh, "has_table", False)によるダックタイピング分岐は
+# AttributeErrorしか吸収しない(Python 3の仕様でhasattrはAttributeError以外の
+# 例外をそのまま伝播させる)。そのため壊れた1シェイプの.text/.table参照が別の
+# 例外を送出すると、従来は_read_pptxの
+# `for sh in slide.shapes: texts.extend(_pptx_shape_texts(sh))` ループの外、
+# ひいては_read_pptx自体の外まで例外が伝播していた。_read_pptxには
+# _read_pdf/_read_excelと違って代替ライブラリへのフォールスルーが無いため、
+# 1シェイプの異常だけでデッキ全体(他の全スライド・同スライドの他の全シェイプ・
+# 既にiter98で個別保護済みのスピーカーノート)がread_file_text(iter53)の広い
+# except Exceptionに握りつぶされて""へ丸ごと脱落していた。本タスクは
+# `texts.extend(_pptx_shape_texts(sh))` の呼び出し1回分だけをtry/exceptで
+# 保護し、iter98(ノート個別保護)/iter93(_read_docx本文走査保護)と同じ
+# skip-bad-part-keep-the-rest方針を本文シェイプ抽出ループへ適用する。
+# python-pptxの有無に関わらず必ず実行されるよう、実python-pptxではなく
+# sys.modulesへ注入するフェイクの'pptx'モジュール(iter43/44で確立済みの
+# swap-restoreパターンをこのブロック内だけで再現)と、上のブロックで定義済みの
+# ダックタイピング疑似シェイプ(_FakePptxTextShape)+新設の「.textアクセスで
+# 例外を送出する壊れたシェイプ」だけで構成する。
+
+
+class _FakePptxRaisingShape:
+    """.textへのアクセスが例外を送出する壊れたシェイプ(破損したXML片や非対応の
+    グラフィック要素を想定)。hasattr(sh, "text")はPython 3の仕様上
+    AttributeErrorしか吸収しないため、この例外は_pptx_shape_texts内の
+    hasattr呼び出し自体からそのまま伝播する。"""
+
+    @property
+    def text(self):
+        raise RuntimeError("simulated malformed shape (corrupt XML)")
+
+
+class _FakePptxSlideForIsolation:
+    """.shapes(リスト)と.has_notes_slide(常にFalse)だけを持つスライド相当の
+    ダックタイピング版。ノート抽出自体は本テストの対象外(iter98で別途検証済み)。"""
+
+    def __init__(self, shapes):
+        self.shapes = shapes
+        self.has_notes_slide = False
+
+
+def _rpi_make_fake_pptx_module(slides):
+    """Presentation(path)が`slides`をそのまま`.slides`として返すフェイク'pptx'
+    モジュールを組み立てる。"""
+    mod = types.ModuleType("pptx")
+
+    class _FakePresentation:
+        def __init__(self, path=None):
+            self.slides = slides
+
+    mod.Presentation = _FakePresentation
+    return mod
+
+
+def _rpi_swap_pptx_module(fake_mod, body):
+    """sys.modules['pptx']をfake_modへ一時的に差し替えてbody()を実行し、
+    元の状態(存在した/しなかった)へ必ず復元する(iter43/44のswap-restore
+    パターンをこのブロック専用に再現したもの)。"""
+    _orig = sys.modules.get("pptx")
+    sys.modules["pptx"] = fake_mod
+    try:
+        return body()
+    finally:
+        if _orig is not None:
+            sys.modules["pptx"] = _orig
+        else:
+            del sys.modules["pptx"]
+
+
+def _rpi_is_cp932_safe(s):
+    """gotcha#4: Windowsコンソール(cp932)でエンコード不能な文字(絵文字等)を
+    含んでいないかを確認する。"""
+    try:
+        s.encode("cp932")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+with _tempfile.TemporaryDirectory() as _rpi_dir:
+    _rpi_path = _pathlib.Path(_rpi_dir) / "isolate.pptx"
+    # フェイクPresentationは中身を一切パースしないため、実体は空でよい
+    # (存在確認や拡張子ベースの分岐が万一入っても壊れないよう実ファイルにする)。
+    _rpi_path.write_bytes(b"dummy pptx bytes, not parsed by the fake Presentation")
+
+    # (1) 1枚のスライドに正常シェイプ1件+壊れたシェイプ1件。壊れたシェイプの
+    #     例外は伝播せず、正常シェイプのテキストが救済され、cp932安全な警告が
+    #     path.nameと例外型名(RuntimeError)を伴って出力される。
+    _rpi_slide1 = _FakePptxSlideForIsolation(
+        [_FakePptxTextShape("Good Shape Text"), _FakePptxRaisingShape()])
+    _rpi_cap1 = io.StringIO()
+    with contextlib.redirect_stdout(_rpi_cap1):
+        _rpi_out1 = _rpi_swap_pptx_module(
+            _rpi_make_fake_pptx_module([_rpi_slide1]),
+            lambda: f._read_pptx(_rpi_path),
+        )
+    check("_read_pptx: 壊れたシェイプが例外を送出してもクラッシュせず正常シェイプの"
+          "テキストが救済される",
+          _rpi_out1 == "[Slide 1]\nGood Shape Text")
+    check("_read_pptx: 壊れたシェイプの警告にファイル名(path.name)が出力される",
+          _rpi_path.name in _rpi_cap1.getvalue())
+    check("_read_pptx: 壊れたシェイプの警告に例外型名(RuntimeError)が出力される",
+          "RuntimeError" in _rpi_cap1.getvalue())
+    check("_read_pptx: 壊れたシェイプの警告メッセージはcp932でエンコード可能"
+          "(絵文字等の非cp932文字を含まない、gotcha#4)",
+          _rpi_is_cp932_safe(_rpi_cap1.getvalue()))
+
+    # (2) 正常シェイプ2件の間に壊れたシェイプを挟んでも、両方の正常シェイプが
+    #     元の追加順のまま残り、壊れたシェイプの寄与だけが欠落する。さらに
+    #     全シェイプ正常な2枚目のスライドは一切影響を受けない。
+    _rpi_slide2a = _FakePptxSlideForIsolation([
+        _FakePptxTextShape("First Good"),
+        _FakePptxRaisingShape(),
+        _FakePptxTextShape("Second Good"),
+    ])
+    _rpi_slide2b = _FakePptxSlideForIsolation([_FakePptxTextShape("Slide Two Text")])
+    _rpi_out2 = _rpi_swap_pptx_module(
+        _rpi_make_fake_pptx_module([_rpi_slide2a, _rpi_slide2b]),
+        lambda: f._read_pptx(_rpi_path),
+    )
+    check("_read_pptx: 正常シェイプ2件に挟まれた壊れたシェイプは両側の正常シェイプを"
+          "元の順序のまま残す(byte-for-byte一致)",
+          _rpi_out2 == "[Slide 1]\nFirst Good\nSecond Good\n\n[Slide 2]\nSlide Two Text")
+    check("_read_pptx: 壊れたシェイプ自身の抽出結果は出力に一切現れない",
+          "Raising" not in _rpi_out2)
+    check("_read_pptx: 1枚目の壊れたシェイプは2枚目(全シェイプ正常)に影響しない",
+          "Slide Two Text" in _rpi_out2)
+
+    # (3) 空デッキ境界: 全スライドの全シェイプが例外を送出する場合でも
+    #     python-pptxは正常にimportできている(=ImportError分岐ではない)ため、
+    #     pip installの未インストール通知ではなく空文字列を返す。
+    _rpi_slide3 = _FakePptxSlideForIsolation(
+        [_FakePptxRaisingShape(), _FakePptxRaisingShape()])
+    _rpi_out3 = _rpi_swap_pptx_module(
+        _rpi_make_fake_pptx_module([_rpi_slide3]),
+        lambda: f._read_pptx(_rpi_path),
+    )
+    check("_read_pptx: 全シェイプが例外を送出する空デッキは''を返す"
+          "(pip install通知ではない)",
+          _rpi_out3 == "")
+    check("_is_lib_missing_notice: 全滅デッキの''はFalse(未インストール通知と"
+          "誤判定されない)",
+          not f._is_lib_missing_notice(_rpi_out3))
+
+check("_read_pptx: シェイプ単離テスト後にsys.modulesの'pptx'エントリが元通り"
+      "解決可能(復元確認)",
+      ("pptx" not in sys.modules) or (sys.modules["pptx"] is not None))
+
 # ----- _read_docx -----
 try:
     import docx as _docx_probe_rd

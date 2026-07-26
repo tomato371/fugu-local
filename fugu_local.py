@@ -1173,7 +1173,29 @@ def _read_pptx(path: Path) -> str:
         for i, slide in enumerate(prs.slides, 1):
             texts = []
             for sh in slide.shapes:
-                texts.extend(_pptx_shape_texts(sh))
+                # 2026-07-26: 1シェイプ単位で抽出を単離する。_pptx_shape_texts内部の
+                # hasattr(sh, "text")/getattr(sh, "has_table", False)によるダック
+                # タイピング分岐はAttributeErrorしか吸収しない（Python 3の仕様で
+                # hasattrはAttributeError以外の例外をそのまま伝播させる）ため、
+                # 破損/非対応の<p:sp>や<p:graphicFrame>(表)のプロパティアクセスが
+                # 別の例外（壊れたXML由来のlxml例外等）を送出すると、この
+                # forループ、ひいては_read_pptx自体の外まで例外がそのまま伝播していた。
+                # _read_pptxには_read_pdf/_read_excelと違って代替ライブラリへの
+                # フォールスルーが無いため、1シェイプの異常だけでデッキ全体
+                # （他の全スライド・同スライドの他の全シェイプ・下のtry/exceptで
+                # 個別に保護済みのスピーカーノートまで）がread_file_text(iter53)の
+                # 広いexcept Exceptionに握りつぶされて""へ丸ごと脱落していた。
+                # 既にこの関数内で個別保護されているスピーカーノート抽出(iter98)や
+                # _read_docxの本文走査(iter93)と同じskip-bad-part-keep-the-restの
+                # 方針で、1シェイプだけを読み飛ばして残り全部を救済する
+                # (bare exceptではなくException限定。KeyboardInterrupt/SystemExitは
+                # ここで握りつぶさず伝播させる)。_pptx_shape_texts自体のhasattr/
+                # getattr分岐や_PPTX_GROUP_MAX_DEPTH再帰上限(iter177)はここでは
+                # 一切変更しない。
+                try:
+                    texts.extend(_pptx_shape_texts(sh))
+                except Exception as exc:
+                    print(f"[_read_pptx] シェイプ抽出に失敗したためスキップ: {path.name} ({type(exc).__name__})")
             if texts:
                 parts.append(f"[Slide {i}]\n" + "\n".join(texts))
             # 2026-07-24 (iter98): スピーカーノートはslide.shapesの走査対象外なので、
