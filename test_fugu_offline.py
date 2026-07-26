@@ -5741,9 +5741,13 @@ with _tempfile.TemporaryDirectory() as _rio_dir:
     check("_read_ipynb: stream textのlistが非str要素のみの場合もそのoutputはskipされる",
           _rio_out_o3 == "```python\nprint(1)\n```")
 
-    # (p) execute_result/display_data/errorのoutput_typeは本iterationでは対象外のまま
-    #     据え置かれ、その'data'辞書(base64画像等を含みうる)やtracebackが一切出力に
-    #     混入しないことを、判別可能なマーカー文字列で確認する。
+    # (p) execute_result/display_data/errorの混在ケース。iter194時点ではこの3種すべて
+    #     対象外だったが、iter195がexecute_result/display_dataの'text/plain'のみを
+    #     追加で対象にしたため、期待値を更新する(下の新セクションでより網羅的に検証):
+    #     execute_resultのtext/plainは抽出される一方、display_data側はimage/pngのみ
+    #     (text/plainなし)なので抽出されず、base64が出力に混入しないこと、errorの
+    #     tracebackは引き続き対象外のまま混入しないことを、判別可能なマーカー文字列で
+    #     確認する。
     _rio_nb_p = {
         "cells": [
             {"cell_type": "code", "source": ["1 + 1"],
@@ -5760,14 +5764,13 @@ with _tempfile.TemporaryDirectory() as _rio_dir:
     _rio_p = _rio_root / "p.ipynb"
     _rio_p.write_text(json.dumps(_rio_nb_p), encoding="utf-8")
     _rio_out_p = f._read_ipynb(_rio_p)
-    check("_read_ipynb: execute_result/display_data/errorは本iterationでは出力ブロックが追加されない",
-          _rio_out_p == "```python\n1 + 1\n```")
-    check("_read_ipynb: execute_resultの'data'内容(text/plain)は出力に混入しない",
-          "EXECRESULT_MARKER_42" not in _rio_out_p)
-    check("_read_ipynb: display_dataのbase64/'data'内容は出力に混入しない",
+    check("_read_ipynb(iter195更新): execute_resultのtext/plainは[Notebook result output]として抽出される",
+          _rio_out_p == "```python\n1 + 1\n```"
+          "\n\n[Notebook result output]\nEXECRESULT_MARKER_42")
+    check("_read_ipynb: display_dataがimage/pngのみ(text/plainなし)の場合はbase64が出力に混入しない",
           "QkFTRTY0X01BUktFUg==" not in _rio_out_p and "image/png" not in _rio_out_p)
-    check("_read_ipynb: errorのtracebackは出力に混入しない",
-          "ERROR_TRACEBACK_MARKER" not in _rio_out_p)
+    check("_read_ipynb: errorのtracebackは本iterationでも対象外のまま出力に混入しない",
+          "ERROR_TRACEBACK_MARKER" not in _rio_out_p and "error" not in _rio_out_p)
 
     # (q) outputsが空listの場合: 出力ブロックは追加されずコード抽出のみ(回帰: 既存の
     #     outputsキー自体が無いケースは上のセクション(a)/(e)等で既に検証済み)。
@@ -5798,6 +5801,275 @@ with _tempfile.TemporaryDirectory() as _rio_dir:
           _rio_out_r == _rio_expected_r)
     check("_read_ipynb: 切り詰め後の出力に元の全文(5000文字連続のA)は残らない",
           _rio_long_text not in _rio_out_r)
+
+# ---------- _read_ipynb: execute_result/display_dataの計算結果(text/plain)抽出 (2026-07-26 / iter195) ----------
+# 発端: iter194はstream(stdout/stderr)出力のみをRAG/--fileコンテキストへ抽出する
+# ように縮小スコープで対応したが、その際の自己コメントでexecute_result/
+# display_dataの'data'辞書(text/plainを含む)は明示的に対象外のまま据え置いていた。
+# データ分析notebookでは、print(...)によるstream出力ではなく、セル末尾の式評価
+# 結果や変数のrepr(戻り値、DataFrameのテキスト表現など)が質問への回答に直結する
+# 事実であることが多く、それが精度criticalなRAG/--fileコンテキストから黙って
+# 欠落していた。iter188はstream/execute_result/display_data(text/plain)の全種類を
+# 一度に扱おうとして行き詰まったため、本iterationはiter194が確立した縮小
+# スコープの作法(str->そのまま、list->str要素のみjoin、その他->空、空白のみ
+# skip、cap超過時は切り詰めマーカー付与)をそのまま流用し、'data'辞書のうち
+# 'text/plain'キー1つだけを追加対象とする。text/html・image/png等の非'text/plain'
+# MIME、およびerrorのtracebackは引き続き意図的に対象外(オーバーサイトではない)。
+# 上のセクション(iter71/72/113/159構造ガード、iter194 stream抽出)は本セクションの
+# 変更で一切変更されていない。f.ask/urlopen/subprocessは一切呼ばない(すべて
+# tempfile上のオフラインI/O)。
+with _tempfile.TemporaryDirectory() as _rid_dir:
+    _rid_root = _pathlib.Path(_rid_dir)
+
+    # (s) execute_resultのtext/plain(list[str])が[Notebook result output]ラベル付きで
+    #     フェンス直後に追加される。
+    _rid_nb_s = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 + 1"],
+             "outputs": [
+                 {"output_type": "execute_result", "execution_count": 1,
+                  "data": {"text/plain": ["2"]}, "metadata": {}},
+             ]},
+        ]
+    }
+    _rid_s = _rid_root / "s.ipynb"
+    _rid_s.write_text(json.dumps(_rid_nb_s), encoding="utf-8")
+    _rid_out_s = f._read_ipynb(_rid_s)
+    check("_read_ipynb: execute_resultのtext/plain(list[str])が[Notebook result output]で抽出される",
+          _rid_out_s == "```python\n1 + 1\n```\n\n[Notebook result output]\n2")
+
+    # (t) execute_resultのtext/plainが単一strでも同様に抽出される。
+    _rid_nb_t = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 + 1"],
+             "outputs": [
+                 {"output_type": "execute_result", "data": {"text/plain": "2"}},
+             ]},
+        ]
+    }
+    _rid_t = _rid_root / "t.ipynb"
+    _rid_t.write_text(json.dumps(_rid_nb_t), encoding="utf-8")
+    _rid_out_t = f._read_ipynb(_rid_t)
+    check("_read_ipynb: execute_resultのtext/plain(単一str)も同様に抽出される",
+          _rid_out_t == "```python\n1 + 1\n```\n\n[Notebook result output]\n2")
+
+    # (u) display_dataのtext/plain(DataFrameのテキスト表現相当)も同じラベルで抽出される。
+    _rid_nb_u = {
+        "cells": [
+            {"cell_type": "code", "source": ["df"],
+             "outputs": [
+                 {"output_type": "display_data",
+                  "data": {"text/plain": ["   a  b\n0  1  2"]}, "metadata": {}},
+             ]},
+        ]
+    }
+    _rid_u = _rid_root / "u.ipynb"
+    _rid_u.write_text(json.dumps(_rid_nb_u), encoding="utf-8")
+    _rid_out_u = f._read_ipynb(_rid_u)
+    check("_read_ipynb: display_dataのtext/plainも[Notebook result output]で抽出される",
+          _rid_out_u == "```python\ndf\n```\n\n[Notebook result output]\n   a  b\n0  1  2")
+
+    # (v) execute_result/display_dataがimage/pngのみ(text/plainなし)の場合は結果ブロックが
+    #     追加されず、base64データも一切出力に混入しない。
+    _rid_nb_v = {
+        "cells": [
+            {"cell_type": "code", "source": ["plot(df)"],
+             "outputs": [
+                 {"output_type": "execute_result",
+                  "data": {"image/png": "QkFTRTY0X0VYRUNfSU1H"}, "metadata": {}},
+                 {"output_type": "display_data",
+                  "data": {"image/png": "QkFTRTY0X0RJU1BfSU1H"}, "metadata": {}},
+             ]},
+        ]
+    }
+    _rid_v = _rid_root / "v.ipynb"
+    _rid_v.write_text(json.dumps(_rid_nb_v), encoding="utf-8")
+    _rid_out_v = f._read_ipynb(_rid_v)
+    check("_read_ipynb: execute_result/display_dataがimage/pngのみの場合は結果ブロックが追加されない",
+          _rid_out_v == "```python\nplot(df)\n```")
+    check("_read_ipynb: image/pngのみのケースでbase64文字列が出力に混入しない",
+          "QkFTRTY0X0VYRUNfSU1H" not in _rid_out_v
+          and "QkFTRTY0X0RJU1BfSU1H" not in _rid_out_v
+          and "image/png" not in _rid_out_v)
+
+    # (w) text/plainとimage/pngが同一dataに同居する場合、text/plainのみが抽出され
+    #     base64は一切出力に混入しない。
+    _rid_nb_w = {
+        "cells": [
+            {"cell_type": "code", "source": ["plot(df)"],
+             "outputs": [
+                 {"output_type": "display_data",
+                  "data": {"text/plain": ["<Figure size 640x480>"],
+                            "image/png": "QkFTRTY0X01JWEVEX0lNRw=="},
+                  "metadata": {}},
+             ]},
+        ]
+    }
+    _rid_w = _rid_root / "w.ipynb"
+    _rid_w.write_text(json.dumps(_rid_nb_w), encoding="utf-8")
+    _rid_out_w = f._read_ipynb(_rid_w)
+    check("_read_ipynb: text/plain+image/png同居時はtext/plainのみ抽出される",
+          _rid_out_w == "```python\nplot(df)\n```\n\n[Notebook result output]\n<Figure size 640x480>")
+    check("_read_ipynb: text/plain+image/png同居時もbase64は出力に混入しない",
+          "QkFTRTY0X01JWEVEX0lNRw==" not in _rid_out_w and "image/png" not in _rid_out_w)
+
+    # (x) 'data'キー自体が無い場合: 例外を送出せず結果ブロックも追加されない。
+    _rid_nb_x = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 + 1"],
+             "outputs": [{"output_type": "execute_result", "execution_count": 1}]},
+        ]
+    }
+    _rid_x = _rid_root / "x.ipynb"
+    _rid_x.write_text(json.dumps(_rid_nb_x), encoding="utf-8")
+    _rid_out_x = f._read_ipynb(_rid_x)
+    check("_read_ipynb: 'data'キーが無いexecute_resultは例外を送出せず結果ブロックも追加されない",
+          _rid_out_x == "```python\n1 + 1\n```")
+
+    # (y) 'data'がtruthyな非dict(整数/文字列/None)の場合も、iteration 113のcells非list
+    #     強制変換と同じ作法(`or []`のtruthinessトリックに頼らない)でそのoutputをskipし、
+    #     例外を送出しない。
+    for _rid_bad_data, _rid_label in (
+        (42, "整数"), ("notadict", "文字列"), (None, "None"),
+    ):
+        _rid_nb_y = {
+            "cells": [
+                {"cell_type": "code", "source": ["1 + 1"],
+                 "outputs": [{"output_type": "execute_result", "data": _rid_bad_data}]},
+            ]
+        }
+        _rid_y = _rid_root / f"y_{_rid_label}.ipynb"
+        _rid_y.write_text(json.dumps(_rid_nb_y), encoding="utf-8")
+        _rid_out_y = f._read_ipynb(_rid_y)
+        check(f"_read_ipynb: 'data'が非dict({_rid_label})の場合は例外を送出せずそのoutputはskipされる",
+              _rid_out_y == "```python\n1 + 1\n```")
+
+    # (z) 'text/plain'の値が非str/非list(整数/None)の場合、空文字へ正規化されblank後
+    #     strip判定でそのoutputはskipされる(例外は送出しない)。
+    for _rid_bad_tp, _rid_label2 in ((123, "整数"), (None, "None")):
+        _rid_nb_z = {
+            "cells": [
+                {"cell_type": "code", "source": ["1 + 1"],
+                 "outputs": [{"output_type": "execute_result",
+                              "data": {"text/plain": _rid_bad_tp}}]},
+            ]
+        }
+        _rid_z = _rid_root / f"z_{_rid_label2}.ipynb"
+        _rid_z.write_text(json.dumps(_rid_nb_z), encoding="utf-8")
+        _rid_out_z = f._read_ipynb(_rid_z)
+        check(f"_read_ipynb: text/plainが非str/非list({_rid_label2})でも例外を送出せずskipされる",
+              _rid_out_z == "```python\n1 + 1\n```")
+
+    # (z2) text/plainが空白のみ(str/list双方)の場合、strip後blankとしてskipされる。
+    _rid_nb_z2 = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 + 1"],
+             "outputs": [
+                 {"output_type": "execute_result", "data": {"text/plain": "   \n  "}},
+                 {"output_type": "display_data", "data": {"text/plain": ["   ", "\n"]}},
+             ]},
+        ]
+    }
+    _rid_z2 = _rid_root / "z2.ipynb"
+    _rid_z2.write_text(json.dumps(_rid_nb_z2), encoding="utf-8")
+    _rid_out_z2 = f._read_ipynb(_rid_z2)
+    check("_read_ipynb: text/plainが空白のみ(str/list双方)の場合は結果ブロックが追加されない",
+          _rid_out_z2 == "```python\n1 + 1\n```")
+
+    # (aa) text/plainのlist内に非str要素が混入する場合、source正規化(iteration 72)と
+    #      全く同じパターンでstr要素のみjoinされる(42は無視されて'a'+'b'='ab')。
+    _rid_nb_aa = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 + 1"],
+             "outputs": [
+                 {"output_type": "execute_result", "data": {"text/plain": ["a", 42, "b"]}},
+             ]},
+        ]
+    }
+    _rid_aa = _rid_root / "aa.ipynb"
+    _rid_aa.write_text(json.dumps(_rid_nb_aa), encoding="utf-8")
+    _rid_out_aa = f._read_ipynb(_rid_aa)
+    check("_read_ipynb: text/plainのlist内の非str要素は無視されstr要素のみjoinされる",
+          _rid_out_aa == "```python\n1 + 1\n```\n\n[Notebook result output]\nab")
+
+    # (bb) 複数のexecute_result/display_dataが存在する場合、outputsのlist順を保った
+    #      決定的な順序で結合される(streamのcombined_outと同じ結合パターン)。
+    _rid_nb_bb = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 + 1"],
+             "outputs": [
+                 {"output_type": "execute_result", "data": {"text/plain": ["first "]}},
+                 {"output_type": "display_data", "data": {"text/plain": ["second"]}},
+             ]},
+        ]
+    }
+    _rid_bb = _rid_root / "bb.ipynb"
+    _rid_bb.write_text(json.dumps(_rid_nb_bb), encoding="utf-8")
+    _rid_out_bb = f._read_ipynb(_rid_bb)
+    check("_read_ipynb: 複数のexecute_result/display_dataはoutputsのlist順で決定的に結合される",
+          _rid_out_bb == "```python\n1 + 1\n```\n\n[Notebook result output]\nfirst second")
+
+    # (cc) stream出力とexecute_result出力が同一セルに同居する場合、両方のブロックが
+    #      それぞれ[Notebook stdout/stderr output]/[Notebook result output]の別ラベルで
+    #      インターリーブせず(混ざらず)フェンス直後に順番通り追加される。
+    _rid_nb_cc = {
+        "cells": [
+            {"cell_type": "code", "source": ["print('out1'); 2 + 2"],
+             "outputs": [
+                 {"output_type": "stream", "name": "stdout", "text": ["out1\n"]},
+                 {"output_type": "execute_result", "data": {"text/plain": ["4"]}},
+             ]},
+        ]
+    }
+    _rid_cc = _rid_root / "cc.ipynb"
+    _rid_cc.write_text(json.dumps(_rid_nb_cc), encoding="utf-8")
+    _rid_out_cc = f._read_ipynb(_rid_cc)
+    check("_read_ipynb: streamとexecute_resultが同居する場合、両ブロックが別ラベルで非インターリーブに追加される",
+          _rid_out_cc == "```python\nprint('out1'); 2 + 2\n```"
+          "\n\n[Notebook stdout/stderr output]\nout1\n"
+          "\n\n[Notebook result output]\n4")
+
+    # (dd) 巨大なtext/plain(暴走したreprを想定)は、streamと同じ上限(4000文字)+
+    #      切り詰めマーカーで打ち切られる(num_ctx保護、_IPYNB_STREAM_OUTPUT_CAP流用)。
+    _rid_long_text = "B" * 5000
+    _rid_nb_dd = {
+        "cells": [
+            {"cell_type": "code", "source": ["huge_repr"],
+             "outputs": [
+                 {"output_type": "execute_result", "data": {"text/plain": [_rid_long_text]}},
+             ]},
+        ]
+    }
+    _rid_dd = _rid_root / "dd.ipynb"
+    _rid_dd.write_text(json.dumps(_rid_nb_dd), encoding="utf-8")
+    _rid_out_dd = f._read_ipynb(_rid_dd)
+    _rid_expected_dd = (
+        "```python\nhuge_repr\n```"
+        "\n\n[Notebook result output]\n" + "B" * 4000 + "\n...(出力が長いため切り詰め)"
+    )
+    check("_read_ipynb: 巨大なtext/plainは上限4000文字+切り詰めマーカーで打ち切られる",
+          _rid_out_dd == _rid_expected_dd)
+    check("_read_ipynb: 切り詰め後の出力に元の全文(5000文字連続のB)は残らない",
+          _rid_long_text not in _rid_out_dd)
+
+    # (ee) errorのoutput_typeは本iterationでも引き続き対象外のまま(iter194からの据え置き
+    #      を継続)、tracebackが出力に混入せず、結果ブロックも追加されない。
+    _rid_nb_ee = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 / 0"],
+             "outputs": [
+                 {"output_type": "error", "ename": "ZeroDivisionError",
+                  "evalue": "division by zero", "traceback": ["ERROR_TRACEBACK_MARKER_EE"]},
+             ]},
+        ]
+    }
+    _rid_ee = _rid_root / "ee.ipynb"
+    _rid_ee.write_text(json.dumps(_rid_nb_ee), encoding="utf-8")
+    _rid_out_ee = f._read_ipynb(_rid_ee)
+    check("_read_ipynb: errorのoutput_typeは本iterationでも対象外のまま結果ブロックが追加されない",
+          _rid_out_ee == "```python\n1 / 0\n```")
+    check("_read_ipynb: errorのtracebackは出力に混入しない",
+          "ERROR_TRACEBACK_MARKER_EE" not in _rid_out_ee)
 
 # ---------- _read_ipynb: cp932(Shift-JIS)デコードラダー (2026-07-25 / iter159) ----------
 # 発端: _read_ipynbは、iteration 94が_read_html/read_file_text汎用テキスト分岐に

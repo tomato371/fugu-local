@@ -1460,13 +1460,17 @@ def _read_ipynb(path: Path) -> str:
                 # 黙って欠落していた（精度優先・時間は気にしない、の方針に反する）。
                 # iteration 188はoutput_type: stream/execute_result/display_data
                 # (text/plain)の全種類を一度に扱おうとして3回試みたが行き詰まり
-                # 断念した。本iterationはあえてスコープを"stream"(stdout/stderr)
-                # 出力1種類のみへ絞り込む — 最も単純な単一形状・最も一般的・最も
+                # 断念した。iteration 194はあえてスコープを"stream"(stdout/stderr)
+                # 出力1種類のみへ絞り込み、最も単純な単一形状・最も一般的・最も
                 # 価値が高いケースに限定することで、iter188の轍を踏まずに小さく
-                # 検証可能な変更に収める。execute_result/display_data/errorの各
-                # output_typeは本iterationでは意図的に対象外のまま据え置く（特に
-                # execute_result/display_dataの'data'辞書はbase64画像等の非テキスト
-                # MIMEを含みうるため、扱うなら別途の慎重な設計が必要）。'source'の
+                # 検証可能な変更に収めた。iteration 195(本iteration)はiter194の
+                # 縮小方針を踏襲しつつ、次に価値が高い単一形状としてexecute_result/
+                # display_dataの'data'辞書のうち'text/plain'キーのみを追加で対象と
+                # する（下のstreamループの直後を参照）。'data'辞書内のtext/htmlや
+                # image/png等の非'text/plain'MIME、およびerrorのtracebackは、
+                # オーバーサイトではなく意図的に対象外のまま据え置く（base64画像等の
+                # 非テキストMIMEを扱うには別途の慎重な設計が必要なため、iter188の
+                # 「一度に全部」の轍を踏まないよう最小スコープを維持する）。'source'の
                 # 正規化(iteration 72: str->そのまま、list->str要素のみjoin、
                 # その他->空、空白のみはskip)と全く同じパターンを各streamの'text'
                 # にも適用し、cellがdictでない場合のskip(iteration 72)・cells/nbの
@@ -1505,6 +1509,59 @@ def _read_ipynb(path: Path) -> str:
                             + "\n...(出力が長いため切り詰め)"
                         )
                     parts.append(f"[Notebook stdout/stderr output]\n{combined_out}")
+                # 2026-07-26 (iteration 195): stream(標準出力/標準エラー)に続き、
+                # execute_result/display_dataの'data'辞書のうち'text/plain'キーのみを
+                # 追加抽出する。iter188はstream/execute_result/display_data(text/plain)
+                # の全種類を一度に扱おうとして行き詰まり断念し、iter194はあえて
+                # streamのみへスコープを縮小した。本iterationはiter194の縮小方針を
+                # そのまま踏襲し、次に価値が高い単一形状(戻り値やDataFrameのrepr等、
+                # セルの"計算結果"を表すtext/plain)のみを追加する。data分析notebookでは
+                # print(...)によるstream出力だけでなく、セル末尾の式の評価結果や
+                # 変数のreprこそが質問への回答に直結することが多く、これも精度
+                # criticalなRAG/--fileコンテキストから黙って欠落していた。'data'辞書は
+                # image/png等のbase64エンコード画像やtext/html等、text/plain以外の
+                # MIMEキーを同時に含みうるが、それらは意図的に対象外のまま据え置く
+                # （オーバーサイトではない。base64画像を扱うには別途の慎重な設計が
+                # 必要なため、iter188の「一度に全部」の轍を踏まないよう最小スコープを
+                # 維持する）。'error'のtracebackも同様に対象外のまま据え置く。
+                # 正規化パターン(str->そのまま、list->str要素のみjoin、その他->空、
+                # 空白のみはskip)は'source'(iteration 72)・stream 'text'
+                # (iteration 194)と全く同一のものを'data'内'text/plain'にも適用し、
+                # `or []`等のtruthinessトリックには頼らずisinstanceチェックのみで
+                # 判定する。'outputs'非list・outputs内非dict要素・cell非dict等の
+                # 構造ガード(iteration 72/113)は上のstreamループと同じ変数
+                # (outputs)を再利用するのみで一切変更しない。暴走した出力が
+                # num_ctxを圧迫しないよう、上のstream出力と同じ
+                # _IPYNB_STREAM_OUTPUT_CAPを流用して上限を設ける。
+                result_chunks = []
+                for out in outputs:
+                    if not isinstance(out, dict):
+                        continue
+                    if out.get("output_type") not in ("execute_result", "display_data"):
+                        continue
+                    data = out.get("data", {})
+                    if not isinstance(data, dict):
+                        continue
+                    raw_result_text = data.get("text/plain", "")
+                    if isinstance(raw_result_text, str):
+                        result_text = raw_result_text
+                    elif isinstance(raw_result_text, list):
+                        result_text = "".join(
+                            t for t in raw_result_text if isinstance(t, str)
+                        )
+                    else:
+                        result_text = ""
+                    if not result_text.strip():
+                        continue
+                    result_chunks.append(result_text)
+                if result_chunks:
+                    combined_result = "".join(result_chunks)
+                    if len(combined_result) > _IPYNB_STREAM_OUTPUT_CAP:
+                        combined_result = (
+                            combined_result[:_IPYNB_STREAM_OUTPUT_CAP]
+                            + "\n...(出力が長いため切り詰め)"
+                        )
+                    parts.append(f"[Notebook result output]\n{combined_result}")
             elif ct == "markdown":
                 parts.append(src)
         return "\n\n".join(parts)
