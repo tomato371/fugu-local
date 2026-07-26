@@ -1562,6 +1562,66 @@ def _read_ipynb(path: Path) -> str:
                             + "\n...(出力が長いため切り詰め)"
                         )
                     parts.append(f"[Notebook result output]\n{combined_result}")
+                # 2026-07-26 (iter196): stream(iter194)・execute_result/display_dataの
+                # 'text/plain'(iter195)に続き、output_type=='error'の'ename'/'evalue'の
+                # みを追加抽出する。従来はコードセルの保存済み出力がerrorであっても
+                # ```pythonフェンスのみが出力され、セルが失敗した事実が一切示されない
+                # まま提案者に渡っていた。これは提案者がコードが成功したものと誤って
+                # 推論しうる精度上の欠陥であり、iter188がstream/execute_result/
+                # display_data/errorの全種類を一度に扱おうとして行き詰まり断念して以来、
+                # iter194/195が意図的に対象外のまま据え置いてきた最後の1種
+                # （iter195のコメント:「'error'のtracebackも同様に対象外のまま据え置く」）
+                # を、同じ縮小スコープの作法で補う。'traceback'(list of str、ANSIカラー
+                # エスケープシーケンスを含む)は本iterationでも意図的に対象外のまま
+                # 据え置く(iter195からのdeferralをそのまま継承する)。ANSIエスケープの
+                # 除去・正規化や、'data'辞書内のtext/html・image/png等の非'text/plain'
+                # MIME(iter195で既に対象外と決めたもの)の扱いには別途の慎重な設計が
+                # 必要であり、iter188の「一度に全部」の轍を踏まないよう'ename'/'evalue'
+                # という単一の最小形状のみへスコープを保つ。正規化パターン
+                # (str->そのまま、list->str要素のみjoin、その他->空、strip後に両方
+                # 空白ならそのoutputはskip)はsource(iter72)・stream 'text'(iter194)・
+                # 'text/plain'(iter195)と全く同一のものをename/evalueにも適用し、非str値
+                # (int/dict/None等)をstr()で強制変換して混入させることは絶対にしない。
+                # 'outputs'非list・outputs内非dict要素・cell非dict等の構造ガード
+                # (iter72/113)は上の2ループと同じ変数(outputs)を再利用するのみで一切
+                # 変更しない。暴走した出力(極端に長いevalue)がnum_ctxを圧迫しないよう、
+                # 上と同じ_IPYNB_STREAM_OUTPUT_CAPを流用して上限を設ける。
+                error_chunks = []
+                for out in outputs:
+                    if not isinstance(out, dict):
+                        continue
+                    if out.get("output_type") != "error":
+                        continue
+                    raw_ename = out.get("ename", "")
+                    if isinstance(raw_ename, str):
+                        ename = raw_ename
+                    elif isinstance(raw_ename, list):
+                        ename = "".join(e for e in raw_ename if isinstance(e, str))
+                    else:
+                        ename = ""
+                    raw_evalue = out.get("evalue", "")
+                    if isinstance(raw_evalue, str):
+                        evalue = raw_evalue
+                    elif isinstance(raw_evalue, list):
+                        evalue = "".join(e for e in raw_evalue if isinstance(e, str))
+                    else:
+                        evalue = ""
+                    if not ename.strip() and not evalue.strip():
+                        continue
+                    if ename.strip() and evalue.strip():
+                        error_chunks.append(f"{ename}: {evalue}")
+                    elif ename.strip():
+                        error_chunks.append(ename)
+                    else:
+                        error_chunks.append(evalue)
+                if error_chunks:
+                    combined_error = "\n".join(error_chunks)
+                    if len(combined_error) > _IPYNB_STREAM_OUTPUT_CAP:
+                        combined_error = (
+                            combined_error[:_IPYNB_STREAM_OUTPUT_CAP]
+                            + "\n...(出力が長いため切り詰め)"
+                        )
+                    parts.append(f"[Notebook error]\n{combined_error}")
             elif ct == "markdown":
                 parts.append(src)
         return "\n\n".join(parts)

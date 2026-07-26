@@ -5875,12 +5875,13 @@ with _tempfile.TemporaryDirectory() as _rio_dir:
           _rio_out_o3 == "```python\nprint(1)\n```")
 
     # (p) execute_result/display_data/errorの混在ケース。iter194時点ではこの3種すべて
-    #     対象外だったが、iter195がexecute_result/display_dataの'text/plain'のみを
-    #     追加で対象にしたため、期待値を更新する(下の新セクションでより網羅的に検証):
-    #     execute_resultのtext/plainは抽出される一方、display_data側はimage/pngのみ
-    #     (text/plainなし)なので抽出されず、base64が出力に混入しないこと、errorの
-    #     tracebackは引き続き対象外のまま混入しないことを、判別可能なマーカー文字列で
-    #     確認する。
+    #     対象外だったが、iter195がexecute_result/display_dataの'text/plain'のみを、
+    #     iter196(本iteration)がerrorの'ename'/'evalue'のみをそれぞれ追加で対象に
+    #     したため、期待値を更新する(下の新セクションでより網羅的に検証):
+    #     execute_resultのtext/plainは抽出され、display_data側はimage/pngのみ
+    #     (text/plainなし)なので抽出されずbase64も混入しない。errorはename/evalueが
+    #     [Notebook error]ブロックとして抽出されるが、tracebackは引き続き対象外の
+    #     まま混入しないことを、判別可能なマーカー文字列で確認する。
     _rio_nb_p = {
         "cells": [
             {"cell_type": "code", "source": ["1 + 1"],
@@ -5897,13 +5898,14 @@ with _tempfile.TemporaryDirectory() as _rio_dir:
     _rio_p = _rio_root / "p.ipynb"
     _rio_p.write_text(json.dumps(_rio_nb_p), encoding="utf-8")
     _rio_out_p = f._read_ipynb(_rio_p)
-    check("_read_ipynb(iter195更新): execute_resultのtext/plainは[Notebook result output]として抽出される",
+    check("_read_ipynb(iter195): execute_resultのtext/plainは[Notebook result output]として抽出される",
           _rio_out_p == "```python\n1 + 1\n```"
-          "\n\n[Notebook result output]\nEXECRESULT_MARKER_42")
+          "\n\n[Notebook result output]\nEXECRESULT_MARKER_42"
+          "\n\n[Notebook error]\nValueError: boom")
     check("_read_ipynb: display_dataがimage/pngのみ(text/plainなし)の場合はbase64が出力に混入しない",
           "QkFTRTY0X01BUktFUg==" not in _rio_out_p and "image/png" not in _rio_out_p)
-    check("_read_ipynb: errorのtracebackは本iterationでも対象外のまま出力に混入しない",
-          "ERROR_TRACEBACK_MARKER" not in _rio_out_p and "error" not in _rio_out_p)
+    check("_read_ipynb(iter196更新): errorはename/evalueが[Notebook error]として抽出されるが、tracebackは対象外のまま混入しない",
+          "ValueError: boom" in _rio_out_p and "ERROR_TRACEBACK_MARKER" not in _rio_out_p)
 
     # (q) outputsが空listの場合: 出力ブロックは追加されずコード抽出のみ(回帰: 既存の
     #     outputsキー自体が無いケースは上のセクション(a)/(e)等で既に検証済み)。
@@ -6185,8 +6187,11 @@ with _tempfile.TemporaryDirectory() as _rid_dir:
     check("_read_ipynb: 切り詰め後の出力に元の全文(5000文字連続のB)は残らない",
           _rid_long_text not in _rid_out_dd)
 
-    # (ee) errorのoutput_typeは本iterationでも引き続き対象外のまま(iter194からの据え置き
-    #      を継続)、tracebackが出力に混入せず、結果ブロックも追加されない。
+    # (ee) iter194/195時点ではerrorのoutput_typeは全面的に対象外だったが、iter196
+    #      (本iteration)がename/evalueのみを[Notebook error]として追加抽出するように
+    #      なった。execute_result/display_data向けの[Notebook result output]ブロックは
+    #      (output_typeがerrorのため)引き続き追加されず、tracebackも引き続き出力に
+    #      混入しない(下の専用セクションでより網羅的に検証)。
     _rid_nb_ee = {
         "cells": [
             {"cell_type": "code", "source": ["1 / 0"],
@@ -6199,10 +6204,226 @@ with _tempfile.TemporaryDirectory() as _rid_dir:
     _rid_ee = _rid_root / "ee.ipynb"
     _rid_ee.write_text(json.dumps(_rid_nb_ee), encoding="utf-8")
     _rid_out_ee = f._read_ipynb(_rid_ee)
-    check("_read_ipynb: errorのoutput_typeは本iterationでも対象外のまま結果ブロックが追加されない",
-          _rid_out_ee == "```python\n1 / 0\n```")
+    check("_read_ipynb(iter196更新): errorは[Notebook result output]としては追加されず[Notebook error]として抽出される",
+          _rid_out_ee == "```python\n1 / 0\n```"
+          "\n\n[Notebook error]\nZeroDivisionError: division by zero")
     check("_read_ipynb: errorのtracebackは出力に混入しない",
           "ERROR_TRACEBACK_MARKER_EE" not in _rid_out_ee)
+
+# ---------- _read_ipynb: コードセルのerror出力(ename/evalue)抽出 (2026-07-26 / iter196) ----------
+# 発端: iter194はstream(stdout/stderr)出力を、iter195はexecute_result/display_dataの
+# 'text/plain'をそれぞれ追加抽出したが、output_type=='error'は「iter188がstream/
+# execute_result/display_data/errorの全種類を一度に扱おうとして行き詰まり断念した」
+# ことを受けて、iter194/195とも意図的に対象外のまま据え置いてきた(iter195のコメント:
+# 「'error'のtracebackも同様に対象外のまま据え置く」)。この据え置きは単なる網羅性の
+# 欠落ではなく精度上のハザードであり、保存済み出力がerrorのコードセルでも従来は
+# ```pythonフェンスのみが出力され、セルが失敗した事実が一切示されないまま提案者に
+# 渡っていた(提案者がコードは成功したものと誤って推論しうる)。本iterationは
+# iter194/195の縮小スコープの作法をそのまま踏襲し、'error'の'ename'/'evalue'という
+# 単一の最小形状のみを追加抽出する。'traceback'(list of str、ANSIカラーエスケープ
+# シーケンスを含む)は意図的に対象外のまま据え置く(iter195からのdeferralの継続。
+# ANSIエスケープの除去・正規化には別途の慎重な設計が必要であり、iter188の轍を
+# 踏まないため)。上のセクション(iter71/72/113/159構造ガード、iter194 stream抽出、
+# iter195 result抽出)は本セクションの変更で一切変更されていない。f.ask/urlopen/
+# subprocessは一切呼ばない(すべてtempfile上のオフラインI/O)。
+with _tempfile.TemporaryDirectory() as _rie_dir:
+    _rie_root = _pathlib.Path(_rie_dir)
+
+    # (a) 基本ケース: ename='ZeroDivisionError'/evalue='division by zero'が
+    #     [Notebook error]ブロックとしてフェンス直後に抽出される。
+    _rie_nb_a = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 / 0"],
+             "outputs": [
+                 {"output_type": "error", "ename": "ZeroDivisionError",
+                  "evalue": "division by zero", "traceback": ["tb line 1", "tb line 2"]},
+             ]},
+        ]
+    }
+    _rie_a = _rie_root / "a.ipynb"
+    _rie_a.write_text(json.dumps(_rie_nb_a), encoding="utf-8")
+    _rie_out_a = f._read_ipynb(_rie_a)
+    check("_read_ipynb: error出力のename/evalueが[Notebook error]としてフェンス直後に抽出される",
+          _rie_out_a == "```python\n1 / 0\n```"
+          "\n\n[Notebook error]\nZeroDivisionError: division by zero")
+
+    # (b) tracebackにANSIカラーエスケープ(\x1b[...m)が含まれていても、ename/evalueは
+    #     正しく抽出されつつ、ANSIエスケープ文字自体は出力のどこにも混入しない
+    #     (traceback自体を一切読まないことの直接的な証明)。
+    _rie_nb_b = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 / 0"],
+             "outputs": [
+                 {"output_type": "error", "ename": "ZeroDivisionError",
+                  "evalue": "division by zero",
+                  "traceback": [
+                      "[0;31m----- Traceback -----[0m",
+                      "[0;31mZeroDivisionError[0m: division by zero",
+                  ]},
+             ]},
+        ]
+    }
+    _rie_b = _rie_root / "b.ipynb"
+    _rie_b.write_text(json.dumps(_rie_nb_b), encoding="utf-8")
+    _rie_out_b = f._read_ipynb(_rie_b)
+    check("_read_ipynb: tracebackのANSIエスケープ文字(\\x1b)は出力のどこにも混入しない",
+          "" not in _rie_out_b)
+    check("_read_ipynb: ANSI混入tracebackが同居してもename/evalueは正しく抽出される",
+          "ZeroDivisionError: division by zero" in _rie_out_b)
+
+    # (c) evalueが欠落('evalue'キー自体が無い)場合、ename単体が抽出され末尾に
+    #     余分な': 'は付かない。
+    _rie_nb_c = {
+        "cells": [
+            {"cell_type": "code", "source": ["raise RuntimeError"],
+             "outputs": [{"output_type": "error", "ename": "RuntimeError"}]},
+        ]
+    }
+    _rie_c = _rie_root / "c.ipynb"
+    _rie_c.write_text(json.dumps(_rie_nb_c), encoding="utf-8")
+    _rie_out_c = f._read_ipynb(_rie_c)
+    check("_read_ipynb: evalueキー自体が無い場合もenameのみ抽出され末尾に': 'が付かない",
+          _rie_out_c == "```python\nraise RuntimeError\n```\n\n[Notebook error]\nRuntimeError")
+
+    # (d) evalueが空白のみの場合も(c)と同様、ename単体が抽出され余分な': 'は付かない。
+    _rie_nb_d = {
+        "cells": [
+            {"cell_type": "code", "source": ["raise RuntimeError"],
+             "outputs": [{"output_type": "error", "ename": "RuntimeError", "evalue": "   "}]},
+        ]
+    }
+    _rie_d = _rie_root / "d.ipynb"
+    _rie_d.write_text(json.dumps(_rie_nb_d), encoding="utf-8")
+    _rie_out_d = f._read_ipynb(_rie_d)
+    check("_read_ipynb: evalueが空白のみの場合もenameのみ抽出され末尾に': 'が付かない",
+          _rie_out_d == "```python\nraise RuntimeError\n```\n\n[Notebook error]\nRuntimeError")
+
+    # (e) enameが欠落/空白でevalueのみ存在する場合は対称的にevalue単体が抽出される
+    #     (先頭に余分な': 'が付かない)。
+    _rie_nb_e = {
+        "cells": [
+            {"cell_type": "code", "source": ["assert False"],
+             "outputs": [{"output_type": "error", "evalue": "assertion failed"}]},
+        ]
+    }
+    _rie_e = _rie_root / "e.ipynb"
+    _rie_e.write_text(json.dumps(_rie_nb_e), encoding="utf-8")
+    _rie_out_e = f._read_ipynb(_rie_e)
+    check("_read_ipynb: enameが無くevalueのみの場合はevalue単体が抽出される",
+          _rie_out_e == "```python\nassert False\n```\n\n[Notebook error]\nassertion failed")
+
+    # (f) enameとevalueの両方が欠落/空白の場合はerrorブロック自体が追加されない
+    #     (キー無し・明示的な空文字・空白のみの3パターン)。
+    for _rie_bad_out, _rie_label_f in (
+        ({"output_type": "error"}, "両方キー無し"),
+        ({"output_type": "error", "ename": "", "evalue": ""}, "両方空文字"),
+        ({"output_type": "error", "ename": "  ", "evalue": "\n"}, "両方空白のみ"),
+    ):
+        _rie_nb_f = {"cells": [{"cell_type": "code", "source": ["pass"], "outputs": [_rie_bad_out]}]}
+        _rie_f = _rie_root / f"f_{_rie_label_f}.ipynb"
+        _rie_f.write_text(json.dumps(_rie_nb_f), encoding="utf-8")
+        _rie_out_f = f._read_ipynb(_rie_f)
+        check(f"_read_ipynb: ename/evalueが{_rie_label_f}の場合はerrorブロックが追加されない",
+              _rie_out_f == "```python\npass\n```")
+
+    # (g) ename/evalueが非str/非list(int/dict/None)の場合、例外を送出せずstr()での
+    #     強制変換(dict/int等のrepr混入)もせず空文字へ正規化される。evalueは固定の
+    #     正常値にして、enameの異常値だけを切り替える。
+    for _rie_bad_ename, _rie_label_g in ((42, "整数"), ({"x": 1}, "dict"), (None, "None")):
+        _rie_nb_g = {
+            "cells": [
+                {"cell_type": "code", "source": ["boom()"],
+                 "outputs": [{"output_type": "error", "ename": _rie_bad_ename,
+                              "evalue": "GDEF_MARKER"}]},
+            ]
+        }
+        _rie_g = _rie_root / f"g_{_rie_label_g}.ipynb"
+        _rie_g.write_text(json.dumps(_rie_nb_g), encoding="utf-8")
+        _rie_out_g = f._read_ipynb(_rie_g)
+        check(f"_read_ipynb: enameが非str/非list({_rie_label_g})でも例外を送出せず空文字へ正規化される",
+              _rie_out_g == "```python\nboom()\n```\n\n[Notebook error]\nGDEF_MARKER")
+
+    # (h) enameがlist内に非str要素を含む場合、source正規化(iteration 72)と全く同じ
+    #     パターンでstr要素のみjoinされる(42は無視されて'a'+'b'='ab')。
+    _rie_nb_h = {
+        "cells": [
+            {"cell_type": "code", "source": ["boom()"],
+             "outputs": [{"output_type": "error", "ename": ["a", 42, "b"], "evalue": "m"}]},
+        ]
+    }
+    _rie_h = _rie_root / "h.ipynb"
+    _rie_h.write_text(json.dumps(_rie_nb_h), encoding="utf-8")
+    _rie_out_h = f._read_ipynb(_rie_h)
+    check("_read_ipynb: enameのlist内の非str要素は無視されstr要素のみjoinされる",
+          _rie_out_h == "```python\nboom()\n```\n\n[Notebook error]\nab: m")
+
+    # (i) outputs内に非dictエントリが混在しても例外を送出せずskipされ、後続の正当な
+    #     error出力は引き続き抽出される(iteration 72の非dictセルskipと同じ作法)。
+    _rie_nb_i = {
+        "cells": [
+            {"cell_type": "code", "source": ["boom()"],
+             "outputs": ["not_a_dict_output",
+                         {"output_type": "error", "ename": "KeyError", "evalue": "boom2"}]},
+        ]
+    }
+    _rie_i = _rie_root / "i.ipynb"
+    _rie_i.write_text(json.dumps(_rie_nb_i), encoding="utf-8")
+    _rie_out_i = f._read_ipynb(_rie_i)
+    check("_read_ipynb: outputs内の非dictエントリはskipされ後続の正当なerror出力は抽出される",
+          _rie_out_i == "```python\nboom()\n```\n\n[Notebook error]\nKeyError: boom2")
+
+    # (j) 'outputs'自体がtruthyな非list(整数)の場合も、iteration 113/72の構造ガードを
+    #     再利用しているため例外を送出せずコード抽出のみが残る。
+    _rie_nb_j = {"cells": [{"cell_type": "code", "source": ["boom()"], "outputs": 42}]}
+    _rie_j = _rie_root / "j.ipynb"
+    _rie_j.write_text(json.dumps(_rie_nb_j), encoding="utf-8")
+    _rie_out_j = f._read_ipynb(_rie_j)
+    check("_read_ipynb: outputsが非list(整数)でも例外を送出せずコード抽出のみ維持される",
+          _rie_out_j == "```python\nboom()\n```")
+
+    # (k) stream + execute_result(text/plain) + errorが同一セルに同居する場合、
+    #     3ブロックが[Notebook stdout/stderr output] -> [Notebook result output] ->
+    #     [Notebook error]の順で、インターリーブせず・欠落/重複なく追加される。
+    _rie_nb_k = {
+        "cells": [
+            {"cell_type": "code", "source": ["print('before'); 1/0"],
+             "outputs": [
+                 {"output_type": "stream", "name": "stdout", "text": ["before\n"]},
+                 {"output_type": "execute_result", "data": {"text/plain": ["<partial>"]}},
+                 {"output_type": "error", "ename": "ZeroDivisionError", "evalue": "division by zero"},
+             ]},
+        ]
+    }
+    _rie_k = _rie_root / "k.ipynb"
+    _rie_k.write_text(json.dumps(_rie_nb_k), encoding="utf-8")
+    _rie_out_k = f._read_ipynb(_rie_k)
+    check("_read_ipynb: stream+result+errorが同居する場合、3ブロックが決定的な順序で1回ずつ追加される",
+          _rie_out_k == "```python\nprint('before'); 1/0\n```"
+          "\n\n[Notebook stdout/stderr output]\nbefore\n"
+          "\n\n[Notebook result output]\n<partial>"
+          "\n\n[Notebook error]\nZeroDivisionError: division by zero")
+
+    # (l) 巨大なevalue(暴走したtraceback相当)は、stream/result出力と同じ上限
+    #     (4000文字、_IPYNB_STREAM_OUTPUT_CAP流用)+切り詰めマーカーで打ち切られる
+    #     (num_ctx保護)。enameは空にして、切り詰め位置の計算をevalue単体に単純化する。
+    _rie_long_evalue = "E" * 5000
+    _rie_nb_l = {
+        "cells": [
+            {"cell_type": "code", "source": ["boom()"],
+             "outputs": [{"output_type": "error", "ename": "", "evalue": _rie_long_evalue}]},
+        ]
+    }
+    _rie_l = _rie_root / "l.ipynb"
+    _rie_l.write_text(json.dumps(_rie_nb_l), encoding="utf-8")
+    _rie_out_l = f._read_ipynb(_rie_l)
+    _rie_expected_l = (
+        "```python\nboom()\n```"
+        "\n\n[Notebook error]\n" + "E" * 4000 + "\n...(出力が長いため切り詰め)"
+    )
+    check("_read_ipynb: 巨大なevalueは上限4000文字+切り詰めマーカーで打ち切られる",
+          _rie_out_l == _rie_expected_l)
+    check("_read_ipynb: 切り詰め後の出力に元の全文(5000文字連続のE)は残らない",
+          _rie_long_evalue not in _rie_out_l)
 
 # ---------- _read_ipynb: cp932(Shift-JIS)デコードラダー (2026-07-25 / iter159) ----------
 # 発端: _read_ipynbは、iteration 94が_read_html/read_file_text汎用テキスト分岐に
