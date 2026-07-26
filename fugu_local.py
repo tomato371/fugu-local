@@ -2880,8 +2880,19 @@ _CODE_TASK_SIGNALS = re.compile(
     r"実装|コード|プログラム|関数を書|クラスを書|デバッグ|"
     r"\bimplement|\bwrite (?:a |the )?(?:function|program|code|class|script)\b|```",
     re.IGNORECASE)
-_FREEFORM_SIGNALS = re.compile(r"証明|\bprove\b|\bproof\b|説明して|解説して|なぜ",
-                               re.IGNORECASE)
+# 2026-07-26: _MATH_TASK_SIGNALS には英語の数学トリガー（\bhow many\b, \bcompute\b,
+# \bcalculate\b, \bfind the ...\b 等）が揃っているのに、この降格用セーフティバルブは
+# 日本語の説明系動詞（証明/説明して/解説して/なぜ）しか見ておらず、英語の explain/
+# describe/why が抜けていた（非対称）。結果、"How many SOLID principles are there?
+# Explain each." のように \bhow many\b で math 判定されつつ説明を求める問いが降格されず、
+# solve_verifiable の自己一貫性投票 + extract_final_answer に流れて説明が黙って
+# 落ちる回帰があった。ここでは explain/describe/why の3語だけを追加する（bare \bhow\b は
+# \bhow many\b と衝突し正当な計数問題まで誤って降格するため絶対に追加しないこと。
+# gotcha #7: 自己一貫性投票は精度優先の要）。
+_FREEFORM_SIGNALS = re.compile(
+    r"証明|\bprove\b|\bproof\b|説明して|解説して|なぜ|"
+    r"\bexplain\b|\bdescribe\b|\bwhy\b",
+    re.IGNORECASE)
 
 
 def _apply_tasktype_guardrails(question, plan):

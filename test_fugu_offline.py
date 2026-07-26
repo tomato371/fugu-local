@@ -2783,6 +2783,45 @@ check("tt: 申告math + 自由記述シグナル(シグナル一致なし) -> kn
 check("tt: 申告mcq + 自由記述ワードが含まれていても mcq のまま(格下げされない)",
       _tt("なぜ空は青いか説明して", "mcq") == "mcq")
 
+# --- 2026-07-26: _FREEFORM_SIGNALS の英語対応漏れ修正。_MATH_TASK_SIGNALS には
+# \bhow many\b / \bcompute\b 等の英語トリガーが揃っているのに、降格側(_FREEFORM_SIGNALS)
+# は日本語の説明系(証明/説明して/解説して/なぜ)しか見ておらず、英語の explain/describe/why
+# が欠けていた。結果、"How many SOLID principles are there? Explain each." のように
+# \bhow many\b で math 判定されつつ説明を求める問いが投票経路(solve_verifiable、gotcha #7)
+# に流れ、要求された説明が黙って落ちる回帰があった。explain/describe/why の3語追加で
+# 日本語側と対称になったことを検証する。
+check("tt: 英語 how many+explain は knowledge へ格下げ(新規)",
+      _tt("How many SOLID principles are there? Explain each.") == "knowledge")
+check("tt: 英語 how many+describe は knowledge へ格下げ(新規)",
+      _tt("How many design patterns exist? Describe when to use each.") == "knowledge")
+check("tt: 英語 how many+why は knowledge へ格下げ(新規)",
+      _tt("How many degrees does a triangle's interior angles sum to, and why?")
+      == "knowledge")
+# --- 回帰: 説明系ワードを伴わない正当な英語計数/計算問題は math のまま
+# (bare \bhow\b を追加していないことの確認。\bhow many\b との衝突を避けるのが本修正の
+# 必須制約 -- gotcha #7 の自己一貫性投票ゲートを誤って外さないため)。
+check("tt: how many のみ(説明要求なし)は math のまま(回帰)",
+      _tt("How many prime numbers are less than 100?") == "math")
+check("tt: how many のみ(説明要求なし・別問題)は math のまま(回帰)",
+      _tt("How many divisors does 60 have?") == "math")
+check("tt: compute のみ(説明要求なし)は math のまま(回帰)",
+      _tt("Compute 17*23.") == "math")
+check("tt: find the value のみ(説明要求なし)は math のまま(回帰)",
+      _tt("Find the value of x if 2x=10.") == "math")
+# --- 回帰: 日本語側の既存デモーション/確定は byte-for-byte 不変
+check("tt: 日本語math専用(を計算し)は引き続き math のまま(回帰)",
+      _tt("42の階乗を計算しなさい") == "math")
+check("tt: 日本語証明系は引き続き knowledge へ格下げ(回帰)",
+      _tt("3連続整数の積が6の倍数であることを証明して求めよ", "math") == "knowledge")
+# --- 回帰: 新規English語彙があっても mcq/code 分類は不変(mcqはmath分岐より先に確定、
+# 格下げは t=="math" のときのみ発火するため構造的に影響を受けない)
+check("tt: explain を含む mcq 問題は mcq のまま(回帰)",
+      _tt("Which of the following is correct? Explain your reasoning.\nA) foo\nB) bar")
+      == "mcq")
+check("tt: explain を含む code 問題は code のまま(回帰)",
+      _tt("Implement a function to reverse a string, then explain your approach.")
+      == "code")
+
 check("tt: validate が task_type を保持",
       f.validate_plan({"mode": "moa", "selected_proposers": [],
                        "task_type": "math"})["task_type"] == "math")
