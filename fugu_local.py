@@ -5416,9 +5416,35 @@ def repl(use_search=False, rag_dirs=None, history_file=None):
             use_search = False
             print("   [Web検索: OFF]")
             continue
+        # 2026-07-27: iteration 204で確認・特性化された(a)/(b)の修正
+        # (iteration 182/186の'save <path>'契約には一切触れない)。
+        # (a) 末尾スペース無しの素の'save'(4文字)はlow.startswith("save ")
+        #     (5文字、末尾スペース必須)に一致せず、従来はどのコマンドにも
+        #     一致しないままループ末尾のask_fugu(q, ...)へ落ちていた。つまり
+        #     'save'という文字列そのものがフルのConductor+MoA/SCパイプラインへの
+        #     質問として実行され、その(意味のない)応答が(user:'save',
+        #     assistant:<応答>)として_HISTORYに追加され、以降の全ターンの
+        #     Conductor/proposerコンテキストを汚染してしまう
+        #     (iteration 59/67/70/73と同じ複数ターン文脈汚染バグ種)。
+        # (b) 'save '(末尾スペースのみ、パス指定なしのつもり)も、repl()冒頭の
+        #     q = input(...).strip()で入力全体が丸ごとstripされるため、判定前に
+        #     'save'(4文字)へ潰れて結局(a)と同じ経路に収束していた。この結果、
+        #     直後のL5421-5423相当「保存先パスを指定してください」ガイダンスは
+        #     qが既にstrip済み(=末尾に空白を残せない)という不変条件と両立せず、
+        #     実際のinput()経由では到達不能なデッドコードだった。
+        # 修正: low(既存の小文字化済み変数、'SAVE'/'Save'等も統一的に扱う)が
+        # 'save'単体に完全一致する場合を明示コマンド分岐として捕捉し、使用方法の
+        # 案内だけ出してcontinueする。ask_fuguへは絶対にディスパッチせず、
+        # _HISTORYも一切変更しない。これにより(a)/(b)双方が同じ分岐で解消される。
+        if low == "save":
+            print("   [保存先パスを指定してください: save <path>]")
+            continue
         if low.startswith("save "):
             save_path = q[5:].strip()
             if not save_path:
+                # 上のlow == "save"分岐により、qは既にstrip済みという不変条件から
+                # ここへは実際のinput()経由では到達し得ない(iteration 204で確認済み
+                # の到達不能デッドコード)。安全側の防御としてそのまま残す。
                 print("   [保存先パスを指定してください: save <path>]")
                 continue
             ok = save_history_file(_HISTORY, path=Path(save_path), force=True)

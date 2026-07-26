@@ -15257,24 +15257,25 @@ check("main: テスト後にsys.stdinが復元されている", sys.stdin is _or
 # solve_verifiableのSC投票内部ロジックはいずれも本セクションでは呼び出さない
 # (ask_fugu自体を丸ごとフェイクに差し替えているため、その内部は素通りする)。
 #
-# 重要(surface-don't-fix, iteration 48/66/71/110/185の流儀を踏襲): 'save <path>'
-# 分岐(L5419-5429)には2つの特性化(未修正のまま固定)がある。
+# 2026-07-27追記(iter205でiter204の特性化(a)/(b)を修正、iter157/172の
+# 「stale characterization pinを反転させる」流儀を踏襲): 'save <path>'分岐には
+# 元々2つの特性化(未修正のまま固定)があった。
 #   (a) 末尾スペース無しの素の'save'(4文字)は low.startswith("save ")(5文字、
 #       末尾スペース必須)に一致せず、コマンドとして扱われないままループ末尾の
-#       ask_fugu(q, ...)へ落ちる。つまり'save'という文字列そのものを質問として
-#       通常のMoAパイプラインに渡してしまう。
+#       ask_fugu(q, ...)へ落ちていた。つまり'save'という文字列そのものを質問として
+#       通常のMoAパイプラインに渡してしまい、その応答が_HISTORYを汚染していた。
 #   (b) さらに、'save '(末尾スペースのみ、パス無しのつもり)を入力しても、
 #       repl()の先頭で q = input(...).strip() が入力全体を丸ごとstripする
-#       ため、末尾の空白だけの"save "は判定前に"save"(4文字)へ潰れてしまう。
-#       結果としてL5421-5423の「保存先パスを指定してください」ガイダンス分岐
-#       (q[5:].strip()が空文字になる経路)は、qが既にstrip済みである
-#       (=末尾に空白を残せない)という不変条件と数学的に両立せず、実際の
-#       input()経由では到達不能である。q[5:]が全て空白文字ならそれらは
-#       qの末尾の連続部分でもあるため、先頭のstrip()で既に除去されているはずだ、
-#       という一般的な理由による(空白の種類・個数・全角スペース・タブ等の
-#       個別ケースで実測検証済み、いずれも結局bare 'save'と同じ(a)の経路に
-#       収束する)。どちらもrepl()自体は変更せず、実際に観測される挙動を
-#       そのまま固定する。人間のレビュー向けに明示コメントする。
+#       ため、末尾の空白だけの"save "は判定前に"save"(4文字)へ潰れてしまい、
+#       結局(a)と同じ経路に収束していた。「保存先パスを指定してください」
+#       ガイダンス分岐(q[5:].strip()が空文字になる経路)はqが既にstrip済みで
+#       ある(=末尾に空白を残せない)という不変条件と数学的に両立せず、実際の
+#       input()経由では到達不能だった。
+# iter205でlow == "save"の専用分岐を追加し、(a)/(b)とも同じガイダンス表示+
+# continueに修正した(ask_fuguへのディスパッチなし、_HISTORY変更なし)。
+# 'save <path>'(パス付き)自体の契約(iteration 182/186: パス大文字小文字保持・
+# force=True・成功/失敗メッセージの分岐)には一切触れていない。
+# 以下(7a)/(7b)は旧・特性化(未修正)テストをiter205で修正後の挙動へ反転したもの。
 import builtins as _repl_builtins
 import tempfile as _repl_tempfile
 
@@ -15449,6 +15450,20 @@ try:
         check("repl: history_fileは明示的に渡した一時ファイルパスがそのまま渡る",
               bool(_ask) and _ask[0]["kwargs"].get("history_file") == _repl_hfile)
 
+        # --- (5b) 'save'で始まるが'save'単体でも'save '(スペース)プレフィックスでも
+        #          ない通常の質問(例: "saving money tips")は、iter205で追加した
+        #          low == "save"分岐にも既存のlow.startswith("save ")分岐にも
+        #          一致せず、従来通りask_fuguへ通常ディスパッチされる
+        #          (誤って新分岐に飲み込まれていないことの確認) ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run(["saving money tips", "exit"],
+                                             history_file=_repl_hfile)
+        check("repl(iter205回帰防止): 'save'で始まるだけの通常の質問"
+              "('saving money tips')はsaveコマンドと誤認識されずask_fuguへ渡る",
+              len(_ask) == 1 and _ask[0]["question"] == "saving money tips")
+        check("repl(iter205回帰防止): 'saving money tips'ではsave_history_fileは"
+              "呼ばれない", len(_save) == 0)
+
         # --- (6) save <path>: 大文字小文字混在パスがそのまま(q[5:]、lowerされたlowでは
         #         ない)保持されforce=Trueで保存される ---
         f._HISTORY = [{"role": "user", "content": "保存対象"}]
@@ -15469,38 +15484,45 @@ try:
         check("repl: save成功メッセージにパスの大文字小文字を保持したまま出力される",
               "MixedCase/Path.json" in _out)
 
-        # --- (7a) 特性化(未修正、要人間レビュー): 末尾スペース無しの素の'save'は
-        #          コマンドとして認識されず、ask_fuguへの通常質問ディスパッチに落ちる ---
+        # --- (7a) iter205修正確認(旧・特性化(a)の反転): 末尾スペース無しの素の
+        #          'save'はコマンドとして認識され、ask_fuguへは一切ディスパッチ
+        #          されずガイダンスだけ表示してcontinueする ---
         f._HISTORY = []
         _ask, _save, _out, _exc = _repl_run(["save", "exit"], history_file=_repl_hfile)
-        check("repl(特性化・未修正): 末尾スペース無しの素の'save'はどのコマンドにも"
-              "一致せずask_fuguへの通常質問ディスパッチに落ちる"
-              "(save_history_fileは呼ばれない。要人間レビュー、このイテレーションでは"
-              "repl()自体を変更しない)",
-              len(_ask) == 1 and _ask[0]["question"] == "save" and len(_save) == 0)
+        check("repl(iter205修正、旧・特性化(a)を反転): 末尾スペース無しの素の'save'は"
+              "ask_fuguへディスパッチされない(_HISTORYを汚染する質問実行を防止)",
+              len(_ask) == 0)
+        check("repl(iter205修正): 素の'save'はsave_history_fileも呼ばない"
+              "(forced saveは発火しない)", len(_save) == 0)
+        check("repl(iter205修正): 素の'save'は'save <path>'の使い方ガイダンスを表示する",
+              "save <path>" in _out and "保存先パスを指定してください" in _out)
+        check("repl(iter205修正): 素の'save'入力後もループが継続し次のexitで正常終了する"
+              "(例外が外へ伝播しない)", _exc is None)
 
-        # --- (7b) 特性化(未修正、要人間レビュー): 'save '(末尾スペースのみ、パス無しの
-        #          つもり)は、repl()冒頭のq = input(...).strip()で入力全体が丸ごと
-        #          stripされるため"save"(4文字)へ潰れてから判定される。したがって
-        #          L5421-5423の「保存先パスを指定してください」ガイダンス分岐
-        #          (q[5:].strip()が空文字になる経路)には実際のinput()経由では
-        #          到達不能である(qは既にstrip済み=末尾に空白を残せないため、
-        #          q[5:]が全て空白ということはそれがqの末尾の連続部分でもあり、
-        #          最初のstrip()で既に除去されているはずだ、という理由。空白の種類・
-        #          個数・全角スペース・タブでも同様であることを実測確認済み)。
-        #          結局(7a)と同じbare 'save'の経路に収束し、ガイダンス行は出力されず、
-        #          forced save(save_history_file(..., force=True))も呼ばれない ---
+        # --- (7b) iter205修正確認(旧・特性化(b)の反転): 'save '(末尾スペースのみ、
+        #          パス無しのつもり)も、repl()冒頭のq = input(...).strip()で
+        #          'save'(4文字)へ潰れてから判定されるため、(7a)と全く同じ
+        #          ガイダンス表示+continueの経路になる(ask_fuguディスパッチなし) ---
         f._HISTORY = []
         _ask, _save, _out, _exc = _repl_run(["save ", "exit"], history_file=_repl_hfile)
-        check("repl(特性化・未修正): 'save '(末尾スペースのみ)は外側のstrip()で"
-              "'save'に潰れ、空パス案内のガイダンス分岐には到達しない"
-              "(数学的に到達不能なデッドコード、要人間レビュー)",
-              "保存先パスを指定してください" not in _out)
-        check("repl(特性化・未修正): 'save '(末尾スペースのみ)も結局bare 'save'と"
-              "同じask_fuguディスパッチに落ちる",
-              len(_ask) == 1 and _ask[0]["question"] == "save")
-        check("repl(特性化・未修正): 'save '(末尾スペースのみ)でもforced save"
+        check("repl(iter205修正、旧・特性化(b)を反転): 'save '(末尾スペースのみ)も"
+              "外側のstrip()で'save'に潰れ、(7a)と同じくask_fuguへディスパッチされない",
+              len(_ask) == 0)
+        check("repl(iter205修正): 'save '(末尾スペースのみ)でもforced save"
               "(save_history_file)は呼ばれない", len(_save) == 0)
+        check("repl(iter205修正): 'save '(末尾スペースのみ)でも使い方ガイダンスが表示される",
+              "save <path>" in _out and "保存先パスを指定してください" in _out)
+
+        # --- (7c) 'SAVE'(大文字)も既存のlow(小文字化済み)判定により(7a)と
+        #          同一に扱われる('search on/off'等、他コマンドとの大文字小文字
+        #          非依存の一貫性を確認) ---
+        f._HISTORY = []
+        _ask, _save, _out, _exc = _repl_run(["SAVE", "exit"], history_file=_repl_hfile)
+        check("repl(iter205修正): 大文字小文字混在'SAVE'も素の'save'と同様に"
+              "ask_fuguへディスパッチされない",
+              len(_ask) == 0 and len(_save) == 0)
+        check("repl(iter205修正): 'SAVE'でも使い方ガイダンスが表示される",
+              "save <path>" in _out)
 
         # --- (8) EOFError/KeyboardInterrupt はrepl()の外へ伝播せず、クリーンに終了する ---
         f._HISTORY = []
