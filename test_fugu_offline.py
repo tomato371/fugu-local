@@ -213,6 +213,100 @@ try:
 finally:
     f.PROPOSERS = _op_persona2
 
+# ---------- proposer_sys_for / build_proposer_desc / _persona_str:
+#            プロポーザーpersona配線 (offline coverage, 2026-07-26) ----------
+# 3つとも純粋関数で、モジュールグローバル(PERSONA_MODELS/PERSONA_IDENTITY/
+# PROPOSER_PROFILES/PROPOSERS/MODEL_TO_PERSONA/PROPOSER_SYS)のみを読む。
+# proposer_sys_for は毎回のproposer呼び出し(get_single_proposal/単体モード
+# fugu_answer)を通り、人格プロンプトの前置有無を左右する(精度ガードレール#7
+# が拾うSC投票の入力に効く)。build_proposer_desc は Conductor プロンプトに
+# 埋め込まれる導入済みpersona一覧を、_persona_str はプラン表示ラベルを作る。
+# いずれもこれまでオフラインテストのカバレッジが皆無だったため特性化する
+# (fugu_local.py は変更しない。テスト専用の追加)。
+_op_persona_models = f.PERSONA_MODELS
+_op_persona_identity = f.PERSONA_IDENTITY
+_op_proposer_profiles = f.PROPOSER_PROFILES
+_op_proposers_seam = f.PROPOSERS
+_op_model_to_persona = f.MODEL_TO_PERSONA
+_op_proposer_sys = f.PROPOSER_SYS
+try:
+    # --- proposer_sys_for: identityの前置/非前置/falsy(空文字)分岐 ---
+    f.PERSONA_IDENTITY = {
+        "model-with-id": "あなたはテスト用人格Aです。",
+        "model-empty-id": "",
+    }
+    check("proposer_sys_for: identityありはPROPOSER_SYSの前に単一改行'\\n'で前置",
+          f.proposer_sys_for("model-with-id")
+          == "あなたはテスト用人格Aです。\n" + f.PROPOSER_SYS)
+    check("proposer_sys_for: identityありの結果はPROPOSER_SYSを末尾に含む(接尾辞)",
+          f.proposer_sys_for("model-with-id").endswith(f.PROPOSER_SYS))
+    check("proposer_sys_for: identityなし(キー不在)はPROPOSER_SYSそのまま(前置なし)",
+          f.proposer_sys_for("model-without-id") == f.PROPOSER_SYS)
+    check("proposer_sys_for: 空文字identity(falsy)もPROPOSER_SYSそのまま",
+          f.proposer_sys_for("model-empty-id") == f.PROPOSER_SYS)
+
+    # --- build_proposer_desc: PERSONA_MODELS挿入順・導入済みのみ列挙・
+    #     PROPOSER_PROFILES既定'汎用'フォールバック ---
+    f.PERSONA_MODELS = {
+        "Proposer A": "model-a",
+        "Proposer B": "model-b",
+        "Proposer C": "model-c",
+    }
+    f.MODEL_TO_PERSONA = {v: k for k, v in f.PERSONA_MODELS.items()}
+    f.PROPOSER_PROFILES = {"model-a": "得意分野Aの説明"}  # model-b/model-cは未設定
+    # 導入順(PROPOSERSの並び)はPERSONA_MODELS順とわざと変えて、出力順が
+    # PERSONA_MODELS の挿入順に従うこと(PROPOSERSの並び順に引きずられない
+    # こと)を検証する。Proposer Cは未導入のまま(除外を確認)。
+    f.PROPOSERS = ["model-b", "model-a"]
+    _pdesc = f.build_proposer_desc()
+    check("build_proposer_desc: 導入済みのみをPERSONA_MODELS挿入順・"
+          "'- {label} ({model}): {profile}'形式で改行結合",
+          _pdesc == "- Proposer A (model-a): 得意分野Aの説明\n"
+                    "- Proposer B (model-b): 汎用")
+    check("build_proposer_desc: 未導入(Proposer C/model-c)は出力に含まれない",
+          "Proposer C" not in _pdesc and "model-c" not in _pdesc)
+    check("build_proposer_desc: PROPOSER_PROFILES未設定モデルは既定'汎用'",
+          "(model-b): 汎用" in _pdesc)
+    check("build_proposer_desc: PROPOSER_PROFILES設定済みモデルはその値を使う",
+          "(model-a): 得意分野Aの説明" in _pdesc)
+
+    f.PROPOSERS = []
+    check("build_proposer_desc: 導入済みpersonaモデルが1つも無ければ空文字列",
+          f.build_proposer_desc() == "")
+
+    # --- _persona_str: 派生辞書MODEL_TO_PERSONA(PERSONA_MODELSではない)
+    #     ベースの整形/フォールバック。PERSONA_MODELSを差し替える際は
+    #     MODEL_TO_PERSONAも整合させて再構築する(でないと古い/不整合な
+    #     マッピングを特性化してしまう) ---
+    f.PERSONA_MODELS = {"Proposer X": "model-x"}
+    f.MODEL_TO_PERSONA = {v: k for k, v in f.PERSONA_MODELS.items()}
+    check("_persona_str: MODEL_TO_PERSONAにあれば'persona (model)'形式",
+          f._persona_str("model-x") == "Proposer X (model-x)")
+    check("_persona_str: MODEL_TO_PERSONAに無ければモデル名そのまま(str()化)",
+          f._persona_str("unknown-model") == "unknown-model")
+    check("_persona_str: 非文字列(int)モデルもstr()化されて返る",
+          f._persona_str(123) == "123")
+finally:
+    f.PERSONA_MODELS = _op_persona_models
+    f.PERSONA_IDENTITY = _op_persona_identity
+    f.PROPOSER_PROFILES = _op_proposer_profiles
+    f.PROPOSERS = _op_proposers_seam
+    f.MODEL_TO_PERSONA = _op_model_to_persona
+    f.PROPOSER_SYS = _op_proposer_sys
+
+check("proposer persona配線: テスト後にPERSONA_MODELSが復元されている",
+      f.PERSONA_MODELS == _op_persona_models)
+check("proposer persona配線: テスト後にPERSONA_IDENTITYが復元されている",
+      f.PERSONA_IDENTITY == _op_persona_identity)
+check("proposer persona配線: テスト後にPROPOSER_PROFILESが復元されている",
+      f.PROPOSER_PROFILES == _op_proposer_profiles)
+check("proposer persona配線: テスト後にPROPOSERSが復元されている",
+      f.PROPOSERS == _op_proposers_seam)
+check("proposer persona配線: テスト後にMODEL_TO_PERSONAが復元されている",
+      f.MODEL_TO_PERSONA == _op_model_to_persona)
+check("proposer persona配線: テスト後にPROPOSER_SYSが復元されている",
+      f.PROPOSER_SYS == _op_proposer_sys)
+
 # ---------- 精度ガードレール（code/proof を single→moa へ格上げ） ----------
 f.PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "phi4"]
 
