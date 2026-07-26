@@ -5594,6 +5594,211 @@ with _tempfile.TemporaryDirectory() as _ri_dir:
     check("_read_ipynb: cells=dictケースの結果に生JSONマーカーが含まれない",
           "cell_type" not in _ri_out_i and "source" not in _ri_out_i)
 
+# ---------- _read_ipynb: コードセルのstream出力(stdout/stderr)抽出 (2026-07-26) ----------
+# _read_ipynbは従来コードセルの'source'(入力コード)のみを抽出し、'outputs'配列
+# (実行結果)は完全に無視していた。データ分析notebookではprint(...)が出力する実際の
+# 数値・結果こそが質問への回答に直結する事実であることが多く、精度criticalな
+# RAG/--fileコンテキストからそれが黙って欠落していた。iteration 188はstream/
+# execute_result/display_data(text/plain)の全種類を一度に扱おうとして3回試みたが
+# 行き詰まり断念しており、本セクションはあえて"stream"(stdout/stderr)出力1種類のみに
+# 絞った縮小スコープの直接検証。'source'正規化(iteration 72)・cellの非dictスキップ
+# (iteration 72)・トップレベル構造ガード(iteration 113)は上のセクションで既に検証済みで
+# 本変更でも一切変更されていないため、ここではstream出力抽出そのものに焦点を絞る。
+# f.ask/urlopen/subprocessは一切呼ばない(すべてtempfile上のオフラインI/O)。
+with _tempfile.TemporaryDirectory() as _rio_dir:
+    _rio_root = _pathlib.Path(_rio_dir)
+
+    # (j) stream stdout出力(text: list[str])が```python フェンス直後にラベル付きで追加される
+    _rio_nb_j = {
+        "cells": [
+            {"cell_type": "code", "source": ["print('hello')"],
+             "outputs": [
+                 {"output_type": "stream", "name": "stdout", "text": ["hello\n"]},
+             ]},
+        ]
+    }
+    _rio_j = _rio_root / "j.ipynb"
+    _rio_j.write_text(json.dumps(_rio_nb_j), encoding="utf-8")
+    _rio_out_j = f._read_ipynb(_rio_j)
+    check("_read_ipynb: stream stdout(text=list[str])がフェンス直後にラベル付きで追加される",
+          _rio_out_j == "```python\nprint('hello')\n```"
+          "\n\n[Notebook stdout/stderr output]\nhello\n")
+
+    # (k) stream stdout出力(text: 単一str)も同様に抽出される
+    _rio_nb_k = {
+        "cells": [
+            {"cell_type": "code", "source": ["print('world')"],
+             "outputs": [
+                 {"output_type": "stream", "name": "stdout", "text": "world\n"},
+             ]},
+        ]
+    }
+    _rio_k = _rio_root / "k.ipynb"
+    _rio_k.write_text(json.dumps(_rio_nb_k), encoding="utf-8")
+    _rio_out_k = f._read_ipynb(_rio_k)
+    check("_read_ipynb: stream stdout(text=単一str)も同様に抽出される",
+          _rio_out_k == "```python\nprint('world')\n```"
+          "\n\n[Notebook stdout/stderr output]\nworld\n")
+
+    # (l) stream stderr出力も同様に抽出される(stdout限定ではない)
+    _rio_nb_l = {
+        "cells": [
+            {"cell_type": "code", "source": ["import sys; sys.stderr.write('oops')"],
+             "outputs": [
+                 {"output_type": "stream", "name": "stderr", "text": ["oops\n"]},
+             ]},
+        ]
+    }
+    _rio_l = _rio_root / "l.ipynb"
+    _rio_l.write_text(json.dumps(_rio_nb_l), encoding="utf-8")
+    _rio_out_l = f._read_ipynb(_rio_l)
+    check("_read_ipynb: stream stderr出力も同様に抽出される",
+          _rio_out_l == "```python\nimport sys; sys.stderr.write('oops')\n```"
+          "\n\n[Notebook stdout/stderr output]\noops\n")
+
+    # (m) outputsがtruthyな非list(整数)の場合: iteration 113のcells非list強制変換と
+    #     同じ作法(`or []`のtruthinessトリックには頼らない)で空へ倒し、例外を送出せず
+    #     コード自体の抽出は無傷のまま出力ブロックのみ省略される。
+    _rio_nb_m = {"cells": [{"cell_type": "code", "source": ["print(1)"], "outputs": 42}]}
+    _rio_m = _rio_root / "m.ipynb"
+    _rio_m.write_text(json.dumps(_rio_nb_m), encoding="utf-8")
+    _rio_out_m = f._read_ipynb(_rio_m)
+    check("_read_ipynb: outputsが非list(整数)でも例外を送出せずコード抽出のみ維持される",
+          _rio_out_m == "```python\nprint(1)\n```")
+
+    # (m2) outputsがtruthyな非list(dict)の場合も同様に空へ倒れる
+    _rio_nb_m2 = {"cells": [{"cell_type": "code", "source": ["print(1)"],
+                              "outputs": {"0": {"output_type": "stream", "text": ["x"]}}}]}
+    _rio_m2 = _rio_root / "m2.ipynb"
+    _rio_m2.write_text(json.dumps(_rio_nb_m2), encoding="utf-8")
+    _rio_out_m2 = f._read_ipynb(_rio_m2)
+    check("_read_ipynb: outputsが非list(dict)でも例外を送出せずコード抽出のみ維持される",
+          _rio_out_m2 == "```python\nprint(1)\n```")
+
+    # (m3) outputs=None(キーはあるが値がnull)の場合も同様に空へ倒れる
+    _rio_nb_m3 = {"cells": [{"cell_type": "code", "source": ["print(1)"], "outputs": None}]}
+    _rio_m3 = _rio_root / "m3.ipynb"
+    _rio_m3.write_text(json.dumps(_rio_nb_m3), encoding="utf-8")
+    _rio_out_m3 = f._read_ipynb(_rio_m3)
+    check("_read_ipynb: outputs=Noneでも例外を送出せずコード抽出のみ維持される",
+          _rio_out_m3 == "```python\nprint(1)\n```")
+
+    # (n) outputsリスト内に非dictエントリが混在する場合: そのエントリだけskipされ、
+    #     後続の正当なstream出力エントリは抽出される(iteration 72の非dictセルskipと
+    #     同じ「1件の破損で全体を道連れにしない」パターン)。
+    _rio_nb_n = {
+        "cells": [
+            {"cell_type": "code", "source": ["print(1)"],
+             "outputs": ["junk", {"output_type": "stream", "name": "stdout", "text": ["ok\n"]}]},
+        ]
+    }
+    _rio_n = _rio_root / "n.ipynb"
+    _rio_n.write_text(json.dumps(_rio_nb_n), encoding="utf-8")
+    _rio_out_n = f._read_ipynb(_rio_n)
+    check("_read_ipynb: outputs内の非dictエントリはskipされ後続の正当なstream出力は抽出される",
+          _rio_out_n == "```python\nprint(1)\n```"
+          "\n\n[Notebook stdout/stderr output]\nok\n")
+
+    # (o) stream 'text'のlistに非str要素が混入する場合: source正規化(iteration 72)と
+    #     全く同じパターンでstr要素のみjoinされる(42は無視されて'a'+'b'='ab')。
+    _rio_nb_o = {
+        "cells": [
+            {"cell_type": "code", "source": ["print(1)"],
+             "outputs": [{"output_type": "stream", "name": "stdout", "text": ["a", 42, "b"]}]},
+        ]
+    }
+    _rio_o = _rio_root / "o.ipynb"
+    _rio_o.write_text(json.dumps(_rio_nb_o), encoding="utf-8")
+    _rio_out_o = f._read_ipynb(_rio_o)
+    check("_read_ipynb: stream textのlist内の非str要素は無視されstr要素のみjoinされる",
+          _rio_out_o == "```python\nprint(1)\n```\n\n[Notebook stdout/stderr output]\nab")
+
+    # (o2) stream 'text'がstrでもlistでもない(整数)場合: 空文字へ正規化されblank後
+    #     strip判定でそのoutputエントリ自体がskipされる(例外は送出しない)。
+    _rio_nb_o2 = {
+        "cells": [
+            {"cell_type": "code", "source": ["print(1)"],
+             "outputs": [{"output_type": "stream", "name": "stdout", "text": 42}]},
+        ]
+    }
+    _rio_o2 = _rio_root / "o2.ipynb"
+    _rio_o2.write_text(json.dumps(_rio_nb_o2), encoding="utf-8")
+    _rio_out_o2 = f._read_ipynb(_rio_o2)
+    check("_read_ipynb: stream textが非str/非list(整数)でも例外を送出せずそのoutputはskipされる",
+          _rio_out_o2 == "```python\nprint(1)\n```")
+
+    # (o3) stream 'text'のlistが非str要素のみで構成される場合: join結果が空文字になり
+    #     blank後stripでそのoutputエントリがskipされる。
+    _rio_nb_o3 = {
+        "cells": [
+            {"cell_type": "code", "source": ["print(1)"],
+             "outputs": [{"output_type": "stream", "name": "stdout", "text": [42, None]}]},
+        ]
+    }
+    _rio_o3 = _rio_root / "o3.ipynb"
+    _rio_o3.write_text(json.dumps(_rio_nb_o3), encoding="utf-8")
+    _rio_out_o3 = f._read_ipynb(_rio_o3)
+    check("_read_ipynb: stream textのlistが非str要素のみの場合もそのoutputはskipされる",
+          _rio_out_o3 == "```python\nprint(1)\n```")
+
+    # (p) execute_result/display_data/errorのoutput_typeは本iterationでは対象外のまま
+    #     据え置かれ、その'data'辞書(base64画像等を含みうる)やtracebackが一切出力に
+    #     混入しないことを、判別可能なマーカー文字列で確認する。
+    _rio_nb_p = {
+        "cells": [
+            {"cell_type": "code", "source": ["1 + 1"],
+             "outputs": [
+                 {"output_type": "execute_result", "execution_count": 1,
+                  "data": {"text/plain": ["EXECRESULT_MARKER_42"]}, "metadata": {}},
+                 {"output_type": "display_data",
+                  "data": {"image/png": "QkFTRTY0X01BUktFUg=="}, "metadata": {}},
+                 {"output_type": "error", "ename": "ValueError", "evalue": "boom",
+                  "traceback": ["ERROR_TRACEBACK_MARKER"]},
+             ]},
+        ]
+    }
+    _rio_p = _rio_root / "p.ipynb"
+    _rio_p.write_text(json.dumps(_rio_nb_p), encoding="utf-8")
+    _rio_out_p = f._read_ipynb(_rio_p)
+    check("_read_ipynb: execute_result/display_data/errorは本iterationでは出力ブロックが追加されない",
+          _rio_out_p == "```python\n1 + 1\n```")
+    check("_read_ipynb: execute_resultの'data'内容(text/plain)は出力に混入しない",
+          "EXECRESULT_MARKER_42" not in _rio_out_p)
+    check("_read_ipynb: display_dataのbase64/'data'内容は出力に混入しない",
+          "QkFTRTY0X01BUktFUg==" not in _rio_out_p and "image/png" not in _rio_out_p)
+    check("_read_ipynb: errorのtracebackは出力に混入しない",
+          "ERROR_TRACEBACK_MARKER" not in _rio_out_p)
+
+    # (q) outputsが空listの場合: 出力ブロックは追加されずコード抽出のみ(回帰: 既存の
+    #     outputsキー自体が無いケースは上のセクション(a)/(e)等で既に検証済み)。
+    _rio_nb_q = {"cells": [{"cell_type": "code", "source": ["print(1)"], "outputs": []}]}
+    _rio_q = _rio_root / "q.ipynb"
+    _rio_q.write_text(json.dumps(_rio_nb_q), encoding="utf-8")
+    _rio_out_q = f._read_ipynb(_rio_q)
+    check("_read_ipynb: outputs=[]の場合は出力ブロックが追加されずコード抽出のみ",
+          _rio_out_q == "```python\nprint(1)\n```")
+
+    # (r) 暴走したprintループ相当の長大なstdoutは上限(4000文字)で切り詰められ、
+    #     切り詰めマーカーが付与される(num_ctx保護)。
+    _rio_long_text = "A" * 5000
+    _rio_nb_r = {
+        "cells": [
+            {"cell_type": "code", "source": ["print('x' * 5000)"],
+             "outputs": [{"output_type": "stream", "name": "stdout", "text": [_rio_long_text]}]},
+        ]
+    }
+    _rio_r = _rio_root / "r.ipynb"
+    _rio_r.write_text(json.dumps(_rio_nb_r), encoding="utf-8")
+    _rio_out_r = f._read_ipynb(_rio_r)
+    _rio_expected_r = (
+        "```python\nprint('x' * 5000)\n```"
+        "\n\n[Notebook stdout/stderr output]\n" + "A" * 4000 + "\n...(出力が長いため切り詰め)"
+    )
+    check("_read_ipynb: 長大なstdoutは上限4000文字+切り詰めマーカーで打ち切られる",
+          _rio_out_r == _rio_expected_r)
+    check("_read_ipynb: 切り詰め後の出力に元の全文(5000文字連続のA)は残らない",
+          _rio_long_text not in _rio_out_r)
+
 # ---------- _read_ipynb: cp932(Shift-JIS)デコードラダー (2026-07-25 / iter159) ----------
 # 発端: _read_ipynbは、iteration 94が_read_html/read_file_text汎用テキスト分岐に
 # 導入した_decode_text_bytes()のutf-8→cp932→replaceラダー(上のセクション、

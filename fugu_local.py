@@ -1420,6 +1420,12 @@ def _read_ipynb(path: Path) -> str:
         if not isinstance(cells, list):
             cells = []
         parts = []
+        # 2026-07-26: コードセルのstream出力(stdout/stderr)1件あたりの取り込み文字数
+        # 上限。RAG_CHUNK_CHARS/SEARCH_CONTEXT_CHARS等と同様、暴走したprintループ
+        # (例: 無限に近いループ内print)がnum_ctxを圧迫しないための保護であり、下の
+        # コードセル処理でのみ参照するため関数ローカルに留める（本iterationの変更を
+        # _read_ipynb関数の外へ一切出さないため）。
+        _IPYNB_STREAM_OUTPUT_CAP = 4000
         for cell in cells:
             # 2026-07-23 (iter72): nbformat仕様上 'source' はstrまたはlist[str]だが、
             # 壊れた/書きかけのnotebookでは source: null や、list内に非str要素
@@ -1447,6 +1453,58 @@ def _read_ipynb(path: Path) -> str:
                 continue
             if ct == "code":
                 parts.append(f"```python\n{src}\n```")
+                # 2026-07-26: 従来はコードセルの'source'(入力コード)のみを抽出し、
+                # 'outputs'配列(実行結果)は完全に無視していた。データ分析notebookでは
+                # print(...)が出力する実際の数値・結果こそが質問への回答に直結する
+                # 事実であることが多く、それが精度criticalなRAG/--fileコンテキストから
+                # 黙って欠落していた（精度優先・時間は気にしない、の方針に反する）。
+                # iteration 188はoutput_type: stream/execute_result/display_data
+                # (text/plain)の全種類を一度に扱おうとして3回試みたが行き詰まり
+                # 断念した。本iterationはあえてスコープを"stream"(stdout/stderr)
+                # 出力1種類のみへ絞り込む — 最も単純な単一形状・最も一般的・最も
+                # 価値が高いケースに限定することで、iter188の轍を踏まずに小さく
+                # 検証可能な変更に収める。execute_result/display_data/errorの各
+                # output_typeは本iterationでは意図的に対象外のまま据え置く（特に
+                # execute_result/display_dataの'data'辞書はbase64画像等の非テキスト
+                # MIMEを含みうるため、扱うなら別途の慎重な設計が必要）。'source'の
+                # 正規化(iteration 72: str->そのまま、list->str要素のみjoin、
+                # その他->空、空白のみはskip)と全く同じパターンを各streamの'text'
+                # にも適用し、cellがdictでない場合のskip(iteration 72)・cells/nbの
+                # トップレベル構造ガード(iteration 113: 非dictなnbは''へ、非listな
+                # cellsは[]へ)はこの変更でも一切変更しない。'outputs'自体がtruthyな
+                # 非list(例: 42)や、outputsの各要素が非dictの場合も、iteration 113の
+                # cells非list強制変換・iteration 72の非dictセルskipと同じ作法
+                # (`or []`のtruthinessトリックには頼らずisinstanceチェックで明示的に
+                # 空/skipへ倒す)を踏襲する。暴走したprintループが巨大な出力を吐いて
+                # num_ctxを圧迫しないよう、1コードセルあたりの出力文字数に上限を
+                # 設け、超過分は切り詰めマーカーを付けて明示する。
+                outputs = cell.get("outputs", [])
+                if not isinstance(outputs, list):
+                    outputs = []
+                stream_chunks = []
+                for out in outputs:
+                    if not isinstance(out, dict):
+                        continue
+                    if out.get("output_type") != "stream":
+                        continue
+                    raw_out_text = out.get("text", [])
+                    if isinstance(raw_out_text, str):
+                        out_text = raw_out_text
+                    elif isinstance(raw_out_text, list):
+                        out_text = "".join(t for t in raw_out_text if isinstance(t, str))
+                    else:
+                        out_text = ""
+                    if not out_text.strip():
+                        continue
+                    stream_chunks.append(out_text)
+                if stream_chunks:
+                    combined_out = "".join(stream_chunks)
+                    if len(combined_out) > _IPYNB_STREAM_OUTPUT_CAP:
+                        combined_out = (
+                            combined_out[:_IPYNB_STREAM_OUTPUT_CAP]
+                            + "\n...(出力が長いため切り詰め)"
+                        )
+                    parts.append(f"[Notebook stdout/stderr output]\n{combined_out}")
             elif ct == "markdown":
                 parts.append(src)
         return "\n\n".join(parts)
