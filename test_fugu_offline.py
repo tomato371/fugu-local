@@ -8631,6 +8631,91 @@ check("_read_excel: テスト後にsys.modulesの'openpyxl'エントリが元通
 check("_read_excel: テスト後にsys.modulesの'pandas'エントリが元通り解決可能(復元確認、iter88)",
       ("pandas" not in sys.modules) or (sys.modules["pandas"] is not None))
 
+# ---------- _read_excel: openpyxl.load_workbook が data_only=True/read_only=True で
+# 呼ばれることの直接固定 (2026-07-26) ----------
+# _read_excel(L1038)は openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+# を呼ぶ。data_only=True は精度に直結する既知の挙動固定であり、これは
+# 数式セル(例 "=SUM(A1:A10)")を持つワークブックに対して、openpyxlが
+# data_only=False(デフォルト)だと数式の"文字列そのもの"を返すのに対し、
+# data_only=True だとExcelが最後に保存した時点でキャッシュした"計算済みの値"
+# (例 12345)を返す、という違いを言う。_read_excelの抽出結果はread_file_text
+# 経由で--fileのプロポーザーコンテキストに、また_load_rag_chunks経由でRAG
+# コンテキストにそのまま混入するため、将来のリファクタでdata_only=Trueが
+# 落とされる(openpyxlのデフォルトはFalse)と、数式を含む財務/データ系
+# スプレッドシートで、計算済みの値の代わりに生の数式文字列がサイレントに
+# LLMへ渡ってしまう(精度優先・時間は気にしないの方針に反する重大な劣化)。
+# read_only=True も(iter82/88のコメント通り)意図した指定でありこれも併せて
+# 固定する。
+# grep上、data_only/read_only という語はこれまでこのテストファイル中の
+# コメントと、フェイクload_workbookラッパー(例: 直前のiter88の
+# _rxl3_fake_load_workbook_a/_e)にのみ出現しており、それらのラッパーは
+# 実処理へフォワードするだけでkwargs自体は一切assertしていなかった。
+# ここでは実openpyxlモジュールのload_workbook属性そのものを、
+# 「本物のload_workbookを呼びつつ(args, kwargs)を記録して結果をそのまま
+# 返すラッパー」でmonkeypatchし、_read_excelから実際に渡されたkwargsを
+# 直接検証する(iter35がgotcha#1/#2の/api/chat・num_ctxピン留めを呼び出し
+# パラメータのassertで固定したのと同じ手法)。openpyxlが利用できない環境
+# でも全体PASSが崩れないよう、importの可否をtry/exceptで検出しガードする
+# (iter82/84/88と同じスタイル)。
+try:
+    import openpyxl as _rxldo_openpyxl
+    _RXLDO_HAS_OPENPYXL = True
+except ImportError:
+    _RXLDO_HAS_OPENPYXL = False
+
+if _RXLDO_HAS_OPENPYXL:
+    import pathlib as _rxldo_pathlib
+    import tempfile as _rxldo_tempfile
+
+    with _rxldo_tempfile.TemporaryDirectory() as _rxldo_dir:
+        _rxldo_path = _rxldo_pathlib.Path(_rxldo_dir) / "data_only_check.xlsx"
+        _rxldo_wb = _rxldo_openpyxl.Workbook()
+        _rxldo_ws = _rxldo_wb.active
+        _rxldo_ws.title = "Sheet1"
+        _rxldo_ws.append(["a", "b"])
+        _rxldo_ws.append([1, 2])
+        _rxldo_wb.save(str(_rxldo_path))
+
+        _rxldo_calls = []
+        _rxldo_orig_load_workbook = _rxldo_openpyxl.load_workbook
+
+        def _rxldo_recording_load_workbook(*args, **kwargs):
+            """本物のopenpyxl.load_workbookを呼びつつ、_read_excelが渡した
+            (args, kwargs)をそのまま記録するラッパー(呼び出しの転送のみで
+            戻り値・副作用は本物と同一、抽出処理は一切変えない)。"""
+            _rxldo_calls.append((args, kwargs))
+            return _rxldo_orig_load_workbook(*args, **kwargs)
+
+        _rxldo_openpyxl.load_workbook = _rxldo_recording_load_workbook
+        try:
+            _rxldo_out = f._read_excel(_rxldo_path)
+        finally:
+            _rxldo_openpyxl.load_workbook = _rxldo_orig_load_workbook
+
+        check("_read_excel: openpyxl.load_workbookが正確に1回呼ばれる"
+              "(data_only/read_only kwargs検証用フィクスチャ)",
+              len(_rxldo_calls) == 1)
+        _rxldo_kwargs = _rxldo_calls[0][1] if _rxldo_calls else {}
+        check("_read_excel: openpyxl.load_workbook呼び出し時にdata_only=Trueが渡される"
+              "(数式セルの計算済み値をRAG/--fileコンテキストへ渡すために必須。"
+              "data_only=Falseだと数式文字列そのものが漏れる)",
+              _rxldo_kwargs.get("data_only") is True)
+        check("_read_excel: openpyxl.load_workbook呼び出し時にread_only=Trueが渡される",
+              _rxldo_kwargs.get("read_only") is True)
+        check("_read_excel: monkeypatch後もopenpyxl成功パスの抽出結果は従来通り"
+              "(kwargs検証は抽出処理に影響しない)",
+              _rxldo_out == "[Sheet: Sheet1]\na\tb\n1\t2")
+        check("_read_excel: テスト後にopenpyxl.load_workbookが元の関数へ復元されている"
+              "(post-restore identity確認)",
+              _rxldo_openpyxl.load_workbook is _rxldo_orig_load_workbook)
+else:
+    print("   [SKIP] openpyxl未インストールのため_read_excel data_only/read_only"
+          " kwargs検証テストをスキップ")
+
+check("_read_excel: テスト後にsys.modulesの'openpyxl'エントリが元通り解決可能"
+      "(復元確認、data_only/read_only kwargs検証)",
+      ("openpyxl" not in sys.modules) or (sys.modules["openpyxl"] is not None))
+
 # ---------- _tokenize / _score_chunk: 現行挙動の直接検証 ----------
 # 2026-07-26: 以前は非ASCII連続列を丸ごと1トークンにしていたため、iter38では
 # _tokenize('PINNについて') == {'pinn','について'} として「1トークンに固定化
