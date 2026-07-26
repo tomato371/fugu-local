@@ -4811,8 +4811,20 @@ finally:
     f.get_proposals = _orig_get_proposals
     f.aggregate = _orig_aggregate
 
-check("fugu_answer: 本文の結論と投票結果が食い違う場合は明示注記を付す",
-      "(自己一貫性投票による最終解答: 5)" in _ans_a)
+# 2026-07-27 (iteration 208、iteration 19 の本ケースを新形式へ更新): bench_fugu の
+# 主要config 'fugu' は grade_item に answer_value=None を渡し、fugu_answer の戻り値
+# 「テキスト」から extract_final_answer で再抽出して採点する。旧・素のプレーンテキスト
+# 注記「(自己一貫性投票による最終解答: 5)」は「答え/正解/answer」宣言にも mcq 単独行にも
+# 一致せず、extract_boxed が last-balanced-box-wins（末尾に一番近い、閉じている \boxed{}を
+# 採用、iteration 12/25）である以上、本文側に残った古い \boxed{7} が再抽出で拾われ続けて
+# 投票結果(5)とずれたままになっていた。注記を \boxed{5} として付す新形式に変わったため、
+# 単なる文字列一致だけでなく「本物の extract_final_answer で読み戻すと投票結果と一致する」
+# ことまで検証する（この往復確認自体が fugu_local.py 側の新しい契約）。
+check("fugu_answer: 本文の結論と投票結果が食い違う場合は明示注記(\\boxed{}化)を付す",
+      "(自己一貫性投票による最終解答: \\boxed{5})" in _ans_a)
+check("fugu_answer: 食い違いケースは注記をboxed化した結果、本文から再抽出しても投票結果(5)に一致する"
+      "(bench_fuguのgrade_itemがテキストから再抽出する経路の再現、gotcha#7)",
+      f.extract_final_answer(_ans_a, "math") == "5")
 check("fugu_answer: 食い違いケースでも元の本文はそのまま含まれる",
       "裁定により \\boxed{7} に差し替え。" in _ans_a)
 check("fugu_answer: 食い違いケースはSC経路で返りMoAへ到達しない", not _moa_touched_a)
@@ -4909,6 +4921,156 @@ check("fugu_answer: SCがNoneならMoA(get_proposals/aggregate)へフォール�
       _ans_c == _MOA_SENTINEL)
 check("fugu_answer: フォールバック時は実際にget_proposals/aggregateが呼ばれる",
       len(_get_proposals_calls_c) >= 1 and len(_aggregate_calls_c) >= 1)
+
+# --- Case D: MCQ value-boxed代表文 (stuck iteration 207 のデッキレベル救済) ---
+# 代表文が \boxed{16} のような値(選択肢文字でない)を残したまま投票結果は 'B' というケース。
+# 旧・プレーンテキスト注記では body 側の \boxed{16} が extract_boxed の
+# last-balanced-box-wins で拾われ続け(16はmcqのA-E正規表現に一致せずNoneへ)、
+# 再抽出結果が投票結果とずれたまま(またはNoneのまま)だった。新形式は注記自体を
+# \boxed{B} として末尾に置くため、再抽出は必ず 'B' に一致する。
+_moa_touched_d = []
+_get_proposals_never_d, _aggregate_never_d = _make_moa_forbidden(_moa_touched_d)
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "B",
+        "text": "各選択肢を検討した結果、\\boxed{16} が最も妥当な数値に見える。",
+        "votes": {"B": 2, "16": 1},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_d
+    f.aggregate = _aggregate_never_d
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_d = f.fugu_answer("次のうち正しい数値の個数は?", plan=_validated_plan("mcq"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer: MCQ value-boxed代表文(\\boxed{16} vs 勝者B)でも注記が付く",
+      "(自己一貫性投票による最終解答: \\boxed{B})" in _ans_d)
+check("fugu_answer: MCQ value-boxed代表文でも本文から再抽出するとBに一致する"
+      "(stuck iteration 207が per-sample で個別救済しようとしていたMCQ value-box化けの、"
+      "デッキレベルでの根治)",
+      f.extract_final_answer(_ans_d, "mcq") == "B")
+check("fugu_answer: MCQ value-boxed代表文ケースもMoAへ到達しない", not _moa_touched_d)
+
+# --- Case E: body_ans が None (代表文にboxedも宣言もない、PoT専業の標準出力末尾等) → math ---
+# extract_final_answer の最終フォールバック(文中最後の数値)にも一致しない、数字を含まない
+# 代表文で body_ans=None を作り、それでも注記のboxed化により再抽出が投票結果に一致することを
+# 確認する。
+_moa_touched_e1 = []
+_get_proposals_never_e1, _aggregate_never_e1 = _make_moa_forbidden(_moa_touched_e1)
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "3",
+        "text": "実行が完了しましたが、結論となる数値は本文中に明示されていません。",
+        "votes": {"3": 2, "4": 1},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_e1
+    f.aggregate = _aggregate_never_e1
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_e1 = f.fugu_answer("PoTで解く問題?", plan=_validated_plan("math"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer(math): body_ansがNone(boxedも宣言も数値もない代表文)でも注記が付く",
+      "(自己一貫性投票による最終解答: \\boxed{3})" in _ans_e1)
+check("fugu_answer(math): body_ans=Noneケースでも再抽出は投票結果(3)に一致する",
+      f.extract_final_answer(_ans_e1, "math") == "3")
+check("fugu_answer(math): body_ans=NoneケースもMoAへ到達しない", not _moa_touched_e1)
+
+# --- Case F: body_ans が None → mcq (代表文にboxedもA-E宣言もない) ---
+_moa_touched_e2 = []
+_get_proposals_never_e2, _aggregate_never_e2 = _make_moa_forbidden(_moa_touched_e2)
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "B",
+        "text": "各選択肢を比較検討しましたが、結論はこの本文には含まれていません。",
+        "votes": {"B": 2, "C": 1},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_e2
+    f.aggregate = _aggregate_never_e2
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_e2 = f.fugu_answer("次のうち正しいものは?", plan=_validated_plan("mcq"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer(mcq): body_ansがNone(boxedもA-E宣言もない代表文)でも注記が付く",
+      "(自己一貫性投票による最終解答: \\boxed{B})" in _ans_e2)
+check("fugu_answer(mcq): body_ans=Noneケースでも再抽出は投票結果(B)に一致する",
+      f.extract_final_answer(_ans_e2, "mcq") == "B")
+check("fugu_answer(mcq): body_ans=NoneケースもMoAへ到達しない", not _moa_touched_e2)
+
+# --- Case G: 病的な答え(波括弧の対応が壊れている) → boxed化した注記の往復確認が失敗し、
+#     従来の素のプレーンテキスト注記へフォールバックする(クラッシュしない・注記は消えない) ---
+_moa_touched_g = []
+_get_proposals_never_g, _aggregate_never_g = _make_moa_forbidden(_moa_touched_g)
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "}{",
+        "text": "本文には結論となる記号は含まれていません。",
+        "votes": {"}{": 2},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_g
+    f.aggregate = _aggregate_never_g
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_g = f.fugu_answer("壊れた答えのテスト", plan=_validated_plan("math"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer: 病的な答え('}{')でも例外を送出せず値を返す(クラッシュしない)",
+      _ans_g is not None)
+check("fugu_answer: 病的な答えでは\\boxed{}化した注記(壊れたbox)は往復確認に失敗し出力に混入しない",
+      "\\boxed{}{}" not in _ans_g)
+check("fugu_answer: 病的な答えでは従来の素のプレーンテキスト注記へフォールバックする"
+      "(注記自体は消えない)",
+      "(自己一貫性投票による最終解答: }{)" in _ans_g)
+check("fugu_answer: 病的な答えケースもMoAへ到達しない", not _moa_touched_g)
+
+# --- Case H: バランスした内側の波括弧を含む答え(例 '{1,2}') は extract_boxed の
+#     深さ走査を通じて正しく往復する ---
+_moa_touched_h = []
+_get_proposals_never_h, _aggregate_never_h = _make_moa_forbidden(_moa_touched_h)
+try:
+    f.SC_ENABLED = True
+    f.solve_verifiable = lambda question, task_type, history=None: {
+        "answer": "{1,2}",
+        "text": "解の組は本文中には明示されていません。",
+        "votes": {"{1,2}": 3},
+        "n_samples": 3,
+    }
+    f.get_proposals = _get_proposals_never_h
+    f.aggregate = _aggregate_never_h
+    with contextlib.redirect_stdout(io.StringIO()):
+        _ans_h = f.fugu_answer("解の集合を求めよ", plan=_validated_plan("math"))
+finally:
+    f.SC_ENABLED = _orig_sc_enabled
+    f.solve_verifiable = _orig_solve_verifiable
+    f.get_proposals = _orig_get_proposals
+    f.aggregate = _orig_aggregate
+
+check("fugu_answer: バランスした内側の波括弧を含む答え({1,2})でも注記が付く",
+      "(自己一貫性投票による最終解答: \\boxed{{1,2}})" in _ans_h)
+check("fugu_answer: {1,2}のような答えもextract_boxedの深さ走査を通じて正しく往復する",
+      f.extract_final_answer(_ans_h, "math") == "{1,2}")
+check("fugu_answer: バランス波括弧ケースもMoAへ到達しない", not _moa_touched_h)
 
 # ---------- fugu_answer MoAループ: 次ラウンドの reference は aggregate 出力の think を
 # 持ち越さない (2026-07-24) ----------

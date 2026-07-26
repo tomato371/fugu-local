@@ -4339,7 +4339,37 @@ def fugu_answer(question, plan=None, history=None):
             # 裁定で答えが差し替わった場合など、本文の結論と投票結果がずれたら明示する
             body_ans = extract_final_answer(txt, plan["task_type"])
             if not (body_ans and answers_equivalent(body_ans, res["answer"])):
-                txt += f"\n\n(自己一貫性投票による最終解答: {res['answer']})"
+                # 2026-07-27: bench_fugu の主要config 'fugu'（run_fugu）は grade_item に
+                # answer_value=None を渡し、fugu_answer の戻り値「テキスト」から
+                # extract_final_answer で答えを再抽出して採点する（res["answer"] は
+                # 直接見ない）。これまでの素のプレーンテキスト注記
+                # 「(自己一貫性投票による最終解答: X)」は「答え/正解/answer」宣言の
+                # 連結詞パターンにも mcq の単独行パターンにも一致せず無視される一方、
+                # extract_boxed は「末尾に一番近い、閉じている \boxed{}」を採用する
+                # last-balanced-box-wins（本関数の上、iteration 12/25 のコメント参照 —
+                # この修正はその順序に依存するカップリングである）。そのため本文側に
+                # 残った古い \boxed{16} 等の方が拾われ続け、PoT専業の代表文・
+                # 空/抽出不能な代表文・\boxed{16} vs 勝者 'B' のような value-boxed MCQ
+                # 代表文で再抽出結果が投票結果とずれていた（stuck iteration 207 が
+                # per-sample で個別に救おうとしていた MCQ value-box 化けの、デッキ
+                # レベルでの根治でもある）。注記自体を \boxed{} で包み、last-wins の
+                # 並びを利用して注記側を「最後の、閉じた box」にすることで、再抽出が
+                # 必ず投票結果と一致するようにする（iteration 19 がこの分岐のテスト
+                # カバレッジ、gotcha #7: 自己一貫性投票は精度優先・時間は気にしない の
+                # 中核パスであり、ここでの再抽出ずれはその投票結果を静かに握りつぶす）。
+                # ただし答えの値自体が波括弧の対応が崩れた病的な文字列（例 "}{"）だと
+                # \boxed{} 化した注記そのものが壊れうるため、クラッシュさせず・注記を
+                # 消してもしまわないよう、往復確認（extract_final_answer で読み戻して
+                # answers_equivalent か）に失敗した場合だけ従来の素のプレーンテキスト
+                # 注記へフォールバックする。
+                boxed_note = f"\n\n(自己一貫性投票による最終解答: \\boxed{{{res['answer']}}})"
+                plain_note = f"\n\n(自己一貫性投票による最終解答: {res['answer']})"
+                try:
+                    roundtrip = extract_final_answer(txt + boxed_note, plan["task_type"])
+                    ok = bool(roundtrip) and answers_equivalent(roundtrip, res["answer"])
+                except Exception:
+                    ok = False
+                txt += boxed_note if ok else plain_note
             return txt
         print("   [SC] 投票不成立 → 通常の合議へフォールバック")
 
