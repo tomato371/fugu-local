@@ -4491,19 +4491,26 @@ finally:
     urllib.request.urlopen = _orig_urlopen
     f.time.sleep = _orig_sleep
 
-# --- シナリオ4: 通常の一過性失敗(thinking非対応ではない500が2連続)は従来通り
-#     ちょうど2回試行してsleep(2)を1回だけ挟み__ERROR__を返す(一過性リトライ予算は不変) ---
+# --- シナリオ4: 通常の一過性失敗(thinking非対応ではない500が連続)の試行回数固定。
+#     2026-07-27: このチェックは元々(iteration 9で構造修正時も意図的に維持、iteration 35で
+#     「ちょうど2回」として明示的に固定)「500,500 の2連続でちょうど2回試行して__ERROR__」を
+#     検証していた。本イテレーションでリトライ予算自体を固定2回からASK_RETRY_ATTEMPTS回の
+#     バックオフへ意図的に拡張したため、ここではその2回固定チェックを削除するのではなく、
+#     f.ASK_RETRY_ATTEMPTS駆動の同種チェック(「持続的な失敗はASK_RETRY_ATTEMPTS回で
+#     ちょうど尽きて__ERROR__になる」)に置き換える。新しい予算そのものの詳細(バックオフ秒数の
+#     完全一致・3回目成功で__ERROR__を返さなくなる回帰確認)は後段の
+#     「ASK_RETRY_ATTEMPTS/ASK_RETRY_BACKOFF」節でさらに直接検証する。 ---
 _calls4 = []
 try:
     f.time.sleep = lambda s: None
     urllib.request.urlopen = _make_fake_urlopen(
-        [("error", 500, "internal error"),
-         ("error", 500, "internal error")],
+        [("error", 500, "internal error")] * f.ASK_RETRY_ATTEMPTS,
         _calls4,
     )
     _r4 = f.ask("m1", [{"role": "user", "content": "hi"}], 0.7, think=True)
-    check("ask: 通常の一過性失敗(500,500)はちょうど2回試行して__ERROR__",
-          len(_calls4) == 2 and str(_r4).startswith("__ERROR__"))
+    check("ask: 通常の一過性失敗(500連続)はちょうどASK_RETRY_ATTEMPTS回試行して__ERROR__"
+          "(旧: iteration9/35が固定していた「ちょうど2回」を本イテレーションで意図的に拡張)",
+          len(_calls4) == f.ASK_RETRY_ATTEMPTS and str(_r4).startswith("__ERROR__"))
 finally:
     urllib.request.urlopen = _orig_urlopen
     f.time.sleep = _orig_sleep
@@ -4616,6 +4623,125 @@ try:
           _final_call8["full_url"].endswith("/api/chat") and "/v1" not in _final_call8["full_url"])
     check("ask: think-strip再送の最終リクエストはthinkキーが除去されている",
           "think" not in _final_call8["payload"])
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
+# ---------- ask(): ASK_RETRY_ATTEMPTS / ASK_RETRY_BACKOFF (2026-07-27) ----------
+# 一過性失敗(HTTP 500等)のリトライ予算を固定2回・sleep(2)固定から、有界な指数
+# バックオフ(ASK_RETRY_ATTEMPTS回・ASK_RETRY_BACKOFF秒間隔)へ拡張したことの直接検証。
+# 背景はfugu_local.py側のASK_RETRY_ATTEMPTS/ASK_RETRY_BACKOFF定義直前のコメント、
+# および直前の「シナリオ4」の更新コメントを参照。ここでは
+# time.sleepに渡された実際の秒数もモックで記録し、バックオフの値そのものを固定する。
+
+
+def _make_fake_sleep(durations_log):
+    """f.time.sleep をモックして、実際に待たずに呼び出し秒数だけ記録する。"""
+
+    def _fake_sleep(seconds):
+        durations_log.append(seconds)
+
+    return _fake_sleep
+
+
+def _make_fake_urlopen_urlerror(n_failures, ok_content, calls_log):
+    """先頭n_failures回は接続レベルのurllib.error.URLError(HTTPErrorではない)を送出し、
+    その後は成功する urlopen モック。(c) 非HTTPErrorの一過性失敗の回帰確認用。"""
+    state = {"i": 0}
+
+    def _fake_urlopen(req, timeout=None):
+        i = state["i"]
+        state["i"] += 1
+        calls_log.append(json.loads(req.data.decode("utf-8")))
+        if i < n_failures:
+            raise urllib.error.URLError("connection refused (mock, model still loading)")
+        return _FakeHTTPResponse(
+            json.dumps({"message": {"content": ok_content}}).encode("utf-8"))
+
+    return _fake_urlopen
+
+
+# (a) 持続的な500 -> ちょうどASK_RETRY_ATTEMPTS回のurlopen呼び出し。記録されたsleep秒数は
+#     ASK_RETRY_BACKOFFとそのまま完全一致(最終試行後はsleepしない = 長さASK_RETRY_ATTEMPTS-1)。
+#     戻り値は__ERROR__のまま。
+_calls_a = []
+_sleeps_a = []
+try:
+    f.time.sleep = _make_fake_sleep(_sleeps_a)
+    urllib.request.urlopen = _make_fake_urlopen(
+        [("error", 500, "internal error, model loading")] * f.ASK_RETRY_ATTEMPTS,
+        _calls_a,
+    )
+    _ra = f.ask("m1", [{"role": "user", "content": "hi"}], 0.7, think=True)
+    check("ask(a): 持続的な500はちょうどASK_RETRY_ATTEMPTS回のurlopen呼び出しで尽きる",
+          len(_calls_a) == f.ASK_RETRY_ATTEMPTS)
+    check("ask(a): 記録されたsleep秒数はASK_RETRY_BACKOFFと完全一致する(最終試行後はsleepなし)",
+          _sleeps_a == list(f.ASK_RETRY_BACKOFF))
+    check("ask(a): 持続的な500は最終的に__ERROR__を返す", str(_ra).startswith("__ERROR__"))
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
+# (b) 500,500の後、3回目の試行で成功 -> 実コンテンツを返す。
+#     重要: この正確なシナリオは本イテレーション以前(固定2回予算)では3回目のリクエストが
+#     一切送信されず__ERROR__になっていた。ASK_RETRY_ATTEMPTS>=3への拡張がなければ
+#     このテストは失敗する(=退行の直接検出)。
+_calls_b = []
+try:
+    f.time.sleep = lambda s: None
+    urllib.request.urlopen = _make_fake_urlopen(
+        [("error", 500, "internal error, model loading"),
+         ("error", 500, "internal error, model loading"),
+         ("ok", "recovered on third attempt")],
+        _calls_b,
+    )
+    _rb = f.ask("m1", [{"role": "user", "content": "hi"}], 0.7, think=True)
+    check("ask(b,回帰): 500,500の後3回目で成功すれば実コンテンツを返す"
+          "(本イテレーション以前は__ERROR__だったシナリオ)",
+          _rb == "recovered on third attempt")
+    check("ask(b): 3回目成功はちょうど3回のurlopen呼び出しで達成される(4回目は発生しない)",
+          len(_calls_b) == 3)
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
+# (c) 接続レベルのURLError(HTTPErrorではない、例: モデルロード中の接続拒否)も
+#     同じ試行回数・バックオフ秒数の予算に従う。
+_calls_c = []
+_sleeps_c = []
+try:
+    f.time.sleep = _make_fake_sleep(_sleeps_c)
+    urllib.request.urlopen = _make_fake_urlopen_urlerror(2, "recovered after URLError", _calls_c)
+    _rc = f.ask("m1", [{"role": "user", "content": "hi"}], 0.7, think=True)
+    check("ask(c): 接続レベルのURLError(非HTTPError)も同じ予算に従い最終的に成功する",
+          _rc == "recovered after URLError")
+    check("ask(c): URLErrorが2回続いた場合の記録sleep秒数はASK_RETRY_BACKOFFの先頭2要素と一致する",
+          _sleeps_c == list(f.ASK_RETRY_BACKOFF[:2]))
+    check("ask(c): URLError回復はちょうど3回のurlopen呼び出しで達成される",
+          len(_calls_c) == 3)
+finally:
+    urllib.request.urlopen = _orig_urlopen
+    f.time.sleep = _orig_sleep
+
+# (d) 持続的な500からASK_RETRY_ATTEMPTS回目にようやく成功する場合でも、初回から最終試行まで
+#     一貫して /api/chat を叩き(gotcha#1)、options.num_ctxがピン留めされ続ける(gotcha#2)こと。
+_calls_d = []
+try:
+    f.time.sleep = lambda s: None
+    urllib.request.urlopen = _make_fake_urlopen_url(
+        [("error", 500, "internal error, model loading")] * (f.ASK_RETRY_ATTEMPTS - 1)
+        + [("ok", "final pinned answer")],
+        _calls_d,
+    )
+    _rd = f.ask("gpt-oss:20b", [{"role": "user", "content": "hi"}], 0.7)
+    _expected_ctx_d = f.model_cfg("gpt-oss:20b", "num_ctx", f.MODEL_NUM_CTX)
+    check("ask(d): 全ASK_RETRY_ATTEMPTS回の試行すべてで/api/chatを維持する(gotcha#1、/v1は使わない)",
+          len(_calls_d) == f.ASK_RETRY_ATTEMPTS and
+          all(c["full_url"].endswith("/api/chat") and "/v1" not in c["full_url"]
+              for c in _calls_d))
+    check("ask(d): 全ASK_RETRY_ATTEMPTS回の試行すべてでoptions.num_ctxがピン留めされ続ける(gotcha#2)",
+          all(c["payload"].get("options", {}).get("num_ctx") == _expected_ctx_d for c in _calls_d))
+    check("ask(d): 最終試行で成功すれば実コンテンツを返す", _rd == "final pinned answer")
 finally:
     urllib.request.urlopen = _orig_urlopen
     f.time.sleep = _orig_sleep

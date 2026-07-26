@@ -2045,12 +2045,34 @@ def resolve_models():
 # 推論ヘルパ
 # ==================================================
 
+# 2026-07-27: ask() の一過性失敗(HTTP 500等)リトライ予算を、固定2回・sleep(2)固定から
+# 有界な指数バックオフに拡張する。
+# 背景: このマシンは OLLAMA_MAX_LOADED_MODELS=1 (gotcha#5, GPUが8GB1枚のため)であり、
+# SCバッチ境界・MoAパネル切替・arbiter呼び出しのたびに13~23GBのモデルをNVMeから
+# 再ロードする。ask()自身のコメントが述べる「ロード直後の一過性500」が起きる
+# windowは、この再ロード時間そのものであり2秒よりずっと広い。
+# 旧予算(for attempt in (1, 2) と sleep(2)固定)は、iteration 9
+# (145f285: think-strip再送がforループ境界で握り潰される別バグを修正した際も
+# 「2回」の予算自体は意図的に変更しなかった)と iteration 35 (gotcha#1/#2の
+# /api/chat・num_ctxピン留めのテスト整備と合わせて「ちょうど2回」をテストで
+# 明示的に固定した)の2回にわたって、意図してそのまま据え置かれてきた値である。
+# しかし、1回の再試行で救えなかった失敗は __ERROR__ として上位へ返り、
+# _sc_sample は answer=None として扱うため、main_cot_count() の SC_MAX 投票予算
+# (gotcha#7: 自己一貫性投票は数学/選択式問題の精度に直結する経路)が1票分
+# 永続的に目減りする。MoA提案者の脱落・arbiterのフォールバックも同根。
+# 精度優先・時間は気にしない方針の下、再ロードwindowを覆うだけ有界に広げるのは
+# 純粋に精度側にプラスなので、ここを拡張する。
+ASK_RETRY_ATTEMPTS = 4        # 旧: 固定2回 (iteration 9 / 35 が意図的にテストで固定していた値)
+ASK_RETRY_BACKOFF = (2, 5, 10)  # 各要素はその回の失敗直後に待つ秒数。len == ASK_RETRY_ATTEMPTS - 1
+
 
 def ask(model, messages, temperature, think=None, fmt=None, label=None, num_predict=None,
         num_ctx=None):
     """Ollama native /api/chat を叩く。num_ctx を必ず options で渡して context を安全域に固定する
     （/v1 互換エンドポイントは num_ctx を無視するため使わない）。失敗時は __ERROR__: を返す。
-    一過性の失敗(HTTP 500 等)には 1 回だけ再試行する。
+    一過性の失敗(HTTP 500 等)には ASK_RETRY_ATTEMPTS 回まで、ASK_RETRY_BACKOFF の間隔で
+    再試行する(2026-07-27: 固定2回・sleep(2)固定から有界バックオフへ拡張。詳細はモジュール
+    冒頭の ASK_RETRY_ATTEMPTS/ASK_RETRY_BACKOFF 付近のコメントを参照)。
     num_predict: 生成トークン上限（None=無制限）。思考モデルの暴走保険として役割別に渡す。
     num_ctx: コンテキスト長の明示指定。None なら MODEL_CONFIG > MODEL_NUM_CTX の順で解決。
       「必ず明示 pin する」不変条件は維持（未指定だと Ollama がモデル最大を確保して 8GB VRAM で
@@ -2106,7 +2128,7 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
                       "(no content was generated)")
         return result
 
-    for attempt in (1, 2):
+    for attempt in range(1, ASK_RETRY_ATTEMPTS + 1):
         try:
             out = _do_call(req)
             break
@@ -2142,12 +2164,13 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
                     out = f"__ERROR__: {e2}"
                 break  # think は pop済みでこの分岐は再発し得ないため、ここで確定終了
             out = f"__ERROR__: {e} {err_body}"
-            if attempt == 1:
-                time.sleep(2)
+            if attempt < ASK_RETRY_ATTEMPTS:
+                time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
         except Exception as e:
             out = f"__ERROR__: {e}"
-            if attempt == 1:
-                time.sleep(2)  # 一過性の失敗(ロード直後の500等)向け。2回目も失敗なら諦める
+            if attempt < ASK_RETRY_ATTEMPTS:
+                # 一過性の失敗(ロード直後の500等)向け。ASK_RETRY_ATTEMPTS 回失敗したら諦める
+                time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
     if SHOW_TIMING:
         _TIMINGS.append((label or "?", model, round(time.time() - t0, 1)))
     return out
