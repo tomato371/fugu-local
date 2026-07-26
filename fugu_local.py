@@ -4552,7 +4552,16 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
             (".pptx", ".ppt"))) else None
         deck = build_pptx(question, final, pptx_out)
         final = text_answer + f"\n\n---\n## 生成した PowerPoint\n- 保存先: {deck}"
-        out_file = None  # 保存はここで完結（下の汎用保存は行わない）
+        # 2026-07-26: out_file を無条件に None化すると、--out が .pptx/.ppt 以外
+        # （例: notes.md）の場合に pptx_out は None のまま渡され build_pptx は
+        # 既定の PPTX_OUT_DIR に保存する一方、ユーザーが明示指定した --out 先への
+        # 保存は下の汎用 _save_answer_to_file がスキップされて silently 消えて
+        # いた（iteration 186 で表面化した repl 経路の --out 取りこぼしと同種）。
+        # ここは pptx_out が実際に消費された（＝out_file が .pptx/.ppt だった）
+        # 場合のみ None化し、それ以外は out_file を残して下の汎用保存に委ね、
+        # 高コストな MoA 回答を保存ステップで失わない（iteration 41-47/80と同種の原則）。
+        if pptx_out is not None:
+            out_file = None  # 保存はここで完結（下の汎用保存は行わない）
 
     # --- 経路3: イラスト付き回答（本文＋回答内容から画像生成）---
     elif (plan.get("use_image_generation") and not plan.get("image_only")

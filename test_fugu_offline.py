@@ -11568,6 +11568,161 @@ check("history: SESSION_SAVE はテスト後に既定値へ復元されている
 check("history: MAX_HISTORY_TURNS_SAVED はテスト後に既定値へ復元されている",
       f.MAX_HISTORY_TURNS_SAVED == _orig_max_hist_turns_saved)
 
+# ---------- ask_fugu 経路2(PPTX): out_file が .pptx/.ppt 以外の場合に汎用保存へ
+# フォールバックすることを検証 (2026-07-26) ----------
+# 2026-07-26: 経路2(make_pptx)は build_pptx 呼び出し後に out_file を無条件で
+# None化していた(旧実装)。--out が .pptx/.ppt 以外(例: notes.md)の場合でも
+# pptx_out は最初から None しか build_pptx に渡らず(=既定のPPTX_OUT_DIRへ保存)、
+# ユーザーが明示指定した --out 先には何も保存されない一方、下の汎用
+# _save_answer_to_file も out_file=None化により実行されず、コストの高いMoA回答が
+# どこにも保存されずに消えていた。iteration 186 で表面化した repl 経路の --out
+# 取りこぼしバグと同種であり、「保存ステップで計算済みの回答を失わない」という
+# iteration 41-47/80 の原則にも反する。修正は pptx_out が実際に消費された
+# (=out_file が .pptx/.ppt だった)場合のみ out_file を None化するように変更し、
+# それ以外は out_file を残して下の汎用保存に委ねるのみ。pptx_out の計算・
+# build_pptx 呼び出し・final の構築(デッキノート付与)・iteration 73 の
+# _HISTORY 分離(クリーンな text_answer のみ積む)はいずれも不変。
+# setup/conduct/fugu_answer/build_pptx/notify_slack/save_history_file/
+# _save_answer_to_file をすべてモックしており、実際の Ollama・ネットワーク・
+# python-pptx バックエンド呼び出しは一切発生しない。
+_orig_af4_hist = list(f._HISTORY)
+_orig_af4_setup = f.setup
+_orig_af4_conduct = f.conduct
+_orig_af4_fugu_answer = f.fugu_answer
+_orig_af4_build_pptx = f.build_pptx
+_orig_af4_notify = f.notify_slack
+_orig_af4_save_hist = f.save_history_file
+_orig_af4_save_file = f._save_answer_to_file
+
+try:
+    f.setup = lambda: True
+    f.notify_slack = lambda *a, **k: None
+    f.save_history_file = lambda *a, **k: None
+
+    _clean_body_pptx2 = "これはクリーンな本文です(経路2 out_fileテスト)。"
+
+    def _af4_pptx_conduct(question, history=None, office_attached=False):
+        return _af_base_plan(make_pptx=True), {}
+
+    # --- (1) out_file が .pptx/.ppt 以外(notes.md): 汎用保存が発動する(新規挙動) ---
+    f._HISTORY = []
+    f.conduct = _af4_pptx_conduct
+    f.fugu_answer = lambda question, plan=None, history=None: _clean_body_pptx2
+    _build_pptx_calls_1 = []
+    f.build_pptx = lambda question, answer, out_path=None: (
+        _build_pptx_calls_1.append(out_path) or "C:/fake/deck1.pptx")
+    _save_calls_1 = []
+    f._save_answer_to_file = lambda *a, **k: _save_calls_1.append((a, k))
+
+    _ret_1 = f.ask_fugu("PPTXにして(notes.md指定)", baseline=False,
+                        out_file="notes.md")
+
+    check("ask_fugu/経路2 out_file=notes.md: build_pptxの第3引数はNone",
+          _build_pptx_calls_1 == [None])
+    check("ask_fugu/経路2 out_file=notes.md: _save_answer_to_fileが1回呼ばれる",
+          len(_save_calls_1) == 1)
+    check("ask_fugu/経路2 out_file=notes.md: _save_answer_to_fileにpath='notes.md'が渡る",
+          len(_save_calls_1) == 1 and _save_calls_1[0][0][3] == "notes.md")
+    check("ask_fugu/経路2 out_file=notes.md: 保存される回答にクリーンな本文が含まれる",
+          len(_save_calls_1) == 1 and _clean_body_pptx2 in _save_calls_1[0][0][1])
+    check("ask_fugu/経路2 out_file=notes.md: 保存される回答に'生成した PowerPoint'ノートが含まれる",
+          len(_save_calls_1) == 1 and "生成した PowerPoint" in _save_calls_1[0][0][1])
+    check("ask_fugu/経路2 out_file=notes.md: _HISTORY[-1]はクリーンな本文のみ(デッキノート混入なし)",
+          f._HISTORY[-1]["content"] == _clean_body_pptx2
+          and "生成した PowerPoint" not in f._HISTORY[-1]["content"])
+    check("ask_fugu/経路2 out_file=notes.md: 戻り値にはデッキノートが含まれる",
+          "生成した PowerPoint" in _ret_1)
+
+    # --- (2) out_file が .pptx: build_pptxが受け取り、汎用保存は呼ばれない(回帰) ---
+    f._HISTORY = []
+    f.conduct = _af4_pptx_conduct
+    _build_pptx_calls_2 = []
+    f.build_pptx = lambda question, answer, out_path=None: (
+        _build_pptx_calls_2.append(out_path) or "C:/fake/deck2.pptx")
+    _save_calls_2 = []
+    f._save_answer_to_file = lambda *a, **k: _save_calls_2.append((a, k))
+
+    _ret_2 = f.ask_fugu("PPTXにして(deck.pptx指定)", baseline=False,
+                        out_file="deck.pptx")
+
+    check("ask_fugu/経路2 out_file=deck.pptx(回帰): build_pptxの第3引数はout_fileそのもの",
+          _build_pptx_calls_2 == ["deck.pptx"])
+    check("ask_fugu/経路2 out_file=deck.pptx(回帰): _save_answer_to_fileは呼ばれない(二重保存なし)",
+          len(_save_calls_2) == 0)
+    check("ask_fugu/経路2 out_file=deck.pptx(回帰): _HISTORY[-1]はクリーンな本文のみ",
+          f._HISTORY[-1]["content"] == _clean_body_pptx2)
+    check("ask_fugu/経路2 out_file=deck.pptx(回帰): 戻り値にはデッキノートが含まれる",
+          "生成した PowerPoint" in _ret_2)
+
+    # --- (2b) out_file が大文字 .PPTX 拡張子(既存の str(...).lower() 判定の回帰) ---
+    f._HISTORY = []
+    f.conduct = _af4_pptx_conduct
+    _build_pptx_calls_2b = []
+    f.build_pptx = lambda question, answer, out_path=None: (
+        _build_pptx_calls_2b.append(out_path) or "C:/fake/deck2b.pptx")
+    _save_calls_2b = []
+    f._save_answer_to_file = lambda *a, **k: _save_calls_2b.append((a, k))
+
+    _ret_2b = f.ask_fugu("PPTXにして(DECK.PPTX指定)", baseline=False,
+                         out_file="DECK.PPTX")
+
+    check("ask_fugu/経路2 out_file=DECK.PPTX(大文字回帰): build_pptxの第3引数はout_fileそのもの",
+          _build_pptx_calls_2b == ["DECK.PPTX"])
+    check("ask_fugu/経路2 out_file=DECK.PPTX(大文字回帰): _save_answer_to_fileは呼ばれない",
+          len(_save_calls_2b) == 0)
+
+    # --- (3) out_file=None: build_pptxはNoneを受け取り、汎用保存も呼ばれない(既存挙動不変) ---
+    f._HISTORY = []
+    f.conduct = _af4_pptx_conduct
+    _build_pptx_calls_3 = []
+    f.build_pptx = lambda question, answer, out_path=None: (
+        _build_pptx_calls_3.append(out_path) or "C:/fake/deck3.pptx")
+    _save_calls_3 = []
+    f._save_answer_to_file = lambda *a, **k: _save_calls_3.append((a, k))
+
+    _ret_3 = f.ask_fugu("PPTXにして(out_file無指定)", baseline=False,
+                        out_file=None)
+
+    check("ask_fugu/経路2 out_file=None(既存挙動不変): build_pptxの第3引数はNone",
+          _build_pptx_calls_3 == [None])
+    check("ask_fugu/経路2 out_file=None(既存挙動不変): _save_answer_to_fileは呼ばれない",
+          len(_save_calls_3) == 0)
+    check("ask_fugu/経路2 out_file=None(既存挙動不変): _HISTORY[-1]はクリーンな本文のみ",
+          f._HISTORY[-1]["content"] == _clean_body_pptx2)
+    check("ask_fugu/経路2 out_file=None(既存挙動不変): 戻り値にはデッキノートが含まれる",
+          "生成した PowerPoint" in _ret_3)
+
+    # --- (4) 非PPTX経路のサニティ: make_pptx=Falseなら従来通り_save_answer_to_fileが呼ばれる ---
+    f._HISTORY = []
+    f.conduct = lambda question, history=None, office_attached=False: (
+        _af_base_plan(), {})
+    _plain_body_af4 = "画像もPPTXも使わない通常のMoA回答本文です(経路2隣接サニティ)。"
+    f.fugu_answer = lambda question, plan=None, history=None: _plain_body_af4
+    _save_calls_4 = []
+    f._save_answer_to_file = lambda *a, **k: _save_calls_4.append((a, k))
+
+    _ret_4 = f.ask_fugu("普通の質問(out_file指定)", baseline=False,
+                        out_file="plain.md")
+
+    check("ask_fugu/非PPTX経路サニティ: _save_answer_to_fileが1回呼ばれる(既存挙動不変)",
+          len(_save_calls_4) == 1)
+    check("ask_fugu/非PPTX経路サニティ: _save_answer_to_fileにpath='plain.md'が渡る",
+          len(_save_calls_4) == 1 and _save_calls_4[0][0][3] == "plain.md")
+    check("ask_fugu/非PPTX経路サニティ: 戻り値はクリーン本文と一致(成果物ノートなし)",
+          _ret_4 == _plain_body_af4)
+finally:
+    f._HISTORY = _orig_af4_hist
+    f.setup = _orig_af4_setup
+    f.conduct = _orig_af4_conduct
+    f.fugu_answer = _orig_af4_fugu_answer
+    f.build_pptx = _orig_af4_build_pptx
+    f.notify_slack = _orig_af4_notify
+    f.save_history_file = _orig_af4_save_hist
+    f._save_answer_to_file = _orig_af4_save_file
+
+check("ask_fugu/経路2テスト: テスト後に_HISTORYが元の状態へ復元されている",
+      f._HISTORY == _orig_af4_hist)
+
 # ---------- ask_fugu 経路3(イラスト付き回答): 画像生成失敗時に __ERROR__ センチネルが
 # 最終回答/保存ファイルへ漏出しないことを検証 ----------
 # 2026-07-24: handle_image_generation は失敗時に内部センチネル '__ERROR__: ...' を
