@@ -12968,7 +12968,6 @@ check("notify_slack: テスト後にurllib.request.urlopenが元の状態へ復�
 # ことで、リーダー内部から独立してディスパッチ経路だけを検証する。
 import tempfile as _rfd_tempfile
 import pathlib as _rfd_pathlib
-import os as _rfd_os
 
 _orig_read_pdf = f._read_pdf
 _orig_read_docx = f._read_docx
