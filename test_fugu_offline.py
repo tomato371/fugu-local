@@ -1292,7 +1292,9 @@ def _run_with_math_verify_stub(verify_result, raise_in, body):
 # normalize_answer に単純数値の \frac{a}{b} 正規化（"a/b" 化）を追加したため、
 # \frac{1}{2} は "1/2" に正規化されて Fraction 高速パスに乗るようになった
 # （math_verify フォールバックには到達しなくなる）。math_verify 呼び出しの実検証には
-# 高速パスに絶対に乗らないペア（\sqrt は非対応マクロなので数値化されない）に差し替える。
+# 高速パスに絶対に乗らないペア（\sqrt{2} は iteration 214 で "sqrt(2)" 綴りに正規化される
+# ようになったが、Fraction("sqrt(2)") は依然として例外を送出するため数値化はされず、
+# na.lower() 不一致・Fraction 失敗のどちらの高速パスにも乗らないまま迂回し続ける）に差し替える。
 _MV_A, _MV_B = r"\sqrt{2}", "1.41421356"
 
 
@@ -15996,6 +15998,119 @@ check("map_value_to_choice: fugu_local.py内で自身のdef行以外から呼ば
       "(_sc_sample等への配線は次イテレーションへ先送り、統合はスコープ外)",
       len(_mvc_occurrences) == 1
       and _mvc_occurrences[0].lstrip().startswith("def map_value_to_choice"))
+
+# ==================================================
+# ---------- normalize_answer: \sqrt{N}/\pi のアンカー正規化 (2026-07-27, iteration 214) ----------
+# ==================================================
+# PoT サンプルは stdout に sympy 綴り(sqrt(2)、pi)を出力し、CoT サンプルは \boxed{} に
+# LaTeX 綴り(\sqrt{2}、\pi)を書く。na.lower()/Fraction() のどちらの高速パスにも乗らず
+# math_verify フォールバック(gotcha #6: Windows では parsing_timeout/timeout_seconds の
+# マルチプロセス実装が壊れており信頼できない)に落ち、同じ無理数の答えが自己整合性投票
+# (gotcha #7)で別クラスに票割れしていた。iteration 210 はスコープを広げすぎて3回スタック
+# したため、iteration 122 の _frac_re と全く同じ「アンカー付き全文一致のみ」の最小形に
+# 絞ってリトライする(iteration 122/210 参照)。
+
+# (a) 基本形: \sqrt{N} -> sqrt(N)、符号あり、整数/小数の被開平数。
+check("normalize_answer: \\sqrt{2} -> sqrt(2)",
+      f.normalize_answer(r"\sqrt{2}") == "sqrt(2)")
+check("normalize_answer: -\\sqrt{2} -> -sqrt(2)",
+      f.normalize_answer(r"-\sqrt{2}") == "-sqrt(2)")
+check("normalize_answer: \\sqrt{12} -> sqrt(12)",
+      f.normalize_answer(r"\sqrt{12}") == "sqrt(12)")
+check("normalize_answer: \\sqrt{2.5} -> sqrt(2.5) (小数の被開平数)",
+      f.normalize_answer(r"\sqrt{2.5}") == "sqrt(2.5)")
+
+# (b) 基本形: \pi -> pi、符号あり。
+check("normalize_answer: \\pi -> pi",
+      f.normalize_answer(r"\pi") == "pi")
+check("normalize_answer: -\\pi -> -pi",
+      f.normalize_answer(r"-\pi") == "-pi")
+
+# (c) 冪等性: 既に sympy 綴り(sqrt(2)/pi)の場合はバックスラッシュが無く新ルールに
+#     一致しないため無変更のまま(PoT側の素の出力を再正規化しても壊れないことの確認)。
+check("normalize_answer: 冪等性 sqrt(2) は不変",
+      f.normalize_answer("sqrt(2)") == "sqrt(2)")
+check("normalize_answer: 冪等性 pi は不変",
+      f.normalize_answer("pi") == "pi")
+
+# (d) \textbf{} 等の体裁マクロとの相互作用: 新ルールは _wrap_re の展開ループより後段に
+#     置いてあるため、\textbf{\sqrt{2}} はまず \sqrt{2} に剥がれてから sqrt(2) になる。
+check("normalize_answer: \\textbf{\\sqrt{2}} -> sqrt(2) (_wrap_re展開後に新ルール適用)",
+      f.normalize_answer(r"\textbf{\sqrt{2}}") == "sqrt(2)")
+
+# (e) \boxed{} 経由のエンドツーエンド(extract_final_answer の math 分岐は
+#     normalize_answer(boxed) をそのまま返す)。
+check("extract_final_answer: \\boxed{\\sqrt{2}} -> sqrt(2)",
+      f.extract_final_answer(r"よって \boxed{\sqrt{2}} である。", "math") == "sqrt(2)")
+check("extract_final_answer: \\boxed{\\pi} -> pi",
+      f.extract_final_answer(r"よって \boxed{\pi} である。", "math") == "pi")
+
+
+def _t_sqrt_pi_fastpath_equiv(calls):
+    result_sqrt = f.answers_equivalent(r"\sqrt{2}", "sqrt(2)")
+    result_pi = f.answers_equivalent(r"\pi", "pi")
+    check("answers_equivalent: \\sqrt{2} と sqrt(2) が正規化高速パスで一致(math_verify不使用)",
+          result_sqrt is True)
+    check("answers_equivalent: \\pi と pi が正規化高速パスで一致(math_verify不使用)",
+          result_pi is True)
+    check("answers_equivalent: \\sqrt{2}/\\pi の一致判定はmath_verify.parseを一切呼ばない"
+          "(高速パス経由、fast-path merge proof)",
+          len(calls["parse_args"]) == 0)
+    check("answers_equivalent: \\sqrt{2}/\\pi の一致判定はmath_verify.verifyを一切呼ばない",
+          len(calls["verify_args"]) == 0)
+
+
+_run_with_math_verify_stub(None, "parse", _t_sqrt_pi_fastpath_equiv)
+
+# (f) vote_answers: PoT/CoT 混在の票が単一クラスに集約される(票割れしない、gotcha #7)。
+_sqrt_votes = [r"\sqrt{2}", "sqrt(2)", "sqrt(2)"]
+_sqrt_top, _sqrt_count, _sqrt_classes = f.vote_answers(_sqrt_votes)
+check("vote_answers: \\sqrt{2}/sqrt(2)/sqrt(2) の3票が単一クラスに集約される(票割れしない)",
+      _sqrt_count == 3 and len(_sqrt_classes) == 1)
+
+_pi_votes = [r"\pi", "pi"]
+_pi_top, _pi_count, _pi_classes = f.vote_answers(_pi_votes)
+check("vote_answers: \\pi/pi の2票が単一クラスに集約される(票割れしない)",
+      _pi_count == 2 and len(_pi_classes) == 1)
+
+# (g) スコープ外の複合/入れ子/係数付き/変数入り/添え字形はバイト単位で不変のまま。
+#     特に \frac{\pi}{4} は answers_equivalent が正規化後の文字列をそのまま
+#     $na$/$nb$ として math_verify に渡す(L4062-4064)ため、\pi をグローバル置換すると
+#     \frac{pi}{4} に化けて LaTeX パーサに 2*p*i 等と誤読されうる懸念があった。
+#     アンカー付き全文一致のみにしたことで、これらの複合形は一切書き換わらない。
+_sqrt_pi_out_of_scope = [
+    r"2\sqrt{3}",
+    r"\sqrt{\sqrt{2}}",
+    r"\sqrt{x}",
+    r"\sqrt[3]{8}",
+    r"\sqrt2",
+    r"\sqrt{2}/2",
+    r"2\pi",
+    r"\pi/2",
+    r"\frac{\pi}{4}",
+]
+_sqrt_pi_out_of_scope_ok = all(
+    f.normalize_answer(form) == form for form in _sqrt_pi_out_of_scope
+)
+check("normalize_answer: 複合/入れ子/係数/変数/index付きの\\sqrt・\\piはバイト単位で不変"
+      "(2\\sqrt{3}, \\sqrt{\\sqrt{2}}, \\sqrt{x}, \\sqrt[3]{8}, \\sqrt2, \\sqrt{2}/2, "
+      "2\\pi, \\pi/2, \\frac{\\pi}{4})",
+      _sqrt_pi_out_of_scope_ok)
+
+# (h) iteration 32 の gotcha #6 math_verify ロック(_MV_A/_MV_B)が今回の変更後も引き続き
+#     全ての高速パスを迂回してフォールバックへ到達すること(回帰確認、L1296 のペアを再利用)。
+
+
+def _t_sqrt_pi_mv_lock_regression(calls):
+    result = f.answers_equivalent(_MV_A, _MV_B)
+    check("回帰: \\sqrt{2}/1.41421356 のgotcha#6ロックペアは新ルール後も高速パスを迂回し"
+          "math_verifyフォールバックへ到達する(parseが実呼出しされる)",
+          len(calls["parse_args"]) >= 2)
+    check("回帰: 同ロックペアはverifyも実呼出しされ、verify=Trueがそのまま伝播する",
+          len(calls["verify_args"]) == 1 and result is True)
+
+
+_run_with_math_verify_stub(True, "none", _t_sqrt_pi_mv_lock_regression)
 
 print()
 if _FAILS:

@@ -3762,6 +3762,33 @@ def normalize_answer(ans):
         num = num.lstrip("-")
         den = den.lstrip("-")
         s = f"{'-' if neg else ''}{num}/{den}"
+    # 2026-07-27 (iteration 214、iteration 210 が3回スタックしたまま未着手だったギャップの
+    # 縮小スコープでのリトライ): PoT サンプルは stdout に sympy 綴り（sqrt(2)、pi）を出力する
+    # 一方、CoT サンプルは \boxed{} に LaTeX 綴り（\sqrt{2}、\pi）を書く。na.lower() は
+    # 不一致、Fraction() は例外で、同じ無理数の答えが math_verify フォールバックに落ちる
+    # （gotcha #6: Windows では parsing_timeout/timeout_seconds のマルチプロセス実装に
+    # 問題があり信頼できないため、正規化側の高速パスで吸収できる形は吸収しておきたい）。
+    # 素の値が変わらず同じ2系統に分裂するのは自己整合性投票（gotcha #7）が最も嫌う
+    # 票割れであり、iteration 122 の _frac_re と全く同じ「アンカー付き全文一致のみ」の
+    # 形で最小スコープに絞ってリトライする。answers_equivalent（L4062-4064 付近）は
+    # ここで正規化した文字列をそのまま $na$/$nb$ として math_verify に渡すため、もし
+    # \pi をグローバルな部分文字列置換で扱うと 2\pi や \frac{\pi}{4} のような複合式を
+    # 2pi や \frac{pi}{4} に書き換えてしまい、LaTeX パーサはこれを 2*p*i と読んで今日
+    # 通っている等価判定を壊しかねない。そのため両ルールとも fullmatch 相当の
+    # ^...$ アンカーで「値全体がちょうどこの形」の場合だけに限定し、2\sqrt{3} や
+    # \sqrt{\sqrt{2}}、\sqrt{x}、\sqrt[3]{8}、\sqrt2（波括弧なし）、\sqrt{2}/2、2\pi、
+    # \pi/2、\frac{\pi}{4} のような複合/入れ子/係数付き/変数入りの形は一切触れず
+    # バイト単位で素通りのまま維持する（この位置は _wrap_re の展開・_frac_re の後段の
+    # ため、\textbf{\sqrt{2}} のような体裁マクロ入れ子も既に剥がされた後に評価される）。
+    _sqrt_re = re.compile(r"^(-?)\\sqrt\{\s*(\d+(?:\.\d+)?)\s*\}$")
+    m = _sqrt_re.match(s)
+    if m:
+        sign, radicand = m.group(1), m.group(2)
+        s = f"{sign}sqrt({radicand})"
+    _pi_re = re.compile(r"^(-?)\\pi$")
+    m = _pi_re.match(s)
+    if m:
+        s = f"{m.group(1)}pi"
     return s
 
 
