@@ -1151,6 +1151,62 @@ check("sc: 抽出 答え宣言 空の宣言候補は競合と数えない",
       f.extract_final_answer(
           "The answer is .\nThe answer is 9.", "math") == "9")
 
+# 2026-07-27: math 宣言ブランチ（すぐ上、iteration 13/22/24/30/136 の系列）に、
+# mcq 宣言ブランチ（iter173、L1090-1132 付近のコメント参照）と対称の Markdown
+# 強調記号ストリップを追加した回帰確認。iter173 は mcq の3か所（boxed先頭文字・
+# 宣言・単独行）だけを直し、math 宣言ブランチは非対称のまま「**42**」等の
+# 装飾込みの生文字列をそのまま候補に append していた（数値コア re.match が
+# 先頭の '*' でマッチ失敗するため）。これは Fraction('**42**') が例外になり
+# math_verify も Windows では信頼できない（gotcha #6）ため素の '42' 票と
+# 合流しない誤投票クラスを生むだけでなく、同じ値を指す2つの宣言
+# （'answer is **12**' と 'answer is 12'）が非同値候補 ['**12**','12'] に
+# 分裂して iteration 30 の複数候補非同値棄権ロジックに誤って引っかかり、
+# 全会一致のはずの正当な1票を None（無投票）に化けさせてしまっていた
+# （false conflict-abstain）。fugu_local.py 側の修正は cand の先頭・末尾に
+# 限定して [*_]{1,3} を剥がすだけで、normalize_answer 本体・'*'/'_' の
+# グローバル剥離（下付き添字 a_1 や乗算 a*b を壊すため厳禁、iter173 が
+# 明言済み）・iteration 30 の棄権ロジック構造・iteration 136 の '%' 保持は
+# 一切変更しない。
+check("sc: 抽出 答え宣言 太字強調（票落ち回帰, iter173のmath版）",
+      f.extract_final_answer("The answer is **42**.", "math") == "42")
+check("sc: 抽出 答え宣言 太字強調(コロン後に強調記号、空白挟み込み)（票落ち回帰）",
+      f.extract_final_answer("**Answer:** 42", "math") == "42")
+check("sc: 抽出 答え宣言 斜体強調(小数)（票落ち回帰）",
+      f.extract_final_answer("The answer is *0.5*", "math") == "0.5")
+check("sc: 抽出 答え宣言 太字強調(負数、日本語宣言)（票落ち回帰）",
+      f.extract_final_answer("答えは **-5** です", "math") == "-5")
+check("sc: 抽出 答え宣言 アンダースコア太字強調（票落ち回帰）",
+      f.extract_final_answer("The answer is __7__", "math") == "7")
+check("sc: 抽出 答え宣言 太字強調(非数値の宣言はPariのまま、数値コアに一致せずcandをそのまま返す)",
+      f.extract_final_answer("The answer is **Paris**", "math") == "Paris")
+# false conflict-abstain の回帰: 装飾ありと装飾なしの同一値宣言は今回の修正前は
+# ['**12**','12'] という非同値候補に分裂し iteration 30 のロジックで誤って
+# None になっていた。修正後は両方とも '12' に正規化されるため全会一致で1票確定する。
+check("sc: 抽出 答え宣言 太字強調と素の同一値宣言は誤棄権しない（false abstain修正, iter173のmath版）",
+      f.extract_final_answer(
+          "The answer is **12**.\nSo the answer is 12.", "math") == "12")
+_emph_vote = f.extract_final_answer("The answer is **12**.", "math")
+_plain_vote = f.extract_final_answer("So the answer is 12.", "math")
+check("sc: 抽出 答え宣言 太字強調と素の宣言は同一の投票クラスに収束する(vote_answers)",
+      _emph_vote == "12" and _plain_vote == "12"
+      and f.answers_equivalent(_emph_vote, _plain_vote))
+_vote_top, _vote_count, _vote_classes = f.vote_answers([_emph_vote, _plain_vote])
+check("sc: 抽出 答え宣言 vote_answersが太字強調票と素の票を1クラスに集約する",
+      _vote_top == "12" and _vote_count == 2 and len(_vote_classes) == 1)
+# iteration 30 の非同値棄権ロジックは維持: 強調記号を剥がした後も値そのものが
+# 異なる場合は従来通りNoneで棄権する（false abstain修正が誤って棄権自体を
+# 無効化していないことの確認）。
+check("sc: 抽出 答え宣言 太字強調でも値が非同値なら従来通り棄権する（iter30ガード維持）",
+      f.extract_final_answer(
+          "The answer is **24**.\nOn second thought, the answer is 12.",
+          "math") is None)
+# 回帰: \boxed{} 分岐（この関数の上のほう、宣言ブランチとは独立の別コードパス）は
+# 今回の変更で一切触れていない。iter173 が確立した「非mcqパス(math)のboxedは
+# 強調記号対応の影響を受けない」pin（L1131-1132）と同じ趣旨で、宣言ブランチ側の
+# 今回の修正後も byte-for-byte 不変であることを重ねて確認する。
+check("sc: 抽出 boxed分岐は宣言ブランチの強調記号ストリップの影響を受けない（byte-for-byte不変, 回帰）",
+      f.extract_final_answer("\\boxed{**42**}", "math") == "**42**")
+
 check("sc: 同値 完全一致", f.answers_equivalent("42", "42"))
 check("sc: 同値 分数=小数", f.answers_equivalent("1/2", "0.5"))
 check("sc: 同値 桁区切り", f.answers_equivalent("12,345", "12345"))
