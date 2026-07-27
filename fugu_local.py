@@ -3958,6 +3958,71 @@ def extract_final_answer(text, task_type="math"):
     return normalize_answer(nums[-1]) if nums else None
 
 
+# 2026-07-27: MCQ の自己一貫性投票（gotcha #7）で観測されている票落ちパターンへの
+# 対処、第一段。プロポーザーが選択肢の文字（A-E）ではなく選択肢の「値」そのものを
+# \boxed{} に入れてしまうことがあり（例:「4^2 は？ A) 12 B) 16 C) 20 D) 24」に対し
+# \boxed{16} と回答）、この場合 extract_final_answer(text, 'mcq') は boxed 先頭の
+# [A-EＡ-Ｅ] しか読まないため None を返し、正当な1票が自己整合性投票から静かに
+# 失われる。この「値を箱に入れてしまう」化けそのものは stuck した iteration 207/209
+# が「パーサーの実装」と「_sc_sample への配線」を同じイテレーションで両方やろうと
+# して行き詰まった経緯があり、直近では代表文（サンプル群の勝者テキスト）側で
+# デッキレベルの \boxed 再整合を行う対策（上の fugu_answer、SC 投票結果を
+# \boxed{} で包み直して再抽出とのずれを解消する修正）が入ったが、これは
+# _sc_sample が個々のサンプルから投票用の値を抽出する時点（vote_answers に渡す
+# 前）の票落ちそのものは救えていない。
+# 以下はその救済の下ごしらえとして、question_text 中の選択肢列（_MCQ_SIGNALS,
+# 上のL2952-2955、が要求するのと同じ最小限の行頭マーカー形状）を解析し、value が
+# その選択肢本文のどれと一意に一致するかを answers_equivalent 経由で判定する、
+# 副作用のない純粋関数。_sc_sample/extract_final_answer への配線（実際にこの
+# 関数を投票経路で呼ぶこと）は本イテレーションのスコープ外であり、次イテレーション
+# へ明示的に先送りする（本関数は現時点でどこからも呼ばれていない）。
+def map_value_to_choice(value, question_text):
+    """value を question_text 中の選択肢文字(A-E)へ一意にマップできればその文字を返す。
+    マップできなければ None（無投票 > 誤投票、精度優先・時間は気にしない）。
+
+    選択肢列の認識形状は _MCQ_SIGNALS と同じ行頭アンカー限定: 行頭（または直前が
+    改行）、任意の空白、任意の '(' / 全角 '（'、選択肢文字(A-EまたはＡ-Ｅ)、続けて
+    ')' '.' ':' '：' '）' '．' のいずれか一つ。選択肢本文は同じ行の残り部分のみを
+    対象とし、複数行にまたがる選択肢本文は本イテレーションのスコープ外とする
+    （_MCQ_SIGNALS 自体も単一行前提であり、それに合わせている）。小文字マーカー
+    （a) b) 等）は「a) の場合は」のような地の文の箇条書き様の記述を選択肢と
+    誤認するリスクを避けるため今回は非対応とし、大文字ASCII/全角のみを認識する
+    （プロポーザーが小文字マーカーの選択肢を書くことは実運用上ほぼ無い）。
+
+    副作用なし（ask()/ネットワーク/subprocess/ファイルI/Oなし、モジュールグローバル
+    変更なし）で、任意のテキスト入力に対して例外を投げない（bare except は使わず、
+    純粋な re.finditer とループだけで構成する）。
+    """
+    if not value:
+        return None
+    # 値そのものが既に単独の選択肢文字（大小文字・全角含む）なら救済不要。
+    # ここで選択肢本文と比較してしまうと誤爆のリスクがあるため触れずに None を返す
+    # （iteration 129 の answers_equivalent 内 A-E ガードと同じ判断: 精度優先）。
+    nv = normalize_answer(value)
+    if not nv:
+        return None
+    if re.fullmatch(r"[A-Ea-e]", nv):
+        return None
+    text = question_text or ""
+    # マーカー: 行頭 or 直前が改行、空白、任意の開き括弧、選択肢文字、閉じマーカー。
+    # 本文は同じ行の残り（\S から行末まで、'.' はデフォルトで改行に一致しないため
+    # 複数行へは絶対に広がらない）のみを取る。
+    option_re = re.compile(r"(?:^|\n)[ \t]*[(（]?([A-EＡ-Ｅ])[)\.:：）．][ \t]*(\S.*)")
+    seen = {}
+    for m in option_re.finditer(text):
+        letter = m.group(1).translate(_FW_TRANS).upper()
+        if letter in seen:
+            continue  # 選択肢列がプロンプト中で再掲されている場合は先勝ち
+        seen[letter] = m.group(2)
+    # _MCQ_SIGNALS と同じ最小限の証拠（A・Bが両方そろって初めてMCQの選択肢列とみなす）
+    if len(seen) < 2 or "A" not in seen or "B" not in seen:
+        return None
+    matches = [letter for letter, body in seen.items() if answers_equivalent(value, body)]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
 def answers_equivalent(a, b):
     """2つの答えが数学的に同値か。正規化一致 → 分数/小数の数値一致 → math_verify の順で判定。"""
     na, nb = normalize_answer(a), normalize_answer(b)

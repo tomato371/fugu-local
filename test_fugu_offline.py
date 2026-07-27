@@ -15916,6 +15916,87 @@ if _repl_real_hist_existed_before:
     check("repl: 実履歴ファイルの内容もテスト前後でバイト単位不変",
           _repl_real_hist_path.read_bytes() == _repl_real_hist_bytes_before)
 
+# ---------- map_value_to_choice (2026-07-27, iteration 213) ----------
+# MCQ の自己一貫性投票（gotcha #7）で、プロポーザーが選択肢文字ではなく選択肢の
+# 「値」を \boxed{} に入れてしまう票落ち（stuck iteration 207/209、iteration 208の
+# デッキレベル \boxed 再整合の項参照）を、value を question_text の選択肢文字へ
+# マップし直して救済するための純関数。本イテレーションでは _sc_sample/
+# extract_final_answer への配線は行わず（次イテレーションへ明示的に先送り）、
+# 関数単体の網羅的なオフラインテストのみを追加する。
+
+_mcq_q1 = "Which is 4^2?\nA) 12\nB) 16\nC) 20\nD) 24"
+check("map_value_to_choice: stuck-207のシナリオそのもの(value-boxed票の救済)",
+      f.map_value_to_choice("16", _mcq_q1) == "B")
+
+# --- マーカー形状のカバレッジ(_MCQ_SIGNALS L2952-2955と同じ行頭アンカー・記号) ---
+check("map_value_to_choice: 括弧マーカー '(A) .. (B) ..'",
+      f.map_value_to_choice("16", "(A) 12\n(B) 16") == "B")
+check("map_value_to_choice: ピリオドマーカー 'A. .. B. ..'",
+      f.map_value_to_choice("16", "A. 12\nB. 16") == "B")
+check("map_value_to_choice: コロンマーカー 'A: .. B: ..'",
+      f.map_value_to_choice("16", "A: 12\nB: 16") == "B")
+check("map_value_to_choice: 全角マーカー/全角数字('Ａ．１２' 'Ｂ．１６')でも戻り値はASCII'B'",
+      f.map_value_to_choice("16", "Ａ．１２\nＢ．１６") == "B")
+
+# --- answers_equivalent 経由の同値判定(独自の同値ロジックを実装していないことの確認) ---
+check("map_value_to_choice: 分数=小数はanswers_equivalentのFractionファストパスで一致(A)",
+      f.map_value_to_choice("0.5", "A) 1/2\nB) 3/4") == "A")
+check("map_value_to_choice: 大文字小文字を無視した散文選択肢の一致(B)",
+      f.map_value_to_choice("london", "A) Paris\nB) London") == "B")
+
+# --- 曖昧・不在は棄権(無投票 > 誤投票、精度優先・時間は気にしない) ---
+check("map_value_to_choice: 2つの選択肢に一致する場合はNone(誤投票より無投票)",
+      f.map_value_to_choice("0.5", "A) 1/2\nB) 0.5") is None)
+check("map_value_to_choice: どの選択肢にも一致しない場合はNone",
+      f.map_value_to_choice("99", "A) 12\nB) 16") is None)
+check("map_value_to_choice: 選択肢列の無い普通の数学問題文はNone",
+      f.map_value_to_choice("42", "2x = 84 を解け。x の値を求めよ。") is None)
+check("map_value_to_choice: 'A)' 行だけで'B)'が無ければ最小限の証拠に満たずNone",
+      f.map_value_to_choice("12", "A) 12\nこれ以外の選択肢はない") is None)
+
+# --- ガード: 値が falsy、または既に単独の選択肢文字(救済不要) ---
+check("map_value_to_choice: value=Noneは None", f.map_value_to_choice(None, _mcq_q1) is None)
+check("map_value_to_choice: value=''(空文字)は None", f.map_value_to_choice("", _mcq_q1) is None)
+check("map_value_to_choice: value='B'(既に大文字の選択肢文字)は救済不要でNone",
+      f.map_value_to_choice("B", _mcq_q1) is None)
+check("map_value_to_choice: value='b'(小文字の選択肢文字)も救済不要でNone",
+      f.map_value_to_choice("b", _mcq_q1) is None)
+check("map_value_to_choice: value='Ｂ'(全角の選択肢文字)も救済不要でNone",
+      f.map_value_to_choice("Ｂ", _mcq_q1) is None)
+
+# --- 頑健性: 敵対的な入力でも例外を投げない ---
+check("map_value_to_choice: 重複した'A)'行は先勝ち(2つ目の'A) 99'ではなく1つ目'A) 12'と比較)",
+      f.map_value_to_choice("12", "A) 12\nA) 99\nB) 16") == "A")
+check("map_value_to_choice: 選択肢本文の末尾句読点はnormalize_answerのrstripで吸収される",
+      f.map_value_to_choice("16", "A) 12.\nB) 16.") == "B")
+check("map_value_to_choice: 文中に埋没した'A)'(行頭アンカー外)は選択肢として解析されない",
+      f.map_value_to_choice("16", "Please read section A) for context.\nB) 16") is None)
+check("map_value_to_choice: 本文の無い(未完結な)'B)'行は選択肢として解析されない",
+      f.map_value_to_choice("12", "A) 12\nB)") is None)
+check("map_value_to_choice: 小文字マーカー(a) b))は今回スコープ外のため解析されずNone",
+      f.map_value_to_choice("16", "a) 12\nb) 16") is None)
+_mvc_adversarial_ok = True
+for _v, _q in [
+    (None, None), ("16", None), ("16", ""), ("(" * 200, "A) (\nB) 16"),
+    ("x" * 500, "A) " + "y" * 500 + "\nB) " + "x" * 500),
+    ("16", ("A)\nB) 16\n") * 50), ("\n\n\n", "A) 1\nB) 2"),
+]:
+    try:
+        f.map_value_to_choice(_v, _q)
+    except Exception:
+        _mvc_adversarial_ok = False
+check("map_value_to_choice: 敵対的な入力(None/空/未終端/超長文/繰り返し)でも例外を送出しない",
+      _mvc_adversarial_ok)
+
+# --- 本イテレーションでは未配線(統合はスコープ外、iteration 207/209の教訓) ---
+with open(f.__file__, encoding="utf-8") as _mvc_fh:
+    _mvc_src_lines = _mvc_fh.readlines()
+_mvc_occurrences = [ln for ln in _mvc_src_lines if "map_value_to_choice" in ln]
+check("map_value_to_choice: fugu_local.py内で自身のdef行以外から呼ばれていない"
+      "(_sc_sample等への配線は次イテレーションへ先送り、統合はスコープ外)",
+      len(_mvc_occurrences) == 1
+      and _mvc_occurrences[0].lstrip().startswith("def map_value_to_choice"))
+
 print()
 if _FAILS:
     print(f"FAILED: {len(_FAILS)} 件 -> {_FAILS}")
