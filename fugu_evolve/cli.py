@@ -301,6 +301,26 @@ def format_result(result: RunResult) -> str:
     return "\n".join(lines)
 
 
+def run_prompt_evolution(name: str, chat, repo: str,
+                         apply: bool = True, n: int = 3) -> Dict[str, object]:
+    """--prompts モード本体: fugu_local のプロンプト定数 ``name`` を進化させる。
+
+    採用時は Workspace 経由で ``auto-evolve/prompts-{name}`` ブランチにコミット
+    される(mainは不変)。``apply=False`` は判定のみで一切書かない。
+    """
+    import fugu_local
+    from fugu_evolve import prompt_evolver
+
+    base = getattr(fugu_local, name, None)
+    if not (isinstance(base, str) and base.strip()):
+        return {"name": name, "adopted": False, "branch": None,
+                "reason": f"unknown or non-string prompt global: {name}"}
+    workspace = Workspace(repo) if apply else None
+    eval_fn = prompt_evolver.make_llm_eval_fn(chat)
+    return prompt_evolver.evolve_prompt(name, base, chat, eval_fn,
+                                        workspace=workspace, n=n, apply=apply)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="fugu_evolve",
@@ -318,9 +338,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="非退行比較に使うベンチコマンド(省略時は比較 skip)")
     parser.add_argument("--offline", action="store_true",
                         help="ベンチ実行を強制 skip(GPU 競合中の安全弁)")
+    parser.add_argument("--prompts", metavar="NAME", default=None,
+                        help="プロンプト進化モード: fugu_local の対象グローバル名"
+                             "(例 PRESENTATION_STYLE)。要 Ollama")
     args = parser.parse_args(argv)
 
     import fugu_llm
+    if args.prompts:
+        result = run_prompt_evolution(
+            args.prompts, fugu_llm.AskChat(label="evolve-prompts"),
+            args.repo, apply=not args.dry_run)
+        print(json.dumps(
+            {k: v for k, v in result.items() if k != "winner"},
+            ensure_ascii=False, indent=1))
+        return 0
     pipeline = build_pipeline({"chat": fugu_llm.AskChat(label="evolve")})
     result = pipeline(
         args.repo, dry_run=args.dry_run, pr_mode=args.pr_mode,

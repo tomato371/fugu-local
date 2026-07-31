@@ -46,6 +46,10 @@ class FakeWorkspace:
         self.calls.append("create_branch")
         return BRANCH_PREFIX + "fake-1"
 
+    def apply_edit(self, rel_path, content):
+        self.calls.append(f"apply_edit:{rel_path}")
+        return rel_path
+
     def commit(self, message):
         self.calls.append(f"commit:{message}")
         return "sha"

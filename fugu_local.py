@@ -4860,6 +4860,12 @@ def setup():
     global PROPOSERS, AGGREGATOR, CONDUCTOR, _READY
     if _READY:
         return True
+    # fugu_prompts override loader (Doc D5): override ファイルが無ければ完全に無変更
+    try:
+        import fugu_prompts
+        fugu_prompts.apply_overrides(globals())
+    except Exception:
+        pass
     if not ensure_server():
         return False
     if os.environ.get("FUGU_HIGH_VRAM") in ("1", "true", "True"):
