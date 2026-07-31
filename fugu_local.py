@@ -2067,7 +2067,7 @@ ASK_RETRY_BACKOFF = (2, 5, 10)  # 各要素はその回の失敗直後に待つ�
 
 
 def ask(model, messages, temperature, think=None, fmt=None, label=None, num_predict=None,
-        num_ctx=None):
+        num_ctx=None, images=None):
     """Ollama native /api/chat を叩く。num_ctx を必ず options で渡して context を安全域に固定する
     （/v1 互換エンドポイントは num_ctx を無視するため使わない）。失敗時は __ERROR__: を返す。
     一過性の失敗(HTTP 500 等)には ASK_RETRY_ATTEMPTS 回まで、ASK_RETRY_BACKOFF の間隔で
@@ -2090,6 +2090,13 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
       スキーマを与えると enum 値まで含めて妥当な JSON に拘束され、かつ高速（実測 ~14s）。"""
     if think is None:
         think = model_cfg(model, "think")   # 呼び出し側が未指定ならモデル別設定を適用
+    if images:
+        # vision 入力: base64 文字列群を最後のメッセージに付与する（Ollama native
+        # /api/chat の仕様）。呼び出し元の messages を変異させないようコピーする。
+        messages = list(messages)
+        last = dict(messages[-1])
+        last["images"] = list(images)
+        messages[-1] = last
     payload = {
         "model": model,
         "messages": messages,
@@ -2396,6 +2403,37 @@ def code_check(answer):
     if ok:
         return None
     return f"code execution FAILED:\n{out[-800:]}"
+
+# ==================================================
+# 画像入力（vision モデルへ直行ルート）
+# ==================================================
+
+# vision 対応モデル。未インストールでも ask() が __ERROR__ を返すだけで安全。
+# num_ctx は MODEL_CONFIG に無ければ MODEL_NUM_CTX(8192) が明示 pin される（gotcha #2 維持）。
+VISION_MODEL = os.environ.get("FUGU_VISION_MODEL", "llama3.2-vision")
+
+
+def _encode_image_file(path):
+    """画像ファイルを base64 文字列へ（Ollama /api/chat の images 仕様）。"""
+    import base64
+    with open(path, "rb") as fh:
+        return base64.b64encode(fh.read()).decode("ascii")
+
+
+def _vision_answer(question, image_paths):
+    """画像付き質問を VISION_MODEL へ直接ルートして回答文字列を返す。
+    ペルソナ選定・MoA はバイパス（vision はパネル内に対応モデルが無いため）。
+    失敗は ask() と同じ __ERROR__ センチネル規約で返す。"""
+    try:
+        images = [_encode_image_file(p) for p in image_paths]
+    except OSError as e:
+        return f"__ERROR__: cannot read image: {e}"
+    return ask(
+        VISION_MODEL,
+        [{"role": "user", "content": question}],
+        0.2, label="vision", images=images,
+    )
+
 
 # ==================================================
 # 画像生成（ローカル SD / ComfyUI へバイパス）
@@ -4676,7 +4714,7 @@ def setup():
 
 def ask_fugu(question, baseline=SHOW_BASELINE, *,
              use_search=False, rag_dirs=None, out_file=None,
-             history_file=None, office_attached=False):
+             history_file=None, office_attached=False, images=None):
     """質問を Fugu パイプラインで処理する。
     use_search: True なら Web 検索を行いコンテキストに注入する（Conductor が
       search_required=true を出した場合も自動で有効化される）。
@@ -4684,11 +4722,29 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
     out_file: 回答を保存するファイルパス（.md 推奨）。
     history_file: 永続化に使う JSON ファイルパス（省略時は HISTORY_FILE）。
     office_attached: Office 文書が添付されている旨を Conductor へ伝えるヒント。
+    images: 画像ファイルパスのリスト。指定時は VISION_MODEL へ直行ルート
+      （Conductor・MoA・履歴更新をバイパスする軽量経路）。
     """
     global _HISTORY
     if not setup():
         return None
     t0 = time.time()
+
+    # --- 経路0: 画像入力（vision モデルへ直行。ペルソナ選定・MoA はバイパス）---
+    if images:
+        print(f"\n[Fugu] 画像入力 {len(images)} 件 → vision モデル ({VISION_MODEL}) へ直行します...")
+        result = strip_think(_vision_answer(question, images))
+        elapsed = round(time.time() - t0, 1)
+        print("\n===== 最終回答 (vision) =====")
+        if result.startswith("__ERROR__"):
+            note = result[len("__ERROR__"):].lstrip(":").strip()
+            print(f"画像応答に失敗しました: {note}" if note else "画像応答に失敗しました")
+        else:
+            print(result)
+        print(f"\n(所要 {elapsed} 秒)")
+        if out_file and not result.startswith("__ERROR__"):
+            _save_answer_to_file(question, result, elapsed, out_file, context="")
+        return result
 
     # --- Conductor プランを先に取得（検索要否・画像生成・Office ルーティングを決める）---
     print("\n[Fugu] Conductor がオーケストレーションを開始します...")
@@ -5595,7 +5651,8 @@ def repl(use_search=False, rag_dirs=None, history_file=None):
     if flags:
         print(f"   [{', '.join(flags)}]")
     print("コマンド: 'exit'/'quit' で終了  'reset' で会話履歴クリア  "
-          "'search on/off' で Web検索切替  'save <path>' で履歴エクスポート")
+          "'search on/off' で Web検索切替  'save <path>' で履歴エクスポート  "
+          "'img <画像パス> [質問]' で vision モデルへ質問")
     while True:
         try:
             q = input("\nUser> ").strip()
@@ -5657,6 +5714,20 @@ def repl(use_search=False, rag_dirs=None, history_file=None):
             else:
                 print(f"   [履歴の保存に失敗しました: {save_path}]")
             continue
+        if low == "img":
+            print("   [使い方: img <画像パス> [質問]]")
+            continue
+        if low.startswith("img "):
+            parts = q[4:].strip().split(None, 1)
+            if not parts:
+                # q は strip 済みのため実 input() 経由では到達不能だが、save の
+                # デッドコード防御(iter205)と同じ流儀で安全側に残す。
+                print("   [使い方: img <画像パス> [質問]]")
+                continue
+            img_q = parts[1] if len(parts) > 1 else "この画像を説明してください。"
+            ask_fugu(img_q, use_search=use_search, rag_dirs=rag_dirs,
+                     history_file=hfile, images=[parts[0]])
+            continue
         ask_fugu(q, use_search=use_search, rag_dirs=rag_dirs,
                  history_file=hfile)
 
@@ -5697,6 +5768,8 @@ def main():
                         help="セッション永続化を無効化（履歴を読まず保存もしない）")
     parser.add_argument("--session", metavar="PATH",
                         help=f"会話履歴ファイルパス（既定: {HISTORY_FILE}）")
+    parser.add_argument("--image", nargs="+", metavar="PATH",
+                        help=f"画像ファイルを vision モデル({VISION_MODEL})へ渡す（複数可）")
     args = parser.parse_args()
 
     # --- セッション設定 ---
@@ -5759,11 +5832,15 @@ def main():
     elif args.question:
         question = args.question
 
+    # --- 画像入力: 質問が無ければ既定の説明依頼を補う ---
+    if args.image and not question:
+        question = "この画像を説明してください。"
+
     # --- 実行 ---
     if question:
         ask_fugu(question, use_search=args.search,
                  rag_dirs=rag_dirs, out_file=args.out, history_file=hfile,
-                 office_attached=office_attached)
+                 office_attached=office_attached, images=args.image)
     elif sys.stdin.isatty():
         # 2026-07-26: iteration 185 で表面化した特性(a) ―― --out はこの対話分岐(repl())
         # には一切転送されず、repl()自身にもout_fileパラメータが無い設計のため、

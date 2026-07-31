@@ -12,14 +12,15 @@ chat.complete を try/except で囲む慣習のため、センチネルを漏ら
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Protocol, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Union
 
 Format = Union[dict, str, None]
 
 
 class Chat(Protocol):
     def complete(self, prompt: str, *, system: Optional[str] = None,
-                 fmt: Format = None, temperature: float = 0.2) -> str:
+                 fmt: Format = None, temperature: float = 0.2,
+                 images: Optional[Sequence[str]] = None) -> str:
         ...
 
 
@@ -39,7 +40,8 @@ class AskChat:
         self.num_predict = num_predict
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
-                 fmt: Format = None, temperature: float = 0.2) -> str:
+                 fmt: Format = None, temperature: float = 0.2,
+                 images: Optional[Sequence[str]] = None) -> str:
         import fugu_local
 
         model = self.model or fugu_local.CONDUCTOR or fugu_local.FALLBACK_MODEL
@@ -50,7 +52,7 @@ class AskChat:
         out = fugu_local.ask(
             model, messages, temperature,
             think=self.think, fmt=fmt, label=self.label,
-            num_predict=self.num_predict,
+            num_predict=self.num_predict, images=images,
         )
         if out.startswith("__ERROR__"):
             raise RuntimeError(out)
@@ -75,9 +77,11 @@ class FakeChat:
         self.calls: List[Dict[str, Any]] = []
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
-                 fmt: Format = None, temperature: float = 0.2) -> str:
+                 fmt: Format = None, temperature: float = 0.2,
+                 images: Optional[Sequence[str]] = None) -> str:
         self.calls.append({"prompt": prompt, "system": system,
-                           "fmt": fmt, "temperature": temperature})
+                           "fmt": fmt, "temperature": temperature,
+                           "images": tuple(images or ())})
         if self.fn is not None:
             return self.fn(prompt)
         if self.responses:

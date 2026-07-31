@@ -165,7 +165,7 @@ def test_askchat_builds_messages_and_passes_through(monkeypatch):
     recorded = {}
 
     def fake_ask(model, messages, temperature, think=None, fmt=None, label=None,
-                 num_predict=None, num_ctx=None):
+                 num_predict=None, num_ctx=None, images=None):
         recorded.update(model=model, messages=messages, temperature=temperature,
                         fmt=fmt, label=label, num_predict=num_predict)
         return "the answer"
