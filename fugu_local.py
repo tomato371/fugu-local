@@ -3213,12 +3213,38 @@ def _critic_judge(question, answer, think):
     return bool(p.get("ok", True)), str(p.get("issue", ""))[:200]
 
 
+def _tdc_check(question, answer):
+    """FUGU_TDC=1 のときだけ呼ばれる Test-Driven Criticism (fugu_tdc) の前段判定。
+    コード回答でない・fugu_tdc 不在・テスト起草失敗の場合は None（従来審査へ委譲）。
+    テスト実行が fail した場合のみ (False, issue) を返す。green なら None を返して
+    従来の LLM 審査も通す（保守的: TDC は拒否権のみ持ち、承認は既存経路に委ねる）。"""
+    code = extract_code(answer)
+    if not code:
+        return None
+    try:
+        import fugu_llm
+        import fugu_tdc
+    except ImportError:
+        return None
+    res = fugu_tdc.run_tdc(code, question, fugu_llm.AskChat(label="tdc"), max_fix=0)
+    if not res.drafted:
+        return None
+    if res.passed:
+        return None
+    tail = (res.report or "tests failed").strip().splitlines()
+    return False, f"TDC: drafted tests failed: {tail[-1][:160] if tail else ''}"
+
+
 def critique(question, answer):
     """回答の十分性を 2 段階で判定。(ok: bool, issue: str) を返す。
     1段目: think=False + スキーマで高速判定。ok ならそこで確定（高速パス維持）。
     2段目: 1段目が NG のときだけ think=True で再検算して最終判定。
     think=False の Critic は頭の中で再計算ができず、正答 '700' を誤って NG にする
     偽エスカレーション(310秒浪費)が 2026-07-03 のフル評価で実測されたための対策。"""
+    if os.environ.get("FUGU_TDC") == "1":
+        tdc = _tdc_check(question, answer)
+        if tdc is not None:
+            return tdc
     ok, _issue = _critic_judge(question, answer, think=False)
     if ok:
         return True, ""
