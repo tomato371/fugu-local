@@ -4551,6 +4551,44 @@ def _emit(kind, **data):
         pass
 
 
+def _debate_proposals(question, proposals):
+    """FUGU_DEBATE=1 のときだけ、意見が割れた提案群に相互批評ターンを挟む (Doc D4)。
+    未設定・全員一致・失敗時は proposals をそのまま返す(既定経路は不変)。"""
+    if os.environ.get("FUGU_DEBATE") != "1" or not proposals:
+        return proposals
+    try:
+        import fugu_llm
+        from fugu_core import debate as fugu_debate
+    except ImportError:
+        return proposals
+    try:
+        if not fugu_debate.should_debate(proposals):
+            return proposals
+        print("   [debate] 提案が割れています → 相互批評ターンを実行")
+        return fugu_debate.debate(
+            question, proposals,
+            lambda model: fugu_llm.AskChat(model=model, label="debate"))
+    except Exception:
+        return proposals
+
+
+def _debate_record(question, models, ok):
+    """FUGU_DEBATE=1 のときだけ、Critic 判定の合否をスコア行列に記録する (Doc D4)。"""
+    if os.environ.get("FUGU_DEBATE") != "1":
+        return
+    try:
+        from fugu_core import debate as fugu_debate
+    except ImportError:
+        return
+    try:
+        matrix = fugu_debate.get_default_matrix()
+        domain = fugu_debate.classify_domain(question)
+        for model in models:
+            matrix.record(model, domain, ok)
+    except Exception:
+        pass
+
+
 def _speculate_context(question, use_search, rag_dirs):
     """FUGU_SPECULATE=1 のときだけ、conduct と並行して build_context を先読みする (Doc D3)。
 
@@ -4743,6 +4781,7 @@ def fugu_answer(question, plan=None, history=None):
     r = 0
     while True:
         proposals = get_proposals(models, question, reference, issue_hint, history=history)
+        proposals = _debate_proposals(question, proposals)  # FUGU_DEBATE=1 のみ
         _emit("proposals", round=r + 1, models=[m for m, _ in proposals])
         if SHOW_PROPOSALS:
             mode = "並列" if PARALLEL_PROPOSERS else "逐次"
@@ -4796,6 +4835,7 @@ def fugu_answer(question, plan=None, history=None):
         elif ALLOW_RECURSION:
             ok, issue = critique(question, fin)
             _emit("critic", ok=ok, issue=(issue or "")[:200])
+            _debate_record(question, models, ok)  # FUGU_DEBATE=1 のみ
             need_more = not ok
             if need_more:
                 issue_hint = issue  # 何が不十分かを次ラウンドの提案へ伝える
