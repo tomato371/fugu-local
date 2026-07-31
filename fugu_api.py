@@ -16,8 +16,9 @@ Interactive docs
     http://localhost:8000/docs
 """
 import difflib
+import os
 import time
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -35,6 +36,8 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, examples=["Is 91 a prime number?"])
     use_search: bool = Field(False, description="Inject DuckDuckGo web-search context")
     rag_dirs: Optional[List[str]] = Field(None, description="Local document dirs for RAG")
+    thinking_budget: Optional[Literal["low", "medium", "high", "auto"]] = Field(
+        None, description="Self-reflection budget for the final answer (auto = classify)")
 
 
 class AskResponse(BaseModel):
@@ -53,10 +56,21 @@ def health():
 def ask(req: AskRequest):
     """Answer a question through the full dynamic-MoA pipeline."""
     t0 = time.time()
+    # The thinking budget travels via the same env flag the CLI uses; scope it to
+    # this request so one caller's budget never leaks into the next request.
+    prev_budget = os.environ.get("FUGU_THINKING_BUDGET")
+    if req.thinking_budget:
+        os.environ["FUGU_THINKING_BUDGET"] = req.thinking_budget
     try:
         answer = fugu.ask_fugu(req.question, use_search=req.use_search, rag_dirs=req.rag_dirs)
     except Exception as exc:  # surface orchestrator errors as 500s
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if req.thinking_budget:
+            if prev_budget is None:
+                os.environ.pop("FUGU_THINKING_BUDGET", None)
+            else:
+                os.environ["FUGU_THINKING_BUDGET"] = prev_budget
     if answer is None:
         raise HTTPException(
             status_code=503,

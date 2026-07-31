@@ -4507,6 +4507,26 @@ def _print_plan(plan):
         print(f"   reason      = {plan['reason']}")
 
 
+def _apply_thinking(question, answer):
+    """FUGU_THINKING_BUDGET 設定時のみ、最終回答に思考予算(fugu_thinking)を適用する。
+    未設定/off なら answer をそのまま返す(既定経路はこの分岐に一切入らない)。
+    フック方式は _tdc_check と同じ env フラグ + lazy import。失敗時は元の回答を返す。"""
+    mode = os.environ.get("FUGU_THINKING_BUDGET", "")
+    if not mode or mode == "off":
+        return answer
+    try:
+        import fugu_llm
+        import fugu_thinking
+    except ImportError:
+        return answer
+
+    def _factory(budget):
+        return fugu_llm.AskChat(label="thinking", think=budget.think,
+                                num_predict=budget.num_predict)
+
+    return fugu_thinking.refine_answer(question, strip_think(answer), mode, _factory)
+
+
 def fugu_answer(question, plan=None, history=None):
     """事前に conduct() で得た plan に従って回答を生成する。
     plan は validate_plan 済み（selected_proposers は実モデル名で解決済み）。
@@ -4592,14 +4612,14 @@ def fugu_answer(question, plan=None, history=None):
             # 高速チェック2系統 + 疑義があれば思考ON再検算（verify_single 参照）
             ok, issue = verify_single(question, ans)
             if ok:
-                return ans
+                return _apply_thinking(question, ans)
             print(f"   ⤴ 単体回答に難あり（{issue}）→ 合議へエスカレーション")
             seed_answer, seed_issue = ans, issue
             plan["mode"] = "moa"
             plan["selected_proposers"] = PROPOSERS[:3]
             plan["rounds"] = max(1, plan["rounds"])
         else:
-            return ans
+            return _apply_thinking(question, ans)
 
     # ---------- 合議(MoA)モード：選抜した分だけ、必要なら再帰的に反復 ----------
     models = plan["selected_proposers"] or PROPOSERS[:3]
@@ -4668,7 +4688,7 @@ def fugu_answer(question, plan=None, history=None):
         if not need_more:
             break
 
-    return final
+    return _apply_thinking(question, final)
 
 # ==================================================
 # 実行制御
@@ -5770,7 +5790,15 @@ def main():
                         help=f"会話履歴ファイルパス（既定: {HISTORY_FILE}）")
     parser.add_argument("--image", nargs="+", metavar="PATH",
                         help=f"画像ファイルを vision モデル({VISION_MODEL})へ渡す（複数可）")
+    parser.add_argument("--thinking-budget", choices=["low", "medium", "high", "auto", "off"],
+                        default=None,
+                        help="思考予算: 最終回答への自己リフレクション量（auto=質問で自動判定。"
+                             "既定は無効＝従来動作）")
     args = parser.parse_args()
+
+    # --- 思考予算: env フラグ経由で fugu_answer のフックに伝える（既定は不変） ---
+    if args.thinking_budget:
+        os.environ["FUGU_THINKING_BUDGET"] = args.thinking_budget
 
     # --- セッション設定 ---
     global SESSION_SAVE, _HISTORY

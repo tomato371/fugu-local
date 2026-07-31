@@ -4,6 +4,7 @@ Fugu Local - Gradio Web Chat UI
 起動: python fugu_web.py
 ブラウザが http://localhost:7860 を自動で開きます
 """
+import os
 import sys
 import queue
 import threading
@@ -34,6 +35,10 @@ DEFAULT_HISTORY = Path.home() / ".fugu_history.json"
 SESS_DIR = Path.home() / ".fugu_sessions"
 
 THINK_CHOICES = ["モデル既定", "OFF（高速）"]
+
+# 思考予算(fugu_thinking): OFF なら従来動作。値は FUGU_THINKING_BUDGET env 経由で
+# fugu_answer のフックに伝わる（CLI --thinking-budget と同じ経路）。
+BUDGET_CHOICES = ["OFF", "low", "medium", "high", "auto"]
 
 
 def _session_path(name: str) -> Path:
@@ -89,8 +94,8 @@ def _run_fugu(question, use_search, rag_dirs, out_file, log_q):
     return answer
 
 
-def _stream(message, history, use_search, think_mode, rag_dirs_str, out_file,
-            session_name):
+def _stream(message, history, use_search, think_mode, budget_mode, rag_dirs_str,
+            out_file, session_name):
     """(チャット表示テキスト, 全処理ログ) を逐次 yield するジェネレーター。"""
     # Gradio の chatbot 履歴を fugu._HISTORY 形式に変換
     fugu._HISTORY.clear()
@@ -106,6 +111,12 @@ def _stream(message, history, use_search, think_mode, rag_dirs_str, out_file,
     fugu.HISTORY_FILE = _session_path(session_name)
     # think:true は qwen3-coder/phi4 が 400 で拒否するため 既定/OFF のみ
     fugu.PROPOSER_THINK = False if think_mode == THINK_CHOICES[1] else None
+
+    # 思考予算: OFF は env を消して従来動作に戻す（他セッションへ漏らさない）
+    if budget_mode and budget_mode != "OFF":
+        os.environ["FUGU_THINKING_BUDGET"] = budget_mode
+    else:
+        os.environ.pop("FUGU_THINKING_BUDGET", None)
 
     rag_dirs = (
         [d.strip() for d in rag_dirs_str.split(",") if d.strip()]
@@ -212,6 +223,12 @@ def build_ui():
                     label="思考 (thinking)",
                     info="OFF は思考トークンを省いて高速化（品質とトレードオフ）",
                 )
+                budget_mode = gr.Radio(
+                    choices=BUDGET_CHOICES,
+                    value=BUDGET_CHOICES[0],
+                    label="思考予算 (reflection)",
+                    info="最終回答への自己リフレクション量。auto は質問で自動判定",
+                )
                 use_search = gr.Checkbox(label="Web 検索", value=False)
                 rag_dirs = gr.Textbox(
                     label="RAG ディレクトリ (カンマ区切り)",
@@ -225,12 +242,12 @@ def build_ui():
                 gr.Markdown(_MODELS_MD)
 
         # ストリーミングレスポンス (Gradio 6 は messages 形式のみ)
-        def _respond(message, chat_history, us, think, rd, of, sess):
+        def _respond(message, chat_history, us, think, budget, rd, of, sess):
             if not message.strip():
                 yield message, chat_history, ""
                 return
             for partial, log_text in _stream(
-                message, chat_history, us, think, rd, of, sess
+                message, chat_history, us, think, budget, rd, of, sess
             ):
                 new_history = chat_history + [
                     {"role": "user", "content": message},
@@ -238,7 +255,8 @@ def build_ui():
                 ]
                 yield "", new_history, log_text
 
-        inputs = [msg, chatbot, use_search, think_mode, rag_dirs, out_file, session_dd]
+        inputs = [msg, chatbot, use_search, think_mode, budget_mode, rag_dirs, out_file,
+                  session_dd]
         outputs = [msg, chatbot, process_log]
         send.click(_respond, inputs=inputs, outputs=outputs)
         msg.submit(_respond, inputs=inputs, outputs=outputs)
