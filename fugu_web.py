@@ -7,10 +7,13 @@ Fugu Local - Gradio Web Chat UI
 import os
 import sys
 import queue
+import tempfile
 import threading
 import builtins
 from datetime import datetime
 from pathlib import Path
+
+import fugu_artifacts
 
 for _s in (sys.stdout, sys.stderr):
     if _s and hasattr(_s, "reconfigure"):
@@ -39,6 +42,30 @@ THINK_CHOICES = ["モデル既定", "OFF（高速）"]
 # 思考予算(fugu_thinking): OFF なら従来動作。値は FUGU_THINKING_BUDGET env 経由で
 # fugu_answer のフックに伝わる（CLI --thinking-budget と同じ経路）。
 BUDGET_CHOICES = ["OFF", "low", "medium", "high", "auto"]
+
+# Canvas エクスポートの書き出し先（gr.File はパスを受けるためファイル化が必要）
+ARTIFACT_DIR = Path(tempfile.gettempdir()) / "fugu_artifacts"
+
+
+def _update_canvas(chat_history, prev_code):
+    """最後のアシスタント回答から Canvas(Preview/Code/Diff/Export)を更新する。
+    ロジックは fugu_artifacts に隔離済み — ここは配線のみ(Gradio ドリフト対策)。"""
+    last = ""
+    for m in reversed(chat_history or []):
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            last = str(m.get("content") or "")
+            break
+    view = fugu_artifacts.build_canvas(last, prev_code or "")
+    file_path = None
+    if view["has_artifact"]:
+        try:
+            ARTIFACT_DIR.mkdir(exist_ok=True)
+            file_path = str(ARTIFACT_DIR / view["filename"])
+            Path(file_path).write_text(str(view["code"]), encoding="utf-8")
+        except OSError:
+            file_path = None  # エクスポート不可でもプレビューは出す
+    new_prev = view["code"] if view["has_artifact"] else (prev_code or "")
+    return view["preview_html"], view["code"], view["diff"], file_path, new_prev
 
 
 def _session_path(name: str) -> Path:
@@ -241,6 +268,22 @@ def build_ui():
                 )
                 gr.Markdown(_MODELS_MD)
 
+            # Canvas / Artifacts ワークスペース（右ペイン）
+            with gr.Column(scale=3, min_width=320):
+                gr.Markdown("### Canvas / Artifacts")
+                canvas_prev = gr.State("")
+                with gr.Tabs():
+                    with gr.Tab("Preview"):
+                        preview_html = gr.HTML(fugu_artifacts.EMPTY_PREVIEW)
+                    with gr.Tab("Code"):
+                        code_view = gr.Code(value="", language=None,
+                                            interactive=False, lines=22)
+                    with gr.Tab("Diff"):
+                        diff_view = gr.Code(value="", language=None,
+                                            interactive=False, lines=22)
+                    with gr.Tab("Export"):
+                        export_file = gr.File(label="ダウンロード", value=None)
+
         # ストリーミングレスポンス (Gradio 6 は messages 形式のみ)
         def _respond(message, chat_history, us, think, budget, rd, of, sess):
             if not message.strip():
@@ -258,8 +301,12 @@ def build_ui():
         inputs = [msg, chatbot, use_search, think_mode, budget_mode, rag_dirs, out_file,
                   session_dd]
         outputs = [msg, chatbot, process_log]
-        send.click(_respond, inputs=inputs, outputs=outputs)
-        msg.submit(_respond, inputs=inputs, outputs=outputs)
+        canvas_in = [chatbot, canvas_prev]
+        canvas_out = [preview_html, code_view, diff_view, export_file, canvas_prev]
+        send.click(_respond, inputs=inputs, outputs=outputs).then(
+            _update_canvas, inputs=canvas_in, outputs=canvas_out)
+        msg.submit(_respond, inputs=inputs, outputs=outputs).then(
+            _update_canvas, inputs=canvas_in, outputs=canvas_out)
 
         # ── セッション操作 ──
         def _new_chat():
