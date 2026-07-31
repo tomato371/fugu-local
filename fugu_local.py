@@ -4526,6 +4526,39 @@ def _print_plan(plan):
         print(f"   reason      = {plan['reason']}")
 
 
+# ==================================================
+# リアルタイムイベント基盤 (D-6 / Doc B5)
+# ==================================================
+
+_EVENT_SINK = None
+
+
+def set_event_sink(cb):
+    """リアルタイムイベントの受け口 cb(kind, data_dict) を登録する(None で解除)。
+    fugu_api の SSE/WS (B5) が消費する。未登録時 _emit は完全 no-op のため
+    既定経路の挙動・性能に影響しない。同時実行1件前提(8GB VRAM・GPU 1基)。"""
+    global _EVENT_SINK
+    _EVENT_SINK = cb
+
+
+def _emit(kind, **data):
+    """イベントを sink へ送る。sink 側の例外は握りつぶす(本処理を絶対に落とさない)。"""
+    if _EVENT_SINK is None:
+        return
+    try:
+        _EVENT_SINK(kind, data)
+    except Exception:
+        pass
+
+
+def _finish_answer(question, answer):
+    """回答確定処理(fugu_answer の全 return 経路共通): 思考予算フック(B2)を適用し、
+    final イベント(B5)を発火してから返す。SC 経路は投票結果保護のため通らない。"""
+    answer = _apply_thinking(question, answer)
+    _emit("final", chars=len(answer or ""))
+    return answer
+
+
 def _apply_thinking(question, answer):
     """FUGU_THINKING_BUDGET 設定時のみ、最終回答に思考予算(fugu_thinking)を適用する。
     未設定/off なら answer をそのまま返す(既定経路はこの分岐に一切入らない)。
@@ -4555,6 +4588,8 @@ def fugu_answer(question, plan=None, history=None):
         plan, _raw = conduct(question, history=history)
         if SHOW_PLAN:
             _print_plan(plan)
+    _emit("plan", mode=plan.get("mode"), task_type=plan.get("task_type"),
+          rounds=plan.get("rounds"))
 
     # ---------- 検証可能タスク（math/mcq）: 自己一貫性投票で解く ----------
     if (SC_ENABLED and plan.get("task_type") in ("math", "mcq")
@@ -4631,14 +4666,14 @@ def fugu_answer(question, plan=None, history=None):
             # 高速チェック2系統 + 疑義があれば思考ON再検算（verify_single 参照）
             ok, issue = verify_single(question, ans)
             if ok:
-                return _apply_thinking(question, ans)
+                return _finish_answer(question, ans)
             print(f"   ⤴ 単体回答に難あり（{issue}）→ 合議へエスカレーション")
             seed_answer, seed_issue = ans, issue
             plan["mode"] = "moa"
             plan["selected_proposers"] = PROPOSERS[:3]
             plan["rounds"] = max(1, plan["rounds"])
         else:
-            return _apply_thinking(question, ans)
+            return _finish_answer(question, ans)
 
     # ---------- 合議(MoA)モード：選抜した分だけ、必要なら再帰的に反復 ----------
     models = plan["selected_proposers"] or PROPOSERS[:3]
@@ -4649,6 +4684,7 @@ def fugu_answer(question, plan=None, history=None):
     r = 0
     while True:
         proposals = get_proposals(models, question, reference, issue_hint, history=history)
+        _emit("proposals", round=r + 1, models=[m for m, _ in proposals])
         if SHOW_PROPOSALS:
             mode = "並列" if PARALLEL_PROPOSERS else "逐次"
             print(f"\n--- ラウンド {r + 1}: 各提案（{mode}・{len(models)}体） ---")
@@ -4665,6 +4701,7 @@ def fugu_answer(question, plan=None, history=None):
         # 済みにしている慣例に合わせ、ここでも strip_think 済みの fin を reference に
         # 使う。返り値の final 自体は生のまま返す（ask_fugu 側で最終的に strip_think）。
         fin = strip_think(final)
+        _emit("aggregate", round=r + 1, chars=len(fin))
         reference = fin  # 次ラウンドは今回の統合結果(think除去済み)を土台に改善
         issue_hint = None  # 指摘は消費済み。以降のチェックが新しい指摘を設定する
         r += 1
@@ -4685,6 +4722,7 @@ def fugu_answer(question, plan=None, history=None):
         # 続行判断1（決定的・最優先）: コードを実行し、失敗なら traceback を修正ヒントに
         # して追加ラウンド。これが「自律的にコードを直し続ける」ループの本体。
         code_issue = code_check(fin)
+        _emit("sandbox", ok=not code_issue)
         if code_issue:
             issue_hint = code_issue
             tail = code_issue.strip().splitlines()[-1][:80]
@@ -4696,6 +4734,7 @@ def fugu_answer(question, plan=None, history=None):
             need_more = True
         elif ALLOW_RECURSION:
             ok, issue = critique(question, fin)
+            _emit("critic", ok=ok, issue=(issue or "")[:200])
             need_more = not ok
             if need_more:
                 issue_hint = issue  # 何が不十分かを次ラウンドの提案へ伝える
@@ -4707,7 +4746,7 @@ def fugu_answer(question, plan=None, history=None):
         if not need_more:
             break
 
-    return _apply_thinking(question, final)
+    return _finish_answer(question, final)
 
 # ==================================================
 # 実行制御

@@ -4,6 +4,10 @@ Endpoints
     GET  /health      -> {"status": "ok" | "ollama_unreachable", "ollama_url": "..."}
     POST /ask         -> {"answer": "...", "elapsed_seconds": 1.2}
                          body: {"question": "...", "use_search": false, "rag_dirs": null}
+    GET  /ask/stream  -> Server-Sent Events: real-time pipeline events
+                         (plan/proposals/aggregate/sandbox/critic/final), then the
+                         answer and a `done` sentinel
+    WS   /ws/ask      -> same event stream over WebSocket (send {"question": ...})
     POST /completion  -> inline code completion (single coder-model call, no MoA)
     POST /refactor    -> instructed rewrite + unified diff
     POST /test-run    -> sandboxed execution with optional self-debug retries
@@ -15,12 +19,17 @@ Run
 Interactive docs
     http://localhost:8000/docs
 """
+import asyncio
 import difflib
+import json
 import os
+import queue
+import threading
 import time
 from typing import List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 import fugu_local as fugu
@@ -77,6 +86,101 @@ def ask(req: AskRequest):
             detail="Setup failed: Ollama unreachable or no models available.",
         )
     return AskResponse(answer=answer, elapsed_seconds=round(time.time() - t0, 2))
+
+
+# ------------------------------------------------------------------ real-time streaming
+# The orchestrator runs in a worker thread; fugu_local._emit events flow through
+# a queue.Queue to the client. Single-flight by design (one GPU, one event sink):
+# concurrent streams would interleave sinks, matching the existing web UI lock
+# philosophy. `None` on the queue is the internal done sentinel.
+
+
+def _run_streaming(question: str, use_search: bool, event_q: "queue.Queue") -> None:
+    """Worker: register the event sink, run the pipeline, then signal completion.
+
+    Puts ("answer", {...}) / ("error", {...}) before the final `None` sentinel so
+    readers can simply drain the queue until None.
+    """
+    def sink(kind, data):
+        event_q.put((kind, data))
+
+    fugu.set_event_sink(sink)
+    try:
+        answer = fugu.ask_fugu(question, use_search=use_search)
+        if answer is None:
+            event_q.put(("error", {"detail": "Setup failed: Ollama unreachable "
+                                             "or no models available."}))
+        else:
+            event_q.put(("answer", {"answer": answer}))
+    except Exception as exc:
+        event_q.put(("error", {"detail": str(exc)}))
+    finally:
+        fugu.set_event_sink(None)
+        event_q.put(None)
+
+
+def _sse_line(kind: str, data: dict) -> str:
+    return f"event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.get("/ask/stream")
+def ask_stream(question: str, use_search: bool = False):
+    """Answer via the full pipeline, streaming internal events as SSE.
+
+    Event kinds: plan / proposals / aggregate / sandbox / critic / final
+    (from fugu_local._emit), then `answer` (or `error`) and a final `done`.
+    """
+    if not question.strip():
+        raise HTTPException(status_code=422, detail="question must not be empty")
+
+    def gen():
+        event_q: "queue.Queue" = queue.Queue()
+        worker = threading.Thread(
+            target=_run_streaming, args=(question, use_search, event_q), daemon=True)
+        worker.start()
+        while True:
+            item = event_q.get()
+            if item is None:
+                break
+            yield _sse_line(item[0], item[1])
+        yield _sse_line("done", {})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.websocket("/ws/ask")
+async def ws_ask(websocket: WebSocket):
+    """Same event stream over WebSocket. Client sends {"question": ..., "use_search"?}.
+
+    Each event is a JSON object {"event": kind, "data": {...}}; the stream ends
+    with {"event": "done"} and the socket is closed by the server.
+    """
+    await websocket.accept()
+    try:
+        payload = await websocket.receive_json()
+        question = str(payload.get("question") or "").strip()
+        if not question:
+            await websocket.send_json({"event": "error",
+                                       "data": {"detail": "question must not be empty"}})
+            return
+        event_q: "queue.Queue" = queue.Queue()
+        worker = threading.Thread(
+            target=_run_streaming,
+            args=(question, bool(payload.get("use_search")), event_q), daemon=True)
+        worker.start()
+        loop = asyncio.get_running_loop()
+        while True:
+            # blocking queue.get を executor へ (D-4: asyncio + run_in_executor)
+            item = await loop.run_in_executor(None, event_q.get)
+            if item is None:
+                break
+            await websocket.send_json({"event": item[0], "data": item[1]})
+        await websocket.send_json({"event": "done", "data": {}})
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass  # クライアント切断済みなら閉じ損ねてよい
 
 
 # ------------------------------------------------------------------ IDE endpoints

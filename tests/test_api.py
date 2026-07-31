@@ -104,3 +104,91 @@ def test_test_run_tdc_mode_runs_pytest():
     })
     body = r.json()
     assert body["ok"] is True
+
+
+# ------------------------------------------------------------------ streaming (B5)
+# Fully offline: the fake pipeline emits events through fugu_local's real
+# set_event_sink/_emit plumbing, exactly like fugu_answer does live.
+
+
+def _fake_pipeline(question, **kwargs):
+    fugu_api.fugu._emit("plan", mode="single", task_type="qa", rounds=1)
+    fugu_api.fugu._emit("aggregate", round=1, chars=10)
+    fugu_api.fugu._emit("final", chars=10)
+    return f"answer to {question}"
+
+
+def test_emit_is_noop_without_sink():
+    fugu_api.fugu.set_event_sink(None)
+    fugu_api.fugu._emit("plan", x=1)  # 例外を出さないこと
+
+
+def test_emit_swallows_sink_exceptions():
+    fugu_api.fugu.set_event_sink(
+        lambda kind, data: (_ for _ in ()).throw(RuntimeError("sink boom")))
+    try:
+        fugu_api.fugu._emit("plan", x=1)  # 本処理を落とさない
+    finally:
+        fugu_api.fugu.set_event_sink(None)
+
+
+def test_ask_stream_emits_events_answer_and_done(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "ask_fugu", _fake_pipeline)
+    r = client.get("/ask/stream", params={"question": "hi"})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    text = r.text
+    assert "event: plan" in text
+    assert "event: aggregate" in text
+    assert "event: answer" in text and "answer to hi" in text
+    assert text.rstrip().endswith("event: done\ndata: {}")  # 終端センチネル
+    assert text.index("event: plan") < text.index("event: answer")  # イベントが先
+
+
+def test_ask_stream_unregisters_sink_after_completion(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "ask_fugu", _fake_pipeline)
+    client.get("/ask/stream", params={"question": "hi"})
+    assert fugu_api.fugu._EVENT_SINK is None
+
+
+def test_ask_stream_orchestrator_error_becomes_error_event(monkeypatch):
+    def boom(question, **kwargs):
+        raise RuntimeError("pipeline boom")
+    monkeypatch.setattr(fugu_api.fugu, "ask_fugu", boom)
+    text = client.get("/ask/stream", params={"question": "hi"}).text
+    assert "event: error" in text and "pipeline boom" in text
+    assert "event: done" in text  # エラーでも必ず終端する
+
+
+def test_ask_stream_setup_failure_is_error_event(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "ask_fugu", lambda q, **kw: None)
+    text = client.get("/ask/stream", params={"question": "hi"}).text
+    assert "event: error" in text and "Setup failed" in text
+
+
+def test_ask_stream_rejects_empty_question():
+    assert client.get("/ask/stream", params={"question": "  "}).status_code == 422
+
+
+def test_ws_ask_streams_events_then_done(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "ask_fugu", _fake_pipeline)
+    with client.websocket_connect("/ws/ask") as ws:
+        ws.send_json({"question": "hi"})
+        events = []
+        while True:
+            msg = ws.receive_json()
+            events.append(msg)
+            if msg["event"] == "done":
+                break
+    kinds = [e["event"] for e in events]
+    assert "plan" in kinds and "answer" in kinds
+    assert kinds[-1] == "done"
+    answer = next(e for e in events if e["event"] == "answer")
+    assert answer["data"]["answer"] == "answer to hi"
+
+
+def test_ws_ask_empty_question_is_error_event():
+    with client.websocket_connect("/ws/ask") as ws:
+        ws.send_json({"question": ""})
+        msg = ws.receive_json()
+    assert msg["event"] == "error"
