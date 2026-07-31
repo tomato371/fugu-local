@@ -183,6 +183,29 @@ def extract_code_block(text: str) -> Optional[str]:
         return None
 
 
+def _record_episode(task: str, result: SandboxResult, attempts: int) -> None:
+    """FUGU_MEMORY=1 のときだけ自己デバッグの顛末をエピソード記憶に残す (Doc D1)。
+    未設定なら完全 no-op。記録失敗は本処理に影響させない。"""
+    if os.environ.get("FUGU_MEMORY") != "1":
+        return
+    try:
+        from fugu_core import memory as fugu_memory
+    except ImportError:
+        return
+    try:
+        if result.ok:
+            lesson = (f"self-debug fixed the script in {attempts} attempt(s)"
+                      if attempts > 1 else "ran clean on first attempt")
+        else:
+            lesson = f"still failing after {attempts} attempt(s): " \
+                     f"{result.output[:300]}"
+        fugu_memory.get_default_memory().record(fugu_memory.Episode(
+            kind="sandbox", task=task[:200],
+            outcome="success" if result.ok else "failure", lesson=lesson))
+    except Exception:
+        pass
+
+
 def run_with_self_debug(code: str, chat, sandbox: Optional[Sandbox] = None,
                         max_retries: int = 3, lang: str = "python",
                         files: Optional[Dict[str, str]] = None,
@@ -203,6 +226,7 @@ def run_with_self_debug(code: str, chat, sandbox: Optional[Sandbox] = None,
         attempts += 1
         result = sandbox.run(current, lang=lang, timeout=timeout, files=files)
         if result.ok:
+            _record_episode(code, result, attempts)
             return result, current, attempts
         if attempts > max_retries:
             break
@@ -221,6 +245,7 @@ def run_with_self_debug(code: str, chat, sandbox: Optional[Sandbox] = None,
         if not fixed or fixed == current:
             break
         current = fixed
+    _record_episode(code, result, attempts)
     return result, current, attempts
 
 

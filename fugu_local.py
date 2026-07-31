@@ -4551,6 +4551,22 @@ def _emit(kind, **data):
         pass
 
 
+def _memory_lessons(question):
+    """FUGU_MEMORY=1 のときだけ、過去エピソードの教訓を質問の前に付す (Doc D1)。
+    未設定なら question をそのまま返す(既定経路は不変)。失敗しても質問を失わない。"""
+    if os.environ.get("FUGU_MEMORY") != "1":
+        return question
+    try:
+        from fugu_core import memory as fugu_memory
+    except ImportError:
+        return question
+    try:
+        lessons = fugu_memory.lessons_for(fugu_memory.get_default_memory(), question)
+    except Exception:
+        return question
+    return f"{lessons}\n\n{question}" if lessons else question
+
+
 def _finish_answer(question, answer):
     """回答確定処理(fugu_answer の全 return 経路共通): 思考予算フック(B2)を適用し、
     final イベント(B5)を発火してから返す。SC 経路は投票結果保護のため通らない。"""
@@ -4584,6 +4600,7 @@ def fugu_answer(question, plan=None, history=None):
     plan は validate_plan 済み（selected_proposers は実モデル名で解決済み）。
     plan=None のときは内部で conduct() を実行する（eval など単体呼び出し向けの後方互換）。"""
     history = history or []
+    question = _memory_lessons(question)
     if plan is None:
         plan, _raw = conduct(question, history=history)
         if SHOW_PLAN:

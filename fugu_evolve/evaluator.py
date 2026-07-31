@@ -15,6 +15,7 @@ merge するかは CLI (C5) の Critic 承認に委ね、ここでは判定だ�
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -109,6 +110,24 @@ def _compare_bench(baseline: Dict[str, object], current: BenchReport,
     return False
 
 
+def _record_episode(repo: str, verification: "Verification") -> None:
+    """FUGU_MEMORY=1 のときだけ検証の顛末をエピソード記憶に残す (Doc D1)。"""
+    if os.environ.get("FUGU_MEMORY") != "1":
+        return
+    try:
+        from fugu_core import memory as fugu_memory
+    except ImportError:
+        return
+    try:
+        fugu_memory.get_default_memory().record(fugu_memory.Episode(
+            kind="evolve", task=f"verify branch in {repo}"[:200],
+            outcome="success" if verification.verdict == VERIFIED else "failure",
+            lesson=("; ".join(verification.notes)[:300]
+                    or f"verdict={verification.verdict}")))
+    except Exception:
+        pass
+
+
 def verify(workspace, sandbox: Optional[Sandbox], chat,
            baseline: Dict[str, object], max_attempts: int = 3,
            bench_argv: Optional[List[str]] = None,
@@ -144,13 +163,17 @@ def verify(workspace, sandbox: Optional[Sandbox], chat,
         notes.append(f"repair attempt {attempt}: rewrote {patch['path']}")
 
     if not report.ok:
-        return Verification(verdict=FAILED, attempts=attempts, pytest=report,
-                            notes=notes)
+        verification = Verification(verdict=FAILED, attempts=attempts,
+                                    pytest=report, notes=notes)
+        _record_episode(workspace.repo, verification)
+        return verification
 
     current_bench = run_bench(workspace.repo, bench_argv=bench_argv,
                               sandbox=sandbox, offline=offline)
     regressed = _compare_bench(baseline, current_bench, tolerance, notes)
     verdict = FAILED if regressed else VERIFIED
-    return Verification(verdict=verdict, attempts=attempts, pytest=report,
-                        bench=current_bench, bench_regressed=regressed,
-                        notes=notes)
+    verification = Verification(verdict=verdict, attempts=attempts, pytest=report,
+                                bench=current_bench, bench_regressed=regressed,
+                                notes=notes)
+    _record_episode(workspace.repo, verification)
+    return verification
