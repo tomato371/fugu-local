@@ -649,11 +649,29 @@ def _search_raw(query: str, max_results: int = None) -> list:
         return []
 
 
+def _browser_enrich(results):
+    """FUGU_BROWSER=1 のときだけ、検索結果の Source URL 先の本文抜粋を追記する。
+    未設定なら results をそのまま返す(既定経路は不変)。フック方式は _apply_thinking
+    と同じ env フラグ + lazy import。失敗しても検索結果を絶対に失わない。"""
+    if os.environ.get("FUGU_BROWSER") != "1" or not results:
+        return results
+    try:
+        import fugu_browser
+    except ImportError:
+        return results
+    try:
+        return fugu_browser.enrich_search_results(results)
+    except Exception as e:
+        print(f"   [ブラウザ増強エラー(読み飛ばし): {e}]")
+        return results
+
+
 def web_search(query: str, max_results: int = None) -> str:
     """Web 検索 1 回分をフォーマット済み文字列で返す（後方互換用の単発検索）。"""
     results = _search_raw(query, max_results)
     if not results:
         return ""
+    results = _browser_enrich(results)
     return "## Web Search Results (DuckDuckGo)\n" + "\n\n".join(results)
 
 
@@ -747,6 +765,7 @@ def research_search(question: str) -> str:
 
     if not results:
         return ""
+    results = _browser_enrich(results)
     # 注入上限で切る（結果の区切り単位）。
     # 2026-07-25: 従来はここで最初に上限超過に当たった結果で break していたため、
     # それ以降の結果（後続ラウンドで Conductor が指定した不足事実を埋める、小さく
