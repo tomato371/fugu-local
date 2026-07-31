@@ -72,16 +72,20 @@ class SubprocessSandbox:
                 os.makedirs(os.path.dirname(path) or tmp, exist_ok=True)
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(content)
+            # argv にはスクリプトを相対名で渡す（run_argv が cwd=tmp で実行する）。
+            # 絶対 Windows パスだと WSL の bash.exe がパスを解決できない
+            # （バックスラッシュが食われ "C:Users...main.sh: No such file" で exit 127）。
+            # 相対名なら WSL bash は cwd を /mnt/c/... に変換して継承するため動く。
             if lang == "python":
                 script = os.path.join(tmp, "main.py")
-                argv = [sys.executable, "-X", "utf8", script]
+                argv = [sys.executable, "-X", "utf8", "main.py"]
             elif lang == "bash":
                 bash = shutil.which("bash")
                 if not bash:
                     return SandboxResult(stderr="bash not available on this system",
                                          exit_code=127)
                 script = os.path.join(tmp, "main.sh")
-                argv = [bash, script]
+                argv = [bash, "main.sh"]
             else:
                 return SandboxResult(stderr=f"unsupported lang: {lang}", exit_code=2)
             with open(script, "w", encoding="utf-8", newline="\n") as fh:
