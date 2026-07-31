@@ -39,3 +39,68 @@ def test_ask_empty_question_is_rejected():
 def test_ask_setup_failure_returns_503(monkeypatch):
     monkeypatch.setattr(fugu_api.fugu, "ask_fugu", lambda q, **kw: None)
     assert client.post("/ask", json={"question": "hi"}).status_code == 503
+
+
+# ------------------------------------------------------------------ IDE endpoints
+
+
+def test_completion_returns_inserted_code(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "setup", lambda: True)
+    monkeypatch.setattr(fugu_api.fugu, "ask",
+                        lambda *a, **k: "return n * 2")
+    r = client.post("/completion", json={"prefix": "def double(n):\n    "})
+    assert r.status_code == 200
+    assert r.json()["completion"] == "return n * 2"
+
+
+def test_completion_model_error_is_502(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "setup", lambda: True)
+    monkeypatch.setattr(fugu_api.fugu, "ask",
+                        lambda *a, **k: "__ERROR__: model exploded")
+    r = client.post("/completion", json={"prefix": "x = "})
+    assert r.status_code == 502
+
+
+def test_completion_setup_failure_is_503(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "setup", lambda: False)
+    r = client.post("/completion", json={"prefix": "x = "})
+    assert r.status_code == 503
+
+
+def test_refactor_returns_diff(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "setup", lambda: True)
+    monkeypatch.setattr(
+        fugu_api.fugu, "ask",
+        lambda *a, **k: "```python\nvalue = 2\n```")
+    r = client.post("/refactor",
+                    json={"code": "value = 1\n", "instruction": "set to 2"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["refactored"] == "value = 2"
+    assert "-value = 1" in body["diff"]
+    assert "+value = 2" in body["diff"]
+
+
+def test_test_run_plain_execution():
+    r = client.post("/test-run", json={"code": "print('from api')"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "from api" in body["stdout"]
+    assert body["attempts"] == 1
+
+
+def test_test_run_failure_reports_stderr():
+    r = client.post("/test-run", json={"code": "raise ValueError('api boom')"})
+    body = r.json()
+    assert body["ok"] is False
+    assert "api boom" in body["stderr"]
+
+
+def test_test_run_tdc_mode_runs_pytest():
+    r = client.post("/test-run", json={
+        "code": "def add(a, b):\n    return a + b\n",
+        "tests": "from solution import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+    })
+    body = r.json()
+    assert body["ok"] is True
