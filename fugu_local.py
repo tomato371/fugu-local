@@ -2342,6 +2342,15 @@ def run_python(code, timeout=None, stdout_only=False):
     は stdout_only の値によらず常に stdout+stderr の結合を返す — code-repair loop が
     traceback を見えるようにするため。"""
     timeout = timeout or CODE_EXEC_TIMEOUT
+    if os.environ.get("FUGU_SANDBOX") == "1":
+        try:
+            import fugu_sandbox  # opt-in: 既定経路はこの分岐に一切入らない
+        except ImportError:
+            fugu_sandbox = None
+        if fugu_sandbox is not None:
+            res = fugu_sandbox.SubprocessSandbox(timeout=timeout).run(code)
+            out = res.stdout if (stdout_only and res.ok) else res.output
+            return res.ok, out.strip()[-2000:]
     fd, path = tempfile.mkstemp(suffix=".py")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
