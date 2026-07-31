@@ -356,20 +356,53 @@ def load_history_file(path: Path = None) -> list:
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # 2026-07-23: このマシンのコンソールが cp932 である既知の落とし穴 #4 と
+        # 同種の環境要因で、セッションファイルが Shift-JIS エディタでの開き直し
+        # や部分的な破損により非UTF-8バイト列を含むことがある。その場合
+        # encoding="utf-8" のみの read_text は UnicodeDecodeError を送出し、
+        # 直下の except Exception: pass に捕まって [] を返す＝JSON構造自体は
+        # 健全でも会話履歴全体を無条件に失う。iteration 47 で
+        # _save_as_markdown/_save_as_text/_save_as_html の読み戻しに適用した
+        # errors="replace" パターンをここにも適用し、読めないバイトだけを
+        # 置換文字 (U+FFFD) に落として JSON をパース可能にし、読み取れる
+        # エントリを保持する（精度優先: 履歴を丸ごと捨てない）。書き込み側の
+        # save_history_file の encoding="utf-8" は変更しない。
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         if isinstance(data, list):
             # 最新 MAX_HISTORY_TURNS_SAVED 往復分のみ保持
-            msgs = [m for m in data if isinstance(m, dict) and "role" in m and "content" in m]
+            # 2026-07-23: iteration 66 で指摘され未修正だったバグを修正。
+            # キーの有無だけでなく値の型も str であることを検証する。
+            # {"role": "user", "content": null}（あるいは content が数値/list/dict）
+            # のような壊れたセッションファイルのエントリはキーの存在チェックだけでは
+            # 通過してしまい、_HISTORY に混入した後、次ターンで _trim_history()
+            # (L949 付近) が sum(len(m["content"]) for m in history) を実行した際に
+            # len(None) / len(123) で TypeError を送出しターンごとクラッシュする。
+            # ここで文字列以外の値を持つエントリを弾き、「壊れたファイルは空/縮退
+            # リストへ degrade する」という本関数の既存契約を値レベルまで拡張する。
+            msgs = [m for m in data
+                    if isinstance(m, dict)
+                    and isinstance(m.get("role"), str)
+                    and isinstance(m.get("content"), str)]
             return msgs[-(MAX_HISTORY_TURNS_SAVED * 2):]
     except Exception:
         pass
     return []
 
 
-def save_history_file(history: list, path: Path = None):
-    """会話履歴を JSON ファイルに保存する。SESSION_SAVE=False 時は何もしない。"""
-    if not SESSION_SAVE:
-        return
+def save_history_file(history: list, path: Path = None, force: bool = False):
+    """会話履歴を JSON ファイルに保存する。
+
+    SESSION_SAVE=False (--no-history) 時は既定では何もしない（自動/受動的な
+    永続化はユーザーのオプトアウトを尊重する）。ただし force=True を渡すと、
+    'save <path>' のようなユーザー明示的なエクスポート操作として
+    SESSION_SAVE の値に関わらず書き込みを行う。
+
+    戻り値: 実際にファイルへ書き込めた場合のみ True。SESSION_SAVE=False かつ
+    force=False で書き込みをスキップした場合、または書き込み中に例外が
+    発生した場合は False（例外は送出しない）。
+    """
+    if not force and not SESSION_SAVE:
+        return False
     path = path or HISTORY_FILE
     try:
         path.write_text(
@@ -377,8 +410,10 @@ def save_history_file(history: list, path: Path = None):
                        ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        return True
     except Exception as e:
         print(f"   [履歴保存エラー: {e}]")
+        return False
 
 
 # ==================================================
@@ -428,17 +463,51 @@ def notify_slack(question: str, answer: str, elapsed: float):
 # Web 検索
 # ==================================================
 
-def _ddg_full(query: str, max_results: int) -> list:
-    """ddgs パッケージ（旧 duckduckgo_search）を使ってフル検索結果を返す。"""
+def _resolve_ddgs_class():
+    """DDGS クラスを解決するだけ（クエリは実行しない＝import 段階のみ）。
+    ddgs（後継、pip install ddgs）→ duckduckgo_search（旧名）の順に import を試み、
+    両方とも未インストールの場合のみ ImportError を送出する。"""
     try:
         from ddgs import DDGS  # 後継パッケージ（pip install ddgs）
     except ImportError:
         from duckduckgo_search import DDGS  # 旧名（非推奨）
+    return DDGS
+
+
+def _ddg_full(query: str, max_results: int) -> list:
+    """ddgs パッケージ（旧 duckduckgo_search）を使ってフル検索結果を返す。"""
+    DDGS = _resolve_ddgs_class()
     results = []
     with DDGS() as ddgs:
         for r in ddgs.text(query, max_results=max_results):
-            snippet = (r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS]
-            results.append(f"[{r.get('title', '')}]\n{snippet}\nSource: {r.get('href', '')}")
+            # 2026-07-25: _ddg_full は ddgs/duckduckgo_search がインストール済みの
+            # 通常運用時に必ず通るプライマリ検索経路であるにもかかわらず、フォール
+            # バック側の _ddg_instant（iter103/111/112/113/138/139で「壊れた外部
+            # ペイロードの1件が全体を握り潰さない」よう isinstance ガードで段階的に
+            # 固められてきた）とは非対称に、r.get("body")/r.get("title")/
+            # r.get("href") を型チェックなしで直接呼んでいた。ddgs.text() が yield
+            # する行が dict でない場合、r.get(...) は即座に AttributeError を送出し、
+            # _search_raw の `except Exception: return []` がそれをクエリ全体の空
+            # リストへ丸ごと潰すため、同じクエリ内の他の正常な行まで全て失われる
+            # （1件の壊れた行が全件を道連れにする、iter113/iter138と同じ問題）。
+            # ここでも同じ作法に倣い、行(r)が dict でなければ例外を出さず continue
+            # して後続の有効な行を救済する。また title/body/href が str でない場合
+            # （list/dict/int 等）は、そのrepr文字列をモデルの検索コンテキストへ
+            # ノイズとして混入させないため str() 変換はせず空文字列として扱う
+            # （_ddg_instant の末端型ガード、2026-07-25追加分と同じ考え方）。
+            if not isinstance(r, dict):
+                continue
+            title = r.get("title", "")
+            if not isinstance(title, str):
+                title = ""
+            body = r.get("body")
+            if not isinstance(body, str):
+                body = ""
+            href = r.get("href", "")
+            if not isinstance(href, str):
+                href = ""
+            snippet = (body or "")[:WEB_SEARCH_SNIPPET_CHARS]
+            results.append(f"[{title}]\n{snippet}\nSource: {href}")
     return results
 
 
@@ -453,13 +522,82 @@ def _ddg_instant(query: str, max_results: int) -> list:
             data = json.loads(r.read().decode("utf-8"))
     except Exception:
         return []
+    # 2026-07-24: DuckDuckGo Instant Answer API はクエリ次第で JSON のトップレベルが
+    # dict ではない（配列・文字列・数値など、いずれも json.loads は例外にしない）ことが
+    # あり、また "RelatedTopics" キーが存在していても値が null のことがある。
+    # dict.get(key, default) の default は「キーが存在しない」場合にのみ使われる仕様の
+    # ため、{"RelatedTopics": null} では data.get("RelatedTopics", []) は [] ではなく
+    # None を返し、続く `for t in None` が TypeError になる。この関数は
+    # _search_raw() の L544 相当 `except ImportError: return _ddg_instant(...)` の
+    # 内側から try に包まれず直接呼ばれているため、その TypeError は _search_raw の
+    # 「失敗時は空リスト（呼び出し側を止めない）」という契約（イテレーション75で確立）
+    # をすり抜けて呼び出し元（web_search/research_search/build_context）まで伝播し、
+    # ターン全体を落としてしまう。ここで dict 以外のトップレベルは即座に [] を返し、
+    # RelatedTopics も非 list（null・dict・str 等）なら [] に丸めることで、
+    # イテレーション85/89で整備した整形済みペイロードの挙動は一切変えずに、
+    # 壊れたペイロードでも例外を出さないようにする。
+    if not isinstance(data, dict):
+        return []
     results = []
-    if data.get("Abstract"):
-        results.append(f"[{data.get('AbstractTitle', '')}]\n{data['Abstract']}\n"
+    # 2026-07-24: _ddg_full は (r.get("body") or "")[:WEB_SEARCH_SNIPPET_CHARS] で
+    # 各スニペットを必ず切り詰めているが、この Instant Answer フォールバックは
+    # Abstract / RelatedTopics の Text を無制限に追加していた。DuckDuckGo の
+    # Abstract は数KBに及ぶことがあり、research_search の body 組み立てループは
+    # 先頭アイテムが SEARCH_CONTEXT_CHARS を超えると
+    # `if not body: body = item[:SEARCH_CONTEXT_CHARS]` で break するため、巨大な
+    # Abstract 1件が他の収集済み事実を全て握り潰してしまう。_ddg_full と同じ上限を
+    # 適用して対称にする（Source 行は切り詰めない）。
+    # 2026-07-25: イテレーション103はコンテナ形状（トップレベル data / RelatedTopics）
+    # のみを isinstance で丸め、末端（Abstract 文字列本体・直接トピックの Text・
+    # ネストされた Topics[].Text）はここに来るまで一度も型を見ておらず、
+    # `if data.get("Abstract"):` のような真偽値チェックの直後でいきなり
+    # `[:WEB_SEARCH_SNIPPET_CHARS]` によるスライスを行っていた。DDG は壊れた
+    # ペイロードで Abstract/Text に int・float・bool・list・dict を返すことがあり、
+    # int/float/bool は「添字操作できません」の TypeError、dict はスライス構文上
+    # 例外にはならないが該当キーの意味を持たない値になり、list は例外を出さず
+    # スライスできてしまうが results にリストオブジェクトが混入し、後段の
+    # research_search の `re.search(r'Source: ...')` や `'\n\n'.join(...)` を
+    # 壊す。コンテナ側の非list/非dict丸め（イテレーション103・111・112・113の
+    # 「isinstance で判定し例外を出さず読み飛ばす」系列と同じ考え方）と同様に、
+    # ここでも末端が str でなければスライスせずそのリーフだけを読み飛ばす
+    # （str への str() 変換はしない。list/dict の repr をそのままノイズとして
+    # モデルの検索コンテキストに混入させないため）。_search_raw() は
+    # `except ImportError:` の内側から try に包まずこの関数を直接呼んでいる
+    # （イテレーション103のコメント参照）ため、ここで拾わない例外は
+    # 「失敗時は空リスト」という never-raise 契約をすり抜けてターン全体を落とす。
+    if data.get("Abstract") and isinstance(data["Abstract"], str):
+        abstract = data["Abstract"][:WEB_SEARCH_SNIPPET_CHARS]
+        results.append(f"[{data.get('AbstractTitle', '')}]\n{abstract}\n"
                        f"Source: {data.get('AbstractURL', '')}")
-    for t in data.get("RelatedTopics", []):
+    rel = data.get("RelatedTopics")
+    if not isinstance(rel, list):
+        rel = []
+    for t in rel:
         if isinstance(t, dict) and t.get("Text"):
-            results.append(t["Text"])
+            # トップレベルに Text がある「直接トピック」はこちらを優先し、
+            # 仮に Topics も併存していても展開しない（下の分岐と二重追加しない
+            # ための優先順位。直接トピックの既存挙動を保つ）。
+            # Text が truthy な非文字列（例: int/float/bool/list/dict）の場合は
+            # スライスせずこのリーフだけを読み飛ばす（上のコメント参照）。
+            # ブランチの選択自体（direct-Text 優先）は変えない。
+            if isinstance(t["Text"], str):
+                results.append(t["Text"][:WEB_SEARCH_SNIPPET_CHARS])
+        elif isinstance(t, dict) and isinstance(t.get("Topics"), list):
+            # 2026-07-24: RelatedTopics には、トップレベル Text を持つ直接トピックと
+            # {"Name": "カテゴリ名", "Topics": [...]} 形式の「グループ化トピック」が
+            # 混在する。従来は isinstance(t, dict) and t.get("Text") しか見ておらず、
+            # グループ化エントリ配下にネストされた事実（Topics 配列の各要素）が無条件
+            # で握り潰されていた（イテレーション85がこの関数を整備した際に残った
+            # 既知の欠落）。DDG のネストは1階層のみなので、ここでも1階層だけを
+            # フラット化する（再帰はしない。壊れた形状は例外を出さず読み飛ばす）。
+            for nested in t["Topics"]:
+                # 2026-07-25: nested["Text"] も同様に truthy 非文字列を読み飛ばす
+                # （上の Abstract/direct-Text と同じ理由）。
+                if (isinstance(nested, dict) and nested.get("Text")
+                        and isinstance(nested["Text"], str)):
+                    results.append(nested["Text"][:WEB_SEARCH_SNIPPET_CHARS])
+                if len(results) >= max_results:
+                    break
         if len(results) >= max_results:
             break
     return results[:max_results]
@@ -468,14 +606,44 @@ def _ddg_instant(query: str, max_results: int) -> list:
 def _search_raw(query: str, max_results: int = None) -> list:
     """1 クエリ分の検索結果をリストで返す。失敗時は空リスト（呼び出し側を止めない）。"""
     max_results = max_results or WEB_SEARCH_MAX_RESULTS
+    # 2026-07-23: 「ライブラリ解決(import)」と「クエリ実行(DDGS().text())」を別の try
+    # に分離する。旧実装は _ddg_full 内部の import 段階とクエリ実行段階を1つの try に
+    # まとめて except ImportError で受けていたため、ddgs/duckduckgo_search が正しく
+    # インストール済みでも、それが内部で遅延 import する primp/lxml 等のバックエンドが
+    # 実行時に ImportError を送出するケースまで「ライブラリ未インストール」と誤認して
+    # いた。その結果、誤った pip install 警告を出した上に Instant Answer フォールバック
+    # （下の警告コメントの通り、事実系クエリで古い知識を返す事故の温床）に倒れてしまう。
+    # ここでは _resolve_ddgs_class() の import 失敗（＝本当に未インストール）だけを
+    # Instant Answer フォールバックの対象とし、解決後の実行時エラーは ImportError で
+    # あっても他の実行時例外と同じ扱い（[] を返すのみ・Instant Answer には倒さない）にする。
     try:
-        return _ddg_full(query, max_results)
+        _resolve_ddgs_class()
     except ImportError:
         # Instant Answer API は事実系クエリでほぼ空を返す。無警告だと「検索したのに
         # 古い知識で回答」する事故になる（実測 2026-07-06: 最新GPUで1世代前を回答）。
         print("   [警告: ddgs 未インストールのため Instant Answer フォールバック中。"
               "pip install ddgs でフル検索が有効になります]")
         return _ddg_instant(query, max_results)
+    except Exception as e:
+        # 2026-07-26: _resolve_ddgs_class() は `from ddgs import DDGS` /
+        # `from duckduckgo_search import DDGS` を実行するため、そのパッケージの
+        # トップレベル __init__ 由来で ImportError 以外（壊れた/非推奨パッケージの
+        # RuntimeError・OSError、Python バージョンガード、壊れたネイティブ依存等）
+        # も送出しうる。ここを except ImportError だけで受けていると、この
+        # 非ImportError が _search_raw の外（research_search → build_context →
+        # ask_fugu）まで無捕捉で伝播し、本関数のドキュメント契約「失敗時は空リスト
+        # （呼び出し側を止めない）」（上記docstring）と、このコードベースが
+        # イテレーション75/103/111/138で繰り返し守ってきた「呼び出し側を絶対に
+        # 落とさない」不変条件に違反してターン全体を失う。イテレーション83の判断
+        # （解決/実行時の失敗を、事実系クエリで古い知識を返しがちな Instant Answer
+        # フォールバックに倒すと本当の失敗が古い回答でマスクされる）に従い、ここも
+        # Instant Answer へは倒さず [] を返すだけにする。except Exception なので
+        # KeyboardInterrupt/SystemExit は従来通り素通りする。
+        print(f"   [Web検索エラー(解決段階): {e}]")
+        return []
+
+    try:
+        return _ddg_full(query, max_results)
     except Exception as e:
         print(f"   [Web検索エラー: {e}]")
         return []
@@ -556,27 +724,54 @@ def research_search(question: str) -> str:
         if not isinstance(j, dict) or j.get("sufficient"):
             break
         missing = str(j.get("missing", ""))[:120]
-        queries = [str(x) for x in (j.get("queries") or []) if str(x).strip()][:3]
+        # 2026-07-24: 従来の `j.get("queries") or []` は "queries" が falsy
+        # (None/[]/""/0 等)の場合のみ [] に丸めるトリックで、int/float/bool のような
+        # 真値だが非反復可能(non-iterable)な値はそのまま通してしまっていた。その場合は
+        # 直後のリスト内包表記 `for x in ...` 自体が TypeError を送出する。さらに
+        # truthy な str/dict はそのまま通ると「1文字ずつ」「キーごと」に分解された
+        # 意味のない検索クエリを発行してしまう。research_search は build_context
+        # (L1285付近) から ask_fugu (L3519付近) まで無防備(try/exceptなし)に
+        # 呼ばれているため、この TypeError は Conductor の計画や既に完了した検索
+        # ラウンドの結果ごとターン全体を落とす。イテレーション103の _ddg_instant
+        # (非list RelatedTopics)・イテレーション111の plan_pptx_images (非list
+        # images) と同じ isinstance 判定で丸める方式に倣い、"queries" が非list
+        # (文字列/None/int/float/bool/dict 等)であれば真偽・型に関わらず必ず []
+        # に倒す(`or []` の truthiness トリックには戻さない)。
+        raw_queries = j.get("queries")
+        if not isinstance(raw_queries, list):
+            raw_queries = []
+        queries = [str(x) for x in raw_queries if str(x).strip()][:3]
         if not queries:
             break
         print(f"   [リサーチ継続 R{rnd + 1}: 不足={missing or '(詳細なし)'}]")
 
     if not results:
         return ""
-    # 注入上限で切る（結果の区切り単位）
+    # 注入上限で切る（結果の区切り単位）。
+    # 2026-07-25: 従来はここで最初に上限超過に当たった結果で break していたため、
+    # それ以降の結果（後続ラウンドで Conductor が指定した不足事実を埋める、小さく
+    # 有益な結果であっても）がまとめて捨てられていた。先頭1件だけで上限超過して
+    # body が空になる問題はイテレーション38の特性テスト(H)で発見・固定され、
+    # イテレーション39で「空のまま返さず先頭結果を切り詰める」フォールバックとして
+    # 対処済みだが、「途中の1件が大きくて超過→それ以降が全部捨てられる」という
+    # 根本原因は残っていた。ここを break から continue（スキップして走査継続）に
+    # 変え、順序を保ったまま残り予算に収まる結果だけを拾う greedy first-fit
+    # パッキングにする。精度優先（精度優先・時間は気にしない）のため、同一の
+    # SEARCH_CONTEXT_CHARS 予算内で実際に注入できる検索事実を最大化する。
+    # 予算チェック式 `len(body) + len(item) > SEARCH_CONTEXT_CHARS` は変更前と同じ
+    # （区切り"\n\n"の2文字はチェックに含めない）。この2文字は次の候補のチェック時に
+    # body の一部として自然に繰り込まれ、最後に採用された結果の末尾の"\n\n"は最終的な
+    # rstrip() で必ず除去されるため、最終的な body の長さが SEARCH_CONTEXT_CHARS を
+    # 超えることはない（off-by-two回避のため、このチェック式自体は変更しないこと）。
     body = ""
     for item in results:
         if len(body) + len(item) > SEARCH_CONTEXT_CHARS:
-            # 2026-07-22: body が空のまま（＝先頭結果1件だけで上限超過）ここで break すると
-            # body="" のまま返ってしまい、Conductor が sufficient=true と判定した検索事実が
-            # 丸ごと消えてモデルが学習データ（古い可能性）で答えてしまう精度リグレッションに
-            # なる（イテレーション38で特性テスト(H)として発見・固定されたが未修正だったバグ）。
-            # 精度優先（精度優先・時間は気にしない）のため、空のまま打ち切らず先頭結果を
-            # 上限まで切り詰めてでも必ず注入する。
-            if not body:
-                body = item[:SEARCH_CONTEXT_CHARS] + "\n\n"
-            break
+            continue
         body += item + "\n\n"
+    if not body:
+        # 全結果が単独でも上限を超える場合の最終フォールバック（イテレーション38/39と
+        # 同じ契約）：空のまま返さず、先頭結果を上限まで切り詰めてでも必ず注入する。
+        body = results[0][:SEARCH_CONTEXT_CHARS] + "\n\n"
     header = (
         f"## Web Search Results (取得日: {time.strftime('%Y-%m-%d')})\n"
         "重要: 以下はあなたの学習データより新しい一次情報である。学習知識と矛盾する場合は"
@@ -595,31 +790,79 @@ def research_search(question: str) -> str:
 # ==================================================
 
 def _read_pdf(path: Path) -> str:
-    """PDF からテキストを抽出。pdfplumber → pypdf → PyPDF2 の順で試行。"""
+    """PDF からテキストを抽出。pdfplumber → pypdf → PyPDF2 の順で試行。
+    2026-07-23: 各ブロックは従来 except ImportError のみで、下位ライブラリへの
+    フォールスルーは「上位ライブラリが未インストール」の場合にしか起きなかった。
+    pdfplumber 等が実際にはインストール済みでも、暗号化/破損/パーサ固有のエッジケースで
+    実行時に例外を送出するPDFに対しては例外がそのまま _read_pdf の外へ伝播し、
+    read_file_text（iter53）の呼び出し側ガードがそれを握りつぶして ""
+    を返してしまい、pypdf/PyPDF2 なら救えたはずのテキストがPDF丸ごとRAG/--file
+    コンテキストから失われていた（精度優先の方針に反する）。全リーダー関数の
+    書き換えを試みた iter51 は行き詰まったスタック案件だが、これは「呼び出し側で
+    クラッシュさせない」話ではなく「下位ライブラリへフォールスルーしてテキストを
+    救済する」話であり別角度の問題。iter41-44 の graceful degradation の方針に合わせ、
+    ImportError に加えて except Exception（bare except にはしない。
+    KeyboardInterrupt/SystemExit は握りつぶさず伝播させる）でも次候補へ
+    フォールスルーさせ、ライブラリが import 自体には成功したのに失敗した場合は
+    cp932セーフな警告（ファイル名+例外型のみ、絵文字等は使わない）で可視化する。
+
+    2026-07-25: 上記iter83の修正は自身のコメントが明示する通り「実行時例外」の
+    場合にしか適用されず、pdfplumberが例外を出さずに空文字列/空白のみを返す
+    ケース（フォントエンコーディング等に起因する既知の仕様上の癖で、実際には
+    読める有効なPDFでも起こりうる）は未対応のまま残っていた。iter41-44の
+    graceful degradation方針とiter83の例外フォールスルーの系譜を継ぎ、ここでは
+    「そのライブラリでの抽出処理自体は完走したが結果が空だった」場合も次候補を
+    試すようにする（＝iter83が閉じ損ねた「例外ではなく結果が空」という穴を塞ぐ）。
+    どの層も import すらできなかった場合（従来のpip installが必要なケース）と、
+    1層以上がimportに成功し完走したが全て空だった場合（スキャンPDF等、本当に
+    中身が無いケース）とを区別し、前者のみ従来のpip install通知を返す。"""
+    # 少なくとも1層がimportに成功し抽出処理自体は完走したか（例外で終わった層は
+    # 数えない）。全層がこれを満たさなければ「未インストール」、満たすが全層空
+    # だった場合は「読める中身が無いPDF」として扱いを区別する(2026-07-25)。
+    _pdf_any_tier_completed = False
     # pdfplumber (最高品質)
     try:
         import pdfplumber
         with pdfplumber.open(path) as pdf:
             pages = [p.extract_text() or "" for p in pdf.pages]
-        return "\n\n".join(pages)
+        text = "\n\n".join(pages)
+        _pdf_any_tier_completed = True
+        if text.strip():
+            return text
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_pdf] pdfplumber抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
     # pypdf (軽量・新しい)
     try:
         import pypdf
         with open(path, "rb") as f:
             r = pypdf.PdfReader(f)
-            return "\n\n".join(p.extract_text() or "" for p in r.pages)
+            text = "\n\n".join(p.extract_text() or "" for p in r.pages)
+        _pdf_any_tier_completed = True
+        if text.strip():
+            return text
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_pdf] pypdf抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
     # PyPDF2 (旧名称)
     try:
         import PyPDF2
         with open(path, "rb") as f:
             r = PyPDF2.PdfReader(f)
-            return "\n\n".join(p.extract_text() or "" for p in r.pages)
+            text = "\n\n".join(p.extract_text() or "" for p in r.pages)
+        _pdf_any_tier_completed = True
+        if text.strip():
+            return text
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_pdf] PyPDF2抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
+    # 2026-07-25: 1層以上が完走していれば(全て空でも)「未インストール」ではないので
+    # pip install通知は返さず、空文字列(スキャンPDF等、本当に中身が無いケース)を返す。
+    if _pdf_any_tier_completed:
+        return ""
     return f"[PDF: {path.name} — テキスト抽出には pdfplumber or pypdf が必要: pip install pdfplumber]"
 
 
@@ -627,14 +870,142 @@ def _read_docx(path: Path) -> str:
     """Word (.docx) からテキストを抽出。"""
     try:
         import docx
-        doc = docx.Document(str(path))
-        parts = []
-        for para in doc.paragraphs:
-            if para.text.strip():
-                parts.append(para.text)
-        for tbl in doc.tables:
+
+        # 2026-07-25: ネスト表の再帰の深さに上限を設け、病的/破損した文書
+        # (自己参照的・異常に深いネスト等)で再帰が終わらなくなることを防ぐ。
+        _DOCX_NESTED_TABLE_MAX_DEPTH = 6
+
+        def _table_rows_text(tbl, _depth=0):
+            # 2026-07-24 (iter91): python-docxのrow.cellsは表のグリッド座標の数だけ
+            # _Cellを返すが、水平方向(gridSpan)にマージされたセルは全ての被マージ
+            # 座標で同一の<w:tc>要素を共有する。そのためc.textはマージされた
+            # テキストを座標の数だけ重複して返し、例えば2列にまたがるヘッダーセルは
+            # 'Header\tHeader'のように重複抽出されてしまう(単純なタブ結合のみだった
+            # 従来コードにはこの重複排除が無かった)。ここでは行内で既出の<w:tc>を
+            # id(getattr(c, '_tc', None))で追跡し、同一セルの2回目以降の出現を
+            # スキップすることで、マージされたセルのテキストを行につき1回だけ
+            # 出力する。_tcが取得できない場合(将来のpython-docx実装変化等)は
+            # 安全側に倒し重複排除を行わず従来通りの挙動にフォールバックする。
+            # なお本修正は行内(水平/gridSpan)の重複排除のみに限定しており、
+            # 垂直マージ(行をまたぐvMerge)の重複排除は意図的にスコープ外としている
+            # (将来のフォローアップ課題)。
+            # 同種の「python-docx/python-pptxの属性欠落・仕様により文字列を
+            # 取りこぼす/重複する」系統の修正としてiter87(_read_pptxの表/グループ
+            # 抽出)の直系であり、iter82では非マージの単純な表しかテストされて
+            # いなかった穴を埋めるもの。iter93(下記)でも本ロジックはbyte-for-byte
+            # 温存しており、順序修正後の本文経路/従来フォールバック経路の両方から
+            # 同一関数として呼ばれる。
+            #
+            # 2026-07-25: python-docxの_Cell.textは、そのセル直下の<w:p>段落だけを
+            # 連結して返し、セル内にネストされた<w:tbl>(表の中の表)は一切含めない。
+            # そのためセルの中にさらに表が入っている文書(よくある「表内表」構成)は、
+            # そのネスト表の内容が丸ごと_read_docxの出力から――ひいてはRAG検索
+            # (_load_rag_chunks)や--fileで各proposerに渡る全文コンテキストからも――
+            # 無言で欠落していた。iter91・iter93はどちらもこれを認識しつつ
+            # 「ネストした表の再帰抽出は意図的にスコープ外(将来のフォローアップ)」と
+            # 明記して先送りしていたもので、本修正がそのフォローアップを完了させる。
+            # python-docxはBlockItemContainerとして_Cell.tablesでネスト表の一覧を
+            # 公開しているため、セル自身のテキストを出力した直後に、そのセルが
+            # 実際に出力対象だった場合(=水平マージの初出セルである場合)に限り
+            # ネスト表へ追加的に再帰する。水平マージでスキップされた被マージセルの
+            # 座標では再帰しない(ネスト表の二重処理を避けるため)。ネスト表の行は
+            # 「そのネスト表を含む行」自身のタブ結合済みテキストの直後にまとめて
+            # 追加し、行の途中に混在させない(フラットな逐次追記という意図的な配置)。
+            # getattr(cell, "tables", [])で取得するため、将来python-docxの属性が
+            # 欠落/改名されても例外化せず現状の(ネスト表を無視する)挙動に安全側で
+            # 縮退する。vMerge(垂直マージ)の重複排除とpptx(セルが表をネストできない)
+            # は引き続き明示的にスコープ外。
+            rows_text = []
             for row in tbl.rows:
-                parts.append("\t".join(c.text for c in row.cells))
+                seen_tc_ids = set()
+                cells_text = []
+                nested_rows = []
+                for c in row.cells:
+                    tc = getattr(c, "_tc", None)
+                    if tc is not None:
+                        tc_id = id(tc)
+                        if tc_id in seen_tc_ids:
+                            continue
+                        seen_tc_ids.add(tc_id)
+                    cells_text.append(c.text)
+                    if _depth < _DOCX_NESTED_TABLE_MAX_DEPTH:
+                        for nested_tbl in getattr(c, "tables", []):
+                            nested_rows.extend(
+                                _table_rows_text(nested_tbl, _depth + 1)
+                            )
+                rows_text.append("\t".join(cells_text))
+                rows_text.extend(nested_rows)
+            return rows_text
+
+        # 2026-07-24 (iter123): docx.Document() 自体は import docx の成功/失敗とは
+        # 別に、破損したzip(BadZipFile)やレガシーバイナリ.docを.docx拡張子のまま
+        # 開いた場合(PackageNotFoundError)等、実行時例外を送出しうる。従来はここが
+        # except ImportError のみで守られていたため、そうした例外は_read_docxの
+        # 外へそのまま伝播し、read_file_text（iter53）の外側ガードに握りつぶされて
+        # "" になるだけで、なぜ失敗したかの情報が失われていた。iter83(_read_pdf)/
+        # iter84(_read_excel)がpdf/excelで行った「実行時例外もopen/parse範囲だけで
+        # 狭く捕捉し、可視化されたnotice文字列に変換する」修正をここにも適用する。
+        # bare exceptにはせずException限定でKeyboardInterrupt/SystemExitは伝播させる。
+        # 直下の except ImportError: pass は既存のバイト単位のまま温存し、
+        # 新しいnoticeは既存の "python-docx が必要" notice とは別の文言にして、
+        # _is_lib_missing_notice の「1行・[...]・pip install を含む」という構造的
+        # 判定には意図的にヒットしない（"pip install" を含まない）ようにする。
+        # ライブラリはインストール済みで読めているのに"未インストール"と誤判定され
+        # RAG側で扱いを誤らないようにするための意図的な区別。
+        try:
+            doc = docx.Document(str(path))
+        except Exception as exc:
+            print(f"[_read_docx] Document()での読み込みに失敗: {path.name} ({type(exc).__name__})")
+            return f"[DOCX: {path.name} — 読み込みエラー ({type(exc).__name__}): 破損しているか非対応形式の可能性があります]"
+        parts = []
+
+        # 2026-07-24 (iter93): 従来はdoc.paragraphsを全件処理してからdoc.tablesを
+        # 全件処理する2パス構成だった。本文中の任意の位置(例:導入文 -> データ表 ->
+        # 結論文)に表が挟まる文書では、これが「導入文・結論文」に続けて「表」が
+        # 文末にまとめて出力される形になり、本文の論理的な読み順を破壊していた。
+        # 表とそれを説明する地の文が同じチャンクに絶対に同居できなくなるため、
+        # RAG検索(_load_rag_chunks)にも--file全文コンテキストにも直接の精度劣化
+        # (精度優先・時間は気にしない、の方針に反する)として効いてくる。
+        # python-docxのdoc.paragraphs/doc.tablesは本文中の出現順序を保持しないため
+        # (どちらも本文内の該当要素だけを別々に集めたビュー)、ここでは
+        # doc.element.body（本文の直下の子要素、<w:p>と<w:tbl>が出現順に並ぶ）を
+        # 直接歩き、python-docx公式に知られる CT_P/CT_Tbl の isinstance判定で
+        # 種別を振り分けて、出現順のまま段落・表を交互に出力する。これは
+        # iter87(_read_pptxの表/グループ抽出)・iter91(本関数の水平マージ重複排除)と
+        # 同系統の「ライブラリの属性/仕様の落とし穴で本文が欠落・変形する」問題の
+        # 修正であり、iter82が固定した「非マージの単純な表」テストや上記iter91の
+        # マージ表テストは、どちらも表を段落の後ろに追加するフィクスチャのため
+        # 本文順序が変わらず影響を受けない。doc.paragraphs/doc.tables同様、本関数は
+        # 表セル内にネストした段落・表までは再帰しない(トップレベルのみ、iter91が
+        # 明示的にスコープ外とした挙動を継続)。
+        try:
+            from docx.oxml.table import CT_Tbl
+            from docx.oxml.text.paragraph import CT_P
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+
+            for child in doc.element.body.iterchildren():
+                if isinstance(child, CT_P):
+                    para = Paragraph(child, doc)
+                    if para.text.strip():
+                        parts.append(para.text)
+                elif isinstance(child, CT_Tbl):
+                    tbl = Table(child, doc)
+                    parts.extend(_table_rows_text(tbl))
+        except Exception as exc:
+            # python-docxの内部実装(CT_P/CT_Tbl/doc.element.body等)が将来の版で
+            # 変わり本文順の走査自体が失敗しても、read_file_text/_load_rag_chunksが
+            # 期待するgraceful degradation契約(iter42/53)を守るため、クラッシュ
+            # させず段落->表の従来の2パス挙動へ安全側にフォールバックする。
+            print(f"[_read_docx] 本文順序抽出に失敗したため段落->表の従来順にフォールバック: "
+                  f"{path.name} ({type(exc).__name__})")
+            parts = []
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    parts.append(para.text)
+            for tbl in doc.tables:
+                parts.extend(_table_rows_text(tbl))
+
         return "\n".join(parts)
     except ImportError:
         pass
@@ -642,43 +1013,213 @@ def _read_docx(path: Path) -> str:
 
 
 def _read_excel(path: Path) -> str:
-    """Excel (.xlsx/.xls) を CSV ライクなテキストに変換。"""
+    """Excel (.xlsx/.xls) を CSV ライクなテキストに変換。openpyxl -> pandas/xlrd の順で試行。
+    2026-07-24 (iter84): read_file_text は .xlsx と .xls の両方をこの関数へディスパッチ
+    するが、従来は各ブロックが except ImportError のみで、下位ライブラリへの
+    フォールスルーは「上位ライブラリが未インストール」の場合にしか起きなかった。
+    openpyxl は legacy な .xls（バイナリ形式）を一切読めず、
+    openpyxl.load_workbook() は openpyxl.utils.exceptions.InvalidFileException という
+    実行時例外（ImportError ではない）を送出する。そのため .xls は
+    read_file_text で公式にディスパッチされる入力形式であるにもかかわらず、
+    pandas+xlrd がインストール済みで読めるはずでも、フォールスルーが起きず例外が
+    そのまま外へ伝播し、read_file_text（iter53）/ _load_rag_chunks（iter42）の
+    呼び出し側ガードがそれを握りつぶしてスプレッドシート丸ごとがRAG/--file
+    コンテキストから静かに失われていた（精度優先の方針に反する）。同じ隙間は
+    破損/openpyxl未対応の .xlsx が pandas 側で再試行されないことにも当てはまる。
+    これは iter83 が _read_pdf に対して行った修正（下位ライブラリへフォールスルーして
+    テキストを救済する）の直系の姉妹修正であり、iter41-44 の graceful degradation
+    方針の延長でもある。ImportError に加えて except Exception（bare except には
+    しない。KeyboardInterrupt/SystemExit は握りつぶさず伝播させる）でも次候補へ
+    フォールスルーさせ、ライブラリが import 自体には成功したのに失敗した場合は
+    cp932セーフな警告（ファイル名+例外型のみ、絵文字等は使わない）で可視化する。"""
+    # openpyxl (高速・.xlsx専用。.xlsは読めずInvalidFileExceptionを送出する)
     try:
         import openpyxl
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-        parts = []
-        for ws in wb.worksheets:
-            parts.append(f"[Sheet: {ws.title}]")
-            for row in ws.iter_rows(values_only=True):
-                row_str = "\t".join("" if v is None else str(v) for v in row)
-                if row_str.strip():
-                    parts.append(row_str)
-        return "\n".join(parts)
+        # 2026-07-24: read_only=True のワークブックは内部で循環参照を持ち、単純な
+        # 参照カウントだけでは解放されない（iter82のテストがこれを踏み、後始末で
+        # gc.collect() を挟まないと WinError 32 でtempディレクトリの削除に失敗した
+        # のが直接の証拠）。close() を呼ばないまま関数を抜けるとzipのファイル
+        # ハンドルがGCまで開いたままになり、Windowsでは同じファイルの後続の
+        # 読み書き/移動をブロックし、_load_rag_chunksが多数の.xlsxを読む場面では
+        # ハンドルリークにもなる。抽出（parts構築）が終わった後にfinallyでclose()
+        # し、close()自体が失敗しても既に取れているテキストは握りつぶさず返す。
+        # 本体の except ImportError / except Exception によるiter84の
+        # フォールスルー動作（.xls等でopenpyxlが読めない場合にpandasへ進む挙動）は
+        # 変更しない。
+        try:
+            parts = []
+            for ws in wb.worksheets:
+                parts.append(f"[Sheet: {ws.title}]")
+                for row in ws.iter_rows(values_only=True):
+                    row_str = "\t".join("" if v is None else str(v) for v in row)
+                    if row_str.strip():
+                        parts.append(row_str)
+            result = "\n".join(parts)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                # close失敗で成功した抽出結果をフォールバック扱いにしない
+                pass
+        return result
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_excel] openpyxl抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
+    # pandas/xlrd (.xls を含む幅広い形式を読める)
     try:
         import pandas as pd
         xl = pd.ExcelFile(str(path))
-        parts = []
-        for sheet in xl.sheet_names:
-            df = xl.parse(sheet)
-            parts.append(f"[Sheet: {sheet}]\n{df.to_csv(index=False)}")
-        return "\n\n".join(parts)
+        # 2026-07-24: pd.ExcelFile も内部でzipハンドルを開いたままにするため、
+        # 上のopenpyxl分岐と同じ理由（iter82のgc.collect()回避策/iter84の
+        # フォールスルー方針）でclose()を明示する。
+        try:
+            parts = []
+            for sheet in xl.sheet_names:
+                df = xl.parse(sheet)
+                parts.append(f"[Sheet: {sheet}]\n{df.to_csv(index=False)}")
+            result = "\n\n".join(parts)
+        finally:
+            try:
+                xl.close()
+            except Exception:
+                pass
+        return result
     except ImportError:
         pass
+    except Exception as exc:
+        print(f"[_read_excel] pandas抽出失敗のため次候補へフォールバック: {path.name} ({type(exc).__name__})")
     return f"[Excel: {path.name} — openpyxl or pandas が必要: pip install openpyxl]"
+
+
+# 2026-07-26: グループシェイプ(GroupShape)のネスト再帰に上限を設ける。iter157で
+# 姉妹関数_read_docxのネスト表再帰(L847の_DOCX_NESTED_TABLE_MAX_DEPTH)に加えた
+# 深さ上限と同じ理由で、こちらは`elif hasattr(sh, "shapes"): for sub in sh.shapes:
+# out.extend(_pptx_shape_texts(sub))`が無制限に自身を呼び直す構造になっており、
+# 病的/破損した<p:grpSp>の異常に深いネスト連鎖(あるいは自己参照的な構造)を
+# 与えられるとPythonのsys.recursionlimitを超えてRecursionErrorを送出しうる。
+# _read_pptx側のtry節はimport pptx失敗によるImportErrorしか捕捉していないため
+# (L1101-1117)、このRecursionErrorはそのまま_read_pptxの外へ伝播し、
+# read_file_text(iter53)・_load_rag_chunks(iter42)の広いexcept Exceptionガードに
+# 握りつぶされて、PowerPointファイル全体がRAG/--fileコンテキストから無言で
+# 丸ごと脱落する。これはiter87が救済した「表/グループ内容が静かに読み飛ばされる」
+# 精度事故と同じ害のクラスであり、精度優先・時間は気にしないの方針に反する。
+# 上限はiter157の6(表ネストは実務上ほぼ無い)より大幅に緩い50を採用する:
+# 実在するPPTXの図解グループは数階層程度しかネストしないため、この上限が現実の
+# デッキを切り詰めることは実質無い一方、sys.recursionlimit(既定1000)には
+# 十分な余裕を残す。上限に達した時点でそれ以上は再帰せず静かに打ち切る
+# (iter157と同じ方針。bare exceptは使わずKeyboardInterrupt/SystemExitも
+# そもそも送出していないので握りつぶす対象にならない)。
+_PPTX_GROUP_MAX_DEPTH = 50
+
+
+def _pptx_shape_texts(sh, _depth=0) -> list:
+    """PPTXの1シェイプから抽出できるテキスト断片を出現順のリストで返す。
+    2026-07-24 (iter87): python-pptxの表シェイプ(GraphicFrame)とグループシェイプ
+    (GroupShape)には `.text` 属性そのものが存在しない（hasattr(sh, "text") が False
+    になる）。そのため_read_pptxの従来コード
+    `[sh.text for sh in slide.shapes if hasattr(sh, "text") and sh.text.strip()]`
+    は表・グループ内の文字列を一切拾えず静かに読み飛ばしていた。実データのPPTXでは
+    表が情報の大半を占めることが多く、その内容がRAG/--fileコンテキストへ一切届かず
+    モデルが古い学習知識で答えてしまう精度事故（精度優先・時間は気にしないの方針に
+    反する）。iter82は_read_pptxの成功時抽出にテストカバレッジを整えたが対象は平文
+    テキストボックスのみで、表/グループ内容は当時未検証・未対応のまま残っていた。
+    iter83(_read_pdf)/iter84(_read_excel)の「呼び出し元が静かに失っていたコンテンツを
+    救済する」系統の修正の直系。表は他のシェイプ種別には無い属性のため
+    getattr(sh, "has_table", False)で存在確認してからsh.tableを読み、行は
+    _read_docxの表取り扱い(L708-710)と同じ規約でセルをタブ結合・行を改行結合する。
+    グループはGroupShapeが`.text`を持たず`.shapes`だけを持つことをhasattr()で
+    ダックタイピング判定し、ネストしたグループにも再帰する。他シェイプ種別に無い
+    属性を無条件で呼ぶと例外になるため、必ずgetattr/hasattrで存在確認してから読む。
+    2026-07-26: 上の_PPTX_GROUP_MAX_DEPTHの説明どおり、_depthが上限に達したら
+    それ以上グループの中へは再帰しない(現実的な深さのデッキは全く影響を受けず、
+    病的に深いデッキだけがRecursionErrorでの全体脱落から部分抽出に縮退する)。"""
+    out = []
+    if hasattr(sh, "text") and sh.text.strip():
+        out.append(sh.text)
+    elif getattr(sh, "has_table", False):
+        for row in sh.table.rows:
+            row_text = "\t".join(cell.text for cell in row.cells)
+            if row_text.strip():
+                out.append(row_text)
+    elif hasattr(sh, "shapes"):
+        if _depth < _PPTX_GROUP_MAX_DEPTH:
+            for sub in sh.shapes:
+                out.extend(_pptx_shape_texts(sub, _depth + 1))
+    return out
 
 
 def _read_pptx(path: Path) -> str:
     """PowerPoint (.pptx) からテキストを抽出。"""
     try:
         from pptx import Presentation
-        prs = Presentation(str(path))
+        # 2026-07-24 (iter123): _read_docx の Document() と同じ隙間が Presentation()
+        # にもある。破損したzip(BadZipFile)やレガシーバイナリ.pptを.pptx拡張子の
+        # まま開いた場合(PackageNotFoundError)等の実行時例外が、従来は
+        # except ImportError のみでは捕捉されず外へ伝播していた。iter83/84/直上の
+        # _read_docx修正と同じ方針で、open/parseの1行だけを狭くException限定で
+        # 捕捉し、可視化されたnotice文字列に変換する（bare exceptにはしない。
+        # KeyboardInterrupt/SystemExitは伝播させる）。直下の except ImportError: pass
+        # は既存のバイト単位のまま温存。新noticeは"pip install"を含まないため
+        # _is_lib_missing_notice の構造判定には意図的にヒットしない(未インストール
+        # と誤判定させないための意図的な区別)。
+        try:
+            prs = Presentation(str(path))
+        except Exception as exc:
+            print(f"[_read_pptx] Presentation()での読み込みに失敗: {path.name} ({type(exc).__name__})")
+            return f"[PPTX: {path.name} — 読み込みエラー ({type(exc).__name__}): 破損しているか非対応形式の可能性があります]"
         parts = []
         for i, slide in enumerate(prs.slides, 1):
-            texts = [sh.text for sh in slide.shapes if hasattr(sh, "text") and sh.text.strip()]
+            texts = []
+            for sh in slide.shapes:
+                # 2026-07-26: 1シェイプ単位で抽出を単離する。_pptx_shape_texts内部の
+                # hasattr(sh, "text")/getattr(sh, "has_table", False)によるダック
+                # タイピング分岐はAttributeErrorしか吸収しない（Python 3の仕様で
+                # hasattrはAttributeError以外の例外をそのまま伝播させる）ため、
+                # 破損/非対応の<p:sp>や<p:graphicFrame>(表)のプロパティアクセスが
+                # 別の例外（壊れたXML由来のlxml例外等）を送出すると、この
+                # forループ、ひいては_read_pptx自体の外まで例外がそのまま伝播していた。
+                # _read_pptxには_read_pdf/_read_excelと違って代替ライブラリへの
+                # フォールスルーが無いため、1シェイプの異常だけでデッキ全体
+                # （他の全スライド・同スライドの他の全シェイプ・下のtry/exceptで
+                # 個別に保護済みのスピーカーノートまで）がread_file_text(iter53)の
+                # 広いexcept Exceptionに握りつぶされて""へ丸ごと脱落していた。
+                # 既にこの関数内で個別保護されているスピーカーノート抽出(iter98)や
+                # _read_docxの本文走査(iter93)と同じskip-bad-part-keep-the-restの
+                # 方針で、1シェイプだけを読み飛ばして残り全部を救済する
+                # (bare exceptではなくException限定。KeyboardInterrupt/SystemExitは
+                # ここで握りつぶさず伝播させる)。_pptx_shape_texts自体のhasattr/
+                # getattr分岐や_PPTX_GROUP_MAX_DEPTH再帰上限(iter177)はここでは
+                # 一切変更しない。
+                try:
+                    texts.extend(_pptx_shape_texts(sh))
+                except Exception as exc:
+                    print(f"[_read_pptx] シェイプ抽出に失敗したためスキップ: {path.name} ({type(exc).__name__})")
             if texts:
                 parts.append(f"[Slide {i}]\n" + "\n".join(texts))
+            # 2026-07-24 (iter98): スピーカーノートはslide.shapesの走査対象外なので、
+            # 上のループでは一切拾えない。ノートには箇条書き本文が要約している詳細な
+            # 説明が書かれていることが多く、これがRAG/--fileコンテキストへ届かないと
+            # プロポーザーが古い学習知識で答えてしまう精度事故になる（iter87で救済した
+            # 表/グループ抽出と同系統の「静かに落としているコンテンツを拾う」修正で、
+            # 精度優先・時間は気にしないの方針に基づく）。ただしslide.notes_slideは
+            # 触れた時点で（存在しなければ）python-pptxが空のノートスライドをその場で
+            # 生成してしまう副作用がある（NotesSlide.notes_slideのdocstring通り）ため、
+            # 必ずslide.has_notes_slideで存在確認してからのみslide.notes_slideへ触れる。
+            # 壊れた/読めないノート1件のせいでそのスライドの本文抽出まで失わないよう
+            # （iter72のskip-bad-part-keep-the-rest方針、iter42/53の段階的劣化と同様）、
+            # ノート読み取りだけを個別のtry/exceptで保護する。bareではなくException限定
+            # なのでKeyboardInterrupt/SystemExitはここで握りつぶさず伝播する。
+            try:
+                if slide.has_notes_slide:
+                    notes_tf = slide.notes_slide.notes_text_frame
+                    if notes_tf is not None:
+                        notes_text = notes_tf.text.strip()
+                        if notes_text:
+                            parts.append(f"[Slide {i} Notes]\n{notes_text}")
+            except Exception:
+                pass
         return "\n\n".join(parts)
     except ImportError:
         pass
@@ -705,9 +1246,87 @@ def _is_lib_missing_notice(text: str) -> bool:
     return bool(_LIB_MISSING_NOTICE_RE.match(stripped))
 
 
+def _decode_text_bytes(data: bytes) -> str:
+    """入力ファイルのバイト列を str にデコードする（utf-8 -> cp932 -> replace の順）。
+
+    2026-07-24: 既知の落とし穴 #4（このマシンのコンソールが cp932/Shift-JIS で
+    あること）と同根の環境要因で、ローカルに保存された非UTF-8（Shift-JIS/cp932）の
+    .txt/.csv/.html 等がこのマシンには普通に存在する。従来 read_file_text の
+    汎用テキスト分岐と _read_html は encoding="utf-8", errors="replace" を
+    無条件に使っていたため、cp932 ファイルを読むと日本語部分が「全て」
+    U+FFFD（置換文字）に化け、その文字化けがそのまま精度critical な
+    RAG/--file コンテキストへ注入されていた（精度優先・時間は気にしないの
+    方針に反する重大な劣化）。iteration 47（_save_as_markdown/_save_as_text/
+    _save_as_html の読み戻し）・iteration 70（会話履歴JSON読み込み）で導入した
+    errors="replace" は「fugu自身がUTF-8で書いたファイルの読み戻し」用の保険で
+    あり、他所由来ファイルの元エンコーディングを救済するものではない。
+    ここでは stdlib のみで完結する最小限のデコードラダーを用意し、
+    (1) utf-8 厳密デコードを試す（クリーンなUTF-8ファイルは従来と完全に
+    バイト同一の結果になる。utf-8-sig ではなく素の utf-8 を使うため BOM の
+    扱いも従来の read_text(encoding="utf-8") と同一）、(2) 失敗したら cp932
+    厳密デコードを試す（成功すれば日本語を含む cp932 ファイルを正しく復元
+    できる）、(3) それも失敗したら最終手段として utf-8 + errors="replace"
+    （＝これまでの挙動そのもの、退行なし）にフォールバックする。
+
+    呼び出し元は path.read_text(encoding=...) ではなく path.read_bytes() で
+    取得した生バイト列を渡す設計のため、read_text() が標準で行う普遍改行
+    変換（newline=None: ファイル上の "\r\n" や単独の "\r" を "\n" に変換）を
+    ここで明示的に再現する。これを省くと、Windows上で write_text() が
+    書き出す "\r\n" 改行がデコード後もそのまま残ってしまい、read_text()を
+    使っていた従来の出力とバイト単位で一致しなくなる（回帰）。
+    この関数は例外を送出しない。"""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("cp932")
+        except UnicodeDecodeError:
+            text = data.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _read_html(path: Path) -> str:
     """HTML からタグを除去してテキストを返す（stdlib html.parser 使用）。"""
     from html.parser import HTMLParser
+
+    # 2026-07-26: 旧実装は handle_data 1回ごとに data.strip() して self.parts
+    # に積み、最後に "\n".join(parts) していた。これは「テキストノードの区切り
+    # =意味的な区切り」という誤った前提に基づいており、<b>/<strong>/<a>/<sub>/
+    # <sup>/<span>/<code> のようなインライン要素は子孫テキストを別ノードとして
+    # 分割するだけで文/フレーズの継続を意味しない。結果、'<p>The <b>quick</b>
+    # brown fox</p>' は 'The\nquick\nbrown fox' に、日本語の
+    # '機械<strong>学習</strong>技術' は '機械\n学習\n技術' に断片化し、
+    # ノード間の実際の空白（'The ' の末尾スペース等）もstrip()で失われていた。
+    # これは iter71 が直接カバレッジを付けた _read_html の「タグ除去」自体は
+    # 正しいが、iter94 の decode ラダー（_decode_text_bytes、下記で不変のまま
+    # 使用）で正しく日本語復元できても、その後のインライン分割で本文の連続性が
+    # 壊れるという別問題。特に致命的なのは、この断片化が iter179 で導入した
+    # 日本語（CJK）バイグラムトークナイザ（_tokenize: 非ASCII連続列を隣接2文字
+    # ずつのバイグラムに分解し rag_search の再現率を確保する方式）を無力化する
+    # 点: '機械\n学習' のように改行を挟んでしまうと '機械'→'学習' の境界を跨ぐ
+    # バイグラム '械学' が二度と生成されず、RAG検索でヒットしなくなる
+    # （本プロジェクトの主要言語である日本語で --file/RAGコンテキストの再現率が
+    # 下がる）。'10<sup>3</sup>' が '10\n3' になる数値表記の破壊も同根。
+    # 対処: ブロックレベルタグ（p/div/li/tr/td/th/table/ul/ol/h1-6/br/hr/
+    # section/article/header/footer/blockquote/pre 等）の開始・終了時にのみ
+    # 区切り記号を挿入し、インライン/未知タグでは何も挿入しない。テキスト
+    # ノード自体は data.strip() せず生のまま連結する（ノード内・ノード間の
+    # 本来の空白を保持するため）。最後にまとめて行単位へ分割し、各行を
+    # strip() して空行を除去する（1行内の単一スペースは行の内部にあるので
+    # 保持され、既存の完全一致回帰 'Hello UTF-8 world. こんにちは。' 等は
+    # 崩れない）。td/th/tr/li/br は引き続き区切りを出すため、
+    # '<td>A</td><td>B</td>' や 'A<br>B' が1行に潰れる回帰は起きない。
+    # なお <sup>/<sub> はインライン扱いのため 'The best' の '10^3' が視覚的に
+    # 上付き/下付きだった情報自体はプレーンテキスト抽出では原理的に復元
+    # できない（'103' という連結された数字列になる）——これは仕様上の限界で
+    # あり、本修正が解決するのは「分断されない」ことまで。
+    _BLOCK_TAGS = frozenset({
+        "address", "article", "aside", "blockquote", "br", "caption",
+        "dd", "details", "dl", "dt", "div", "figcaption", "figure",
+        "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+        "hr", "li", "main", "nav", "ol", "p", "pre", "section", "summary",
+        "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+    })
 
     class _Strip(HTMLParser):
         def __init__(self):
@@ -717,36 +1336,297 @@ def _read_html(path: Path) -> str:
         def handle_starttag(self, tag, attrs):
             if tag in ("script", "style"):
                 self._skip = True
+            if tag in _BLOCK_TAGS:
+                self.parts.append("\n")
         def handle_endtag(self, tag):
             if tag in ("script", "style"):
                 self._skip = False
+            if tag in _BLOCK_TAGS:
+                self.parts.append("\n")
         def handle_data(self, data):
-            if not self._skip and data.strip():
-                self.parts.append(data.strip())
+            # 生のまま(strip しない)積む: インライン要素をまたぐノード間の
+            # 空白（例: 'The ' の末尾スペース）を保持するため。
+            if not self._skip and data:
+                self.parts.append(data)
 
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    # 2026-07-24: 落とし穴 #4 (cp932コンソール) と同根の環境要因で、ローカルの
+    # .html/.htm がShift-JIS(cp932)保存されていることがある。旧来の
+    # encoding="utf-8", errors="replace" 一本槍だと日本語本文が全滅してU+FFFD
+    # 化けがそのままRAG/--fileコンテキストに載っていた。_decode_text_bytes()
+    # のutf-8→cp932→replaceラダーで復元する（iter47/iter70のerrors="replace"
+    # 適用箇所とは目的が異なる: あちらはfugu自身がUTF-8で書いたファイルの
+    # 読み戻し用の保険で、こちらは他所由来ファイルの元エンコーディングの救済）。
+    raw = _decode_text_bytes(path.read_bytes())
     p = _Strip()
     p.feed(raw)
-    return "\n".join(p.parts)
+    # ブロック区切り("\n")と生テキストを結合してから行単位に正規化する:
+    # 各行をstrip()して空行を落とす。インライン要素の内側/またぎでは区切りが
+    # 一切挿入されていないため、同じ行内でテキストがそのまま連結される。
+    joined = "".join(p.parts)
+    lines = (line.strip() for line in joined.split("\n"))
+    return "\n".join(line for line in lines if line)
 
 
 def _read_ipynb(path: Path) -> str:
     """Jupyter Notebook からコードセルとマークダウンセルを抽出。"""
+    # 2026-07-25: 落とし穴 #4 (cp932コンソール) と同根の環境要因で、ローカルに
+    # 保存された .ipynb がShift-JIS(cp932)保存されていることがある。notebookの
+    # JSON構造（波括弧・引用符・キー名）はすべてASCIIのため、cp932保存の
+    # notebookでもjson.loads自体は成功し、iteration 72/113が導入したセル単位/
+    # トップレベルの構造ガードも問題なく通過してしまう。だが従来の
+    # path.read_text(encoding="utf-8", errors="replace")（本関数の解析用と、
+    # 下のexceptフォールバック用の2箇所で使用）はデコード時点で各セルの
+    # 'source'に含まれる日本語を全てU+FFFD（置換文字）へ潰してから渡して
+    # いたため、json.loadsが成功して構造ガードも通ってもセル内容そのものは
+    # 既に文字化けした状態のまま、精度criticalなRAG/--fileコンテキストへ
+    # 注入されていた（他の多くのリーダーと異なり.ipynbはJSONなので
+    # 「パース自体は成功するのに中身だけ化ける」という気づきにくい劣化）。
+    # iteration 94が_read_html/read_file_text汎用テキスト分岐に導入した
+    # utf-8→cp932→replaceの_decode_text_bytes()ラダーをここにも適用する
+    # （iteration 70のerrors="replace"はfugu自身がUTF-8で書いたファイルの
+    # 読み戻し用の保険であり、他所由来ファイルの元エンコーディングまでは
+    # 救済しないという整理は変わらない）。生バイト列はpath.read_bytes()で
+    # 一度だけ読み、_decode_text_bytes()で一度だけデコードし、そのデコード
+    # 結果をjson.loadsにも、非JSON時のexceptフォールバック（生テキスト
+    # 返却）にも共用する（旧実装のようにexcept節でpath.read_text()を
+    # 再度読み直すことはしない）。iteration 72（セル単位: source文字列/
+    # list[str]/その他の正規化、空白sourceのスキップ、非strリスト要素の
+    # 除外）とiteration 113（トップレベル: 非dictなnbは''へ、非listな
+    # cellsは[]へ強制変換）の構造ガードは、このデコード経路変更とは独立に
+    # 一切変更せずそのまま維持する。
+    raw = _decode_text_bytes(path.read_bytes())
     try:
-        nb = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        nb = json.loads(raw)
+        # 2026-07-24: json.loads自体は成功しても、トップレベルがdictでない
+        # ケース（例: [{"cell_type": "code"}] のような配列、あるいは裸の数値・
+        # 文字列）や、nb["cells"]がtruthyな非list値（例: {"cells": 42} や
+        # {"cells": {"0": {...}}} のようなdict）が存在しうる。旧実装は前者で
+        # nb.get(...)がAttributeErrorを、後者でfor cell in <non-list>が
+        # TypeErrorを送出し、いずれも本関数の外側except Exceptionに落ちて
+        # notebook全体の生JSON（metadata・execution_count・base64画像出力を
+        # 含む）がそのままRAG/--fileコンテキストへ丸ごと注入されていた。
+        # これはiteration 71がtest-onlyで発見してフラグし、iteration 72が
+        # セル単位の壊れたsourceについてのみ対処した「1件の破損で全体を
+        # 道連れにする」劣化のトップレベル構造版であり、対処が漏れていた
+        # ものである。iteration 103/111/112と同じ非list強制変換（truthy
+        # チェックのトリックに頼らず必ず既定値へ倒す）の作法に倣い、構造が
+        # 不正な場合は例外を送出させず空文字列/空contextへ落とす（精度優先：
+        # 生JSON混入より整形済みの空の方がまし）。json.loadsが失敗した場合
+        # （真に不正なJSON）は従来通り外側exceptで生テキストへフォールバック
+        # する経路を変えない。
+        if not isinstance(nb, dict):
+            return ""
+        cells = nb.get("cells", [])
+        if not isinstance(cells, list):
+            cells = []
         parts = []
-        for cell in nb.get("cells", []):
+        # 2026-07-26: コードセルのstream出力(stdout/stderr)1件あたりの取り込み文字数
+        # 上限。RAG_CHUNK_CHARS/SEARCH_CONTEXT_CHARS等と同様、暴走したprintループ
+        # (例: 無限に近いループ内print)がnum_ctxを圧迫しないための保護であり、下の
+        # コードセル処理でのみ参照するため関数ローカルに留める（本iterationの変更を
+        # _read_ipynb関数の外へ一切出さないため）。
+        _IPYNB_STREAM_OUTPUT_CAP = 4000
+        for cell in cells:
+            # 2026-07-23 (iter72): nbformat仕様上 'source' はstrまたはlist[str]だが、
+            # 壊れた/書きかけのnotebookでは source: null や、list内に非str要素
+            # （例: 42）が混入することがある。旧実装は"".join(cell.get("source", []))を
+            # 無条件に呼んでおり、これがTypeError/AttributeErrorを送出すると本関数の
+            # 外側try/exceptで捕捉され、「1セルの壊れたsourceでnotebook全体の生JSON
+            # 全文がそのままRAG/--fileコンテキストへ丸ごと注入される」という劣化を
+            # 招いていた（iteration 71がtest-onlyで発見し、特性検証テストとして
+            # ピン留めした上で将来のiterationでの修正候補と明示的にフラグしていたもの）。
+            # ここではセル単位で壊れたsourceだけを安全にスキップし、良好な他セルの
+            # 構造化抽出（精度優先：整形済みcontext > 生JSON）を守る。cell自体が
+            # dictでない場合も同様にスキップする。これはiteration 42/53と同じ
+            # 「1件の破損で全体を道連れにしない」graceful degradationパターン。
+            if not isinstance(cell, dict):
+                continue
             ct = cell.get("cell_type", "")
-            src = "".join(cell.get("source", []))
+            raw_src = cell.get("source", [])
+            if isinstance(raw_src, str):
+                src = raw_src
+            elif isinstance(raw_src, list):
+                src = "".join(s for s in raw_src if isinstance(s, str))
+            else:
+                src = ""
             if not src.strip():
                 continue
             if ct == "code":
                 parts.append(f"```python\n{src}\n```")
+                # 2026-07-26: 従来はコードセルの'source'(入力コード)のみを抽出し、
+                # 'outputs'配列(実行結果)は完全に無視していた。データ分析notebookでは
+                # print(...)が出力する実際の数値・結果こそが質問への回答に直結する
+                # 事実であることが多く、それが精度criticalなRAG/--fileコンテキストから
+                # 黙って欠落していた（精度優先・時間は気にしない、の方針に反する）。
+                # iteration 188はoutput_type: stream/execute_result/display_data
+                # (text/plain)の全種類を一度に扱おうとして3回試みたが行き詰まり
+                # 断念した。iteration 194はあえてスコープを"stream"(stdout/stderr)
+                # 出力1種類のみへ絞り込み、最も単純な単一形状・最も一般的・最も
+                # 価値が高いケースに限定することで、iter188の轍を踏まずに小さく
+                # 検証可能な変更に収めた。iteration 195(本iteration)はiter194の
+                # 縮小方針を踏襲しつつ、次に価値が高い単一形状としてexecute_result/
+                # display_dataの'data'辞書のうち'text/plain'キーのみを追加で対象と
+                # する（下のstreamループの直後を参照）。'data'辞書内のtext/htmlや
+                # image/png等の非'text/plain'MIME、およびerrorのtracebackは、
+                # オーバーサイトではなく意図的に対象外のまま据え置く（base64画像等の
+                # 非テキストMIMEを扱うには別途の慎重な設計が必要なため、iter188の
+                # 「一度に全部」の轍を踏まないよう最小スコープを維持する）。'source'の
+                # 正規化(iteration 72: str->そのまま、list->str要素のみjoin、
+                # その他->空、空白のみはskip)と全く同じパターンを各streamの'text'
+                # にも適用し、cellがdictでない場合のskip(iteration 72)・cells/nbの
+                # トップレベル構造ガード(iteration 113: 非dictなnbは''へ、非listな
+                # cellsは[]へ)はこの変更でも一切変更しない。'outputs'自体がtruthyな
+                # 非list(例: 42)や、outputsの各要素が非dictの場合も、iteration 113の
+                # cells非list強制変換・iteration 72の非dictセルskipと同じ作法
+                # (`or []`のtruthinessトリックには頼らずisinstanceチェックで明示的に
+                # 空/skipへ倒す)を踏襲する。暴走したprintループが巨大な出力を吐いて
+                # num_ctxを圧迫しないよう、1コードセルあたりの出力文字数に上限を
+                # 設け、超過分は切り詰めマーカーを付けて明示する。
+                outputs = cell.get("outputs", [])
+                if not isinstance(outputs, list):
+                    outputs = []
+                stream_chunks = []
+                for out in outputs:
+                    if not isinstance(out, dict):
+                        continue
+                    if out.get("output_type") != "stream":
+                        continue
+                    raw_out_text = out.get("text", [])
+                    if isinstance(raw_out_text, str):
+                        out_text = raw_out_text
+                    elif isinstance(raw_out_text, list):
+                        out_text = "".join(t for t in raw_out_text if isinstance(t, str))
+                    else:
+                        out_text = ""
+                    if not out_text.strip():
+                        continue
+                    stream_chunks.append(out_text)
+                if stream_chunks:
+                    combined_out = "".join(stream_chunks)
+                    if len(combined_out) > _IPYNB_STREAM_OUTPUT_CAP:
+                        combined_out = (
+                            combined_out[:_IPYNB_STREAM_OUTPUT_CAP]
+                            + "\n...(出力が長いため切り詰め)"
+                        )
+                    parts.append(f"[Notebook stdout/stderr output]\n{combined_out}")
+                # 2026-07-26 (iteration 195): stream(標準出力/標準エラー)に続き、
+                # execute_result/display_dataの'data'辞書のうち'text/plain'キーのみを
+                # 追加抽出する。iter188はstream/execute_result/display_data(text/plain)
+                # の全種類を一度に扱おうとして行き詰まり断念し、iter194はあえて
+                # streamのみへスコープを縮小した。本iterationはiter194の縮小方針を
+                # そのまま踏襲し、次に価値が高い単一形状(戻り値やDataFrameのrepr等、
+                # セルの"計算結果"を表すtext/plain)のみを追加する。data分析notebookでは
+                # print(...)によるstream出力だけでなく、セル末尾の式の評価結果や
+                # 変数のreprこそが質問への回答に直結することが多く、これも精度
+                # criticalなRAG/--fileコンテキストから黙って欠落していた。'data'辞書は
+                # image/png等のbase64エンコード画像やtext/html等、text/plain以外の
+                # MIMEキーを同時に含みうるが、それらは意図的に対象外のまま据え置く
+                # （オーバーサイトではない。base64画像を扱うには別途の慎重な設計が
+                # 必要なため、iter188の「一度に全部」の轍を踏まないよう最小スコープを
+                # 維持する）。'error'のtracebackも同様に対象外のまま据え置く。
+                # 正規化パターン(str->そのまま、list->str要素のみjoin、その他->空、
+                # 空白のみはskip)は'source'(iteration 72)・stream 'text'
+                # (iteration 194)と全く同一のものを'data'内'text/plain'にも適用し、
+                # `or []`等のtruthinessトリックには頼らずisinstanceチェックのみで
+                # 判定する。'outputs'非list・outputs内非dict要素・cell非dict等の
+                # 構造ガード(iteration 72/113)は上のstreamループと同じ変数
+                # (outputs)を再利用するのみで一切変更しない。暴走した出力が
+                # num_ctxを圧迫しないよう、上のstream出力と同じ
+                # _IPYNB_STREAM_OUTPUT_CAPを流用して上限を設ける。
+                result_chunks = []
+                for out in outputs:
+                    if not isinstance(out, dict):
+                        continue
+                    if out.get("output_type") not in ("execute_result", "display_data"):
+                        continue
+                    data = out.get("data", {})
+                    if not isinstance(data, dict):
+                        continue
+                    raw_result_text = data.get("text/plain", "")
+                    if isinstance(raw_result_text, str):
+                        result_text = raw_result_text
+                    elif isinstance(raw_result_text, list):
+                        result_text = "".join(
+                            t for t in raw_result_text if isinstance(t, str)
+                        )
+                    else:
+                        result_text = ""
+                    if not result_text.strip():
+                        continue
+                    result_chunks.append(result_text)
+                if result_chunks:
+                    combined_result = "".join(result_chunks)
+                    if len(combined_result) > _IPYNB_STREAM_OUTPUT_CAP:
+                        combined_result = (
+                            combined_result[:_IPYNB_STREAM_OUTPUT_CAP]
+                            + "\n...(出力が長いため切り詰め)"
+                        )
+                    parts.append(f"[Notebook result output]\n{combined_result}")
+                # 2026-07-26 (iter196): stream(iter194)・execute_result/display_dataの
+                # 'text/plain'(iter195)に続き、output_type=='error'の'ename'/'evalue'の
+                # みを追加抽出する。従来はコードセルの保存済み出力がerrorであっても
+                # ```pythonフェンスのみが出力され、セルが失敗した事実が一切示されない
+                # まま提案者に渡っていた。これは提案者がコードが成功したものと誤って
+                # 推論しうる精度上の欠陥であり、iter188がstream/execute_result/
+                # display_data/errorの全種類を一度に扱おうとして行き詰まり断念して以来、
+                # iter194/195が意図的に対象外のまま据え置いてきた最後の1種
+                # （iter195のコメント:「'error'のtracebackも同様に対象外のまま据え置く」）
+                # を、同じ縮小スコープの作法で補う。'traceback'(list of str、ANSIカラー
+                # エスケープシーケンスを含む)は本iterationでも意図的に対象外のまま
+                # 据え置く(iter195からのdeferralをそのまま継承する)。ANSIエスケープの
+                # 除去・正規化や、'data'辞書内のtext/html・image/png等の非'text/plain'
+                # MIME(iter195で既に対象外と決めたもの)の扱いには別途の慎重な設計が
+                # 必要であり、iter188の「一度に全部」の轍を踏まないよう'ename'/'evalue'
+                # という単一の最小形状のみへスコープを保つ。正規化パターン
+                # (str->そのまま、list->str要素のみjoin、その他->空、strip後に両方
+                # 空白ならそのoutputはskip)はsource(iter72)・stream 'text'(iter194)・
+                # 'text/plain'(iter195)と全く同一のものをename/evalueにも適用し、非str値
+                # (int/dict/None等)をstr()で強制変換して混入させることは絶対にしない。
+                # 'outputs'非list・outputs内非dict要素・cell非dict等の構造ガード
+                # (iter72/113)は上の2ループと同じ変数(outputs)を再利用するのみで一切
+                # 変更しない。暴走した出力(極端に長いevalue)がnum_ctxを圧迫しないよう、
+                # 上と同じ_IPYNB_STREAM_OUTPUT_CAPを流用して上限を設ける。
+                error_chunks = []
+                for out in outputs:
+                    if not isinstance(out, dict):
+                        continue
+                    if out.get("output_type") != "error":
+                        continue
+                    raw_ename = out.get("ename", "")
+                    if isinstance(raw_ename, str):
+                        ename = raw_ename
+                    elif isinstance(raw_ename, list):
+                        ename = "".join(e for e in raw_ename if isinstance(e, str))
+                    else:
+                        ename = ""
+                    raw_evalue = out.get("evalue", "")
+                    if isinstance(raw_evalue, str):
+                        evalue = raw_evalue
+                    elif isinstance(raw_evalue, list):
+                        evalue = "".join(e for e in raw_evalue if isinstance(e, str))
+                    else:
+                        evalue = ""
+                    if not ename.strip() and not evalue.strip():
+                        continue
+                    if ename.strip() and evalue.strip():
+                        error_chunks.append(f"{ename}: {evalue}")
+                    elif ename.strip():
+                        error_chunks.append(ename)
+                    else:
+                        error_chunks.append(evalue)
+                if error_chunks:
+                    combined_error = "\n".join(error_chunks)
+                    if len(combined_error) > _IPYNB_STREAM_OUTPUT_CAP:
+                        combined_error = (
+                            combined_error[:_IPYNB_STREAM_OUTPUT_CAP]
+                            + "\n...(出力が長いため切り詰め)"
+                        )
+                    parts.append(f"[Notebook error]\n{combined_error}")
             elif ct == "markdown":
                 parts.append(src)
         return "\n\n".join(parts)
     except Exception:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return raw
 
 
 # テキストとして直接読めない拡張子
@@ -766,22 +1646,80 @@ def read_file_text(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in _BINARY_SKIP:
         return ""
-    if suffix == ".pdf":
-        return _read_pdf(path)
-    if suffix in {".docx", ".doc"}:
-        return _read_docx(path)
-    if suffix in {".xlsx", ".xls"}:
-        return _read_excel(path)
-    if suffix in {".pptx", ".ppt"}:
-        return _read_pptx(path)
-    if suffix in {".html", ".htm"}:
-        return _read_html(path)
-    if suffix == ".ipynb":
-        return _read_ipynb(path)
+    # 2026-07-23 (iter53): _read_pdf/_read_docx/_read_excel/_read_pptx/_read_html は
+    # それぞれ import 文と実際のパース処理を同じ try/except ImportError で包んでいるため、
+    # ライブラリ自体は入っているがファイルが壊れている/パスワード付き/旧形式バイナリ等の
+    # 場合（zipfile.BadZipFile, PDFSyntaxError 等の ImportError 以外の例外）はここまで
+    # 素通しで伝播していた。iter42 は _load_rag_chunks 側（RAG経由の呼び出し）だけを
+    # 個別に保護したが、main() の --file 呼び出し（`read_file_text(fp).strip()`）は
+    # 無防備なままで、壊れたOffice/PDFファイルを渡すとCLI全体がクラッシュしていた
+    # （本関数のdocstringが約束する「空文字を返す」というgraceful degradation契約に
+    # 反する）。全リーダー関数の書き換えを試みたiter51は行き詰まったため、ここでは
+    # ディスパッチ関数側だけを薄く保護し、失敗時は空文字にフォールバックしつつ
+    # 警告を可視化する（黙って握りつぶさない）。
+    try:
+        if suffix == ".pdf":
+            return _read_pdf(path)
+        if suffix in {".docx", ".doc"}:
+            return _read_docx(path)
+        if suffix in {".xlsx", ".xls"}:
+            return _read_excel(path)
+        if suffix in {".pptx", ".ppt"}:
+            return _read_pptx(path)
+        if suffix in {".html", ".htm"}:
+            return _read_html(path)
+        if suffix == ".ipynb":
+            return _read_ipynb(path)
+    except Exception as exc:
+        print(f"[read_file_text] 読み込み失敗のためスキップ: {path} ({type(exc).__name__})")
+        return ""
     # その他: テキストとして読む（コード・設定ファイル・Markdown など）
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
+        # 2026-07-24: 落とし穴 #4 (cp932コンソール) と同根の環境要因で、この
+        # 汎用テキスト分岐が読む .txt/.md/.csv/.py/.json 等がローカルで
+        # Shift-JIS(cp932)保存されていることがある。旧来の
+        # encoding="utf-8", errors="replace" 一本槍では日本語が全滅し、
+        # 精度critical なRAG/--fileコンテキストに文字化けがそのまま注入
+        # されていた。_decode_text_bytes() のutf-8→cp932→replaceラダーで
+        # 復元する（iter47/iter70のerrors="replace"適用箇所とは目的が異なる:
+        # あちらはfugu自身がUTF-8で書いたファイルの読み戻し用の保険で、
+        # こちらは他所由来ファイルの元エンコーディングの救済）。
+        raw_bytes = path.read_bytes()
+        # 2026-07-25: read_file_textのdocstringは「バイナリはスキップして
+        # 空文字を返す」契約（iter53/125のgraceful-degradation方針と同根）を
+        # 約束しているが、実際にこれを支えているのは_BINARY_SKIP（約30拡張子
+        # のみの小さなdenylist、上記）だけである。.npy/.h5/.parquet/
+        # .safetensors/.gguf/.sqlite/.db/.woff/.ttf/.class/.wasm/.pyc や
+        # 拡張子なしバイナリなど_BINARY_SKIP未収載のバイナリはこの汎用分岐まで
+        # 落ちてきて、_decode_text_bytes()（iter94のutf-8→cp932→replace
+        # ラダー、下記関数）は例外を送出しない設計のため、文字化けした
+        # 「ゴミテキスト」がそのまま返っていた。このゴミは--file経路では
+        # main()で質問全文そのものになり（下流フィルタなし）、RAG経路では
+        # _load_rag_chunks（iter42のファイル単位隔離、下記）を通じて精度
+        # criticalなコンテキストへチャンク注入される。RAG_EXTENSIONS（本ファイル
+        # L271）は本来アローリストとして使う想定に見えるが実際は未使用の
+        # dead codeであり、ここをアローリスト化する対処も検討したが、
+        # .log/.conf/Dockerfile/READMEや拡張子なしテキストなど正当なNUL非
+        # 含有テキストまで拡張子未収載を理由に巻き添えで弾いてしまい、
+        # 精度優先・時間は気にしないの方針に反するrecall低下となるため
+        # 採用しない。代わりにgit等が使う標準的なバイナリ判定手法である
+        # 「生バイト列中のNUL(0x00)の有無」で判定する: NULはcp932/Shift-JIS
+        # を含むテキストエンコーディングでは正当な文字の一部として現れない
+        # ため、iter94のcp932救済ラダー（NUL非含有入力）を一切変更せず、
+        # 真のバイナリ（NUL含有）だけを追加で弾ける。
+        if b"\x00" in raw_bytes:
+            print(f"[read_file_text] バイナリ検出(NULバイト)のためスキップ: {path}")
+            return ""
+        return _decode_text_bytes(raw_bytes)
+    except Exception as exc:
+        # 2026-07-24 (iter125): 上のsuffix-dispatch分岐(iter53)はここに来る前に
+        # 例外を捕捉して警告を出すが、この汎用テキストフォールバック分岐は
+        # 従来 except Exception: return "" のみで、権限エラー(PermissionError)や
+        # Path.read_bytes自体の失敗、_decode_text_bytes内のデコード失敗が
+        # 無警告のまま握りつぶされていた（_load_rag_chunksの個別ファイルガードは
+        # 常に警告を出すのに対し、このパスだけ非対称だった）。read_file_textの
+        # 「例外→空文字」という契約自体は変えず、可視化のための警告printのみ追加する。
+        print(f"[read_file_text] 読み込み失敗のためスキップ: {path} ({type(exc).__name__})")
         return ""
 
 
@@ -820,11 +1758,28 @@ def _load_rag_chunks(dirs: list) -> list:
             if not text or _is_lib_missing_notice(text):
                 continue
             # チャンク分割（オーバーラップ付き）
+            # 2026-07-25: RAG_CHUNK_CHARS/RAG_CHUNK_OVERLAP は上（L268-269）で
+            # 「チャンクサイズ」「オーバーラップ文字数」と明記された調整可能な
+            # モジュール定数。従来は step を
+            # `start += RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP` と直接計算しており、
+            # 将来だれかがオーバーラップを厚くしようとして
+            # RAG_CHUNK_OVERLAP >= RAG_CHUNK_CHARS に設定すると step が 0 以下になり、
+            # `while start < len(text)` の start が二度と前進しないまま chunks へ
+            # 追記し続ける無限ループ（ハング）になる。これは
+            # _load_rag_chunks -> _get_rag_chunks -> rag_search -> build_context に
+            # 直結しており、以後すべての質問で応答が一切返らなくなる、"遅い"より
+            # 悪い完全なフリーズになる。iter 111 (plan_pptx_images の非list ガード)・
+            # iter 132 (_resolve_proposer の非ハッシュ可能値ガード) と同じ
+            # 「発生確率は低いが起きれば致命的」クラスの防御として、step を
+            # 最低1文字分の前進に固定する。既定値(100 < 600)では
+            # max(1, 500) == 500 となり、従来のチャンク境界・オーバーラップ・
+            # 個数・順序は一切変わらない（strict no-op）。
             start = 0
+            step = max(1, RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP)
             while start < len(text):
                 end = start + RAG_CHUNK_CHARS
                 chunks.append((str(fp), text[start:end]))
-                start += RAG_CHUNK_CHARS - RAG_CHUNK_OVERLAP
+                start += step
     return chunks
 
 
@@ -843,12 +1798,33 @@ def _get_rag_chunks(dirs: list) -> list:
 
 def _tokenize(text: str) -> set:
     """英字・数字・日本語を混在テキストから別々に抽出してトークンセットを返す。
-    例: 'PINNについて' → {'pinn', 'について'} (単純 \\w+ では 'pinnについて' 1トークンになる)。"""
+    例: 'PINNについて' → {'pinn', 'につ', 'つい', 'いて'}
+    (単純 \\w+ では 'pinnについて' 1トークンになる)。
+
+    2026-07-26: 非ASCII連続列は以前、丸ごと1トークンにしていた
+    （iter38で _tokenize('PINNについて') == {'pinn','について'} として
+    固定化されていた挙動）。しかしこれだと、クエリの部分フレーズが
+    チャンク側のより長い非ASCII連続列と「完全一致」しない限り
+    _score_chunk の集合オーバーラップが常に0になり、'機械学習の手法に
+    ついて' のような現実的な日本語クエリで rag_search が実質常に ''
+    を返す＝日本語RAG再現率がほぼゼロという精度上の問題があった
+    （本プロジェクトの主要言語である日本語で --file / RAG 経由の文書が
+    proposer に一切届かない）。形態素解析器（MeCab等）を追加せずに
+    対処する標準的な手法として、非ASCII連続列を隣接2文字の文字
+    バイグラムに分解する（Lucene/Elasticsearch の CJKBigramFilter と
+    同様の方式）。1文字だけの連続列はそのまま1文字トークンとする。
+    ASCII側の抽出ロジックは一切変更していないため、英語/ASCIIの
+    トークン化・rag_searchの挙動は完全に不変（CJKバイグラムはASCII
+    クエリトークンと一致し得ない）。"""
     lower = text.lower()
-    # ASCII: 英字・数字・アンダースコア
+    # ASCII: 英字・数字・アンダースコア（変更なし・byte-for-byte同一）
     tokens = set(re.findall(r'[a-z0-9_]+', lower))
-    # 非ASCII連続列（日本語・CJK など）
-    tokens |= set(re.findall(r'[^\x00-\x7f\s]+', text))
+    # 非ASCII連続列（日本語・CJK など）→ 隣接2文字ずつのバイグラムに分解
+    for run in re.findall(r'[^\x00-\x7f\s]+', text):
+        if len(run) == 1:
+            tokens.add(run)
+        else:
+            tokens.update(run[i:i + 2] for i in range(len(run) - 1))
     return tokens - {''}
 
 
@@ -920,8 +1896,19 @@ def _with_context(question: str, context: str) -> str:
 
 def _trim_history(history):
     """_HISTORY が MAX_HISTORY_CHARS を超えたら古い (user, assistant) ペアを先頭から削除する。"""
+    # 2026-07-23: ガードを `>= 2` から `> 2` に修正。
+    # ask_fugu は直近の [user, assistant] ペアを追記した「直後」に本関数を呼ぶため、
+    # 旧ガード `len(history) >= 2` だと履歴がその最新ペア1組だけ（長さ2）に
+    # なった状態でも、文字数がまだ MAX_HISTORY_CHARS（4000。詳細なMoA回答は
+    # コード/証明/節見出し込みですぐ超える）を超えていればループに入り、
+    # pop(0) を2回叩いて最新ペアごと消してしまっていた。結果、直前に生成した
+    # ばかりの回答が跡形もなく消え、次の行で「[会話履歴: 0 往復保持中]」と出て
+    # 以降のフォローアップ質問が文脈ゼロで飛ぶ。docstring 通り「古いペアを
+    # 先頭から削除する」のが目的であり、最新ペアまで削るのは仕様外。
+    # `> 2` にすることで、削除対象が残り最新ペアのみになった時点でループを
+    # 止め、多ターン対話の文脈（精度に直結）を必ず1ペアは残すようにする。
     while (sum(len(m["content"]) for m in history) > MAX_HISTORY_CHARS
-           and len(history) >= 2):
+           and len(history) > 2):
         history.pop(0)
         if history and history[0]["role"] == "assistant":
             history.pop(0)
@@ -959,10 +1946,37 @@ def ensure_server():
 
 
 def installed_models():
+    # 2026-07-25 (iter152): 素のリスト内包表記 [m["name"] for m in ...] は、
+    # /api/tags の応答中の1件でも壊れている（要素がdictでない、"name"キーが
+    # 無い、"name"が非文字列、"name"が空文字列）と内包表記の途中でその場で
+    # 例外を出し、外側の except Exception: return [] が正常な要素も含めて
+    # 導入済みモデル一覧を丸ごと空にしてしまっていた。これはiter103/111/
+    # 112/113/139と同じ「1件の壊れた要素が全件を道連れにする」失敗形。
+    # installed_models()はpull()で自己修復しない2箇所の判定に直結しており、
+    # 空リストへの縮退は静かに精度を落とす: _arbitrateのis_installed(
+    # ARBITER_MODEL, installed_models())は最上位知性モデルgpt-oss:120bを
+    # 裁定チェーンへ加えるか否かを決めており、空リストだと裁定が弱い
+    # フォールバックモデルへ静かに格下げされる（gotcha #7: SC投票の
+    # tie-break劣化）。solve_verifiableのis_installed(SC_CHEAP_MODEL,
+    # installed_models())も同様に安価な追加投票の有無を決めており、空
+    # リストだと投票パネルが静かに薄くなる。ここでは壊れた要素だけを
+    # 読み飛ばし、正常な要素は元の順序で回収する。
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as r:
             data = json.loads(r.read().decode())
-        return [m["name"] for m in data.get("models", [])]
+        if not isinstance(data, dict):
+            return []
+        models = data.get("models", [])
+        if not isinstance(models, list):
+            return []
+        names = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            name = m.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+        return names
     except Exception:
         return []
 
@@ -1031,12 +2045,34 @@ def resolve_models():
 # 推論ヘルパ
 # ==================================================
 
+# 2026-07-27: ask() の一過性失敗(HTTP 500等)リトライ予算を、固定2回・sleep(2)固定から
+# 有界な指数バックオフに拡張する。
+# 背景: このマシンは OLLAMA_MAX_LOADED_MODELS=1 (gotcha#5, GPUが8GB1枚のため)であり、
+# SCバッチ境界・MoAパネル切替・arbiter呼び出しのたびに13~23GBのモデルをNVMeから
+# 再ロードする。ask()自身のコメントが述べる「ロード直後の一過性500」が起きる
+# windowは、この再ロード時間そのものであり2秒よりずっと広い。
+# 旧予算(for attempt in (1, 2) と sleep(2)固定)は、iteration 9
+# (145f285: think-strip再送がforループ境界で握り潰される別バグを修正した際も
+# 「2回」の予算自体は意図的に変更しなかった)と iteration 35 (gotcha#1/#2の
+# /api/chat・num_ctxピン留めのテスト整備と合わせて「ちょうど2回」をテストで
+# 明示的に固定した)の2回にわたって、意図してそのまま据え置かれてきた値である。
+# しかし、1回の再試行で救えなかった失敗は __ERROR__ として上位へ返り、
+# _sc_sample は answer=None として扱うため、main_cot_count() の SC_MAX 投票予算
+# (gotcha#7: 自己一貫性投票は数学/選択式問題の精度に直結する経路)が1票分
+# 永続的に目減りする。MoA提案者の脱落・arbiterのフォールバックも同根。
+# 精度優先・時間は気にしない方針の下、再ロードwindowを覆うだけ有界に広げるのは
+# 純粋に精度側にプラスなので、ここを拡張する。
+ASK_RETRY_ATTEMPTS = 4        # 旧: 固定2回 (iteration 9 / 35 が意図的にテストで固定していた値)
+ASK_RETRY_BACKOFF = (2, 5, 10)  # 各要素はその回の失敗直後に待つ秒数。len == ASK_RETRY_ATTEMPTS - 1
+
 
 def ask(model, messages, temperature, think=None, fmt=None, label=None, num_predict=None,
         num_ctx=None):
     """Ollama native /api/chat を叩く。num_ctx を必ず options で渡して context を安全域に固定する
     （/v1 互換エンドポイントは num_ctx を無視するため使わない）。失敗時は __ERROR__: を返す。
-    一過性の失敗(HTTP 500 等)には 1 回だけ再試行する。
+    一過性の失敗(HTTP 500 等)には ASK_RETRY_ATTEMPTS 回まで、ASK_RETRY_BACKOFF の間隔で
+    再試行する(2026-07-27: 固定2回・sleep(2)固定から有界バックオフへ拡張。詳細はモジュール
+    冒頭の ASK_RETRY_ATTEMPTS/ASK_RETRY_BACKOFF 付近のコメントを参照)。
     num_predict: 生成トークン上限（None=無制限）。思考モデルの暴走保険として役割別に渡す。
     num_ctx: コンテキスト長の明示指定。None なら MODEL_CONFIG > MODEL_NUM_CTX の順で解決。
       「必ず明示 pin する」不変条件は維持（未指定だと Ollama がモデル最大を確保して 8GB VRAM で
@@ -1092,7 +2128,7 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
                       "(no content was generated)")
         return result
 
-    for attempt in (1, 2):
+    for attempt in range(1, ASK_RETRY_ATTEMPTS + 1):
         try:
             out = _do_call(req)
             break
@@ -1128,12 +2164,13 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
                     out = f"__ERROR__: {e2}"
                 break  # think は pop済みでこの分岐は再発し得ないため、ここで確定終了
             out = f"__ERROR__: {e} {err_body}"
-            if attempt == 1:
-                time.sleep(2)
+            if attempt < ASK_RETRY_ATTEMPTS:
+                time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
         except Exception as e:
             out = f"__ERROR__: {e}"
-            if attempt == 1:
-                time.sleep(2)  # 一過性の失敗(ロード直後の500等)向け。2回目も失敗なら諦める
+            if attempt < ASK_RETRY_ATTEMPTS:
+                # 一過性の失敗(ロード直後の500等)向け。ASK_RETRY_ATTEMPTS 回失敗したら諦める
+                time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
     if SHOW_TIMING:
         _TIMINGS.append((label or "?", model, round(time.time() - t0, 1)))
     return out
@@ -1176,8 +2213,27 @@ def extract_json(text):
         return None
     text = strip_think(text)
     # 1) そのまま
+    # 2026-07-25: 旧実装はここで json.loads(text) の結果を型を問わず素通しで
+    # return していた。docstring は「最初の JSON オブジェクト」（dict）を約束し、
+    # 2)/3) は実際に dict-or-None 契約を守っているのに、1) だけはトップレベルが
+    # 妥当な JSON でありさえすれば list/int/float/bool/str/None も丸ごと返して
+    # しまい、契約が破られていた。呼び出し側の一部（_critic_judge L2662,
+    # second_opinion L2710, _sd_prompt_from_request L1944, plan_pptx_images
+    # L4494）は `extract_json(raw) or {}` の後に無条件で `.get(...)` するため、
+    # モデルが `[{"ok": true}]` や `true`/`42`/`"text"` のようなトップレベル非
+    # object な（しかし妥当な）JSON を出力すると、truthy な非dict値がそのまま
+    # 通り抜けて `.get` で AttributeError を送出し、精度が最も重要な
+    # critique/verify ゲートを含むターン全体をクラッシュさせていた。
+    # これは iteration 103/111/112/113/138/139 で修正してきた「妥当だが型が
+    # 想定と違うモデル出力」への防御的対処と同種のクラス。
+    # 修正: 1) はパース結果が isinstance(dict) の場合のみ return し、それ以外
+    # （list/int/float/bool/str/None）は return も raise もせず 2)/3) にフォール
+    # スルーする。これにより例えば `[{"ok": true}]` は 3) の波括弧スキャナが
+    # ネストした {"ok": true} を回収できるようになる（副次的な改善）。
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
     except Exception:
         pass
     # 2) ```json ... ``` フェンス内
@@ -1389,17 +2445,50 @@ def _backend_up(url):
 def generate_image_a1111(prompt, negative=""):
     """AUTOMATIC1111 stable-diffusion-webui の txt2img API で生成し保存パスを返す。"""
     import base64
+    import uuid
     payload = {"prompt": prompt, "negative_prompt": negative,
                "steps": IMAGE_STEPS, "width": IMAGE_WIDTH, "height": IMAGE_HEIGHT}
     data = _http_post_json(f"{A1111_URL}/sdapi/v1/txt2img", payload, IMAGE_TIMEOUT)
-    images = data.get("images") or []
-    if not images:
+    # 2026-07-25 (iter144): iter139でComfyUI側(generate_image_comfyui)のoutputs/image
+    # エントリ走査に施したskip-and-recoverと対称の穴がこちら(A1111側)にも残っていた。
+    # data.get("images")はdata自体がdictである前提、images[0]はimagesがnon-emptyな
+    # listである前提、images[0].split(",", 1)は先頭要素がstrである前提で、いずれも
+    # 無保証。非dictなdata・truthyだが非listなimages・非str/空/デコード不能な先頭
+    # エントリはAttributeError/TypeError/binascii.Errorを送出し、呼び出し元
+    # generate_imageの外側except Exceptionまで伝播、後続に有効な画像が残っていても
+    # 生成結果ごと握り潰してNoneになっていた。iter103/111/112/113/138（非list/非dict
+    # の強制truthy変換に頼らない既定値フォールバックとentry単位skip）と同じ作法に
+    # 倣い、dataが非dictならNone、imagesが非listなら[]へ矯正し、先頭決め打ちではなく
+    # リストを走査して非str/空/デコードまたは書き込み失敗エントリを1件ずつskipして
+    # 後続の有効な画像を回収する。
+    if not isinstance(data, dict):
         return None
-    IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}.png"
-    # data URI プレフィックスが付く場合があるのでカンマ以降を取る
-    out.write_bytes(base64.b64decode(images[0].split(",", 1)[-1]))
-    return out
+    images = data.get("images")
+    if not isinstance(images, list):
+        images = []
+    for img in images:
+        if not isinstance(img, str) or not img:
+            continue
+        try:
+            # data URI プレフィックスが付く場合があるのでカンマ以降を取る
+            blob = base64.b64decode(img.split(",", 1)[-1])
+            IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+            # 2026-07-25: time.strftime('%Y%m%d_%H%M%S')は秒単位までしか刻まない。
+            # build_pptxはPPTX_MAX_IMAGES=4枚まで本関数を連続呼び出しし、SDXL生成が
+            # 同一秒内に完了すると旧実装のfugu_{ts}.pngは2枚目以降が1枚目と同じ
+            # パスに解決し、後発のout.write_bytes()が先発の画像を無言で上書きして
+            # 消していた。8GB GPUの現行機では数秒かかるため滅多に起きないが、
+            # apply_high_vram_profileが想定する96GB高VRAM環境の高速SDXLでは
+            # 同一秒内の衝突が現実的になる。iter77/139/144と同系統の
+            # 「既に生成できたアーティファクトを無言で失わない」原則に倣い、
+            # uuid4由来の8桁hexを付与して秒精度に依存しない一意性を保証する。
+            uniq = uuid.uuid4().hex[:8]
+            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{uniq}.png"
+            out.write_bytes(blob)
+            return out
+        except Exception:
+            continue
+    return None
 
 
 def generate_image_comfyui(prompt, negative=""):
@@ -1456,7 +2545,25 @@ def generate_image_comfyui(prompt, negative=""):
         return None
     for node in hist.get("outputs", {}).values():
         for img in node.get("images", []):
-            q = urllib.parse.urlencode({"filename": img["filename"],
+            # 2026-07-25 (iter139): 隣接するsubfolder/typeは.get()で守られている
+            # 一方、filenameだけはimg["filename"]の直接dictアクセスが2箇所に
+            # 残っていた。ComfyUI /history の壊れたエントリ（filenameキー欠落・
+            # null・またはimages配列内の非dict要素、例えば文字列/数値）に対して
+            # 旧実装はKeyError/TypeErrorを送出し、それが本関数を丸ごと巻き込んで
+            # 呼び出し元generate_imageの外側except Exceptionまで伝播、以降の
+            # ノード・エントリに有効な画像があっても生成結果ごと握り潰して
+            # Noneを返していた。iter77（良い方を回収する）・iter103/111/112
+            # （非list/非dictの強制truthy変換に頼らない既定値フォールバック）・
+            # iter113/iter138（外部由来ペイロードの1件の破損で全体を道連れに
+            # しないためのentry単位skip）と同じ作法に倣い、ここでもfilenameを
+            # img.get()で一度だけ読み、非dictエントリ・欠落/None/空/非str
+            # filenameは例外を出さずcontinueして後続の有効なエントリを救済する。
+            if not isinstance(img, dict):
+                continue
+            filename = img.get("filename")
+            if not isinstance(filename, str) or not filename:
+                continue
+            q = urllib.parse.urlencode({"filename": filename,
                                         "subfolder": img.get("subfolder", ""),
                                         "type": img.get("type", "output")})
             try:
@@ -1465,7 +2572,16 @@ def generate_image_comfyui(prompt, negative=""):
             except Exception:
                 continue
             IMAGE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{img['filename']}"
+            # 2026-07-25: time.strftime('%Y%m%d_%H%M%S')は秒単位までしか刻まない。
+            # ComfyUI側のfilenameは同一seed/同一prefixのSaveImageノードが同一秒内に
+            # 複数回走ると衝突しうる（サーバ再起動でComfyUI内部のカウンタがリセット
+            # される場合を含む）ため、fugu_{ts}_{filename}だけでは一意性が保証
+            # できない。A1111側(generate_image_a1111、同日付コメント参照)と対称の
+            # 同一秒上書き問題であり、iter77/139/144と同じ「既に生成できた
+            # アーティファクトを無言で失わない」原則に倣い、uuid4由来の8桁hexを
+            # ComfyUI側filenameの前に挟んで秒精度に依存しない一意性を保証する。
+            uniq = uuid.uuid4().hex[:8]
+            out = IMAGE_OUT_DIR / f"fugu_{time.strftime('%Y%m%d_%H%M%S')}_{uniq}_{filename}"
             out.write_bytes(blob)
             return out
     return None
@@ -1726,6 +2842,24 @@ def build_proposer_desc():
 def _resolve_proposer(name):
     """ペルソナ名 or モデル名を実モデル名へ解決する（未導入・未知なら None）。
     'Proposer A' / 'proposer a' / 'A' / 実モデル名 の緩い表記を許容。"""
+    # 2026-07-25: CONDUCTOR_SCHEMA は selected_proposers の要素を
+    # items:{type:string} で拘束しているが、本ファイル各所のコメントが
+    # 明記する通りこの強制は完全ではない（"スキーマ強制でも稀に JSON が
+    # 崩れる"）。list/dict のような非文字列・非ハッシュ可能な要素が
+    # 紛れ込むと、直後の `name in PERSONA_MODELS`（dict メンバーシップ
+    # テスト）が isinstance/str() 変換を経る前に TypeError: unhashable
+    # type を送出し、これが唯一の呼び出し元 validate_plan を経て
+    # conduct -> ask_fugu/fugu_answer まで無捕捉で伝播し、ターン全体を
+    # クラッシュさせて計算済みの回答を失っていた。iter 103
+    # (_ddg_instant の非list RelatedTopics)、iter 111
+    # (plan_pptx_images の非list images)、iter 112
+    # (research_search の非list queries)、iter 113 (_read_ipynb の
+    # 非dict/非list cells) と同じ「壊れたスキーマ制約付きプランは例外を
+    # 出さず既定値へフォールバックさせる」作法に倣い、非文字列要素は
+    # ここで即座に None へ倒す（精度優先: フォールバックの方がターン
+    # 喪失よりまし）。
+    if not isinstance(name, str):
+        return None
     if name in PERSONA_MODELS:
         m = PERSONA_MODELS[name]
         return m if m in PROPOSERS else None
@@ -1796,8 +2930,19 @@ def _apply_routing_guardrails(question, plan):
         return plan
     if _IMAGE_SIGNALS.search(q):
         plan["use_image_generation"] = True
+        # 2026-07-24: make_pptx=True ⇒ image_only=False は validate_plan
+        # (iteration 40, 2227-2228/2240-2241) が確立した不変条件。ここは
+        # validate_plan の「後」に conduct() から呼ばれる（2320行目）ため、
+        # plan["make_pptx"] を見ずに image_only を立てるとその不変条件を
+        # 再び壊してしまう（コンダクタが '発表資料'/'デッキ' 等 _PPTX_SIGNALS
+        # 非一致のPPTX同義語で make_pptx=True にした上で、質問が画像シグナルに
+        # マッチし解説シグナルには非マッチな場合、make_pptx=True かつ
+        # image_only=True という矛盾が復活する）。ask_fugu はルート1(画像)を
+        # ルート2(PowerPoint)より先に判定するため、その矛盾は要求された
+        # PowerPoint を黙って握りつぶし画像のみを返す形で表面化する。
         # テキスト解説も求めている＝イラスト付き / 画像だけ＝image_only
-        plan["image_only"] = not bool(_TEXT_TASK_SIGNALS.search(q))
+        # （ただし make_pptx が既に True なら image_only は常に False）
+        plan["image_only"] = (not plan.get("make_pptx")) and not bool(_TEXT_TASK_SIGNALS.search(q))
     return plan
 
 
@@ -1818,8 +2963,19 @@ _CODE_TASK_SIGNALS = re.compile(
     r"実装|コード|プログラム|関数を書|クラスを書|デバッグ|"
     r"\bimplement|\bwrite (?:a |the )?(?:function|program|code|class|script)\b|```",
     re.IGNORECASE)
-_FREEFORM_SIGNALS = re.compile(r"証明|\bprove\b|\bproof\b|説明して|解説して|なぜ",
-                               re.IGNORECASE)
+# 2026-07-26: _MATH_TASK_SIGNALS には英語の数学トリガー（\bhow many\b, \bcompute\b,
+# \bcalculate\b, \bfind the ...\b 等）が揃っているのに、この降格用セーフティバルブは
+# 日本語の説明系動詞（証明/説明して/解説して/なぜ）しか見ておらず、英語の explain/
+# describe/why が抜けていた（非対称）。結果、"How many SOLID principles are there?
+# Explain each." のように \bhow many\b で math 判定されつつ説明を求める問いが降格されず、
+# solve_verifiable の自己一貫性投票 + extract_final_answer に流れて説明が黙って
+# 落ちる回帰があった。ここでは explain/describe/why の3語だけを追加する（bare \bhow\b は
+# \bhow many\b と衝突し正当な計数問題まで誤って降格するため絶対に追加しないこと。
+# gotcha #7: 自己一貫性投票は精度優先の要）。
+_FREEFORM_SIGNALS = re.compile(
+    r"証明|\bprove\b|\bproof\b|説明して|解説して|なぜ|"
+    r"\bexplain\b|\bdescribe\b|\bwhy\b",
+    re.IGNORECASE)
 
 
 def _apply_tasktype_guardrails(question, plan):
@@ -1838,6 +2994,58 @@ def _apply_tasktype_guardrails(question, plan):
     if t == "math" and _FREEFORM_SIGNALS.search(q):
         t = "knowledge"
     plan["task_type"] = t or "chat"
+    return plan
+
+
+# 2026-07-26: Office 添付ファイル(.docx/.xlsx/.pdf 等)の決定的ガードレール。
+# CONDUCTOR_SYS の【特殊ルーティング指示】3(本ファイル 2547-2548 行目)は
+# 「Office ファイルが添付されその解説・分析を求めている場合は、必ず mode='moa' とし
+# selected_proposers に必ず 'Proposer C' を含めて主軸に据えること」を明記し、
+# conduct() はさらに自然文のヒント（'[注記] ... 特殊ルーティング指示 #2 ...'、
+# conduct() 内 hint 変数）まで添えている。だが本ファイル各所のガードレール群
+# ―― PPTX/画像出力形態は _apply_routing_guardrails（iter 36）、コード/証明の
+# single→moa 格上げは _apply_accuracy_guardrails（iter 97）、task_type 誤分類補正は
+# 直上の _apply_tasktype_guardrails（iter 64、二重JSON失敗フォールバックにも適用）
+# ―― が繰り返し記録している通り、小型 Conductor(qwen3:4b) はプロンプト中の
+# ルーティング指示文を取りこぼすことが実測されている。office_attached は
+# これまで conduct() のヒント文言生成以外に一切参照されておらず（grep 済み）、
+# Conductor がヒントを無視すると .docx/.xlsx/.pdf 添付の解説・分析タスクが
+# mode='single' のまま単一の非専門モデルへ回されたり、RAG/Office 文書専門家
+# gemma4:26b (Proposer C) が selected_proposers から抜け落ちたまま実行される
+# ――このフラグが守るはずの文書解析経路そのものがサイレントに劣化する。
+# 他のガードレール群と同じ「プロンプトのヒントとは別に、フラグ/キーワードで
+# 決定的に確定させる」作法（belt-and-suspenders）に倣い、office_attached を
+# 直接の決定的シグナルとして mode='moa' を強制し、導入済みであれば
+# Proposer C を主軸(先頭)に確実に加える。プロンプトのヒント自体は削らない
+# （二重の安全網として両方を維持する）。
+def _apply_office_guardrail(plan, office_attached):
+    """office_attached=True を決定的ガードレールとして扱う。
+    mode='moa' を強制し、導入済みなら Proposer C (PERSONA_MODELS 由来の実モデル名)を
+    selected_proposers の先頭に確実に加える(重複排除・4件上限は validate_plan の
+    models[:4] と揃える)。office_attached=False は完全な no-op（plan を一切変更しない）。
+    image_only=True の画像専用プランは _apply_accuracy_guardrails と同じ理由で
+    テキスト側 MoA 強制の対象外（画像だけの回答にテキストパネルを割り当てても無意味）。
+    べき等: 2回適用しても mode/selected_proposers/reason は変化しない。"""
+    if not office_attached:
+        return plan
+    if plan.get("image_only"):
+        return plan
+    plan["mode"] = "moa"
+    tag = "[guardrail: office→moa+ProposerC] "
+    reason = str(plan.get("reason", ""))
+    if not reason.startswith(tag):
+        plan["reason"] = tag + reason
+    c_model = PERSONA_MODELS.get("Proposer C")
+    if c_model and c_model in PROPOSERS:
+        models = list(plan.get("selected_proposers") or [])
+        if c_model in models:
+            models.remove(c_model)
+        models.insert(0, c_model)
+        deduped = []
+        for m in models:
+            if m not in deduped:
+                deduped.append(m)
+        plan["selected_proposers"] = deduped[:4]
     return plan
 
 
@@ -1964,6 +3172,7 @@ def conduct(question, history=None, office_attached=False):
         plan = extract_json(raw)
     plan = _apply_routing_guardrails(question, validate_plan(plan))
     plan = _apply_accuracy_guardrails(question, plan)
+    plan = _apply_office_guardrail(plan, office_attached)
     return _apply_tasktype_guardrails(question, plan), raw
 
 
@@ -2114,7 +3323,12 @@ def get_single_proposal(model, question, reference, issue=None, history=None):
                 "accurate. Output your improved answer only."
             )}]
         )
-    return model, ask(model, msgs, PROPOSER_TEMP, think=PROPOSER_THINK,
+    # 2026-07-23: ここは長らく think=PROPOSER_THINK（生のグローバル、既定 None）を直接渡して
+    # おり、num_predict だけ proposer_predict_for(model) で MODEL_CONFIG 対応させたのに think
+    # が取り残されていた欠落サイト。これだと gpt-oss:20b/qwen3.6:35b が MoA 提案でも
+    # think:"high"/True を一度も受け取れず、_sc_sample（SC 経路、proposer_think_for 使用済み）
+    # とだけ非対称だった。proposer_think_for に揃えて解決（PROPOSER_THINK override 優先は温存）。
+    return model, ask(model, msgs, PROPOSER_TEMP, think=proposer_think_for(model),
                       num_predict=proposer_predict_for(model), label="proposer")
 
 
@@ -2124,12 +3338,21 @@ def get_proposals(models, question, reference=None, issue=None, history=None):
     jobs = [(m, (None if (reference is not None and i == 0) else reference))
             for i, m in enumerate(models)]
     if PARALLEL_PROPOSERS:
-        out = []
+        # 2026-07-23: as_completed() は完了順で future を返すため、返り値の
+        # (model, answer) 順序が実行毎に非決定的になり、aggregator の
+        # "Answer A/B/C" ラベル割当がブレて MoA 統合の再現性が失われる。加えて
+        # 多様性契約（jobs[0] は reference=None の新規回答を先頭に置く）が
+        # aggregator に見える位置として保証されなくなる。このパスは 8GB GPU
+        # の既定では休眠中（gotcha #5: OLLAMA_MAX_LOADED_MODELS=1 により逐次
+        # 実行が正しい既定）だが、apply_high_vram_profile が有効化する 96GB
+        # 実験用の高VRAM構成ではまさにここが使われるため、投入順
+        # (futs リストの順序 = jobs の順序) で結果を集めて決定的にする。
+        # 全ジョブを先に submit してから結果収集するので並列度・wall-clock は
+        # 変わらない（as_completed をやめても同時実行性は失われない）。
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
             futs = [ex.submit(get_single_proposal, m, question, ref, issue, history)
                     for m, ref in jobs]
-            for f in concurrent.futures.as_completed(futs):
-                out.append(f.result())
+            out = [fut.result() for fut in futs]
         return out
     return [get_single_proposal(m, question, ref, issue, history) for m, ref in jobs]
 
@@ -2172,11 +3395,17 @@ def aggregate(question, proposals):
     # (model, strip_think(answer)) のまま保持し、タグ付きビューは別変数
     # （annotated）に持たせて、アグリゲータへの block 文字列構築にのみ使う。
     annotated = good
+    # 【2026-07-24】保険2（下記）が「コードが実際に FAILED したと判明している提案」を
+    # 避けられるよう、このアノテーションループで既に呼んでいる code_check() の結果を
+    # good のインデックスに紐づけて保持する。code_check/run_python を再実行はしない。
+    failed_idxs = set()
     if CODE_EXECUTION:
         annotated = []
-        for m, ans in good:
+        for i, (m, ans) in enumerate(good):
             if extract_code(ans):
                 issue = code_check(ans)
+                if issue is not None:
+                    failed_idxs.add(i)
                 tag = ("[Execution check: PASSED]" if issue is None
                        else f"[Execution check: FAILED]\n{issue}")
                 ans = f"{ans}\n\n{tag}"
@@ -2217,11 +3446,24 @@ def aggregate(question, proposals):
     # 3体分の正しい提案が手元にあるのに空回答で失点するのが最悪ケースなので、それを塞ぐ。
     if _bad(out):
         print("   ⚠ 統合に失敗 → 提案から直接選択します")
-        for _m, a in good:
+        # 【2026-07-24 修正】critique() は LLM によるレビューのみでコードを実行しない。
+        # そのため以前はここで good を単純に先頭から走査しており、CODE_EXECUTION の
+        # アノテーションループで「実行して FAILED と判明済み」の提案でも critique() が
+        # ok と判定すればそのまま最終回答として返してしまい得た
+        # （AGGREGATOR_SYS ルール6「FAILED のコードを最終回答の根拠にしない」に反する）。
+        # iteration 9 で good はクリーンな (model, strip_think(answer)) のまま保持する
+        # ようにしたが、それだけでは保険2の選択ロジック自体は直せていなかった。
+        # ここでは failed_idxs（上の実行済み証拠、再実行はしない）を使って、まず
+        # 「コードが FAILED していない」提案（コード無し提案も含む）に候補を絞り、
+        # 全提案が FAILED だった場合のみ元の全候補（good, 元の順序）にフォールバックする。
+        candidates = [(m, a) for i, (m, a) in enumerate(good) if i not in failed_idxs]
+        if not candidates:
+            candidates = good
+        for _m, a in candidates:
             ok, _issue = critique(question, a)
             if ok:
                 return a
-        return max(good, key=lambda x: len(x[1]))[1]
+        return max(candidates, key=lambda x: len(x[1]))[1]
 
     return out
 
@@ -2290,9 +3532,16 @@ SC_PROMPT_POT = (
 # 消費・仲裁が発生する（精度優先の自己整合性投票が崩れる）。曖昧な en-dash
 # (U+2013) / em-dash (U+2014) は区間表記等と衝突しうるため、意図的にここでは
 # マッピングしない。
+# 2026-07-25: 全角パーセント（U+FF05 ％）も同じ理由で '%' へ正規化する。CJK 寄りの
+# プロポーザ（qwen/gemma 系）が百分率の答えを全角数字ごと「５０％」のように書くと、
+# 全角数字自体は本テーブルで半角化されても ％ は素通りして "50％" のまま残り、
+# 半角の "50%" と別の投票クラスに分裂する（下の normalize_answer 側の '\%' -> '%'
+# 正規化＝iteration 13/22/78/122 と同系統の姉妹修正、詳細は normalize_answer 内の
+# コメント参照）。str.maketrans は変換元・変換先の文字数を一致させる必要があるため、
+# 変換元の末尾に '％'、変換先の末尾に対応する '%' を追加する。
 _FW_TRANS = str.maketrans(
-    "０１２３４５６７８９ＡＢＣＤＥａｂｃｄｅ−－．／，",
-    "0123456789ABCDEabcde--./,",
+    "０１２３４５６７８９ＡＢＣＤＥａｂｃｄｅ−－．／，％",
+    "0123456789ABCDEabcde--./,%",
 )
 
 
@@ -2370,7 +3619,68 @@ def normalize_answer(ans):
     if ans is None:
         return ""
     s = str(ans).strip().translate(_FW_TRANS)
-    s = s.replace("$", "").replace("\\!", "").replace("\\,", "").strip()
+    # 2026-07-25: LaTeX でバレの '%' はコメント開始文字として解釈されてしまうため、
+    # 学習済みの行儀の良いモデルは百分率を \boxed{50\%} のようにエスケープして書く。
+    # 一方、素の散文回答は \boxed{50%} のようにエスケープなしで書き、_FW_TRANS
+    # （直上）が全角数字は正規化しても全角パーセント ％ をここまで手つかずのままにしていた
+    # 旧版では qwen/gemma 系 CJK プロポーザが「５０％」を出すこともあり、同じ50%という
+    # 値が \%（LaTeX）/ %（素の散文）/ ％（全角）の最大3系統の投票クラスに分裂して
+    # vote_answers の集計を薄める（自己整合性投票 gotcha #7 が票割れに最も弱い箇所）。
+    # \boxed{} 経路（extract_final_answer の math 分岐、L3033 付近）はここで
+    # normalize_answer をそのまま素通しするため数値コア正規表現の対象外であり、この
+    # スペルの違いを吸収できる唯一の場所がここになる。値は変えず綴りだけを '%' に
+    # 揃える点で iteration 13（全角記号）/22（末尾カンマ）/78/122（\frac 数値正規化）と
+    # 同系統の姉妹修正。パーセント記号自体を落とすと 50% が 50 という別の値に化けて
+    # しまう（精度劣化）ため、ここでは絶対に除去しない。
+    # 2026-07-25: \(...\)（inline 数式モード）/ \[...\]（display 数式モード）はエスケープ
+    # 済みの LaTeX 数式区切り文字であり、直前で剥がしている '$'（同じく数式モードの区切り）・
+    # '\!'・'\,'（幅なしスペース系マクロ）と同様、値を一切持たない体裁トークンに過ぎない。
+    # まだこの4つだけ剥がしていなかったため、プロポーザーが \boxed{\(5\)} や
+    # \[x+1\]、「answer is \(42\)」のように答えをこれらで包んで書くと、素の "5"/"x+1"/"42"
+    # 票とは別の "\(5\)" 等という投票クラスに分裂し、na.lower()/Fraction の高速パスにも
+    # 乗らない（自己整合性投票 gotcha #7 が最も嫌う票割れ）。値を変えない純粋な区切り
+    # 記号なので、$ と対称的にここで剥がす。\left(/\right)（実括弧を包む別マクロ）・
+    # エスケープ済み中括弧 \{/\}（集合記法）・素の ( )/[ ]・\frac 等の値を持つマクロは
+    # 対象外のまま維持する。iteration 13/22/78/122/134/136 と同系統の姉妹修正。
+    s = s.replace("\\%", "%").replace("$", "").replace("\\!", "").replace("\\,", "") \
+        .replace("\\(", "").replace("\\)", "").replace("\\[", "").replace("\\]", "").strip()
+    # 2026-07-25: エスケープ済み中括弧 \{ / \} は集合記法の区切り文字であり、直上のブロック
+    # （iteration 140、\( \) \[ \] 剥がし）も直下のブロック（iteration 164、\left/\right 剥がし）
+    # も、コメントで明示的に「\{/\} は集合の区切り文字として保持する、剥がさない」とスコープ外に
+    # していた。区切り文字そのものを残す判断は正しい（剥がすと \{1,2\} が "1,2" になり、素の
+    # タプル/スカラー票と値を変えて誤って一致してしまう）が、そのエスケープの綴り違いは残った
+    # ままだった。多様性重視の SC パネルでモデル A が \boxed{{1,2}}（extract_boxed は '{1,2}'
+    # を返す）、モデル B が \boxed{\{1,2\}}（extract_boxed は '\{1,2\}' を返す）のように同じ
+    # 集合を異なるエスケープ綴りで書くと、na.lower() も Fraction() もこの2つを一致させられず、
+    # 同一の値なのに別々の投票クラスに分裂してしまう（自己整合性投票 gotcha #7 が最も嫌う
+    # 票割れ）。ここでは中括弧そのものは絶対に削除せず（削除は禁止 — \{1,2\} を "1,2" に
+    # してしまうと集合を素のタプル/スカラーと誤って同一視する）、バックスラッシュのエスケープ
+    # だけを外して素の { } に統一する。iteration 13/22/78/122/134/136/148/160 と同系統の
+    # 「表記の綴り違いを吸収して票をまとめる」姉妹修正で、iteration 140/164 が意図的に
+    # 先送りにしていた \{\}（集合デリミタのエスケープ綴り）のギャップを埋める。
+    s = s.replace("\\{", "{").replace("\\}", "}")
+    # 2026-07-25: \left(/\right) 等は実括弧・角括弧・波括弧の「自動サイズ調整」だけを行う
+    # 体裁マクロで、値は一切持たない。iteration 140（直前のブロック、\( \) \[ \] 剥がし）
+    # はコメントで明示的にこれをスコープ外としたまま据え置いており（"\left(/\right)
+    # （実括弧を包む別マクロ）...は対象外のまま維持する"）、grep でも \left/\right は
+    # どこでも処理されておらずテストも皆無だった。プロポーザーは MATH-500 形式の
+    # 順序対・区間・集合を \left(3, 4\right) / \left[2, 5\right) / \left\{1, 2\right\}
+    # のように書くことが多く、素の (3,4) 等と綴りだけが違う別の投票クラスに分裂する。
+    # na.lower() は不一致、Fraction("\left(3,4\right)") は例外で math_verify に落ちるが
+    # gotcha #6 の通り Windows 上では信頼できず、自己整合性投票（gotcha #7）が最も
+    # 嫌う票割れをそのまま放置してしまう。\left/\right の文字列だけを剥がし、内側の
+    # 実区切り文字 ( ) [ ] \{ \} はそのまま残す（\{/\} を含む集合記法は剥がさない）。
+    # \b は必須: \leftarrow/\rightarrow/\leftrightarrow のような矢印マクロは "left"/
+    # "right" の直後が英字（word文字）で続き単語境界が生じないため、\b が誤って
+    # 巻き込むのを防ぐ（正規表現は \left/\right の小文字専用で \Leftrightarrow 等の
+    # 大文字マクロにもそもそも一致しない）。ここで剥がした後の空白・カンマは後段の
+    # \s+ 畳み込み（下）と iteration 160 の数字間カンマ空白除去にそのまま乗るため、
+    # \left(3, 4\right) -> (3, 4) -> (3,4) と、素の (3,4) と完全一致するようになる。
+    # \frac/\sqrt/\operatorname 等の値を持つマクロ、素の ( )/[ ]、エスケープ済み中括弧
+    # \{/\} は対象外のまま維持する。iteration 13/22/24/30/78/122/134/136/140/148/160 と
+    # 同系統の「ファストパスで拾えない票を拾う」姉妹修正で、iteration 140 が明示的に
+    # 先送りにしたギャップを埋める。
+    s = re.sub(r"\\(?:left|right)\b", "", s)
     s = re.sub(r"^(?:the\s+)?(?:final\s+)?(?:answer|答え|正解)\s*(?:is|[:：は])?\s*",
                "", s, flags=re.IGNORECASE)
     # 桁区切りの除去。"11,\! 111,\! 100" のように区切り後に空白が入る表記（MATH-500 の
@@ -2386,9 +3696,99 @@ def normalize_answer(ans):
     # ここで落とす。内部（末尾以外）のカンマは rstrip の性質上そのまま保持される。
     s = s.rstrip("。．.,").strip()
     s = re.sub(r"\s+", " ", s)
-    m = re.fullmatch(r"\\(?:text|mathrm)\{(.*)\}", s)
-    if m:
+    # 2026-07-25: 数字に挟まれたカンマの直後の空白を除去する。(3, 4) と (3,4) は同じ
+    # 順序対/区間/座標の値だが、上の桁区切り正規表現 (?<=\d),\s*(?=\d{3}\b) はカンマの
+    # 直後にちょうど3桁が続く場合しか吸収しない（"4)" は \d{3} に一致しない）ため、
+    # このままでは "(3, 4)" と "(3,4)" が別々の投票クラスに分裂する。MATH-500 では
+    # 順序対・区間・座標形式の正解が珍しくなく、いずれも na.lower()/Fraction の高速
+    # パスに乗らないため math_verify のフォールバックに落ちるが、gotcha #6 の通り
+    # math_verify は Windows 上で parsing_timeout/timeout_seconds のマルチプロセス
+    # タイムアウト実装に問題があり信頼できない。自己整合性投票（gotcha #7）は票割れに
+    # 最も弱いため、ここで吸収して1票にまとめる。カンマの両側を厳密に数字だけに限定
+    # することで、"yes, it is" のような散文カンマや (x, y) のような記号的タプルの
+    # カンマは対象外のままとし、値を変えずに表記だけを揃える（精度優先）。上の桁区切り
+    # 正規表現・空白畳み込みより後段に置くことで "12, 345" -> "12345" の桁区切り処理を
+    # 妨げない。iteration 13/22/24/30/78/122/134/136/140/148 と同系統の姉妹修正。
+    s = re.sub(r"(?<=\d),\s+(?=\d)", ",", s)
+    # 2026-07-23: \text/\mathrm 以外にも \textbf/\mathbf/\boldsymbol などの
+    # 「見た目だけ」を変える体裁マクロで最終回答を装飾するプロポーザーがいる。
+    # mcq では \boxed{\textbf{B}} を extract_final_answer の先頭選択肢文字
+    # 正規表現が読めず None（無投票）になり、math では \boxed{\mathbf{42}} が
+    # 文字列 "\mathbf{42}" のまま投票されて answers_equivalent の
+    # na.lower()/Fraction 系ファストパスに乗らず、素の "42" 票と別の投票クラスに
+    # 分裂してしまう（自己整合性投票 gotcha #7 での票落ち・票割れ）。これらは
+    # 値を変えない純粋な体裁指定なので剥がしても精度は落とさず、むしろ本来1つ
+    # であるべき票をまとめられる（精度優先・時間は気にしない）。\frac/\sqrt/
+    # \operatorname 等の値を変えうるマクロは対象外のまま維持する。\mathbf{\text{D}}
+    # のような入れ子に対応するため、固定回数の上限（暴走防止）付きループで剥がす。
+    _wrap_re = re.compile(
+        r"\\(?:text|mathrm|textbf|textit|texttt|textsf|textnormal|"
+        r"mathbf|mathit|mathsf|mathtt|boldsymbol|bm)\{(.*)\}"
+    )
+    for _ in range(4):
+        m = _wrap_re.fullmatch(s)
+        if not m:
+            break
         s = m.group(1).strip()
+    # 2026-07-24: \frac{a}{b}/\dfrac{a}{b}/\tfrac{a}{b}（純粋に数値のみ、非入れ子）を
+    # "a/b" 形に正規化する。iteration 108 で同じ修正を試みて3回スタックしたまま未着手
+    # だったギャップ（gotcha #7 の自己整合性投票がここに直結）で、\boxed{\frac{1}{2}} と
+    # \boxed{0.5}/\boxed{1/2} が本来同じ値なのに別の投票クラスに分裂し、票の合算を
+    # 過小評価する（math_verify に頼れば拾えるが遅く、_FW_TRANS/Fraction 比較等の
+    # 既存ファストパス優先方針に反する）。前回の停滞を踏まえてスコープを最小化し、
+    # ネストした中括弧（\frac{\frac{1}{2}}{3} 等）や変数を含む場合（\frac{x}{2} 等）は
+    # 正規表現で捕捉せずそのまま素通りさせ、既存の math_verify フォールバックに委ねる
+    # （クラッシュさせない・誤った値を作らない）。iteration 13/22/78 の姉妹的な
+    # normalize_answer 修正群と同じ「ファストパスで拾えない票を拾う」方針に沿う。
+    _frac_re = re.compile(
+        r"^(-?)\\[dt]?frac\{\s*(-?\d+(?:\.\d+)?)\s*\}\{\s*(-?\d+(?:\.\d+)?)\s*\}$"
+    )
+    m = _frac_re.match(s)
+    if m:
+        sign, num, den = m.group(1), m.group(2), m.group(3)
+        # 2026-07-25: iteration 122 は分子・先頭の符号だけを neg へ XOR しており、
+        # 分母の符号は無視して den をそのまま埋め込んでいた（同コメント末尾
+        # 「numerator/leading sign」限定のスコープ通り）。しかし _frac_re の分母グループ
+        # は (-?\d+...) で先頭マイナスを許容するため、\frac{1}{-2}（=-1/2）は
+        # "1/-2" に、\frac{-1}{-2}（=+1/2）は "-1/-2" になってしまう。Fraction() は
+        # 分母に符号が付いた文字列を受け付けないため、これらは下の Fraction 高速パスに
+        # 乗れずすり抜け、-1/2・\frac{-1}{2}・-0.5 という「素直な」表記の票とは別の
+        # 投票クラスに分裂して自己整合性投票（gotcha #7）の票を薄める。iteration
+        # 13/22/24/30/78/122/134/136/140 と同系統の「ファストパスで拾えない票を拾う」
+        # 修正として、分母の符号も neg へ XOR してから den から取り除く。正の分母
+        # （den.startswith("-") が False）の場合は lstrip が no-op のため、既存の
+        # iteration 122/134/136/140 の正規化結果は一切変わらない。
+        neg = (sign == "-") ^ num.startswith("-") ^ den.startswith("-")
+        num = num.lstrip("-")
+        den = den.lstrip("-")
+        s = f"{'-' if neg else ''}{num}/{den}"
+    # 2026-07-27 (iteration 214、iteration 210 が3回スタックしたまま未着手だったギャップの
+    # 縮小スコープでのリトライ): PoT サンプルは stdout に sympy 綴り（sqrt(2)、pi）を出力する
+    # 一方、CoT サンプルは \boxed{} に LaTeX 綴り（\sqrt{2}、\pi）を書く。na.lower() は
+    # 不一致、Fraction() は例外で、同じ無理数の答えが math_verify フォールバックに落ちる
+    # （gotcha #6: Windows では parsing_timeout/timeout_seconds のマルチプロセス実装に
+    # 問題があり信頼できないため、正規化側の高速パスで吸収できる形は吸収しておきたい）。
+    # 素の値が変わらず同じ2系統に分裂するのは自己整合性投票（gotcha #7）が最も嫌う
+    # 票割れであり、iteration 122 の _frac_re と全く同じ「アンカー付き全文一致のみ」の
+    # 形で最小スコープに絞ってリトライする。answers_equivalent（L4062-4064 付近）は
+    # ここで正規化した文字列をそのまま $na$/$nb$ として math_verify に渡すため、もし
+    # \pi をグローバルな部分文字列置換で扱うと 2\pi や \frac{\pi}{4} のような複合式を
+    # 2pi や \frac{pi}{4} に書き換えてしまい、LaTeX パーサはこれを 2*p*i と読んで今日
+    # 通っている等価判定を壊しかねない。そのため両ルールとも fullmatch 相当の
+    # ^...$ アンカーで「値全体がちょうどこの形」の場合だけに限定し、2\sqrt{3} や
+    # \sqrt{\sqrt{2}}、\sqrt{x}、\sqrt[3]{8}、\sqrt2（波括弧なし）、\sqrt{2}/2、2\pi、
+    # \pi/2、\frac{\pi}{4} のような複合/入れ子/係数付き/変数入りの形は一切触れず
+    # バイト単位で素通りのまま維持する（この位置は _wrap_re の展開・_frac_re の後段の
+    # ため、\textbf{\sqrt{2}} のような体裁マクロ入れ子も既に剥がされた後に評価される）。
+    _sqrt_re = re.compile(r"^(-?)\\sqrt\{\s*(\d+(?:\.\d+)?)\s*\}$")
+    m = _sqrt_re.match(s)
+    if m:
+        sign, radicand = m.group(1), m.group(2)
+        s = f"{sign}sqrt({radicand})"
+    _pi_re = re.compile(r"^(-?)\\pi$")
+    m = _pi_re.match(s)
+    if m:
+        s = f"{m.group(1)}pi"
     return s
 
 
@@ -2407,15 +3807,60 @@ def extract_final_answer(text, task_type="math"):
             # 誤って拾わない。先頭にマッチしなければ（\boxed{None of the above} 等）誤った
             # 文字を返さず、下の宣言パターン探索 → 最終的に None（無投票、誤投票より安全）に
             # フォールスルーさせる。
-            m = re.match(r"\(?\s*([A-E])\b", normalize_answer(boxed).upper())
+            # 2026-07-24: \(? は ASCII 括弧しか許容しておらず、CJK寄りのプロポーザー
+            # （qwen/gemma 系）が好む全角括弧 \boxed{（A）} を通すと、normalize_answer/
+            # _FW_TRANS（iter 13）は全角数字・A-E・マイナス・小数点・スラッシュ・カンマは
+            # 正規化するが全角括弧（U+FF08/FF09）は意図的に対象外のため （ がそのまま残り、
+            # \(? は幅ゼロでマッチ済み、続く ([A-E]) が （ に一致できず extract_final_answer
+            # が None を返して自己整合性投票（gotcha #7）から正当な1票が無投票のまま
+            # 静かに失われていた。[(（]? に広げて全角括弧も許容し、この票落ちを回復する
+            # （無投票より正しい1票、精度優先・時間は気にしない）。iter 3 の \b 境界ガードと
+            # iter 26 の複数文字競合時の棄権ロジックはそのまま維持する。
+            # 2026-07-25: SC_PROMPT_MCQ は選択肢文字を \boxed{} に入れるよう指示しているが、
+            # 上のコメント群（iter 3/26/102/109）が繰り返し記録している通り CJK 寄りの
+            # プロポーザー（qwen/gemma 系）は無視して散文で答えを書く。その散文寄りの答えを
+            # 「answer is **B**」「単独行の *C*／__A__」のように Markdown の強調記号で
+            # 装飾するのは LLM の出力で非常によくある癖で、strip_think も normalize_answer も
+            # '*'/'_' を除去しないため、装飾された選択肢文字はこの3か所のどれにもマッチせず
+            # None（無投票）になり、自己整合性投票（gotcha #7）から正当な1票が静かに
+            # 失われていた。文字に直接隣接する強調記号だけを [*_]{0,2} で束縛して許容し
+            # （'*'/'_' をテキスト全体から一律に剥がすと math 分岐の下付き添字等を壊すため
+            # 厳禁）、この票落ちを回復する。iter 3 の \b／(?![A-Za-z]) 境界ガードは強調記号が
+            # 非単語文字であるため自然に維持され（'**Bee**' の 'B' の直後は依然 'e' で
+            # 境界不成立のまま）、iter 26 の複数文字競合時の棄権ロジックもそのまま変えない。
+            m = re.match(r"[*_]{0,2}[(（]?\s*([A-E])\b", normalize_answer(boxed).upper())
             if m:
                 return m.group(1)
         # 2026-07-22: 連結詞（is/：/は）を省略可にしていたせいで、「answer A」のような
         # 単なる言及（例:「Note that answer A was a common distractor.」）まで宣言と
         # 誤認していた。本物の宣言は「answer is B」「答え：B」のように連結詞を伴うのが
         # 通例なので、下の math 宣言ブランチ（L2334 付近）と同じく連結詞を必須にする。
-        for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])\s*\(?([A-EＡ-Ｅ])\)?(?![A-Za-z])",
-                    r"^\s*\(?([A-E])\)?\s*(?:が正解|です)?\s*$"):
+        # 2026-07-24: 上の boxed 分岐と同じ理由（全角括弧はカッコ内はA-E数字と異なり
+        # _FW_TRANS 未対応、iter 13 参照）で、宣言パターン「答えは（B）です」・単独行
+        # パターン「（C）」のどちらも \(?/\)? のままだと全角括弧を素通りできず None を
+        # 返し無投票になる。[(（]?/[)）]? に広げて ASCII と同様に許容する。iter 3 の
+        # \b・先頭文字ガードと iter 26 の複数文字競合時 None 化（下の len(letters) > 1）は
+        # 変更しない。
+        # 2026-07-24: iter 102 は上記の全角括弧対応時に宣言パターン（1行下）の文字クラスは
+        # [A-EＡ-Ｅ] に広げたが、こちらの単独行パターンは [A-E] のまま ASCII 限定に
+        # 取り残されていた。そのため CJK 寄りのプロポーザー（qwen/gemma 系、iter 102 が
+        # 想定した対象そのもの）が \boxed{} を無視して「Ｃ」「（Ｃ）」のように全角文字だけを
+        # 単独行で答えると、boxed 分岐（該当なし）・宣言パターン（answer/答え/正解 の
+        # 連結詞なし）・この単独行パターン（[A-E] は U+FF23 に不一致）のいずれにも拾われず
+        # None となり、自己整合性投票（gotcha #7）の正当な1票が静かに失われていた。
+        # 宣言パターンと同じ [A-EＡ-Ｅ] に揃えて票落ちを解消する。.translate(_FW_TRANS)
+        # （iter 13）が全角→ASCII正規化を担うため誤投票のリスクはなく、iter 26 の
+        # 複数文字競合時の棄権ロジックもそのまま維持する。
+        # 2026-07-25: boxed 分岐と同じ理由（上のコメント参照、iter 3/26/102/109 系列）で、
+        # 宣言パターン「answer is **B**」・単独行パターン「*C*」「__A__」も Markdown の
+        # 強調記号を素通りできず None（票落ち）になっていた。文字に直接隣接する
+        # [*_]{0,2} のみを括弧の外側（既存の [(（]?/[)）]? の外）に許容し、iter 3 の
+        # \b／(?![A-Za-z]) 境界ガード（強調記号は非単語文字なので '**Bee**' の誤爆は
+        # 引き続き起きない）・iter 26 の複数文字競合時 None 化・単独行パターンの
+        # ^...$ MULTILINE アンカー（'**A. Introduction**' のような見出し行を拾わない）は
+        # いずれもそのまま維持する。
+        for pat in (r"(?:answer|答え|正解)\s*(?:is|[:：は])\s*[*_]{0,2}[(（]?([A-EＡ-Ｅ])[)）]?[*_]{0,2}(?![A-Za-z])",
+                    r"^\s*[*_]{0,2}[(（]?([A-EＡ-Ｅ])[)）]?[*_]{0,2}\s*(?:が正解|です)?\s*$"):
             ms = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
             if ms:
                 letters = {m.translate(_FW_TRANS).upper() for m in ms}
@@ -2451,6 +3896,30 @@ def extract_final_answer(text, task_type="math"):
             cand = normalize_answer(raw)
             if not cand:
                 continue
+            # 2026-07-27: mcq 宣言分岐（iter 173、この関数の上のほう L3795 以降のコメント
+            # 参照）に施した Markdown 強調記号の束縛許容がこちらの math 宣言分岐には
+            # 適用されておらず非対称なままだった。「The answer is **42**.」のように
+            # normalize_answer 後も cand が "**42**" のまま Markdown の強調記号を
+            # 保持していると、直後の数値コア re.match（下）は '*' の位置で先頭マッチに
+            # 失敗し、m が None のまま cand（"**42**" という装飾込みの生文字列）自体が
+            # そのまま候補に append されていた。これは二重に有害で、(1) Fraction("**42**")
+            # は例外になり、math_verify も Windows では信頼できない（gotcha #6）ため
+            # "42" という素の票と永久に合流しない別クラスの誤投票として
+            # self-consistency 投票（solve_verifiable、gotcha #7）を汚染し、(2) さらに
+            # 悪いことに「answer is **12**」と「answer is 12」のように同じ値を指す
+            # 2つの宣言が cands=['**12**','12'] という非同値な候補ペアに分裂してしまい、
+            # 全会一致のはずの正当な1票が iteration 30 の複数候補非同値棄権ロジック
+            # （すぐ下の any(not answers_equivalent(...))）に誤って引っかかって
+            # None（無投票）に化けてしまう。iter 173 と同じ設計方針（強調記号は
+            # 値に隣接する境界だけを束縛して剥がし、テキスト全体から一律に '*'/'_' を
+            # 剥がすことは a_1 のような下付き添字や a*b のような乗算表記を壊すため
+            # 厳禁のまま、というのがそこのコメントの要旨）をここでも踏襲し、cand の
+            # 先頭・末尾に限定して [*_]{1,3} を剥がす。normalize_answer 自体（iteration
+            # 13/22/24/78/122/134/136/140/148/160/164 の蓄積）や iteration 30 の
+            # 非同値棄権ロジック、iteration 136 の '%' 保持はいずれも変更しない。
+            cand = re.sub(r"^[*_]{1,3}\s*|\s*[*_]{1,3}$", "", cand)
+            if not cand:
+                continue
             # 「700 円です」のような後置き単位・助詞を落とす: 数値で始まるなら数値部のみ
             # 2026-07-22: 整数部の文字クラスを \d[\d,]* から「桁区切りとして妥当な
             # \d{1,3}(?:,\d{3})+ か、カンマなしの \d+」の二択へ厳格化する（iteration 13/22/24 の
@@ -2462,7 +3931,23 @@ def extract_final_answer(text, task_type="math"):
             # 単独の誤投票クラスとして混入する。「無投票 > 誤投票」の方針（精度優先・時間は
             # 気にしない）に従い、正当な桁区切り（1,234 / 1,234,567 等）は1トークンのまま保つ
             # 一方、桁区切りとして不正なカンマ列は数値ごとに分離させる。
-            m = re.match(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*/\s*\d+)?", cand)
+            # 2026-07-25 (iteration 136): この数値コア正規表現は '%' を含めていなかった
+            # ため、"The final answer is 50%" のような非boxed宣言では cand が
+            # normalize_answer 経由で "50%"（iteration 134 が '%' を保持するよう修正済み、
+            # 50% を 50 という別の値に化けさせない = 精度劣化を防ぐ）になっていても、
+            # ここで数値部だけを切り出す際に '%' を落として "50" にしてしまっていた。
+            # 一方 \boxed{50\%} 側は normalize_answer(boxed) をそのまま返す boxed 分岐
+            # （この関数の上のほう）を通るため '%' が残る。同じ50%という値が
+            # boxed 経路の '50%' 票と宣言経路の '50' 票という別クラスに分裂し、
+            # 自己整合性投票（solve_verifiable、gotcha #7）が本来1票にまとまるはずの
+            # 票を薄めてしまう（無投票ならまだしも、ここでは意味の異なる整数値へ
+            # 誤って投票する点がより悪い）。数値本体に「直後」（間に \s* を挟まない）で
+            # 続く '%' だけを任意で拾う %? を末尾に足し、"50 %"のような離れた%は
+            # 従来通り拾わない（新たな別クラスを作らない）。iteration 13/22/24 の
+            # 桁区切り厳格化・符号クラス拡張と同系統の姉妹修正であり、iteration 30 の
+            # 複数候補の非同値棄権ロジック（すぐ上）はそのまま維持する。
+            # 「無投票／誤投票より綺麗な1票」の方針（精度優先・時間は気にしない）。
+            m = re.match(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*/\s*\d+)?%?", cand)
             cands.append(m.group(0).replace(" ", "") if m else cand)
         if cands:
             if any(not answers_equivalent(c, cands[-1]) for c in cands[:-1]):
@@ -2485,8 +3970,84 @@ def extract_final_answer(text, task_type="math"):
     # solve_verifiable の自己整合性投票（gotcha #7）を汚染するため、「無投票 > 誤投票」
     # （精度優先・時間は気にしない）の方針に従い、桁区切りとして妥当なカンマ（1,234 や
     # 1,234,567）のみ1トークンにまとめ、そうでないカンマ区切りは個々の数値へ分離する。
-    nums = re.findall(r"[-−－]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*/\s*\d+)?", text)
+    # 2026-07-25 (iteration 136): 上の宣言ブランチと同じ理由で、\boxed{} も「答え/正解/
+    # answer」宣言も無く「so the probability is 50%.」のように percent で終わる本文だと、
+    # この最後の数値フォールバックが '%' を含めていなかったため "50" を返し、
+    # \boxed{50\%}（iteration 134 が '%' 保持へ修正済み）が返す "50%" 票と別クラスに
+    # 分裂していた。数値本体に「直後」（\s* を挟まない）で続く '%' だけを任意で拾う
+    # %? を末尾に足して merge する。findall は文中の各数値トークンを個別に拾うため、
+    # 「increased by 50% to reach 75」のように途中の percent は自分の直後にしか
+    # 付与されず、末尾の別の数値（75）にまで '%' が誤って伝播することはない。
+    # iteration 13/22/24 の桁区切り厳格化・符号クラス拡張、iteration 30 の宣言側の
+    # 棄権ロジックと同系統の姉妹修正（無投票／誤投票より綺麗な1票、精度優先・
+    # 時間は気にしない）。
+    nums = re.findall(r"[-−－]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*/\s*\d+)?%?", text)
     return normalize_answer(nums[-1]) if nums else None
+
+
+# 2026-07-27: MCQ の自己一貫性投票（gotcha #7）で観測されている票落ちパターンへの
+# 対処、第一段。プロポーザーが選択肢の文字（A-E）ではなく選択肢の「値」そのものを
+# \boxed{} に入れてしまうことがあり（例:「4^2 は？ A) 12 B) 16 C) 20 D) 24」に対し
+# \boxed{16} と回答）、この場合 extract_final_answer(text, 'mcq') は boxed 先頭の
+# [A-EＡ-Ｅ] しか読まないため None を返し、正当な1票が自己整合性投票から静かに
+# 失われる。この「値を箱に入れてしまう」化けそのものは stuck した iteration 207/209
+# が「パーサーの実装」と「_sc_sample への配線」を同じイテレーションで両方やろうと
+# して行き詰まった経緯があり、直近では代表文（サンプル群の勝者テキスト）側で
+# デッキレベルの \boxed 再整合を行う対策（上の fugu_answer、SC 投票結果を
+# \boxed{} で包み直して再抽出とのずれを解消する修正）が入ったが、これは
+# _sc_sample が個々のサンプルから投票用の値を抽出する時点（vote_answers に渡す
+# 前）の票落ちそのものは救えていない。
+# 以下はその救済の下ごしらえとして、question_text 中の選択肢列（_MCQ_SIGNALS,
+# 上のL2952-2955、が要求するのと同じ最小限の行頭マーカー形状）を解析し、value が
+# その選択肢本文のどれと一意に一致するかを answers_equivalent 経由で判定する、
+# 副作用のない純粋関数。_sc_sample/extract_final_answer への配線（実際にこの
+# 関数を投票経路で呼ぶこと）は本イテレーションのスコープ外であり、次イテレーション
+# へ明示的に先送りする（本関数は現時点でどこからも呼ばれていない）。
+def map_value_to_choice(value, question_text):
+    """value を question_text 中の選択肢文字(A-E)へ一意にマップできればその文字を返す。
+    マップできなければ None（無投票 > 誤投票、精度優先・時間は気にしない）。
+
+    選択肢列の認識形状は _MCQ_SIGNALS と同じ行頭アンカー限定: 行頭（または直前が
+    改行）、任意の空白、任意の '(' / 全角 '（'、選択肢文字(A-EまたはＡ-Ｅ)、続けて
+    ')' '.' ':' '：' '）' '．' のいずれか一つ。選択肢本文は同じ行の残り部分のみを
+    対象とし、複数行にまたがる選択肢本文は本イテレーションのスコープ外とする
+    （_MCQ_SIGNALS 自体も単一行前提であり、それに合わせている）。小文字マーカー
+    （a) b) 等）は「a) の場合は」のような地の文の箇条書き様の記述を選択肢と
+    誤認するリスクを避けるため今回は非対応とし、大文字ASCII/全角のみを認識する
+    （プロポーザーが小文字マーカーの選択肢を書くことは実運用上ほぼ無い）。
+
+    副作用なし（ask()/ネットワーク/subprocess/ファイルI/Oなし、モジュールグローバル
+    変更なし）で、任意のテキスト入力に対して例外を投げない（bare except は使わず、
+    純粋な re.finditer とループだけで構成する）。
+    """
+    if not value:
+        return None
+    # 値そのものが既に単独の選択肢文字（大小文字・全角含む）なら救済不要。
+    # ここで選択肢本文と比較してしまうと誤爆のリスクがあるため触れずに None を返す
+    # （iteration 129 の answers_equivalent 内 A-E ガードと同じ判断: 精度優先）。
+    nv = normalize_answer(value)
+    if not nv:
+        return None
+    if re.fullmatch(r"[A-Ea-e]", nv):
+        return None
+    text = question_text or ""
+    # マーカー: 行頭 or 直前が改行、空白、任意の開き括弧、選択肢文字、閉じマーカー。
+    # 本文は同じ行の残り（\S から行末まで、'.' はデフォルトで改行に一致しないため
+    # 複数行へは絶対に広がらない）のみを取る。
+    option_re = re.compile(r"(?:^|\n)[ \t]*[(（]?([A-EＡ-Ｅ])[)\.:：）．][ \t]*(\S.*)")
+    seen = {}
+    for m in option_re.finditer(text):
+        letter = m.group(1).translate(_FW_TRANS).upper()
+        if letter in seen:
+            continue  # 選択肢列がプロンプト中で再掲されている場合は先勝ち
+        seen[letter] = m.group(2)
+    # _MCQ_SIGNALS と同じ最小限の証拠（A・Bが両方そろって初めてMCQの選択肢列とみなす）
+    if len(seen) < 2 or "A" not in seen or "B" not in seen:
+        return None
+    matches = [letter for letter, body in seen.items() if answers_equivalent(value, body)]
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def answers_equivalent(a, b):
@@ -2496,6 +4057,22 @@ def answers_equivalent(a, b):
         return False
     if na.lower() == nb.lower():
         return True
+    # 2026-07-25 (iteration 129): iteration 107 が指摘したが当時は未修正のまま残した懸念
+    # への対応（gotcha #6/#7参照）。MCQ の SC サンプルは単一の選択肢文字 A-E であり、ここまで
+    # 到達した時点で na.lower()==nb.lower() は不一致（=文字として異なる）ことが確定している。
+    # このまま下へ抜けると Fraction('A') は例外で次段へフォールスルーし、最終的に
+    # math_verify フォールバックまで到達しうる。だが sympy は 'E' を自然対数の底
+    # (Euler's number)、'I' を虚数単位として数式解釈するため、選択肢文字を数式として解析
+    # するのは意味論的に不健全であり、万一「同値」と誤判定されれば solve_verifiable の
+    # 自己整合性投票（gotcha #7）で本来別クラスの票が併合され多数決が汚染されかねない。
+    # この開発環境には math_verify が未インストールで実挙動を検証できない（import失敗の
+    # 例外はexceptでFalseに握り潰されるだけ）ため、決定的なガードとして「両方とも単一の
+    # 選択肢文字 A-E」の形をしている場合は Fraction/math_verify に一切渡さず、ここで確定的に
+    # 判定して返す（math_verify呼び出し自体・gotcha #6のparsing_timeout=None/
+    # timeout_seconds=Noneは変更しない）。na.lower()==nb.lower()が既に不一致なのでこの分岐の
+    # 戻り値は常にFalseになるが、意図を明示するため case-insensitive 比較として書く。
+    if re.fullmatch(r"[A-Ea-e]", na) and re.fullmatch(r"[A-Ea-e]", nb):
+        return na.upper() == nb.upper()
     try:
         from fractions import Fraction
         if Fraction(na.replace(" ", "")) == Fraction(nb.replace(" ", "")):
@@ -2558,9 +4135,32 @@ def _sc_sample(model, question, task_type, pot=False, history=None):
         if not ok or not out:
             return None, text
         ans = out.splitlines()[-1].strip()
-        if not ans or len(ans) > 80:
+        if not ans:
             return None, text
-        return (normalize_answer(ans) or None), text + f"\n\n[PoT execution output]\n{out[-500:]}"
+        # 2026-07-25: PoT分岐(ここ)とCoT分岐(直下の extract_final_answer)で答えの抽出方法が
+        # 非対称だった。CoT側はextract_final_answerがtextから\boxed{}を剥がしてから
+        # normalize_answerへ渡すが、PoT側はstdout最終行(iteration 4)をnormalize_answerへ
+        # 素通しするだけで\boxed{}を剥がしていなかった。数学寄りにチューニングされた
+        # モデルはコード内でprint(f'\\boxed{{{ans}}}')のように反射的に\boxed{}で答えを
+        # 包むことがあり、その場合stdout最終行が丸ごと"\boxed{42}"になる。normalize_answer
+        # は$・\%・\(\)\[\]・\text/\mathbf系ラッパは剥がすが\boxed{}は対象外なので、
+        # 素の"42"というCoT側の投票クラスとは別クラスに割れ、gotcha #7の自己整合性投票
+        # （CoTの計算ミスをPoTで裏取り/上書きするための仕組み）でPoT票が丸ごと死票化して
+        # いた。ここで最終行に\boxed{が含まれる場合のみextract_boxedで中身を取り出し、
+        # 取れた場合だけそれをnormalize_answerへ渡す。取れなかった場合（末尾が
+        # \boxed{や\boxed{}のように閉じていない/空、iteration 11/23/25と同じ安全側判定）は
+        # 従来どおり生の行をnormalize_answerへ渡す。値を捏造しない・既存の票を壊さない
+        # 「票を拾えるところだけ拾う」方針は iteration 11/23/25/78/122/134/136/140/148の
+        # 票救出系修正列と同じ（精度優先・時間は気にしない）。長さガード(len>80)は
+        # 従来どおり最終的に投票される値に対して適用する（生の行ではなく剥がした後の値）。
+        vote_src = ans
+        if "\\boxed{" in ans:
+            unwrapped = extract_boxed(ans)
+            if unwrapped is not None:
+                vote_src = unwrapped
+        if not vote_src or len(vote_src) > 80:
+            return None, text
+        return (normalize_answer(vote_src) or None), text + f"\n\n[PoT execution output]\n{out[-500:]}"
     return extract_final_answer(text, task_type), text
 
 
@@ -2610,12 +4210,27 @@ def _arbitrate(question, task_type, samples, classes):
         tied = tied[:ARBITRATE_MAX_CANDIDATES]
         omitted_desc = ", ".join(str(c[0]) for c in omitted)
         print(f"   [SC] {len(omitted)}件の同数タイ候補は上限のため裁定役に提示されません: {omitted_desc}")
+    # 2026-07-25: 従来はタイ候補ごとに samples を先頭から走査し、canon と
+    # answers_equivalent な最初のサンプルをそのまま裁定役へ見せていた(下のfor内break)。
+    # add_batch(~L3731-3738)は各バッチの末尾でそのバッチのPoTサンプルを1件だけ追加する
+    # ため、samples内では「あるバッチのPoTサンプル」が「後続バッチのCoTサンプル」より
+    # 先に並ぶ。その結果、同じ答えにCoT一致サンプルが後から存在していても、先に並んだ
+    # PoTサンプルの方(コード＋'[PoT execution output]'という実行結果ブロック)がそのまま
+    # 「代表解答」として裁定役に渡り、「各候補の誤りを指摘して裁定せよ」という指示に対し
+    # 自然言語の思考過程ではなくコードしか見せられない弱い入力になっていた。
+    # _representative_text(iteration 2/55, L3594)はユーザー向け代表解答の選出で全く同じ
+    # 状況をCoT優先(pot=Falseを優先、無ければ最初に一致したPoT、リスト順序に非依存)で
+    # 既に解決しており、L3471-3472のコメントが指摘する通り _arbitrate 側のrep選出は
+    # それとは無関係な別contractのまま放置されていた。ここでも同じCoT>PoT優先を適用する。
+    # _representative_text の「一致なし→全サンプル中最長」フォールバックはここでは
+    # 発火しえない: tied の各 canon は vote_answers/classes 経由でsamples中の実在の
+    # answerそのものから作られたクラス代表であり、必ず>=1件のanswers_equivalentな
+    # サンプルが存在するため(不一致候補やその場しのぎの最長テキストが紛れ込むことはない)。
+    # strip_thinkと[:3000]切り詰め(num_ctx保護、gotcha #2)は選ばれたテキストへ従来通り適用する。
     reps = []
     for canon, _cnt in tied:
-        for s in samples:
-            if s["answer"] and answers_equivalent(s["answer"], canon):
-                reps.append((canon, strip_think(s["text"] or "")[:3000]))
-                break
+        rep_text = _representative_text(samples, canon)
+        reps.append((canon, strip_think(rep_text or "")[:3000]))
     listing = "\n\n".join(
         f"### Candidate {chr(ord('A') + i)} (final answer: {c})\n{t}"
         for i, (c, t) in enumerate(reps))
@@ -2626,11 +4241,33 @@ def _arbitrate(question, task_type, samples, classes):
     # と言われ、3件目以降への精査が手薄になる恐れがあった。「each candidate」
     # 「the incorrect one(s)」という候補数非依存の表現に統一する。2択の場合も
     # 意味は従来の "check both / find the flaw in the wrong one" と同等。
+    # 2026-07-24: _arbitrate は math/mcq 両方の拮抗解消で共用される（呼び出し元は
+    # solve_verifiable）が、末尾の出力形式指示はここまで math 前提の "put ONLY the
+    # correct final answer in \boxed{}" 一本しか無かった。extract_final_answer(text,
+    # 'mcq')（iter 3 で確立・iter 26/102 で誤爆修正済み）は \boxed{} の中身が選択肢
+    # 文字 A-E で始まる場合しか採用せず、計算値や選択肢本文（\boxed{7} や
+    # \boxed{Paris} 等）は None（無投票）になる。math 寄りの文言に引きずられた裁定役が
+    # それを箱に入れると、下のループが全裁定役で ans=None のまま尽き、_arbitrate 全体が
+    # None を返して mcq の拮抗が黙って MoA フォールバックへ劣化していた（iter 16/45 は
+    # math 側の文言調整のみで、この mcq 側の出力形式齟齬は未対応だった）。
+    # task_type=='mcq' のときだけ「\boxed{} には選択肢の文字(A-Eのいずれか1文字)だけを
+    # 入れよ」と明示する。推論自体（"solve the problem yourself if needed"）は禁止せず、
+    # 制約するのは最後の boxed トークンのみ。math/その他の文言は従来と完全に同一
+    # （バイト単位で不変。回帰テストで固定）。
+    if task_type == "mcq":
+        final_instruction = (
+            "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
+            "and solve the problem yourself if needed. At the very end, put ONLY the "
+            "single choice letter (A, B, C, D, or E) in \\boxed{} -- not the option's "
+            "wording or a computed value, just that one letter.")
+    else:
+        final_instruction = (
+            "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
+            "and solve the problem yourself if needed. At the very end, put ONLY the "
+            "correct final answer in \\boxed{}.")
     prompt = (f"Problem:\n{question}\n\n"
               f"{len(reps)} candidate solutions disagree:\n\n{listing}\n\n"
-              "Carefully check each candidate, find the flaw(s) in the incorrect one(s), "
-              "and solve the problem yourself if needed. At the very end, put ONLY the "
-              "correct final answer in \\boxed{}.")
+              + final_instruction)
     for arb in chain:
         print(f"   [SC] 票が拮抗 → {arb} が裁定します")
         raw = ask(arb, [{"role": "user", "content": prompt}], 0.1,
@@ -2818,7 +4455,37 @@ def fugu_answer(question, plan=None, history=None):
             # 裁定で答えが差し替わった場合など、本文の結論と投票結果がずれたら明示する
             body_ans = extract_final_answer(txt, plan["task_type"])
             if not (body_ans and answers_equivalent(body_ans, res["answer"])):
-                txt += f"\n\n(自己一貫性投票による最終解答: {res['answer']})"
+                # 2026-07-27: bench_fugu の主要config 'fugu'（run_fugu）は grade_item に
+                # answer_value=None を渡し、fugu_answer の戻り値「テキスト」から
+                # extract_final_answer で答えを再抽出して採点する（res["answer"] は
+                # 直接見ない）。これまでの素のプレーンテキスト注記
+                # 「(自己一貫性投票による最終解答: X)」は「答え/正解/answer」宣言の
+                # 連結詞パターンにも mcq の単独行パターンにも一致せず無視される一方、
+                # extract_boxed は「末尾に一番近い、閉じている \boxed{}」を採用する
+                # last-balanced-box-wins（本関数の上、iteration 12/25 のコメント参照 —
+                # この修正はその順序に依存するカップリングである）。そのため本文側に
+                # 残った古い \boxed{16} 等の方が拾われ続け、PoT専業の代表文・
+                # 空/抽出不能な代表文・\boxed{16} vs 勝者 'B' のような value-boxed MCQ
+                # 代表文で再抽出結果が投票結果とずれていた（stuck iteration 207 が
+                # per-sample で個別に救おうとしていた MCQ value-box 化けの、デッキ
+                # レベルでの根治でもある）。注記自体を \boxed{} で包み、last-wins の
+                # 並びを利用して注記側を「最後の、閉じた box」にすることで、再抽出が
+                # 必ず投票結果と一致するようにする（iteration 19 がこの分岐のテスト
+                # カバレッジ、gotcha #7: 自己一貫性投票は精度優先・時間は気にしない の
+                # 中核パスであり、ここでの再抽出ずれはその投票結果を静かに握りつぶす）。
+                # ただし答えの値自体が波括弧の対応が崩れた病的な文字列（例 "}{"）だと
+                # \boxed{} 化した注記そのものが壊れうるため、クラッシュさせず・注記を
+                # 消してもしまわないよう、往復確認（extract_final_answer で読み戻して
+                # answers_equivalent か）に失敗した場合だけ従来の素のプレーンテキスト
+                # 注記へフォールバックする。
+                boxed_note = f"\n\n(自己一貫性投票による最終解答: \\boxed{{{res['answer']}}})"
+                plain_note = f"\n\n(自己一貫性投票による最終解答: {res['answer']})"
+                try:
+                    roundtrip = extract_final_answer(txt + boxed_note, plan["task_type"])
+                    ok = bool(roundtrip) and answers_equivalent(roundtrip, res["answer"])
+                except Exception:
+                    ok = False
+                txt += boxed_note if ok else plain_note
             return txt
         print("   [SC] 投票不成立 → 通常の合議へフォールバック")
 
@@ -2835,7 +4502,12 @@ def fugu_answer(question, plan=None, history=None):
              + history
              + [{"role": "user", "content": question}]),
             PROPOSER_TEMP,
-            think=PROPOSER_THINK,
+            # 2026-07-23: get_single_proposal と同じ欠落パターン（gotcha 該当箇所として明記）。
+            # 単体モードの ask も think=PROPOSER_THINK の生グローバルを直渡ししており、隣の
+            # num_predict=proposer_predict_for(model) だけがモデル別設定に対応していた非対称を
+            # 解消。proposer_think_for(model) で _sc_sample と同じ解決順（PROPOSER_THINK override
+            # > MODEL_CONFIG > モデル既定）に統一する。
+            think=proposer_think_for(model),
             num_predict=proposer_predict_for(model),
             label="single",
         ))
@@ -2871,12 +4543,21 @@ def fugu_answer(question, plan=None, history=None):
             for m, a in proposals:
                 print(f"[{m}]\n{strip_think(a)}\n")
         final = aggregate(question, proposals)
-        reference = final  # 次ラウンドは今回の統合結果を土台に改善
+        # 2026-07-24: reference には think を持ち越さない。aggregate の生出力を
+        # そのまま次ラウンドの reference にすると、get_single_proposal が
+        # 'A draft answer from the panel:\n{reference}' として <think>...</think>
+        # の内部思考をプロポーザーへ「ドラフト回答」として提示してしまい改善を誤誘導
+        # する上、8192/16384 に固定した num_ctx（gotcha #2）を think ブロックが圧迫し
+        # 本来の質問文/ドラフトが切り詰められかねない（精度優先＝gotcha #7 に反する）。
+        # aggregate の結果は L2321、ask_fugu の最終出力は L3196 で同様に strip_think
+        # 済みにしている慣例に合わせ、ここでも strip_think 済みの fin を reference に
+        # 使う。返り値の final 自体は生のまま返す（ask_fugu 側で最終的に strip_think）。
+        fin = strip_think(final)
+        reference = fin  # 次ラウンドは今回の統合結果(think除去済み)を土台に改善
         issue_hint = None  # 指摘は消費済み。以降のチェックが新しい指摘を設定する
         r += 1
 
         # コード回答は実行検証で誤りが機械的に見つかるため、修正ラウンドの上限を広げる
-        fin = strip_think(final)
         limit = (MAX_ROUNDS_CODE if (CODE_EXECUTION and extract_code(fin))
                  else MAX_ROUNDS)
         if r >= limit:
@@ -2989,7 +4670,21 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
         result = handle_image_generation(question, panel=panel)
         elapsed = round(time.time() - t0, 1)
         print("\n===== 画像生成結果 =====")
-        print(result)
+        # 2026-07-24: handle_image_generation が失敗時に返す内部センチネル
+        # '__ERROR__: ...' をそのまま print(result) していたため、コンソールに
+        # 機械向けマーカーが生のまま漏出していた。aggregate()（iteration 9）、
+        # _critic_judge/second_opinion（iteration 15）、_arbitrate（iteration 20）、
+        # および経路3のイラスト付き回答（iteration 99）で対処した「内部センチネル
+        # をユーザ向け出力に漏らさない」バグと同種。ここではコンソール表示だけを
+        # 人間可読な文言に置き換える。notify_slack への通知（iteration 119 の
+        # 失敗アイコン判定用）・_save_answer_to_file のゲート（iteration 80 の
+        # エラー時未保存）・関数の戻り値は、従来どおり生の result
+        # （'__ERROR__' 始まりで失敗を示す）のまま変更しない。
+        if result.startswith("__ERROR__"):
+            note = result[len("__ERROR__"):].lstrip(":").strip()
+            print(f"画像生成に失敗しました: {note}" if note else "画像生成に失敗しました")
+        else:
+            print(result)
         print(f"\n(所要 {elapsed} 秒)")
         notify_slack(question, result, elapsed)
         if out_file and not result.startswith("__ERROR__"):
@@ -3026,7 +4721,16 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
             (".pptx", ".ppt"))) else None
         deck = build_pptx(question, final, pptx_out)
         final = text_answer + f"\n\n---\n## 生成した PowerPoint\n- 保存先: {deck}"
-        out_file = None  # 保存はここで完結（下の汎用保存は行わない）
+        # 2026-07-26: out_file を無条件に None化すると、--out が .pptx/.ppt 以外
+        # （例: notes.md）の場合に pptx_out は None のまま渡され build_pptx は
+        # 既定の PPTX_OUT_DIR に保存する一方、ユーザーが明示指定した --out 先への
+        # 保存は下の汎用 _save_answer_to_file がスキップされて silently 消えて
+        # いた（iteration 186 で表面化した repl 経路の --out 取りこぼしと同種）。
+        # ここは pptx_out が実際に消費された（＝out_file が .pptx/.ppt だった）
+        # 場合のみ None化し、それ以外は out_file を残して下の汎用保存に委ね、
+        # 高コストな MoA 回答を保存ステップで失わない（iteration 41-47/80と同種の原則）。
+        if pptx_out is not None:
+            out_file = None  # 保存はここで完結（下の汎用保存は行わない）
 
     # --- 経路3: イラスト付き回答（本文＋回答内容から画像生成）---
     elif (plan.get("use_image_generation") and not plan.get("image_only")
@@ -3034,6 +4738,21 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
         print("\n[Fugu] 回答内容からイラストを生成します...")
         base = f"{question}\n\n[回答の要点]\n{text_answer[:800]}"
         img = handle_image_generation(base, panel=panel)
+        # 2026-07-24: handle_image_generation が失敗時に返す内部センチネル
+        # '__ERROR__: ...' をそのまま final に連結すると、final は
+        # text_answer から始まるため直後の全ての `final.startswith("__ERROR__")`
+        # 判定（コンソール表示・notify_slack・履歴保存・_save_answer_to_file）を
+        # すり抜けてしまい、内部向けマーカーがユーザ向け回答・Slack通知・保存
+        # ファイルにそのまま漏出していた。aggregate()（iteration 9）、
+        # _critic_judge/second_opinion（iteration 15）、_arbitrate（iteration 20）
+        # で対処した「内部センチネル/タグをユーザ向け出力に漏らさない」バグと
+        # 同種。ここでは img がセンチネルなら人間可読な失敗ノートに置き換える
+        # （プレフィックスを剥がすだけで、テキスト本文自体は失敗として扱わない）。
+        # iteration 73 で確立した「_HISTORY にはクリーンな text_answer のみを
+        # 積む」分離は変更しない（下の履歴追記は従来通り text_answer のまま）。
+        if img.startswith("__ERROR__"):
+            note = img[len("__ERROR__"):].lstrip(":").strip()
+            img = f"(画像生成に失敗しました: {note})" if note else "(画像生成に失敗しました)"
         final = text_answer + "\n\n---\n## 生成画像\n" + img
 
     elapsed = round(time.time() - t0, 1)
@@ -3048,7 +4767,19 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
     # --- 会話履歴を更新（エラーでなければ記録・永続化）---
     if not final.startswith("__ERROR__"):
         _HISTORY.append({"role": "user", "content": question})   # 元の質問を保存
-        _HISTORY.append({"role": "assistant", "content": final})
+        # 2026-07-23: L3098 のコメント「履歴にはテキスト本文のみ保存する」の
+        # 意図と実装が乖離していたのを修正。旧実装は final（PPTX 経路では
+        # '## 生成した PowerPoint / 保存先: <deck>'、イラスト経路では
+        # '## 生成画像 / <img markup-or-status>' が本文に追記された成果物付き
+        # 文字列）をそのまま履歴に積んでおり、次ターンの Conductor/proposers が
+        # ファイルパスや画像生成ステータスを「前回回答の実質的内容」として誤読
+        # し得る状態だった（iteration 59/67/70 で対処した複数ターン間の忠実性
+        # 劣化と同種の問題）。加えて MAX_HISTORY_CHARS の予算も無駄に消費する。
+        # 修正: 履歴には text_answer（成果物注記より前のクリーンな本文）を積む。
+        # 画像・PPTX 経路を使わない通常パスでは text_answer == final のため
+        # 挙動は変わらない。戻り値・コンソール出力・notify_slack・
+        # _save_answer_to_file は従来通り final（成果物付き）を使い続ける。
+        _HISTORY.append({"role": "assistant", "content": text_answer})
         _trim_history(_HISTORY)
         save_history_file(_HISTORY, path=history_file)
         print(f"   [会話履歴: {len(_HISTORY) // 2} 往復保持中]")
@@ -3113,6 +4844,33 @@ def _extract_code_for_output(answer: str, suffix: str) -> str:
         ".sh": ["bash", "sh", "shell"],
         ".sql": ["sql"],
         ".r": ["r"],
+        # 2026-07-23: _CODE_EXTENSIONS (L3100, --out がコードとして書き出す25拡張子)
+        # と lang_map の同期漏れ。上の13エントリしか無く、残り12拡張子
+        # (.jsx .tsx .mjs .h .hpp .kt .swift .php .bat .ps1 .m .jl) は
+        # langs が空集合になるため tier-1 (対象言語タグ一致) が絶対に発火せず、
+        # 複数フェンスの回答で非対象言語のブロック(例: 使い方説明の```bash)が
+        # 先行すると tier-3 (非コードタグ以外の最初のブロック) でそれが誤って
+        # 採用され、意図した言語のブロックより先に書き出されていた
+        # (iteration 7/18/28/29/56 が繰り返し修正してきたのと同じ
+        # ブロック誤選択バグクラスだが、このタグ集合の穴自体は今回まで未対応で、
+        # 既存の code_out: テストは全て .py/.c という対応済み拡張子だけを使って
+        # いたため検出されずにいた)。tier-1 は「優先されるブロックを選ぶだけ」
+        # で受理判定を誤って拡げても非対象ブロックを誤採用する副作用は無いため、
+        # .h (C/C++/Objective-C 共用ヘッダ) と .m (MATLAB/Objective-C/Octave) の
+        # ように言語が一意に決まらない拡張子は、単一言語を憶測するのではなく
+        # 妥当なタグを広めに全部含める。
+        ".jsx": ["jsx", "javascript", "js"],
+        ".tsx": ["tsx", "typescript", "ts"],
+        ".mjs": ["javascript", "js", "mjs"],
+        ".h": ["c", "cpp", "c++", "objc", "objective-c", "objectivec"],
+        ".hpp": ["cpp", "c++", "hpp"],
+        ".kt": ["kotlin", "kt"],
+        ".swift": ["swift"],
+        ".php": ["php"],
+        ".bat": ["bat", "batch", "cmd"],
+        ".ps1": ["powershell", "ps1", "pwsh"],
+        ".m": ["matlab", "objc", "objective-c", "objectivec", "octave"],
+        ".jl": ["julia"],
     }
     # 非コードとみなす既知のドキュメント系タグ（保守的なスキップリスト）
     _NON_CODE_TAGS = {
@@ -3141,7 +4899,23 @@ def _extract_code_for_output(answer: str, suffix: str) -> str:
         if lang not in _NON_CODE_TAGS:
             return body
     # フェンスなし: マークダウン見出し行を除いた本文を返す
-    lines = [l for l in answer.splitlines() if not l.startswith("#")]
+    # 2026-07-23: 旧実装は l.startswith("#") で '#' から始まる行を無条件に
+    # 全削除しており、docstring が意図する「マークダウン見出し(ATX heading)の
+    # 除去」の範囲を大きく超えていた。この関数はコード拡張子ファイルへの
+    # 保存(--out file.<ext>)にも使われるため、フェンス無しの生コードに含まれる
+    # C の #include/#define/#pragma、シェバン行 #!/usr/bin/env python、
+    # Rust の属性 #[derive(Debug)] まで「見出し」として問答無用に削除され、
+    # コンパイル不能な壊れたファイルが書き出されていた（iteration 7/18/28/29 が
+    # 繰り返し修正してきたのはこの上のフェンス選択側で、この素通しの兄弟分岐は
+    # 今回まで手つかずだった）。CommonMark の ATX heading 仕様では、見出しは
+    # 行頭の '#' が1〜6個続いた直後が空白または行末である行に限られる
+    # （'#include' のように '#' の直後に空白なしで文字が続く行は見出しではない）。
+    # そこで削除対象を正規表現 ^#{1,6}(?:\s|$) に限定し、真の見出し行
+    # (# Title, ## Section 等)だけを除去して、上記のような '#' 始まりの
+    # 非見出しコード行は保持する。列0アンカー(インデント行を見出し扱いしない)は
+    # 従来通り維持する。
+    _ATX_HEADING_RE = re.compile(r"^#{1,6}(?:\s|$)")
+    lines = [l for l in answer.splitlines() if not _ATX_HEADING_RE.match(l)]
     return "\n".join(lines).strip()
 
 
@@ -3155,7 +4929,18 @@ def _save_as_markdown(out: Path, question: str, answer: str,
         block += (f"<details><summary>Context (search/RAG)</summary>\n\n"
                   f"{context}\n\n</details>\n\n")
     block += f"## A\n\n{answer}\n\n*所要: {elapsed}s*\n\n---\n\n"
-    existing = out.read_text(encoding="utf-8") if out.exists() else ""
+    # 2026-07-23: --out が既存ファイルを指す追記保存で、その既存ファイルが
+    # cp932/Shift_JIS 等の非UTF-8バイト列を含む場合（このマシンのコンソールが
+    # cp932 であることに起因する既知の落とし穴 #4 と同種の環境要因）、
+    # encoding="utf-8" のみの read_text は UnicodeDecodeError を送出し、
+    # _save_answer_to_file 経由で保存ステップ全体が異常終了して、せっかく
+    # 計算し終えた回答が失われてしまう。これは iteration 41-44 で
+    # _save_as_excel/_docx/_pdf に対して行った「保存を絶対にクラッシュさせず
+    # 回答を失わない」という degrade-gracefully 修正と同じバグクラスであり、
+    # errors="replace" を付けることで読めない既存バイトだけを置換文字に
+    # 落とし、正常な（UTF-8な）既存内容とこれから書く新規回答は従来通り
+    # そのまま保持する。書き込み側の encoding="utf-8" はそのまま維持。
+    existing = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
     out.write_text(existing + block, encoding="utf-8")
 
 
@@ -3164,7 +4949,11 @@ def _save_as_text(out: Path, question: str, answer: str, elapsed: float):
     from datetime import datetime
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     block = f"[{ts}]\nQ: {question}\n\nA:\n{answer}\n\n(所要 {elapsed}s)\n{'='*60}\n\n"
-    existing = out.read_text(encoding="utf-8") if out.exists() else ""
+    # 2026-07-23: _save_as_markdown と同じ理由（落とし穴 #4 のcp932環境で
+    # 既存 --out ファイルが非UTF-8バイトを含むと read_text がクラッシュし、
+    # iteration 41-44 の office savers 同様に回答保存が丸ごと失われる）で
+    # errors="replace" を追加。書き込みは encoding="utf-8" のまま不変。
+    existing = out.read_text(encoding="utf-8", errors="replace") if out.exists() else ""
     out.write_text(existing + block, encoding="utf-8")
 
 
@@ -3190,7 +4979,22 @@ def _save_as_html(out: Path, question: str, answer: str, elapsed: float):
     # まま escape して <pre><code>...</code></pre> の中に入れる。
     in_code = False
     for line in answer.splitlines():
-        if line.startswith("```"):
+        # 2026-07-23: フェンス判定が line.startswith("```") のまま列0固定
+        # だったため、LLM が番号付き/箇条書きリストの中に```pythonブロックを
+        # 2〜4スペースでインデントして出力する（よくあるケース）と、行頭に
+        # 空白があるだけでフェンスとして認識されず in_code に入れなかった。
+        # 結果、```python/``` の行自体がプレーンテキストとして escape され
+        # そのまま文字列として表示され、コード本文の各行も else 節に落ちて
+        # 余計な <br> が付与された状態で崩れて出力されていた。これは
+        # extract_boxed（iteration 11）・strip_think（iteration 16）・
+        # _save_as_html のタグ整合性そのもの（iteration 37）・_parse_slides
+        # （iteration 50）で既に対処済みのフェンス未検出/不整合と同種の
+        # バグクラスで、本関数だけインデント方向が未対応だった。他の全ての
+        # フェンス処理（extract_code, _extract_code_for_output, _parse_slides）
+        # と同じ line.strip().startswith("```") に揃えることで、インデント
+        # されたフェンスも列0のフェンスと同様に単一の <pre><code>…
+        # </code></pre> へバランスよく変換されるようにする。
+        if line.strip().startswith("```"):
             if in_code:
                 a_lines.append("</code></pre>")
                 in_code = False
@@ -3209,7 +5013,12 @@ def _save_as_html(out: Path, question: str, answer: str, elapsed: float):
             f"<hr><p><small>所要: {elapsed}s</small></p>\n")
     existing_body = ""
     if out.exists():
-        content = out.read_text(encoding="utf-8")
+        # 2026-07-23: _save_as_markdown/_save_as_text と同じ理由（落とし穴 #4 の
+        # cp932環境で既存 --out ファイルが非UTF-8バイトを含むケース）で
+        # errors="replace" を追加。既存<body>のマージ読み戻しがクラッシュして
+        # iteration 41-44 の office savers と同じバグクラスで回答保存が失われる
+        # のを防ぐ。書き込みは encoding="utf-8" のまま不変。
+        content = out.read_text(encoding="utf-8", errors="replace")
         m = re.search(r"(<body>)(.*?)(</body>)", content, re.DOTALL)
         if m:
             existing_body = m.group(2)
@@ -3352,8 +5161,29 @@ def _save_as_excel(out: Path, answer: str):
         ws.title = "Fugu Output"
         for line in answer.splitlines():
             if line.strip():
-                cols = [_illegal_xml_re.sub("", c.strip()) for c in re.split(r"[,\t|]", line)]
-                ws.append(cols)
+                _stripped_line = line.strip()
+                # 2026-07-26: LLM の回答が Markdown 表（例: '| Name | Age |'）の場合、
+                # 従来の re.split(r"[,\t|]", line) では行頭/行末の '|' がそれぞれ
+                # 空文字列の列を生み（例: ['', 'Name', 'Age', '']）、区切り線の行
+                # '| --- | --- |' がそのままゴミの1データ行として書き込まれ、さらに
+                # セル内の桁区切りカンマ（例: '| 1,234 | total |'）まで誤って列区切り
+                # とみなされ数値データが '1' と '234' に分断されてしまっていた。これは
+                # iteration 41-47・68 の保存系ハードニング（IllegalCharacterError対策
+                # 等）と同種の、表形式パース漏れによる保存内容の破損バグ。行の前後を
+                # '|' で囲まれた Markdown 表の行だけは、外側の '|' を1つずつ剥がした
+                # うえで中身を '|' のみで分割し（カンマ/タブでは分割しない）、
+                # '---'/':---'/'---:'/':---:' のような区切り線の行は列として追加しない。
+                # それ以外の行（Markdown 表でない行）は従来通り
+                # re.split(r"[,\t|]", line) のままで挙動を一切変えない。
+                if _stripped_line.startswith("|") and _stripped_line.endswith("|"):
+                    inner = _stripped_line[1:-1]
+                    cols = [_illegal_xml_re.sub("", c.strip()) for c in inner.split("|")]
+                    if cols and all(re.match(r"^:?-+:?$", c) for c in cols):
+                        continue
+                    ws.append(cols)
+                else:
+                    cols = [_illegal_xml_re.sub("", c.strip()) for c in re.split(r"[,\t|]", line)]
+                    ws.append(cols)
         wb.save(str(out))
         return
     except Exception as e:
@@ -3373,23 +5203,68 @@ def _parse_slides(answer):
     slides = []
     cur = None
     in_code = False
-    for ln in answer.splitlines():
+
+    # 2026-07-23: ```フェンスの数が奇数（＝閉じ忘れ/開き忘れで打ち切られた
+    # proposer 出力）だと、旧実装の単純なトグルでは in_code が文書の残り
+    # 全体で True に固定されたままになる。すると以降の全ての '#'/'##' 見出し
+    # が新規スライドを作れず（"if m and not in_code" のガードに阻まれ）、かつ
+    # 強調記号除去（[*_`#]+ の除去）もスキップされるため、見出しが
+    # "## 節タイトル" というリテラルな文字列のまま1枚のスライドの箇条書きに
+    # 押し込まれ、複数節あるはずのデッキが1枚に崩壊してしまう。これは
+    # フェンスの閉じ忘れ/不対応によって以降の処理状態が汚染され続ける同種の
+    # バグで、extract_boxed（iteration 11）・strip_think（iteration 16）・
+    # _save_as_html（iteration 37）で既に対処済みのバグクラスだが、
+    # _parse_slides だけは未対応だった。ここでは事前に本文中の```で始まる
+    # 行を数え、その総数が奇数＝最後の1個が対になっていない場合、その最後の
+    # 1個だけをトグル対象から除外する（フェンスとして扱わずコード開始/終了
+    # 処理をしない）。それより前の、正しく対になったコードブロックは従来
+    # 通りコードモードを維持するので、そのブロック内の '# コメント' が見出し
+    # に昇格することはない。フェンスが偶数個（＝全て正しく対応）の入力では
+    # unpaired_idx が -1 のままとなり、挙動は一切変わらない。
+    lines = answer.splitlines()
+    fence_idxs = [i for i, ln in enumerate(lines) if ln.rstrip().strip().startswith("```")]
+    unpaired_idx = fence_idxs[-1] if len(fence_idxs) % 2 == 1 else -1
+
+    for i, ln in enumerate(lines):
         s = ln.rstrip()
         if s.strip().startswith("```"):
-            in_code = not in_code
+            if i != unpaired_idx:
+                in_code = not in_code
             continue
         m = re.match(r"^\s*#{1,4}\s+(.*)$", s)
         if m and not in_code:
             if cur is not None:
                 slides.append(cur)
-            cur = {"title": re.sub(r"[*_`#]+", "", m.group(1)).strip()[:80], "bullets": []}
+            # 2026-07-23: 旧実装 re.sub(r"[*_`#]+", "", t) は行中の *, _, `, # を
+            # 位置・対応関係を一切見ず無差別に全削除しており、Markdown装飾
+            # （**太字**、`インラインコード`）と、数式の演算子/指数（m*c_0**2 の
+            # * や **）・識別子中のアンダースコア（snake_case の a_1、do_thing()）・
+            # 地の文のハッシュ（C#, #123 等）を区別できなかった。検証例:
+            # "E = m*c_0**2" が "E = mc02" に、"`do_thing()`" が "dothing()" に
+            # 化けていた。スライド本文はそのまま .pptx へ書き出される最終成果物
+            # であり、装飾の見た目より内容の忠実性を優先すべき（精度優先・
+            # 時間は気にしない）。ここでは対になった `...` インラインコード区間
+            # だけをバッククォート込みで除去して中身（アンダースコア含む）は
+            # そのまま残す精密な正規表現に限定し、対になっていない単独の
+            # `/*/_/# はいずれも曖昧なので削除せず残す（安全な方向＝落とすより
+            # 残す）。過度に広い正規表現を用途を満たす最小限のパターンへ精密化
+            # する同種の修正は iteration 26（MCQ宣言の連結子）・28（数式宣言の
+            # 桁区切り）・30（3桁区切りカンマ）・56（_extract_code_for_output の
+            # ATX見出し限定除去）で既出のバグクラス。本関数自体は iteration 50
+            # （奇数フェンスの未対応対策）で一度手を入れているが、この強調記号
+            # 除去の過剰マッチは今回まで未対応だった。次の本文側の同一置換
+            # （t = re.sub(...)）にも同じ理由で同じ精密化を適用する。
+            cur = {"title": re.sub(r"`([^`\n]+)`", r"\1", m.group(1)).strip()[:80], "bullets": []}
             continue
         t = s.strip()
         if not t:
             continue
         if not in_code:
             t = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", t)  # 箇条書き記号除去
-            t = re.sub(r"[*_`#]+", "", t).strip()           # 強調記号除去
+            # 2026-07-23: タイトル側と同じ精密化（上のコメント参照）。対になった
+            # `...` のみ除去し、*/_/# や対になっていないバッククォートは
+            # 演算子/識別子/地の文の可能性があるため残す（フィデリティ優先）。
+            t = re.sub(r"`([^`\n]+)`", r"\1", t).strip()    # 強調記号除去（対のバッククォートのみ）
         if not t:
             continue
         if cur is None:
@@ -3444,7 +5319,27 @@ def plan_pptx_images(title, slides):
               num_predict=768, label="pptx-img-plan")
     j = extract_json(raw) or {}
     out = {}
-    for it in (j.get("images") or []):
+    # 2026-07-24: 従来の `j.get("images") or []` は "images" が falsy(None/{}/[]/""/0
+    # 等)の場合のみ [] に丸めるトリックで、int/float/bool のような真値だが
+    # 非反復可能(non-iterable)な値はそのまま通してしまっていた。その場合は
+    # 直後の `for it in ...` 自体が TypeError を送出し、内側の try/except
+    # (int(it.get("index")) 用)より手前=for文そのもので落ちるため捕捉されない。
+    # plan_pptx_images は build_pptx (L4162付近) から XML安全化 try/except
+    # (iteration68) の外で呼ばれ、build_pptx 自体も ask_fugu (L3545付近) から
+    # 無防備に呼ばれているため、この TypeError は計算済み(数学/MCQでは
+    # solve_verifiable の自己整合性投票済み)の MoA 回答ごとターン全体を落とす
+    # (iteration41-47/68/80と同種の「高コスト回答喪失」障害)。イテレーション110は
+    # このケースをテストコメント(旧case 8)で発見済みだったが、当時はテストのみの
+    # 変更に限定されており修正は見送られていた。イテレーション103の _ddg_instant
+    # における非list RelatedTopics 補正(isinstance判定で丸める方式)と同じやり方
+    # で、"images" が非list(文字列/None/int/float/bool 等)であれば真偽・型に
+    # 関わらず必ず [] に倒す(`or []` の truthiness トリックには戻さない)。
+    imgs = j.get("images")
+    if not isinstance(imgs, list):
+        imgs = []
+    for it in imgs:
+        if not isinstance(it, dict):
+            continue
         try:
             idx = int(it.get("index"))
         except Exception:
@@ -3492,9 +5387,23 @@ def build_pptx(question, answer, out_path=None):
     imgs = {}
     if _detect_backend() is not None and IMAGE_BACKEND != "off":
         plan = plan_pptx_images(title, slides)
+        had_zero = 0 in plan
         plan.setdefault(0, None)  # タイトルには必ずヒーロー画像
+        items = list(plan.items())
+        if not had_zero and len(items) > PPTX_MAX_IMAGES:
+            # 2026-07-23: dict は挿入順を保持するため、plan_pptx_images が
+            # index 0 を含めずに（LLM が上の「タイトルには必ずヒーロー画像」
+            # 指示を無視して）ちょうど PPTX_MAX_IMAGES 件返した場合、直上の
+            # setdefault(0, None) は 0 を末尾に追加するだけになる。従来は
+            # 直後の [:PPTX_MAX_IMAGES] スライスがその末尾の 0 を切り捨てて
+            # おり、タイトルスライドにヒーロー画像が入らないまま不変条件が
+            # 静かに破られていた。0 を先頭に固定してから残りを詰め直すことで
+            # 画像総数は PPTX_MAX_IMAGES のまま（枠を1つタイトルへ再割当）0
+            # の生成を保証する。0 が既に予算内にある場合／plan が定員未満の
+            # 場合はこの分岐に入らず、従来と完全に同じ順序のまま処理する。
+            items = [(0, plan[0])] + [kv for kv in items if kv[0] != 0]
         print(f"   [PPTX画像: {min(len(plan), PPTX_MAX_IMAGES)} 枚を生成します...]")
-        for idx, pr in list(plan.items())[:PPTX_MAX_IMAGES]:
+        for idx, pr in items[:PPTX_MAX_IMAGES]:
             if pr:
                 path = generate_image(pr, "")
             else:
@@ -3504,53 +5413,80 @@ def build_pptx(question, answer, out_path=None):
             if path:
                 imgs[idx] = str(path)
 
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)   # 16:9
-    prs.slide_height = Inches(7.5)
-    blank = prs.slide_layouts[6]
+    # 2026-07-23: デッキ構築〜保存の間、LLM 回答由来の制御文字
+    # (NUL 0x00, ESC 0x1B 等) が add_textbox 経由で run.text に渡ると
+    # python-pptx/lxml が ValueError ('All strings must be XML compatible:
+    # no NULL bytes or control characters') を送出する。従来は
+    # except ImportError しか捕捉しておらず、この ValueError がそのまま
+    # _save_answer_to_file、さらには ask_fugu の make_pptx 経路まで伝播し、
+    # 計算済み（math/mcq では SC投票済みの）回答ごと失われていた。
+    # iteration 41 (_save_as_excel の IllegalCharacterError)・43
+    # (_save_as_docx の ValueError)・44 (_save_as_pdf の
+    # FPDFUnicodeEncodingException) と同じバグクラスの修正として、
+    # add_textbox の choke point（タイトルスライド・コンテンツスライドの
+    # 見出し・箇条書き全てがここを通る）で XML 不正制御文字のみを除去し
+    # （実データは維持）、かつデッキ構築〜保存全体を broad except で囲んで
+    # 失敗時は既存の .md フォールバックへ安全に降格させる。画像生成
+    # (plan_pptx_images/generate_image/add_image) は既に自前で失敗を
+    # 許容しており（backend 不在時は None を返す／embed エラーは
+    # add_image が catch する）、このガードはデッキ構築・保存のみを対象と
+    # し、画像生成の挙動（backend 不在時も画像無しでデッキが構築される）
+    # は変更しない。
+    _illegal_xml_re = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+    try:
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)   # 16:9
+        prs.slide_height = Inches(7.5)
+        blank = prs.slide_layouts[6]
 
-    def add_textbox(slide, text, left, top, width, height, size, bold=False):
-        tb = slide.shapes.add_textbox(left, top, width, height)
-        tf = tb.text_frame
-        tf.word_wrap = True
-        first = True
-        for line in (text if isinstance(text, list) else [text]):
-            p = tf.paragraphs[0] if first else tf.add_paragraph()
-            first = False
-            run = p.add_run()
-            run.text = ("• " + line) if isinstance(text, list) else line
-            run.font.size = Pt(size)
-            run.font.bold = bold
-        return tb
+        def add_textbox(slide, text, left, top, width, height, size, bold=False):
+            tb = slide.shapes.add_textbox(left, top, width, height)
+            tf = tb.text_frame
+            tf.word_wrap = True
+            first = True
+            for line in (text if isinstance(text, list) else [text]):
+                p = tf.paragraphs[0] if first else tf.add_paragraph()
+                first = False
+                run = p.add_run()
+                raw = ("• " + line) if isinstance(text, list) else line
+                run.text = _illegal_xml_re.sub("", raw)
+                run.font.size = Pt(size)
+                run.font.bold = bold
+            return tb
 
-    def add_image(slide, path, left, top, width):
-        try:
-            slide.shapes.add_picture(path, left, top, width=width)
-        except Exception as e:
-            print(f"   [PPTX画像埋込エラー: {e}]")
+        def add_image(slide, path, left, top, width):
+            try:
+                slide.shapes.add_picture(path, left, top, width=width)
+            except Exception as e:
+                print(f"   [PPTX画像埋込エラー: {e}]")
 
-    # タイトルスライド
-    s0 = prs.slides.add_slide(blank)
-    if 0 in imgs:
-        add_image(s0, imgs[0], Inches(4.17), Inches(2.5), Inches(5.0))
-        add_textbox(s0, title, Inches(0.7), Inches(0.6), Inches(12.0), Inches(1.3), 40, True)
-        add_textbox(s0, "Fugu MoA 生成", Inches(0.7), Inches(1.9), Inches(12.0), Inches(0.6), 18)
-    else:
-        add_textbox(s0, title, Inches(0.9), Inches(2.6), Inches(11.5), Inches(1.6), 44, True)
-        add_textbox(s0, "Fugu MoA 生成", Inches(0.9), Inches(4.2), Inches(11.5), Inches(0.7), 20)
+        # タイトルスライド
+        s0 = prs.slides.add_slide(blank)
+        if 0 in imgs:
+            add_image(s0, imgs[0], Inches(4.17), Inches(2.5), Inches(5.0))
+            add_textbox(s0, title, Inches(0.7), Inches(0.6), Inches(12.0), Inches(1.3), 40, True)
+            add_textbox(s0, "Fugu MoA 生成", Inches(0.7), Inches(1.9), Inches(12.0), Inches(0.6), 18)
+        else:
+            add_textbox(s0, title, Inches(0.9), Inches(2.6), Inches(11.5), Inches(1.6), 44, True)
+            add_textbox(s0, "Fugu MoA 生成", Inches(0.9), Inches(4.2), Inches(11.5), Inches(0.7), 20)
 
-    # コンテンツスライド
-    for i, s in enumerate(slides, start=1):
-        sl = prs.slides.add_slide(blank)
-        add_textbox(sl, s["title"], Inches(0.6), Inches(0.4), Inches(12.1), Inches(1.0), 30, True)
-        has_img = i in imgs
-        body_w = Inches(7.0) if has_img else Inches(12.1)
-        add_textbox(sl, s["bullets"], Inches(0.6), Inches(1.6), body_w, Inches(5.4), 18)
-        if has_img:
-            add_image(sl, imgs[i], Inches(7.9), Inches(1.7), Inches(4.9))
+        # コンテンツスライド
+        for i, s in enumerate(slides, start=1):
+            sl = prs.slides.add_slide(blank)
+            add_textbox(sl, s["title"], Inches(0.6), Inches(0.4), Inches(12.1), Inches(1.0), 30, True)
+            has_img = i in imgs
+            body_w = Inches(7.0) if has_img else Inches(12.1)
+            add_textbox(sl, s["bullets"], Inches(0.6), Inches(1.6), body_w, Inches(5.4), 18)
+            if has_img:
+                add_image(sl, imgs[i], Inches(7.9), Inches(1.7), Inches(4.9))
 
-    prs.save(str(out_path))
-    return out_path
+        prs.save(str(out_path))
+        return out_path
+    except Exception as e:
+        md = out_path.with_suffix(".md")
+        _save_as_markdown(md, question, answer, 0.0, "")
+        print(f"   [PPTX保存に失敗しました ({e!r})。代わりに保存: {md}]")
+        return md
 
 
 def _save_answer_to_file(question: str, answer: str, elapsed: float,
@@ -3566,6 +5502,20 @@ def _save_answer_to_file(question: str, answer: str, elapsed: float,
     その他   → Markdown で保存
     """
     out = Path(path)
+    # 2026-07-23: --out に存在しないサブディレクトリ（例: reports/answer.md）
+    # を指定すると、.md/.txt/.py 等は out.write_text が、.docx/.xlsx 等は
+    # 各 lib.save が FileNotFoundError を送出し、ask_fugu 側は無捕捉のため
+    # MoA/SC投票まで完了した高コストな計算済み回答がトレースバックと共に
+    # 丸ごと失われていた。さらに office 系フォールバック（.docx/.xlsx 失敗時
+    # の .md/.csv 代替書き込み）も同じ存在しないディレクトリに書こうとして
+    # 二重に失敗し、出力が完全に消える。build_pptx は既に自前で
+    # out_path.parent.mkdir を呼んでいる（L3729、フォールバック分岐にも
+    # 別途 mkdir あり）が、他の拡張子には無かった。iteration 41-47・68
+    # （_save_as_excel の IllegalCharacterError、_save_as_docx の
+    # ValueError、_save_as_pdf の FPDFUnicodeEncodingException 等、保存段で
+    # 計算済み回答を失わないための一連の修正）と同じバグクラスであるため、
+    # 全 suffix 分岐・その場フォールバック双方をこの一箇所で保護する。
+    out.parent.mkdir(parents=True, exist_ok=True)
     suffix = out.suffix.lower()
     actual = out  # 実際に書かれたファイル（フォールバック時に変わる可能性あり）
 
@@ -3635,10 +5585,42 @@ def repl(use_search=False, rag_dirs=None, history_file=None):
             use_search = False
             print("   [Web検索: OFF]")
             continue
+        # 2026-07-27: iteration 204で確認・特性化された(a)/(b)の修正
+        # (iteration 182/186の'save <path>'契約には一切触れない)。
+        # (a) 末尾スペース無しの素の'save'(4文字)はlow.startswith("save ")
+        #     (5文字、末尾スペース必須)に一致せず、従来はどのコマンドにも
+        #     一致しないままループ末尾のask_fugu(q, ...)へ落ちていた。つまり
+        #     'save'という文字列そのものがフルのConductor+MoA/SCパイプラインへの
+        #     質問として実行され、その(意味のない)応答が(user:'save',
+        #     assistant:<応答>)として_HISTORYに追加され、以降の全ターンの
+        #     Conductor/proposerコンテキストを汚染してしまう
+        #     (iteration 59/67/70/73と同じ複数ターン文脈汚染バグ種)。
+        # (b) 'save '(末尾スペースのみ、パス指定なしのつもり)も、repl()冒頭の
+        #     q = input(...).strip()で入力全体が丸ごとstripされるため、判定前に
+        #     'save'(4文字)へ潰れて結局(a)と同じ経路に収束していた。この結果、
+        #     直後のL5421-5423相当「保存先パスを指定してください」ガイダンスは
+        #     qが既にstrip済み(=末尾に空白を残せない)という不変条件と両立せず、
+        #     実際のinput()経由では到達不能なデッドコードだった。
+        # 修正: low(既存の小文字化済み変数、'SAVE'/'Save'等も統一的に扱う)が
+        # 'save'単体に完全一致する場合を明示コマンド分岐として捕捉し、使用方法の
+        # 案内だけ出してcontinueする。ask_fuguへは絶対にディスパッチせず、
+        # _HISTORYも一切変更しない。これにより(a)/(b)双方が同じ分岐で解消される。
+        if low == "save":
+            print("   [保存先パスを指定してください: save <path>]")
+            continue
         if low.startswith("save "):
             save_path = q[5:].strip()
-            save_history_file(_HISTORY, path=Path(save_path))
-            print(f"   [履歴を保存しました: {save_path}]")
+            if not save_path:
+                # 上のlow == "save"分岐により、qは既にstrip済みという不変条件から
+                # ここへは実際のinput()経由では到達し得ない(iteration 204で確認済み
+                # の到達不能デッドコード)。安全側の防御としてそのまま残す。
+                print("   [保存先パスを指定してください: save <path>]")
+                continue
+            ok = save_history_file(_HISTORY, path=Path(save_path), force=True)
+            if ok:
+                print(f"   [履歴を保存しました: {save_path}]")
+            else:
+                print(f"   [履歴の保存に失敗しました: {save_path}]")
             continue
         ask_fugu(q, use_search=use_search, rag_dirs=rag_dirs,
                  history_file=hfile)
@@ -3714,6 +5696,31 @@ def main():
         office_attached = fp.suffix.lower() in _OFFICE_SUFFIXES
         print(f"[file] {fp.name} ({fp.suffix}) から {len(question)} 文字を読み込みました"
               + ("  [Office→Proposer C 主軸]" if office_attached else ""))
+        # 2026-07-26 (iteration 192): gotcha #2 ―― num_ctx は全モデルで明示pinが必須
+        # (非thinkingモデルはMODEL_NUM_CTX=8192、thinkingモデルでもMODEL_CONFIG側の
+        # 上限は16384。32768はこの8GB GPUでは遅すぎるため常用しない)。iteration 185で
+        # 表面化した特性(c)(「--fileのテキストはサイズ上限が一切無く、抽出結果が
+        # どれだけ長くてもnum_ctxを意識したトランケートをせずそのままask_fugu()へ
+        # 渡す」)はそのまま残っている。抽出テキストがnum_ctxを超えると、Ollama側で
+        # 入力が黙って切り詰められ、本文末尾に置かれがちな指示・質問そのものが
+        # 失われて精度が劣化しうるのに、従来はユーザーへの合図が一切無かった。
+        # ここではトランケート・チャンク分割・サンプリングは一切行わない
+        # (精度優先・時間は気にしない。gotcha #7と同じ思想で、正確さを文脈窓に
+        # 収める都合で犠牲にしない)。抽出テキスト全文は従来通りask_fugu()へ渡した
+        # うえで、オーバーフローがほぼ確実なときにのみ可視の警告を追加する。
+        # 閾値はモジュールグローバルMODEL_NUM_CTX(既定8192。FUGU_HIGH_VRAM=1なら
+        # 32768)をそのまま「文字数」の目安として使う保守的な見積もりで、
+        # 1文字≒1トークンという最も密な想定（日本語の全角文字は実際にはこれより
+        # トークン効率が悪いことが多く、本当はもっと早く溢れる）かつシステム
+        # プロンプト・生成分の余地をゼロ扱いする、つまり「これを超えたら絶対に
+        # 収まらない」と言い切れるラインだけを基準にする。そのため中規模ファイル
+        # では誤報が出ず、本当に危険なケースだけを確実に警告できる。
+        if len(question) > MODEL_NUM_CTX:
+            print(f"[警告] {fp.name}: 抽出テキストが{len(question)}文字あり、"
+                  f"num_ctx({MODEL_NUM_CTX}トークン)を超える可能性が高いため、"
+                  f"モデルへの入力の一部(末尾の質問・指示を含む可能性があります)が"
+                  f"Ollama側で黙って切り詰められる恐れがあります。"
+                  f"本文はトランケートせずそのまま渡します。")
     elif args.question:
         question = args.question
 
@@ -3723,6 +5730,18 @@ def main():
                  rag_dirs=rag_dirs, out_file=args.out, history_file=hfile,
                  office_attached=office_attached)
     elif sys.stdin.isatty():
+        # 2026-07-26: iteration 185 で表面化した特性(a) ―― --out はこの対話分岐(repl())
+        # には一切転送されず、repl()自身にもout_fileパラメータが無い設計のため、
+        # `--out result.md` を質問なしで指定すると黙って無視されていた(エラー・警告なし)。
+        # repl()にout_fileを追加してターン毎に自動保存する案は「どのターンを保存するか・
+        # 上書きか追記か」が曖昧なため見送り(対話中の `save <path>` コマンドで既に手動
+        # エクスポート可能)。surface-don't-swallow方針(gotcha #8, iters 66/71/110)に
+        # 従い、ここでは無視される旨を可視化する警告のみ追加する
+        # (repl()呼び出し自体・引数は不変のまま)。
+        if args.out:
+            print(f"[警告] --out {args.out} は対話モードでは無視されます。"
+                  f"回答を保存するには対話中に `save {args.out}` のように"
+                  f"saveコマンドを使ってください。")
         repl(use_search=args.search, rag_dirs=rag_dirs, history_file=hfile)
     else:
         # パイプ入力: stdin を質問として読む
