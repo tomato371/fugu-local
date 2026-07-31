@@ -4551,6 +4551,29 @@ def _emit(kind, **data):
         pass
 
 
+def _speculate_context(question, use_search, rag_dirs):
+    """FUGU_SPECULATE=1 のときだけ、conduct と並行して build_context を先読みする (Doc D3)。
+
+    返り値は closure(do_search) または None(無効時)。closure は「プリフェッチ時の
+    検索条件と conduct 後の実際の条件が一致」した場合のみ結果を返し、不一致・失敗
+    時は None(呼び出し側が従来の同期 build_context に落ちる — 投機は外れてよい)。"""
+    if os.environ.get("FUGU_SPECULATE") != "1":
+        return None
+    try:
+        from fugu_core import pipeline as fugu_pipeline
+    except ImportError:
+        return None
+    handle = fugu_pipeline.Prefetch(
+        lambda: build_context(question, use_search=use_search, rag_dirs=rag_dirs))
+
+    def resolve(do_search):
+        if do_search != use_search:
+            return None  # 投機条件が外れた(Conductor が検索要と判断)→ 取り直し
+        return handle.result()
+
+    return resolve
+
+
 def _compress_state(question, reference, next_round):
     """FUGU_COMPRESS=1 のときだけ、次ラウンドへ渡す reference を圧縮する (Doc D2)。
     round≥2 に入る前のみ有効。未設定・失敗時は reference をそのまま返す。"""
@@ -4864,6 +4887,8 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
 
     # --- Conductor プランを先に取得（検索要否・画像生成・Office ルーティングを決める）---
     print("\n[Fugu] Conductor がオーケストレーションを開始します...")
+    # FUGU_SPECULATE=1: conduct と並行してコンテキストを先読み（既定は None=無効）
+    prefetched = _speculate_context(question, use_search, rag_dirs or RAG_DIRS)
     plan, _raw = conduct(question, history=list(_HISTORY),
                          office_attached=office_attached)
     if SHOW_PLAN:
@@ -4900,8 +4925,10 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
 
     # --- コンテキスト構築（Web検索 + RAG）。検索は CLI フラグ or Conductor 判断で有効化 ---
     do_search = use_search or plan.get("search_required", False)
-    context = build_context(question, use_search=do_search,
-                            rag_dirs=rag_dirs or RAG_DIRS)
+    context = prefetched(do_search) if prefetched is not None else None
+    if context is None:  # 投機無効・条件外れ・失敗 → 従来の同期経路
+        context = build_context(question, use_search=do_search,
+                                rag_dirs=rag_dirs or RAG_DIRS)
     question_with_ctx = _with_context(question, context)
 
     if baseline:
