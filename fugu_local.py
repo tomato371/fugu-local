@@ -4551,6 +4551,25 @@ def _emit(kind, **data):
         pass
 
 
+def _compress_state(question, reference, next_round):
+    """FUGU_COMPRESS=1 のときだけ、次ラウンドへ渡す reference を圧縮する (Doc D2)。
+    round≥2 に入る前のみ有効。未設定・失敗時は reference をそのまま返す。"""
+    if os.environ.get("FUGU_COMPRESS") != "1" or not reference or next_round < 2:
+        return reference
+    try:
+        import fugu_llm
+        from fugu_core import compressor
+    except ImportError:
+        return reference
+    try:
+        digest = compressor.compress_round(
+            question, reference, fugu_llm.AskChat(label="compress"), next_round)
+        rendered = compressor.render_digest(digest)
+        return rendered or reference
+    except Exception:
+        return reference
+
+
 def _memory_lessons(question):
     """FUGU_MEMORY=1 のときだけ、過去エピソードの教訓を質問の前に付す (Doc D1)。
     未設定なら question をそのまま返す(既定経路は不変)。失敗しても質問を失わない。"""
@@ -4719,7 +4738,9 @@ def fugu_answer(question, plan=None, history=None):
         # 使う。返り値の final 自体は生のまま返す（ask_fugu 側で最終的に strip_think）。
         fin = strip_think(final)
         _emit("aggregate", round=r + 1, chars=len(fin))
-        reference = fin  # 次ラウンドは今回の統合結果(think除去済み)を土台に改善
+        # 次ラウンドは今回の統合結果(think除去済み)を土台に改善。
+        # FUGU_COMPRESS=1 なら round≥2 へ渡す前に状態圧縮(既定は素通し)。
+        reference = _compress_state(question, fin, r + 2)
         issue_hint = None  # 指摘は消費済み。以降のチェックが新しい指摘を設定する
         r += 1
 
