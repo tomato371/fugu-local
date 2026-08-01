@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_thinking — 動的 Thinking Budget / テスト時計算スケーリング (Doc B Phase 2)。
 
 質問の複雑さに応じて「どれだけ考えるか」を予算化する:

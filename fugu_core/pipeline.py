@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.pipeline — VRAM 予算内の投機的並行実行 (Doc D Phase 3 / D-4)。
 
 Conductor の計画中に RAG/Web コンテキストを先読みするなど、独立な作業を

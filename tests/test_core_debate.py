@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.debate のオフラインテスト + FUGU_DEBATE=1 フック検証。"""
 import json
 

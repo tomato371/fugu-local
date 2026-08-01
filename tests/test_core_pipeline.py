@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.pipeline のオフラインテスト(即時フェイクで順序/例外分離/並列度)。"""
 import asyncio
 import threading

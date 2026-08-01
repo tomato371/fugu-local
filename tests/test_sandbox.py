@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_sandbox / fugu_llm のオフラインテスト（Ollama 不要・純 subprocess）。"""
 from __future__ import annotations
 

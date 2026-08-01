@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the offline retrieval-evaluation harness (rag_bench)."""
 import rag_bench
 

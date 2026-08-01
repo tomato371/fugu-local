@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.memory のオフラインテスト + FUGU_MEMORY=1 フックの検証。"""
 import json
 import math

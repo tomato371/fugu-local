@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.compressor — マルチラウンド MoA の状態圧縮 (Doc D Phase 2)。
 
 ラウンドを重ねると reference(前ラウンドの統合結果)が育ち、8GB VRAM で pin

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Fugu 統一ランチャー — 「どのファイルを実行すれば何が起動するか」を 1 画面に集約する。
 
 エクスプローラーから ``START_FUGU.bat`` をダブルクリック(あるいは

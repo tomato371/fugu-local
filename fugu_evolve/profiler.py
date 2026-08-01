@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.profiler — メタインスペクター: コード健全性の計測 (Doc C Phase 1)。
 
 自己改善ループの最初の段。リポジトリの現状を3系統で観測し、planner (C2) が

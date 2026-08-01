@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_browser — 差し替え可能なブラウザ自動化と Web ページ取得 (Doc B Phase 3)。
 
 検索スニペットだけでは足りない「ページ本文」を取得する層。3段フォールバック:

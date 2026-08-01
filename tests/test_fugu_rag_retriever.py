@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the optional fugu-rag bridge (offline: fugu-rag not installed here)."""
 from fugu_rag_retriever import fugu_rag_retriever, get_retriever
 from rag_bench import lexical_retriever

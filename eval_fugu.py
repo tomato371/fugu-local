@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """フェーズ3 評価ハーネス: 単体ベースライン / 静的MoA(思考ON/OFF) / 動的Fugu を
 同じ質問セットで比較し、正誤・所要時間・段階別タイミングを出す。
 

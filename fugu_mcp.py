@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Fugu MCP サーバー — Claude Code から fugu を道具として呼べるようにする。
 
 MCP (Model Context Protocol) の stdio トランスポート(1 行 1 JSON-RPC メッセージ)を

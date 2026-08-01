@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.planner — 自律改善プランナー (Doc C Phase 2)。
 
 profiler (C1) のヘルスレポートを LLM に渡し、JSON スキーマ制約付きで改善提案

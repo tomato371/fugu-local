@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_artifacts — Canvas/Artifacts 用の純ロジック (Doc B Phase 4)。
 
 回答テキストから「アーティファクト」(HTML/SVG/コードブロック等の成果物)を検出し、

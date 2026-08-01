@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core — MoA オーケストレーターのミドルウェア層 (Doc D / phase-4.md)。
 
 memory(エピソード記憶)/ compressor(状態圧縮)/ pipeline(投機実行)/

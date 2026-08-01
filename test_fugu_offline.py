@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """モデル呼び出しなしの高速回帰テスト。Ollama 不要・数秒で完走する。
 実行: python test_fugu_offline.py
 fugu_local / eval_fugu の純粋ロジック（プラン検証・JSON抽出・思考除去・言語判定・

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Doc E5 のオフラインテスト: adversarial_verify と記憶統合(consolidate)。"""
 import json
 

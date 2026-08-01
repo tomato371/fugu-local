@@ -1,6 +1,7 @@
 # Fugu-Local — Dynamic Mixture-of-Agents, 100% local on 8 GB VRAM
 
 [![CI](https://github.com/tomato371/fugu-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tomato371/fugu-local/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 A local, dependency-light **Mixture-of-Agents (MoA) orchestrator** for LLMs, inspired by
 Sakana AI's *Fugu*. It runs entirely on consumer hardware (built and tuned for an
@@ -296,9 +297,24 @@ deliberation to spend — comes from their work; this repository is an independe
 hobbyist study of how far that idea can be pushed on consumer hardware
 (8 GB VRAM, fully offline). It is not affiliated with or endorsed by Sakana AI.
 
+Further idea sources (algorithms re-implemented from their published
+descriptions — **no code was copied or ported** from either project, keeping
+this repo dependency-free and independently written):
+
+- **AB-MCTS** — adaptive branching Monte-Carlo tree search with Thompson
+  sampling over "go wider vs. go deeper", from
+  [SakanaAI/treequest](https://github.com/SakanaAI/treequest) (Apache-2.0) and
+  the accompanying paper. Basis for `fugu_search.py`.
+- **BoN-MAV (Multi-Agent Verification)** — best-of-N answer selection scored by
+  a panel of aspect verifiers, from *"Multi-Agent Verification: Scaling
+  Test-Time Compute with Multiple Verifiers"* (Lifshitz et al., 2025).
+  Basis for `fugu_verify.py`.
+
 ## License
 
-TODO: choose a license (MIT is a common, permissive default).
+[Apache License 2.0](LICENSE). Chosen over MIT for its explicit patent grant, and
+for license consistency with the projects this work draws ideas from
+(SakanaAI's treequest / ShinkaEvolve are Apache-2.0).
 
 ---
 

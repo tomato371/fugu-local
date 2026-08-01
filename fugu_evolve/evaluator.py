@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.evaluator — サンドボックス検証と自己デバッグループ (Doc C Phase 4)。
 
 workspace (C3) 上の変更を機械的に検証する。合格条件は厳格に2つ:

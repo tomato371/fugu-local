@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.tasks のオフラインテスト + FUGU_TASKS=1 フック検証。"""
 import json
 

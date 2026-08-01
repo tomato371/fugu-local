@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_sandbox — 安全なローカル実行サンドボックスと自己デバッグループ (Doc A Phase 1)。
 
 生成コード/コマンドを一時ディレクトリ内で subprocess 実行し、stdout / stderr /

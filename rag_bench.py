@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """A tiny, offline retrieval-evaluation harness.
 
 Wires the `rag_eval` metrics around a retriever so a retrieval configuration can

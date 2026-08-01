@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.workspace のテスト — FakeGit 単体 + tmp_path 実 git リポ E2E。
 
 実 git E2E は tmp_path 上に `git init` した使い捨てリポジトリのみを対象にする

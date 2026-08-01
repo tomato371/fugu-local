@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.patcher — unified diff ベースのパッチ適用 (Doc E Phase 4)。
 
 従来の implement_proposal はファイル全置換のみで、3000字に切り詰めた文脈から

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.memory — エピソード軌跡記憶 (Doc D Phase 1)。
 
 サンドボックス自己デバッグ (A1) や自己進化検証 (C4) の顛末を :class:`Episode`

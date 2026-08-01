@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_browser のオフラインテスト(ネットワーク不要。実HTTP は一切叩かない)。
 
 UrllibBrowser は stdlib が data: URL をサポートすることを利用して実 fetch 経路を

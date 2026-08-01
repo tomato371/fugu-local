@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_launcher のオフラインテスト(モデル・GPU・ネット不要)。
 
 ランチャーは subprocess を起動する層なので、テストは

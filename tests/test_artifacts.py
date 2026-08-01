@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_artifacts のオフラインテスト(Gradio import なし・純ロジックのみ)。"""
 from fugu_artifacts import (
     EMPTY_PREVIEW,

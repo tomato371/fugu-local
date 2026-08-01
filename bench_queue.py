@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu ベンチ直列キューランナー（2026-07-12）。
 
 nk108 方針（時間無制限・精度最優先）のフルキューを無人で回す。

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.prompt_evolver — メタプロンプト進化エンジン (Doc D Phase 5)。
 
 fugu_local のプロンプト定数を対象に、変異(:func:`mutate_prompts`)→評価

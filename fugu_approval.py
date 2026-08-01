@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_approval — 人間承認ゲート (Doc E Phase 3)。
 
 自律実行が長時間・無人で回るほど「危険操作の直前で人間に確認する」口が必要に

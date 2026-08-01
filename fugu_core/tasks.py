@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.tasks — 永続タスクボード (Doc E Phase 2)。
 
 conduct() の単発フラットプランでは扱えない「複数サブタスクの段階的消化」と

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """notify_slack のオフラインテスト(ネット不要 — urlopen をフェイクに差し替える)。
 
 既定(FUGU_SLACK_FULL 未設定)は従来どおり「1 通・先頭 500 字プレビュー」で

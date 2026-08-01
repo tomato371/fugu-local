@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Offline retrieval-evaluation metrics for RAG.
 
 Pure standard library. Given a ranked list of retrieved document ids and the

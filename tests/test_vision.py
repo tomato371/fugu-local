@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Vision 入力（images パススルー・直行ルーティング）のオフラインテスト。"""
 from __future__ import annotations
 

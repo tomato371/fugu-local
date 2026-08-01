@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_tdc のオフラインテスト（FakeChat + 実 SubprocessSandbox、LLM/Ollama 不要）。"""
 from __future__ import annotations
 

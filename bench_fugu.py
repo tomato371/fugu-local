@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_local ベンチマークハーネス（Phase 2, 2026-07-11）。
 旧版（代表16問のミニベンチ）は bench_quick.py に温存してある。
 

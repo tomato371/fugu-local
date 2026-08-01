@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.cli のオフラインテスト(全依存フェイク注入で配線を検証)。"""
 import json
 

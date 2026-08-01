@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.workspace — 隔離ブランチ上の安全な自己編集 (Doc C Phase 4=D-3)。
 
 自己改善ループがリポジトリを書き換えるための唯一の入口。安全策は3層:

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.cli — 自己改善オーケストレーター (Doc C Phase 5)。
 
 フロー: profiler(健全性)→ planner(提案)→ workspace(隔離ブランチ)→

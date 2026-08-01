@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_mcp のオフラインテスト(モデル・GPU・ネット不要)。
 
 サーバーの JSON-RPC 処理 handle_message / call_tool を直接叩く。

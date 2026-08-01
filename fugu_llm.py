@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_llm — 新規モジュール向けの Chat プロトコルと fugu_local.ask() アダプタ。
 
 fugu-rag の fugu_rag.llm.Chat と同一シグネチャの Protocol を定義することで、

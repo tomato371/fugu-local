@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the FastAPI wrapper (fugu_api).
 
 These stub out the orchestrator (`ask_fugu`) and the Ollama probe (`server_up`),

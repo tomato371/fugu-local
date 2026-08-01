@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.subagents — 動的サブエージェント生成 (Doc E Phase 4)。
 
 従来の council は固定4パーソナ(Proposer A〜D)からの選抜のみで、質問に固有の

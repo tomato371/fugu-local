@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_tools — 汎用ツール呼び出し層 (Doc E Phase 1)。
 
 従来のツール起動は Conductor 固定スキーマの bool フラグ+fugu_local.py 内の

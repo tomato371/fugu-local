@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_tdc — Test-Driven Criticism (Doc A Phase 2)。
 
 Critic が回答コードを評価する前に、要求仕様から pytest テストを起草し、

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """Optional bridge: use the sibling project fugu-rag as a fugu-local retriever.
 
 fugu-local's ``rag_bench`` defines ``Retriever = Callable[[str, Corpus], List[str]]``.

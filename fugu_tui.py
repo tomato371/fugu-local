@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 #!/usr/bin/env python3
 """
 Fugu Local - Rich TUI (Claude Code 風ターミナル)

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_core.debate — マルチスコアルーティングと構造化討論 (Doc D Phase 4)。
 
 - :class:`ScoreMatrix` — モデル×ドメインの勝敗記録(JSON 永続化・壊れた

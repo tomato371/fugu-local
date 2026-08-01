@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """
 Local Fugu-style Orchestrator (RTX 4060 Laptop 8GB VRAM / RAM 48GB / i7-13700H 向け)
 
@@ -4869,6 +4871,80 @@ def _adversarial_check(question, answer, ok, issue):
         return ok, issue
 
 
+def _mav_verifiers():
+    """MAV / 探索共用: 小型モデル(FALLBACK_MODEL)で回す既定 5 検証者。
+    検証者に大型モデルを使うと予算が溶けるため、意図的に小型へ固定する。"""
+    import fugu_llm
+    import fugu_verify
+    return fugu_verify.default_verifiers(
+        lambda aspect: fugu_llm.AskChat(model=FALLBACK_MODEL,
+                                        label=f"verify-{aspect}"))
+
+
+def _mav_select(question, proposals, aggregated):
+    """FUGU_MAV=1 のときだけ、best-of-N 多検証者スコアリングで回答を選ぶ (BoN-MAV)。
+
+    候補 = 統合回答(先頭) + 各提案(FUGU_MAV_N 件まで)。統合回答が最高(同点含む)
+    なら None を返して従来の流れを一切変えない。提案が上回ったときのみ、その
+    提案テキスト(think 除去済み)を返す。失敗時も None(安全側)。"""
+    if os.environ.get("FUGU_MAV") != "1":
+        return None
+    try:
+        import fugu_verify
+    except ImportError:
+        return None
+    try:
+        n = fugu_verify.mav_n()
+        candidates = [aggregated] + [strip_think(p) for _, p in proposals][:n]
+        idx, best, reports = fugu_verify.best_of_n(
+            question, candidates, _mav_verifiers())
+        print(f"   [mav] best-of-{len(candidates)}: "
+              + " / ".join(f"{rep.score:.2f}" for rep in reports)
+              + f" → 候補{idx} ({best.breakdown()})")
+        return None if idx == 0 else candidates[idx]
+    except Exception:
+        return None
+
+
+def _tree_search_refine(question, draft, issue, models, remaining_rounds):
+    """FUGU_SEARCH=1 のときだけ、Critic 却下後の線形な追加ラウンドの代わりに
+    AB-MCTS 探索(fugu_search)で精緻化する。
+
+    予算は「残りの線形ラウンドが使ったはずの生成呼び出し数」と同一:
+    remaining_rounds × (提案 len(models) + 統合 1 + 批評 1)。FUGU_SEARCH_BUDGET で
+    明示上書き可能(ベンチ用)。報酬は fugu_verify の多検証者スコア。
+    失敗・無効時は None(従来の再帰ラウンドに落ちる)。"""
+    if os.environ.get("FUGU_SEARCH") != "1":
+        return None
+    try:
+        import fugu_llm
+        import fugu_search
+        import fugu_verify
+    except ImportError:
+        return None
+    try:
+        try:
+            budget = int(os.environ.get("FUGU_SEARCH_BUDGET", "0"))
+        except ValueError:
+            budget = 0
+        if budget <= 0:
+            budget = max(1, remaining_rounds) * (len(models) + 2)
+        verifiers = _mav_verifiers()
+        default_model = models[0] if models else None
+        print(f"   [search] 再帰ラウンドの代わりに AB-MCTS 探索"
+              f"(予算 {budget} 生成呼び出し)")
+        res = fugu_search.search(
+            question,
+            lambda m: fugu_llm.AskChat(model=m or default_model, label="search"),
+            lambda q, a: fugu_verify.score_answer(q, a, verifiers),
+            budget=budget, seed_answer=draft,
+            models=list(models), plan_hint=list(models))
+        print(f"   [search] {res.shape()} best={res.score:.2f}")
+        return res.answer
+    except Exception:
+        return None
+
+
 def _rank_models_by_domain(question, models):
     """FUGU_DEBATE=1 のときだけ、蓄積済みスコア行列(モデル×ドメイン勝率)で
     プロポーザー列をドメイン適性順に並べ替える(配線1b)。集合は不変(追加・
@@ -5147,6 +5223,10 @@ def fugu_answer(question, plan=None, history=None):
         # 済みにしている慣例に合わせ、ここでも strip_think 済みの fin を reference に
         # 使う。返り値の final 自体は生のまま返す（ask_fugu 側で最終的に strip_think）。
         fin = strip_think(final)
+        mav_pick = _mav_select(question, proposals, fin)  # FUGU_MAV=1 のみ
+        if mav_pick is not None:
+            final = mav_pick
+            fin = strip_think(mav_pick)
         _emit("aggregate", round=r + 1, chars=len(fin))
         # 次ラウンドは今回の統合結果(think除去済み)を土台に改善。
         # FUGU_COMPRESS=1 なら round≥2 へ渡す前に状態圧縮(既定は素通し)。
@@ -5187,6 +5267,13 @@ def fugu_answer(question, plan=None, history=None):
             _debate_record(question, models, ok)  # FUGU_DEBATE=1 のみ
             need_more = not ok
             if need_more:
+                # FUGU_SEARCH=1 のみ: 線形の追加ラウンドの代わりに AB-MCTS 探索。
+                # None(無効・失敗)なら従来どおりの再帰ラウンドへ落ちる。
+                searched = _tree_search_refine(question, fin, issue, models,
+                                               limit - r)
+                if searched is not None:
+                    final = searched
+                    break
                 issue_hint = issue  # 何が不十分かを次ラウンドの提案へ伝える
                 print(f"   ↻ 品質不足のため追加ラウンド（{issue}）")
             else:

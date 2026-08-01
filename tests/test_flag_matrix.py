@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """フラグ相互作用の統合テスト(オフライン)。
 
 opt-in env フラグが12個を超え、単体テストはあっても「同時有効」の相互作用は

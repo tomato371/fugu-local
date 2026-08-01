@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.profiler のオフラインテスト(FakeSandbox / tmp_path のみ)。"""
 import json
 

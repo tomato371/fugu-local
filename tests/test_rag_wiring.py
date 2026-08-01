@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """配線1c(FUGU_RAG adaptive 検索)と配線1d(Deep Research 統合)のオフラインテスト。"""
 import sys
 import types

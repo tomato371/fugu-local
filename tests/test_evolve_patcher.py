@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_evolve.patcher のオフラインテスト(FakeChat + FakeGit Workspace)。"""
 from fugu_llm import FakeChat
 from fugu_evolve.cli import implement_proposal

@@ -1,3 +1,5 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
 """fugu_prompts — プロンプト設定レイヤ (Doc D Phase 5)。
 
 fugu_local のプロンプト定数(モジュールグローバルの str)を、コードを書き換えずに
