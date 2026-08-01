@@ -236,6 +236,26 @@ curl -X POST http://localhost:8000/ask \
 
 IDE endpoint schemas and curl examples: `docs/api_ide.md`.
 
+## MCP server (use fugu from Claude Code)
+
+`fugu_mcp.py` exposes fugu as a [Model Context Protocol](https://modelcontextprotocol.io)
+stdio server (stdlib only — no SDK dependency), so Claude Code can call the local MoA
+pipeline as a tool:
+
+```bash
+claude mcp add --scope user fugu -- python D:/repos/fugu-local-integ/fugu_mcp.py
+```
+
+| Tool | Purpose |
+|---|---|
+| `fugu_ask` | Answer via the full MoA pipeline (blocking — for quick questions) |
+| `fugu_ask_start` / `fugu_ask_status` | Job-style ask for multi-minute questions: start returns a `job_id` immediately, poll for the answer |
+| `fugu_health` | Instant preflight: Ollama up? models pulled? optional deps installed? |
+
+Progress output goes to stderr (visible in MCP logs) so the JSON-RPC channel stays clean;
+jobs run one at a time (8 GB VRAM). Slack notification (`FUGU_SLACK_WEBHOOK`) fires on
+completion as usual, so a long `fugu_ask_start` job can ping you when it's done.
+
 ## Project structure
 
 | File | Purpose |
@@ -246,6 +266,7 @@ IDE endpoint schemas and curl examples: `docs/api_ide.md`.
 | `fugu_web.py` | Gradio web front-end (chat + Canvas/Artifacts pane) |
 | `fugu_api.py` | FastAPI REST API (ask / SSE / WebSocket / IDE endpoints) |
 | `fugu_tui.py` | Terminal UI front-end |
+| `fugu_mcp.py` | MCP stdio server — call fugu as a tool from Claude Code |
 | `fugu_llm.py` | `Chat` protocol + `AskChat` adapter (injection seam for every new module) |
 | `fugu_sandbox.py` | Subprocess execution sandbox + self-debug repair loop |
 | `fugu_tdc.py` | Test-driven criticism (draft pytest tests, approve only on green) |
