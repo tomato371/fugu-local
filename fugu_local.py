@@ -4709,6 +4709,30 @@ def _adversarial_check(question, answer, ok, issue):
         return ok, issue
 
 
+def _rank_models_by_domain(question, models):
+    """FUGU_DEBATE=1 のときだけ、蓄積済みスコア行列(モデル×ドメイン勝率)で
+    プロポーザー列をドメイン適性順に並べ替える(配線1b)。集合は不変(追加・
+    脱落なし)で順序のみ最適化 — 単体モードでは先頭が回答者になるため実効が大きい。
+    実績の無いモデルは中立扱いで元順維持。未設定・失敗時は元順をそのまま返す。"""
+    if os.environ.get("FUGU_DEBATE") != "1" or not models:
+        return models
+    try:
+        from fugu_core import debate as fugu_debate
+    except ImportError:
+        return models
+    try:
+        matrix = fugu_debate.get_default_matrix()
+        domain = fugu_debate.classify_domain(question)
+        ranked = matrix.select_models(domain, list(models), k=len(models))
+        if ranked and set(ranked) == set(models):
+            if ranked != list(models):
+                print(f"   [debate] スコア行列({domain})でプロポーザー順を最適化")
+            return ranked
+        return models
+    except Exception:
+        return models
+
+
 def _debate_record(question, models, ok):
     """FUGU_DEBATE=1 のときだけ、Critic 判定の合否をスコア行列に記録する (Doc D4)。"""
     if os.environ.get("FUGU_DEBATE") != "1":
@@ -4898,7 +4922,8 @@ def fugu_answer(question, plan=None, history=None):
 
     # ---------- 単体モード ----------
     if plan["mode"] == "single":
-        sel = plan.get("selected_proposers") or PROPOSERS[:1]
+        sel = _rank_models_by_domain(  # FUGU_DEBATE=1 のみ: 適性順に並べ替え
+            question, plan.get("selected_proposers") or PROPOSERS[:1])
         model = sel[0] if sel else (PROPOSERS[0] if PROPOSERS else AGGREGATOR)
         ans = strip_think(ask(
             model,
@@ -4933,7 +4958,8 @@ def fugu_answer(question, plan=None, history=None):
             return _finish_answer(question, ans)
 
     # ---------- 合議(MoA)モード：選抜した分だけ、必要なら再帰的に反復 ----------
-    models = plan["selected_proposers"] or PROPOSERS[:3]
+    models = _rank_models_by_domain(  # FUGU_DEBATE=1 のみ: 適性順に並べ替え
+        question, plan["selected_proposers"] or PROPOSERS[:3])
     # 拡張思考: 深い予算(high/ultra/max)は MoA ラウンド数の下限も引き上げる(既定は 0=不介入)
     planned = min(MAX_ROUNDS, max(1, plan["rounds"], _thinking_rounds_floor(question)))
     reference = seed_answer  # エスカレーションなら単体回答を初期ドラフトとして再利用

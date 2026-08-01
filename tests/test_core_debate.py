@@ -197,6 +197,46 @@ def test_debate_record_hook(monkeypatch, tmp_path):
     assert matrix.scores["m2"]["code"] == [1, 1]
 
 
+def test_rank_models_disabled_by_default(monkeypatch):
+    import fugu_local
+    monkeypatch.delenv("FUGU_DEBATE", raising=False)
+    models = ["a", "b"]
+    assert fugu_local._rank_models_by_domain("q", models) is models
+
+
+def test_rank_models_reorders_by_domain_fit(monkeypatch):
+    import fugu_local
+    from fugu_core import debate as debate_mod
+    monkeypatch.setenv("FUGU_DEBATE", "1")
+    matrix = ScoreMatrix()
+    for _ in range(4):
+        matrix.record("coder-model", "code", True)
+        matrix.record("prose-model", "code", False)
+    monkeypatch.setattr(debate_mod, "get_default_matrix", lambda: matrix)
+    ranked = fugu_local._rank_models_by_domain(
+        "この Python コードのバグを直して", ["prose-model", "coder-model"])
+    assert ranked == ["coder-model", "prose-model"]  # 適性順に並べ替え(集合不変)
+
+
+def test_rank_models_no_history_keeps_order(monkeypatch):
+    import fugu_local
+    from fugu_core import debate as debate_mod
+    monkeypatch.setenv("FUGU_DEBATE", "1")
+    monkeypatch.setattr(debate_mod, "get_default_matrix", lambda: ScoreMatrix())
+    models = ["a", "b", "c"]
+    assert fugu_local._rank_models_by_domain("コードを直して", models) == models
+
+
+def test_rank_models_failure_keeps_order(monkeypatch):
+    import fugu_local
+    from fugu_core import debate as debate_mod
+    monkeypatch.setenv("FUGU_DEBATE", "1")
+    monkeypatch.setattr(debate_mod, "get_default_matrix",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    models = ["a", "b"]
+    assert fugu_local._rank_models_by_domain("q", models) is models
+
+
 def test_debate_record_hook_disabled_by_default(monkeypatch):
     import fugu_local
     from fugu_core import debate as debate_mod
