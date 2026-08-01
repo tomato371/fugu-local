@@ -330,6 +330,41 @@ def format_result(result: RunResult) -> str:
     return "\n".join(lines)
 
 
+def default_context_fn(repo: str):
+    """AST-RAG コードコンテキスト供給器を guarded に構築する (配線1e)。
+
+    fugu_rag 不在なら None(planner は従来どおりコンテキスト無しで動く)。
+    ヘルスレポート上位モジュールに属するチャンク見出し(chunk id + docstring
+    先頭行)のダイジェストを返す — planner が「コード構造を見た提案」を出せる。
+    corpus 構築は初回のみ(closure にキャッシュ)。
+    """
+    try:
+        from fugu_rag.ast_indexer import build_code_corpus
+    except ImportError:
+        return None
+
+    state: Dict[str, object] = {}
+
+    def context_fn(health_report: Dict[str, object]) -> str:
+        if "chunks" not in state:
+            _corpus, chunks, _graph = build_code_corpus(repo)
+            state["chunks"] = chunks
+        chunks = state["chunks"]
+        top_paths = [m.get("path") for m in (health_report.get("modules") or [])
+                     if isinstance(m, dict) and m.get("path")][:5]
+        lines: List[str] = []
+        for chunk_id in sorted(chunks):
+            if top_paths and not any(str(chunk_id).startswith(str(p))
+                                     for p in top_paths):
+                continue
+            doc = getattr(chunks[chunk_id], "docstring", "") or ""
+            head = doc.splitlines()[0][:80] if doc else ""
+            lines.append(f"{chunk_id}: {head}".rstrip(": "))
+        return "\n".join(lines)[:2000]
+
+    return context_fn
+
+
 def run_prompt_evolution(name: str, chat, repo: str,
                          apply: bool = True, n: int = 3) -> Dict[str, object]:
     """--prompts モード本体: fugu_local のプロンプト定数 ``name`` を進化させる。
@@ -381,7 +416,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             {k: v for k, v in result.items() if k != "winner"},
             ensure_ascii=False, indent=1))
         return 0
-    pipeline = build_pipeline({"chat": fugu_llm.AskChat(label="evolve")})
+    deps: Dict[str, object] = {"chat": fugu_llm.AskChat(label="evolve")}
+    context_fn = default_context_fn(args.repo)  # fugu_rag 不在なら None(従来どおり)
+    if context_fn is not None:
+        deps["context_fn"] = context_fn
+    pipeline = build_pipeline(deps)
     result = pipeline(
         args.repo, dry_run=args.dry_run, pr_mode=args.pr_mode,
         nightly=args.nightly, max_proposals=args.max_proposals,

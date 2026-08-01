@@ -1,0 +1,16 @@
+# fugu sandbox 実行用イメージ (Doc E3 / 配線1e)
+#
+# 素の python:*-slim には pytest / sympy が無く、TDC のテスト実行や PoT の
+# 数式検算がコンテナ内で全滅する(get_sandbox が Docker 自動昇格を採らない理由)。
+# このイメージは fugu が生成コードの実行に使う依存を焼き込み、Docker 隔離
+# (--network none)を実用にする。
+#
+# build:
+#   docker build -f Dockerfile.sandbox -t fugu-sandbox .
+# use:
+#   $env:FUGU_SANDBOX_BACKEND = "docker"
+#   $env:FUGU_SANDBOX_IMAGE   = "fugu-sandbox"
+FROM python:3.11-slim
+RUN pip install --no-cache-dir pytest sympy numpy
+# 実行は fugu_sandbox.DockerSandbox が /work をマウントして行う(ネットワーク無効)
+WORKDIR /work

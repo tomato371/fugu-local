@@ -235,6 +235,74 @@ def test_format_result_summarizes():
 
 # ------------------------------------------------------------------ main
 
+def test_default_context_fn_none_without_fugu_rag():
+    # この環境には fugu_rag が無い → guarded import が None を返す
+    assert cli.default_context_fn(".") is None
+
+
+def _fake_ast_indexer(monkeypatch, chunks):
+    import sys
+    import types
+
+    calls = []
+
+    def build_code_corpus(root):
+        calls.append(root)
+        return {}, chunks, {}
+
+    pkg = types.ModuleType("fugu_rag")
+    mod = types.ModuleType("fugu_rag.ast_indexer")
+    mod.build_code_corpus = build_code_corpus
+    pkg.ast_indexer = mod
+    monkeypatch.setitem(sys.modules, "fugu_rag", pkg)
+    monkeypatch.setitem(sys.modules, "fugu_rag.ast_indexer", mod)
+    return calls
+
+
+class _Chunk:
+    def __init__(self, docstring=""):
+        self.docstring = docstring
+
+
+def test_default_context_fn_digests_top_modules(monkeypatch):
+    calls = _fake_ast_indexer(monkeypatch, {
+        "a.py::f": _Chunk("Does X.\n詳細..."),
+        "a.py::C.m": _Chunk(""),
+        "other.py::g": _Chunk("Unrelated."),
+    })
+    context_fn = cli.default_context_fn("R")
+    report = {"modules": [{"path": "a.py"}]}
+    digest = context_fn(report)
+    assert "a.py::f: Does X." in digest
+    assert "a.py::C.m" in digest
+    assert "other.py" not in digest              # 上位モジュール外は除外
+    context_fn(report)
+    assert calls == ["R"]                        # corpus 構築は初回のみ
+
+
+def test_default_context_fn_no_modules_includes_all(monkeypatch):
+    _fake_ast_indexer(monkeypatch, {"x.py::h": _Chunk("Doc.")})
+    digest = cli.default_context_fn("R")({"modules": []})
+    assert "x.py::h: Doc." in digest
+
+
+def test_main_injects_context_fn_when_available(monkeypatch):
+    sentinel = lambda report: "ctx"  # noqa: E731
+    monkeypatch.setattr(cli, "default_context_fn", lambda repo: sentinel)
+    captured = {}
+
+    def fake_build(deps):
+        captured.update(deps)
+
+        def run(repo, **kw):
+            return RunResult(health=HEALTH, outcomes=[], dry_run=True)
+        return run
+
+    monkeypatch.setattr(cli, "build_pipeline", fake_build)
+    assert cli.main(["--repo", "R", "--dry-run"]) == 0
+    assert captured["context_fn"] is sentinel
+
+
 def test_main_wires_args_into_pipeline(monkeypatch, capsys):
     captured = {}
 
