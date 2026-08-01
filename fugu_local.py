@@ -4551,6 +4551,57 @@ def _emit(kind, **data):
         pass
 
 
+_TASKS_ACTIVE = False  # 再入ガード: サブタスク実行中の fugu_answer は素通し
+
+
+def _tasked_answer(question, history=None):
+    """FUGU_TASKS=1 のとき、質問をサブタスク列に分解してボード経由で消化する (Doc E2)。
+    2件以上に分解できた場合のみ発動。単一タスク・分解失敗は None(従来経路へ)。"""
+    try:
+        import fugu_llm
+        from fugu_core import tasks as fugu_tasks
+    except ImportError:
+        return None
+    try:
+        items = fugu_tasks.decompose(question, fugu_llm.AskChat(label="tasks"))
+        if len(items) <= 1:
+            return None
+        board = fugu_tasks.TaskBoard.new(question, items)
+        print(f"   [tasks] {len(items)} サブタスクに分解 (board={board.board_id})")
+        return _run_board(board, history=history)
+    except Exception:
+        return None
+
+
+def _run_board(board, history=None):
+    """ボードの ready なサブタスクを順次消化し、決定論的に統合して返す。
+    各遷移はボード側で永続化されるため、途中で落ちても --resume で再開できる。"""
+    global _TASKS_ACTIVE
+    from fugu_core import tasks as fugu_tasks
+    _TASKS_ACTIVE = True
+    try:
+        while True:
+            item = board.next_ready()
+            if item is None:
+                break
+            board.update(item.id, "in_progress")
+            print(f"   [tasks] ▶ {item.id}: {item.subject}  ({board.progress()})")
+            prior = board.results_context()
+            sub_question = f"{prior}\n\n{item.subject}" if prior else item.subject
+            try:
+                answer = fugu_answer(sub_question, history=history)
+            except Exception as e:
+                board.update(item.id, "failed", result=f"error: {e}")
+                continue
+            ok = bool(answer) and not str(answer).startswith("__ERROR__")
+            board.update(item.id, "completed" if ok else "failed",
+                         result=strip_think(str(answer or ""))[:2000])
+            print(f"   [tasks] {'✓' if ok else '✗'} {item.id}  ({board.progress()})")
+    finally:
+        _TASKS_ACTIVE = False
+    return fugu_tasks.synthesize_board(board)
+
+
 def _tool_context(question):
     """FUGU_TOOL_CALLING=1 のときだけ、汎用ツール呼び出し層 (Doc E1) を起動する。
     ツール選択・実行・整形は fugu_tools に委譲。未設定・失敗・ツール不要は ""
@@ -4699,6 +4750,11 @@ def fugu_answer(question, plan=None, history=None):
     """事前に conduct() で得た plan に従って回答を生成する。
     plan は validate_plan 済み（selected_proposers は実モデル名で解決済み）。
     plan=None のときは内部で conduct() を実行する（eval など単体呼び出し向けの後方互換）。"""
+    # FUGU_TASKS=1: サブタスク分解+永続ボード消化 (Doc E2)。再入時は素通し。
+    if os.environ.get("FUGU_TASKS") == "1" and not _TASKS_ACTIVE:
+        tasked = _tasked_answer(question, history=history)
+        if tasked is not None:
+            return tasked
     history = history or []
     question = _memory_lessons(question)
     if plan is None:
@@ -5987,7 +6043,28 @@ def main():
                         default=None,
                         help="思考予算: 最終回答への自己リフレクション量（auto=質問で自動判定。"
                              "既定は無効＝従来動作）")
+    parser.add_argument("--resume", metavar="BOARD_ID",
+                        help="中断したタスクボードを未完了サブタスクから再開する"
+                             "（FUGU_TASKS のチェックポイントを消化）")
     args = parser.parse_args()
+
+    # --- タスクボード再開 (Doc E2): 質問入力より優先して処理する ---
+    if args.resume:
+        if not setup():
+            return
+        try:
+            from fugu_core import tasks as fugu_tasks
+        except ImportError:
+            print("fugu_core.tasks が見つかりません。")
+            return
+        board = fugu_tasks.TaskBoard.load(args.resume)
+        if board is None:
+            print(f"タスクボードが見つかりません: {args.resume}")
+            return
+        print(f"[tasks] ボード再開: {board.board_id} ({board.progress()})")
+        print("\n===== 最終回答 (resume) =====")
+        print(_run_board(board))
+        return
 
     # --- 思考予算: env フラグ経由で fugu_answer のフックに伝える（既定は不変） ---
     if args.thinking_budget:
