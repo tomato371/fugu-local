@@ -226,6 +226,15 @@ IDE endpoint schemas and curl examples: `docs/api_ide.md`.
 | `docker-compose.yml` | One-command stack: Ollama + fugu web UI |
 | `requirements.txt` | Optional deps (web UI + file I/O); core needs none |
 
+## Acknowledgements
+
+This project was born out of deep respect for **[Sakana AI](https://sakana.ai)'s
+*Fugu*** and is directly inspired by it. The core idea — a Conductor LLM that
+dynamically decides, per query, how many agents to convene and how much
+deliberation to spend — comes from their work; this repository is an independent
+hobbyist study of how far that idea can be pushed on consumer hardware
+(8 GB VRAM, fully offline). It is not affiliated with or endorsed by Sakana AI.
+
 ## License
 
 TODO: choose a license (MIT is a common, permissive default).
