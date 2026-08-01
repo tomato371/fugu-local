@@ -21,6 +21,103 @@ from typing import Dict, List, Optional, Protocol, Tuple
 
 DEFAULT_TIMEOUT = 30.0
 
+#: 生成コード実行プロセスの既定メモリ上限(MB)。None/0 で無効。
+#: env FUGU_SANDBOX_MEMORY_MB で上書き可(ベストエフォート: 適用に失敗しても
+#: 実行自体は従来どおり続行する)。
+DEFAULT_MEMORY_MB = 1024
+
+
+def _memory_limit_mb() -> Optional[int]:
+    raw = os.environ.get("FUGU_SANDBOX_MEMORY_MB")
+    if raw is None:
+        return DEFAULT_MEMORY_MB
+    try:
+        value = int(raw)
+        return value if value > 0 else None
+    except ValueError:
+        return DEFAULT_MEMORY_MB
+
+
+def _assign_windows_job(process, memory_mb: int):
+    """Windows Job Object でプロセスにメモリ上限を課す(ベストエフォート)。
+
+    失敗しても None を返すだけで実行は続く。返り値のハンドルはプロセス終了まで
+    呼び出し側が保持すること(GC されるとジョブが閉じる)。
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        kernel32 = ctypes.windll.kernel32
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in (
+                "ReadOperationCount", "WriteOperationCount",
+                "OtherOperationCount", "ReadTransferCount",
+                "WriteTransferCount", "OtherTransferCount")]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+        JobObjectExtendedLimitInformation = 9
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        info.ProcessMemoryLimit = memory_mb * 1024 * 1024
+        if not kernel32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            kernel32.CloseHandle(job)
+            return None
+        handle = kernel32.OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, process.pid)
+        if not handle:
+            kernel32.CloseHandle(job)
+            return None
+        ok = kernel32.AssignProcessToJobObject(job, handle)
+        kernel32.CloseHandle(handle)
+        if not ok:
+            kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception:
+        return None
+
+
+def _unix_preexec(memory_mb: int):
+    """Unix: 子プロセス側で RLIMIT_AS を課す preexec_fn を返す。"""
+    def _limit():
+        import resource
+        limit_bytes = memory_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    return _limit
+
 
 @dataclass
 class SandboxResult:
@@ -51,6 +148,17 @@ class Sandbox(Protocol):
         ...
 
 
+def _approved_to_run(code: str) -> bool:
+    """FUGU_REQUIRE_APPROVAL=1 のときだけ人間承認を待つ(未設定は素通し)。"""
+    if os.environ.get("FUGU_REQUIRE_APPROVAL") != "1":
+        return True
+    try:
+        import fugu_approval
+    except ImportError:
+        return True
+    return fugu_approval.require_approval("sandbox-run", code[:200])
+
+
 class SubprocessSandbox:
     """一時ディレクトリ + subprocess による標準実装。
 
@@ -60,11 +168,21 @@ class SubprocessSandbox:
       （TDC が solution.py + test_solution.py を並べる用途）。
     """
 
-    def __init__(self, timeout: float = DEFAULT_TIMEOUT):
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT,
+                 memory_mb: Optional[int] = None):
         self.timeout = timeout
+        # None は「env 既定に従う」。明示 0 以下で無効化。
+        self.memory_mb = _memory_limit_mb() if memory_mb is None else (
+            memory_mb if memory_mb > 0 else None)
 
     def run(self, code: str, lang: str = "python", timeout: Optional[float] = None,
             files: Optional[Dict[str, str]] = None) -> SandboxResult:
+        # FUGU_REQUIRE_APPROVAL=1: 任意コード実行の入口ゲート (Doc E3)。
+        # run_argv(pytest 等の固定コマンド)は対象外 — 検証ループを承認連打に
+        # しないため、「LLM が書いたコードの実行」だけを守る。
+        if not _approved_to_run(code):
+            return SandboxResult(stderr="approval denied or timed out",
+                                 exit_code=-1)
         timeout = timeout or self.timeout
         with tempfile.TemporaryDirectory(prefix="fugu_sbx_") as tmp:
             for name, content in (files or {}).items():
@@ -100,21 +218,36 @@ class SubprocessSandbox:
         if env:
             run_env = dict(os.environ)
             run_env.update(env)
+        # メモリ上限(ベストエフォート): Unix は setrlimit、Windows は Job Object。
+        # 適用に失敗しても実行は従来どおり続行する。
+        preexec = (_unix_preexec(self.memory_mb)
+                   if os.name == "posix" and self.memory_mb else None)
         try:
-            r = subprocess.run(
-                argv, cwd=cwd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                timeout=timeout, stdin=subprocess.DEVNULL, env=run_env,
+            proc = subprocess.Popen(
+                argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL, env=run_env, preexec_fn=preexec,
             )
-            return SandboxResult(stdout=r.stdout or "", stderr=r.stderr or "",
-                                 exit_code=r.returncode, cmd=list(argv))
-        except subprocess.TimeoutExpired as e:
-            return SandboxResult(
-                stdout=_as_text(e.stdout), stderr=_as_text(e.stderr),
-                exit_code=-1, timed_out=True, cmd=list(argv))
         except Exception as e:  # 実行環境自体の失敗（実行ファイル不在など）
             return SandboxResult(stderr=f"runner error: {e}", exit_code=-1,
                                  cmd=list(argv))
+        job = (_assign_windows_job(proc, self.memory_mb)
+               if os.name == "nt" and self.memory_mb else None)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return SandboxResult(stdout=stdout or "", stderr=stderr or "",
+                                 exit_code=proc.returncode, cmd=list(argv))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            return SandboxResult(
+                stdout=_as_text(stdout), stderr=_as_text(stderr),
+                exit_code=-1, timed_out=True, cmd=list(argv))
+        except Exception as e:
+            return SandboxResult(stderr=f"runner error: {e}", exit_code=-1,
+                                 cmd=list(argv))
+        finally:
+            del job  # ジョブハンドルはプロセス終了までこのフレームで保持
 
 
 class DockerSandbox:
@@ -133,6 +266,9 @@ class DockerSandbox:
             files: Optional[Dict[str, str]] = None) -> SandboxResult:
         if not self.available():
             return SandboxResult(stderr="docker not available", exit_code=127)
+        if not _approved_to_run(code):  # Doc E3: 任意コード実行の入口ゲート
+            return SandboxResult(stderr="approval denied or timed out",
+                                 exit_code=-1)
         timeout = timeout or self.timeout
         tmp = tempfile.mkdtemp(prefix="fugu_dsbx_")
         try:
@@ -155,6 +291,60 @@ class DockerSandbox:
                  timeout: Optional[float] = None,
                  env: Optional[Dict[str, str]] = None) -> SandboxResult:
         return self._inner.run_argv(argv, cwd=cwd, timeout=timeout, env=env)
+
+
+# ------------------------------------------------------------------ 既定解決 (Doc E3)
+
+_DOCKER_READY: Optional[bool] = None
+_FALLBACK_WARNED = False
+
+
+def _docker_ready() -> bool:
+    """docker バイナリの存在に加えて daemon の応答まで確認する(結果はキャッシュ)。
+
+    `shutil.which("docker")` だけだと Docker Desktop 停止中でも True になり、
+    実行時に全コンテナ起動が失敗する — daemon probe で実際に使える時だけ昇格する。
+    """
+    global _DOCKER_READY
+    if _DOCKER_READY is None:
+        if not DockerSandbox.available():
+            _DOCKER_READY = False
+        else:
+            try:
+                probe = subprocess.run(["docker", "info"], capture_output=True,
+                                       timeout=10)
+                _DOCKER_READY = probe.returncode == 0
+            except Exception:
+                _DOCKER_READY = False
+    return _DOCKER_READY
+
+
+def get_sandbox(timeout: float = DEFAULT_TIMEOUT,
+                prefer: Optional[str] = None) -> Sandbox:
+    """コード実行用サンドボックスの中央解決点 (Doc E3)。
+
+    既定は SubprocessSandbox(メモリ上限付き)。``prefer`` または env
+    ``FUGU_SANDBOX_BACKEND`` に "docker" / "auto" を指定したときだけ、daemon が
+    応答すれば DockerSandbox(イメージは env ``FUGU_SANDBOX_IMAGE`` で指定、
+    `--network none`)へ昇格する。
+
+    **無条件の自動昇格にしない理由**: 素の python:3.11-slim には pytest も
+    sympy も無く、TDC のテスト実行や PoT の数式検算がコンテナ内で全滅する —
+    隔離のために完走性を壊さない。docker を使う場合は依存入りイメージを
+    用意して FUGU_SANDBOX_IMAGE で指すこと。docker 指名で daemon 不応答の
+    場合は Subprocess にフォールバックし初回のみ警告する。
+    """
+    global _FALLBACK_WARNED
+    prefer = prefer or os.environ.get("FUGU_SANDBOX_BACKEND") or "subprocess"
+    if prefer in ("docker", "auto") and _docker_ready():
+        image = os.environ.get("FUGU_SANDBOX_IMAGE")
+        return (DockerSandbox(image=image, timeout=timeout) if image
+                else DockerSandbox(timeout=timeout))
+    if prefer == "docker" and not _FALLBACK_WARNED:
+        _FALLBACK_WARNED = True
+        print("   [sandbox] docker 指定ですが daemon 不応答 → "
+              "SubprocessSandbox にフォールバック(コンテナ隔離なし・メモリ上限のみ)")
+    return SubprocessSandbox(timeout=timeout)
 
 
 _FENCE_RE = re.compile(r"```(?:python|py|bash|sh)?\s*\n(.*?)```", re.DOTALL)
@@ -218,7 +408,7 @@ def run_with_self_debug(code: str, chat, sandbox: Optional[Sandbox] = None,
     修正案からコードを抽出できない、または前回と同一コードが返った場合は
     それ以上進展しないため打ち切る。
     """
-    sandbox = sandbox or SubprocessSandbox()
+    sandbox = sandbox or get_sandbox()  # Doc E3: Docker 稼働時は自動昇格
     attempts = 0
     current = code
     result = SandboxResult(stderr="not executed", exit_code=-1)

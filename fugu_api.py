@@ -184,6 +184,32 @@ async def ws_ask(websocket: WebSocket):
             pass  # クライアント切断済みなら閉じ損ねてよい
 
 
+# ------------------------------------------------------------------ approval gate (E3)
+# FUGU_REQUIRE_APPROVAL=1 のとき、sandbox 実行や evolve merge が
+# `approval_required` イベント(SSE/WS)を発行してブロックする。ここはその解決口。
+
+
+class ApprovalDecision(BaseModel):
+    approve: bool = Field(..., description="true=実行を許可 / false=拒否")
+
+
+@app.get("/approvals")
+def approvals():
+    """未決の承認要求 run_id 一覧(FUGU_REQUIRE_APPROVAL=1 のときのみ増える)。"""
+    import fugu_approval
+    return {"pending": fugu_approval.pending()}
+
+
+@app.post("/approve/{run_id}")
+def approve(run_id: str, decision: ApprovalDecision):
+    """承認要求を解決する。未知・解決済みの run_id は 404。"""
+    import fugu_approval
+    if not fugu_approval.resolve(run_id, decision.approve):
+        raise HTTPException(status_code=404,
+                            detail=f"unknown or already-resolved run_id: {run_id}")
+    return {"run_id": run_id, "approved": decision.approve}
+
+
 # ------------------------------------------------------------------ IDE endpoints
 # Single-model, low-latency surfaces for editor integration (VS Code / Cursor).
 # No MoA, no Conductor — one coder-model call (or a pure sandbox run).
@@ -316,7 +342,7 @@ def test_run(req: TestRunRequest):
     import fugu_sandbox
     import fugu_tdc
 
-    sandbox = fugu_sandbox.SubprocessSandbox(timeout=req.timeout)
+    sandbox = fugu_sandbox.get_sandbox(timeout=req.timeout)  # Docker 稼働時は自動昇格
     if req.tests:
         result = fugu_tdc.run_tests(req.code, req.tests, sandbox=sandbox,
                                     timeout=req.timeout)

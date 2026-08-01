@@ -201,12 +201,24 @@ def append_history(repo: str, proposal: Proposal, verification: Verification,
     return path
 
 
+def merge_approval(proposal: Proposal, diff: str) -> bool:
+    """FUGU_REQUIRE_APPROVAL=1 のときだけ merge 直前に人間承認を待つ (Doc E3)。
+    未設定なら即 True。タイムアウト・拒否は False(merge しない=安全側)。"""
+    try:
+        import fugu_approval
+    except ImportError:
+        return True
+    return fugu_approval.require_approval(
+        "evolve-merge", f"{proposal.title}: {diff[:160]}")
+
+
 def build_pipeline(deps: Dict[str, object]) -> Callable[..., RunResult]:
     """全依存注入でオーケストレーターを組み立てる(C5 の合成点)。
 
     deps: ``chat``(必須)/ ``sandbox`` / ``workspace_factory`` / ``health_fn`` /
     ``propose_fn`` / ``implement_fn`` / ``verify_fn`` / ``critic_fn`` /
-    ``history_fn`` / ``now_fn`` / ``context_fn``。省略時は本物が使われる。
+    ``history_fn`` / ``now_fn`` / ``context_fn`` / ``merge_approval_fn``。
+    省略時は本物が使われる。
     """
     chat = deps["chat"]
     sandbox = deps.get("sandbox")
@@ -219,6 +231,7 @@ def build_pipeline(deps: Dict[str, object]) -> Callable[..., RunResult]:
     history_fn = deps.get("history_fn", append_history)
     now_fn = deps.get("now_fn", lambda: time.strftime("%Y-%m-%d %H:%M"))
     context_fn = deps.get("context_fn")
+    merge_approval_fn = deps.get("merge_approval_fn", merge_approval)
 
     def run(repo: str, dry_run: bool = False, pr_mode: bool = False,
             nightly: bool = False, max_proposals: int = 3,
@@ -273,6 +286,14 @@ def build_pipeline(deps: Dict[str, object]) -> Callable[..., RunResult]:
                 outcomes.append(ProposalOutcome(
                     proposal=proposal, branch=branch, verification=verification,
                     approved=True, reason="pr-mode: branch left for human review"))
+                continue
+            # Doc E3: FUGU_REQUIRE_APPROVAL=1 のときだけ人間承認を merge 直前に要求
+            if not merge_approval_fn(proposal, diff):
+                workspace.rollback()
+                outcomes.append(ProposalOutcome(
+                    proposal=proposal, branch=branch, verification=verification,
+                    approved=True,
+                    reason="merge approval denied or timed out"))
                 continue
             workspace.merge_to_main()
             history_fn(repo, proposal, verification, now_fn(), nightly=nightly)

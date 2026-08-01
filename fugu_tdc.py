@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import fugu_sandbox
-from fugu_sandbox import Sandbox, SubprocessSandbox
+from fugu_sandbox import Sandbox, get_sandbox
 
 # solution.py / test_solution.py を並べた一時ディレクトリ内で pytest を回す駆動スクリプト。
 # sandbox.run() は cwd を一時ディレクトリに揃えるため相対名でよい。
@@ -80,7 +80,7 @@ def draft_tests(requirements: str, code: str, chat) -> Optional[str]:
 def run_tests(code: str, test_source: str, sandbox: Optional[Sandbox] = None,
               timeout: Optional[float] = None) -> "fugu_sandbox.SandboxResult":
     """solution.py + test_solution.py を配置して pytest を 1 回実行する。"""
-    sandbox = sandbox or SubprocessSandbox()
+    sandbox = sandbox or get_sandbox()  # Doc E3: 中央解決(既定は従来どおり subprocess)
     return sandbox.run(
         _PYTEST_DRIVER,
         files={"solution.py": code, "test_solution.py": test_source},
@@ -96,7 +96,7 @@ def run_tdc(code: str, requirements: str, chat,
     承認 (passed=True) は全テスト green のときのみ。起草に失敗した場合は
     drafted=False, passed=False で返し、呼び出し側が従来の LLM 審査へ
     フォールバックできるようにする。"""
-    sandbox = sandbox or SubprocessSandbox()
+    sandbox = sandbox or get_sandbox()  # Doc E3: 中央解決(既定は従来どおり subprocess)
     test_source = draft_tests(requirements, code, chat)
     if not test_source:
         return TDCResult(passed=False, drafted=False, code=code,

@@ -2374,7 +2374,7 @@ def run_python(code, timeout=None, stdout_only=False):
         except ImportError:
             fugu_sandbox = None
         if fugu_sandbox is not None:
-            res = fugu_sandbox.SubprocessSandbox(timeout=timeout).run(code)
+            res = fugu_sandbox.get_sandbox(timeout=timeout).run(code)
             out = res.stdout if (stdout_only and res.ok) else res.output
             return res.ok, out.strip()[-2000:]
     fd, path = tempfile.mkstemp(suffix=".py")
