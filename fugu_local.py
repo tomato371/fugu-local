@@ -321,9 +321,20 @@ _HISTORY: list = []   # グローバル会話履歴
 # 最も効くのは「同時ロードは 1 体」を強制する環境変数（サーバ起動前に設定）:
 #   Windows(PowerShell): $env:OLLAMA_MAX_LOADED_MODELS=1 ; ollama serve
 #   Linux / mac:         OLLAMA_MAX_LOADED_MODELS=1 ollama serve
-# 下の keep_alive をコード側から渡したい場合のみ文字列を設定（例 "0"=即アンロード, "5m"）。
-# 既定 None は「渡さない」＝互換性リスクなし。
-MODEL_KEEP_ALIVE = None
+# 下の keep_alive は /api/chat の payload でリクエスト毎に渡す（サーバ再起動不要）。
+# 2026-08-01 プロファイル実測（部分データ17呼び出し）: 全呼び出しが cold_load
+# （平均~11s、計199.5s）であり、生成が数分に及ぶ SC サンプルの合間に Ollama 既定
+# keep_alive(5m) でモデルが揮発していた。OLLAMA_MAX_LOADED_MODELS=1 環境では
+# keep_alive を伸ばしても VRAM リスクは無い（別モデルのロードは従来どおり
+# 追い出しで行われ、idle アンロードだけが延びる）ため、既定を "30m" にする。
+# env FUGU_KEEP_ALIVE で上書き可（"off"/"none" で従来の「渡さない」に戻す）。
+_KEEP_ALIVE_ENV = os.environ.get("FUGU_KEEP_ALIVE", "").strip()
+if _KEEP_ALIVE_ENV.lower() in ("off", "none"):
+    MODEL_KEEP_ALIVE = None
+elif _KEEP_ALIVE_ENV:
+    MODEL_KEEP_ALIVE = _KEEP_ALIVE_ENV
+else:
+    MODEL_KEEP_ALIVE = "30m"
 
 # 【重要】コンテキスト長。未指定だと Ollama がモデル最大(qwen3=262144 等)を確保しようとし、
 # 8GB VRAM では KV キャッシュが破綻して runner がクラッシュする。実測で 8192 なら
