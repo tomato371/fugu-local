@@ -187,22 +187,52 @@ def _stream(message, history, use_search, think_mode, budget_mode, rag_dirs_str,
 # Gradio UI
 # ──────────────────────────────────────────────────
 
-_MODELS_MD = (
-    "**Conductor**: qwen3:4b  \n"
-    "**Proposer A**: qwen3-coder:30b  \n"
-    "**Proposer B**: phi4  \n"
-    "**Proposer C**: gpt-oss:20b  \n"
-    "**Aggregator**: qwen3-coder:30b  \n"
-    "\n*質問は数分〜十数分かかります*"
-)
+#: ワンクリックで試せる例文(初心者向け)。クリックすると入力欄に入る。
+EXAMPLE_QUESTIONS = [
+    "91は素数ですか？",
+    "このPythonコードのバグを直して: print(1/0)",
+    "次の文章を丁寧な英語に翻訳して: 明日の会議は10時からです",
+    "簡単なToDoリストのHTMLページを作って",
+]
+
+_GUIDE_MD = """\
+**このアプリは、あなたのPCの中だけで動くAIチャットです**(インターネット上のAIには送信されません)。
+
+1. 下の入力欄に質問を書いて **送信** を押す(例文をクリックしても入ります)
+2. ⏳ **回答には数分〜十数分かかります**。複数のAIが議論して答えを作るためです。
+   「処理ログ」に途中経過が流れていれば正常に動いています
+3. 回答が表示されたら、続けて追加の質問ができます(会話は覚えています)
+
+**よくある質問**
+- *止めたいとき*: このウィンドウを閉じるか、起動した黒い画面で Ctrl+C
+- *新しい話題にしたいとき*: 右の「＋ 新しいチャット」
+- *最新情報を調べてほしいとき*: 右の「Web 検索」にチェック
+- *コードやHTMLを作らせたとき*: 右端の Canvas に自動でプレビューが出ます
+"""
+
+
+def _models_md():
+    """導入済みモデル構成を動的に表示(setup 後に呼ばれる前提。未解決なら省略表示)。"""
+    try:
+        lines = [f"**Conductor**: {fugu.CONDUCTOR or '(未解決)'}  "]
+        for label, model in fugu.PERSONA_MODELS.items():
+            mark = "" if model in (fugu.PROPOSERS or []) else " (未導入)"
+            lines.append(f"**{label}**: {model}{mark}  ")
+        lines.append(f"**Aggregator**: {fugu.AGGREGATOR or '(未解決)'}  ")
+        return "\n".join(lines) + "\n\n*質問は数分〜十数分かかります*"
+    except Exception:
+        return "*モデル構成は起動ログを参照*"
 
 
 def build_ui():
     with gr.Blocks(title="Fugu Local MoA") as demo:
         gr.Markdown(
-            "# Fugu Local MoA\n"
-            "完全ローカル Mixture-of-Agents (qwen3-coder:30b + phi4 + gpt-oss:20b)"
+            "# 🐡 Fugu Local\n"
+            "**完全ローカルのAIチャット** — 質問を入力して送信するだけ。"
+            "複数のAIが議論してから答えます(そのぶん時間はかかります)。"
         )
+        with gr.Accordion("❓ はじめての方へ(使い方)", open=False):
+            gr.Markdown(_GUIDE_MD)
 
         with gr.Row(equal_height=False):
             # メインチャット
@@ -216,23 +246,31 @@ def build_ui():
                 )
                 with gr.Row():
                     msg = gr.Textbox(
-                        placeholder="質問を入力 (Shift+Enter で改行、Enter で送信)",
+                        placeholder="ここに質問を入力 (Enter で送信 / Shift+Enter で改行)",
                         show_label=False,
                         lines=3,
                         scale=5,
                     )
-                    send = gr.Button("送信", variant="primary", scale=1, min_width=80)
+                    send = gr.Button("送信 ▶", variant="primary", scale=1,
+                                     min_width=80)
+                gr.Examples(
+                    examples=[[q] for q in EXAMPLE_QUESTIONS],
+                    inputs=[msg],
+                    label="例文(クリックすると入力欄に入ります)",
+                )
                 with gr.Row():
-                    gr.ClearButton([msg, chatbot], value="履歴クリア")
+                    gr.ClearButton([msg, chatbot], value="🗑 履歴クリア")
 
-                with gr.Accordion("処理ログ（途中経過）", open=True):
+                with gr.Accordion("処理ログ（いま何をしているか）", open=True):
                     process_log = gr.Textbox(
                         show_label=False,
                         lines=14,
                         max_lines=30,
                         interactive=False,
                         autoscroll=True,
-                        placeholder="質問を送信すると Conductor/Proposer の途中経過がここに流れます",
+                        placeholder="質問を送信すると途中経過がここに流れます。"
+                                    "流れている間は AI が考え中です — "
+                                    "数分〜十数分かかるのが正常です",
                     )
 
             # 設定サイドバー
@@ -247,33 +285,44 @@ def build_ui():
                 new_chat = gr.Button("＋ 新しいチャット", variant="secondary")
 
                 gr.Markdown("### 設定")
-                think_mode = gr.Radio(
-                    choices=THINK_CHOICES,
-                    value=THINK_CHOICES[0],
-                    label="思考 (thinking)",
-                    info="OFF は思考トークンを省いて高速化（品質とトレードオフ）",
+                use_search = gr.Checkbox(
+                    label="Web 検索を使う", value=False,
+                    info="最新の情報が必要な質問(ニュース・相場など)のときにオン",
                 )
-                budget_mode = gr.Radio(
-                    choices=BUDGET_CHOICES,
-                    value=BUDGET_CHOICES[0],
-                    label="思考予算 (reflection)",
-                    info="最終回答への自己リフレクション量。auto は質問で自動判定",
-                )
-                use_search = gr.Checkbox(label="Web 検索", value=False)
-                rag_dirs = gr.Textbox(
-                    label="RAG ディレクトリ (カンマ区切り)",
-                    placeholder="/path/to/docs",
-                    lines=2,
-                )
-                out_file = gr.Textbox(
-                    label="出力ファイル (answer.md など)",
-                    placeholder="answer.md",
-                )
-                gr.Markdown(_MODELS_MD)
+                with gr.Accordion("詳細設定(通常は変更不要)", open=False):
+                    think_mode = gr.Radio(
+                        choices=THINK_CHOICES,
+                        value=THINK_CHOICES[0],
+                        label="思考モード",
+                        info="OFF にすると速くなりますが、答えの質は下がることがあります",
+                    )
+                    budget_mode = gr.Radio(
+                        choices=BUDGET_CHOICES,
+                        value=BUDGET_CHOICES[0],
+                        label="考える深さ",
+                        info="深いほど丁寧に考えますが時間がかかります。"
+                             "auto は質問の難しさで自動調整",
+                    )
+                    rag_dirs = gr.Textbox(
+                        label="参考にするフォルダ (RAG)",
+                        placeholder="例: D:\\docs (複数はカンマ区切り)",
+                        info="手元の文書フォルダを指定すると、その内容を参照して答えます",
+                        lines=2,
+                    )
+                    out_file = gr.Textbox(
+                        label="回答の保存先ファイル",
+                        placeholder="例: answer.md",
+                        info="指定すると回答をファイルにも保存します"
+                             "(.md .py .pdf .docx .xlsx など)",
+                    )
+                with gr.Accordion("使用モデル", open=False):
+                    gr.Markdown(_models_md())
 
             # Canvas / Artifacts ワークスペース（右ペイン）
             with gr.Column(scale=3, min_width=320):
-                gr.Markdown("### Canvas / Artifacts")
+                gr.Markdown("### Canvas（作ったものが映る画面）\n"
+                            "<small>HTMLやコードを作らせると、ここに自動で"
+                            "プレビューが出ます</small>")
                 canvas_prev = gr.State("")
                 with gr.Tabs():
                     with gr.Tab("Preview"):

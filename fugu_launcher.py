@@ -463,6 +463,7 @@ def _flag_summary(settings):
 
 def cli_menu(settings):
     print("\n--- 対話CLI (fugu_local.py) ---")
+    print("これからいくつか質問しますが、わからなければ全部そのまま Enter でOKです。")
     question = _ask("質問(空 Enter で対話モードに入る): ")
     params = {"question": question}
     params["search"] = _yes("Web 検索を使う?")
@@ -644,14 +645,17 @@ def main_menu(settings, report):
  Fugu Local — 起動メニュー   [{status}]
  有効な機能: {_flag_summary(settings)}
 ============================================================
- 1) 対話CLI          fugu_local.py
- 2) Web UI           fugu_web.py            http://localhost:7860
- 3) TUI              fugu_tui.py
- 4) REST API         fugu_api:app           http://localhost:8000/docs
- 5) ベンチマーク・評価 >
- 6) 自己進化 >        fugu_evolve
- 7) fugu-rag >        検索・リサーチ
- 8) 設定(機能フラグ / 思考の深さ / OLLAMA_URL)
+ ★ はじめての方: まず 2 を入力 → ブラウザ画面で使えます
+    (回答には数分かかります。黒い画面に経過が流れていれば正常)
+
+ 1) 対話CLI          この画面のまま文字で質問する
+ 2) Web UI           ブラウザのチャット画面(おすすめ)  http://localhost:7860
+ 3) TUI              見た目がリッチなターミナル版
+ 4) REST API         プログラムから使う人向け  http://localhost:8000/docs
+ 5) ベンチマーク・評価 >   精度・速度の測定(上級者向け)
+ 6) 自己進化 >        fugu が自分のコードを改善する(上級者向け)
+ 7) fugu-rag >        文書検索・リサーチ(上級者向け)
+ 8) 設定             機能のON/OFF・考える深さ・Slack通知など
  9) 環境チェックをやり直す
  0) 終了""")
         choice = _choice("選択> ")

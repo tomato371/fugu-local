@@ -6286,6 +6286,28 @@ def _save_answer_to_file(question: str, answer: str, elapsed: float,
     print(f"   [回答を保存しました: {actual}]")
 
 
+#: 対話モードのヘルプ。初心者が最初に読む前提で、専門用語を避けて書く。
+REPL_HELP = """\
+──────────────────────────────────────────────────────
+ 使い方: 質問をそのまま入力して Enter を押すだけです。
+   例) 91は素数ですか？
+   例) このPythonコードのバグを直して: print(1/0)
+   例) 次の文章を英訳して: こんにちは
+
+ ⏳ 回答には数分〜十数分かかります(複数のAIが議論して
+    答えを作るため)。途中経過が流れている間はお待ちください。
+    急ぐときは Ctrl+C で中断できます。
+
+ コマンド(質問の代わりに入力):
+   help              このヘルプをもう一度表示
+   search on / off   Web検索を使う / やめる
+   img <画像> [質問]  画像について質問する
+   save <path>       会話履歴をファイルへ保存
+   reset             会話履歴を消してやり直す
+   exit / quit       終了
+──────────────────────────────────────────────────────"""
+
+
 def repl(use_search=False, rag_dirs=None, history_file=None):
     global _HISTORY
     hfile = history_file or HISTORY_FILE
@@ -6297,9 +6319,7 @@ def repl(use_search=False, rag_dirs=None, history_file=None):
         flags.append(f"RAG:{','.join(str(d) for d in dirs)}")
     if flags:
         print(f"   [{', '.join(flags)}]")
-    print("コマンド: 'exit'/'quit' で終了  'reset' で会話履歴クリア  "
-          "'search on/off' で Web検索切替  'save <path>' で履歴エクスポート  "
-          "'img <画像パス> [質問]' で vision モデルへ質問")
+    print(REPL_HELP)
     while True:
         try:
             q = input("\nUser> ").strip()
@@ -6311,6 +6331,11 @@ def repl(use_search=False, rag_dirs=None, history_file=None):
         low = q.lower()
         if low in ("exit", "quit"):
             break
+        # 初心者が最初に打ちがちな語はヘルプへ(質問としてモデルに送って
+        # 数分待たせない)。本当に「help」を質問したい場合は文章にすれば通る。
+        if low in ("help", "?", "？", "ヘルプ", "へるぷ", "commands"):
+            print(REPL_HELP)
+            continue
         if low == "reset":
             _HISTORY.clear()
             save_history_file(_HISTORY, path=hfile)

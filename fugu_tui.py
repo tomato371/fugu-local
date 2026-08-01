@@ -120,15 +120,31 @@ def ask_rich(question, use_search=False, rag_dirs=None, out_file=None):
 # REPL
 # ──────────────────────────────────────────────────
 
-_HELP = """コマンド一覧:
-  /search on|off    Web 検索を有効/無効化
-  /rag <dir>        RAG ディレクトリを設定 (カンマ区切りで複数可)
-  /rag off          RAG を無効化
+_HELP = """使い方: 質問をそのまま入力して Enter を押すだけです。
+  例) 91は素数ですか？
+  例) このコードのバグを直して: print(1/0)
+
+⏳ 回答には数分〜十数分かかります(複数のAIが議論して答えを作るため)。
+   途中経過が流れている間はお待ちください。Ctrl+C で中断できます。
+
+コマンド一覧(質問の代わりに入力):
+  /search on|off    Web 検索を使う / やめる
+  /rag <dir>        参考にするフォルダを設定 (カンマ区切りで複数可)
+  /rag off          フォルダ参照をやめる
   /out <file>       次の回答をファイルに保存 (answer.md, result.py など)
-  /reset            会話履歴をクリア
-  /history          現在の会話履歴を表示
+  /reset            会話履歴を消してやり直す
+  /history          いままでの会話を表示
   /help             このヘルプを表示
   /exit | /quit     終了"""
+
+
+def _models_line():
+    """導入済みモデル構成(setup 後に呼ぶ)。未解決でも落とさない。"""
+    try:
+        proposers = ", ".join(fugu.PROPOSERS or []) or "(未解決)"
+        return f"Conductor: {fugu.CONDUCTOR or '(未解決)'}  |  Proposers: {proposers}"
+    except Exception:
+        return "モデル構成は起動ログを参照"
 
 
 def repl():
@@ -136,12 +152,9 @@ def repl():
     rag_dirs = []
     out_file = None
 
-    console.rule("[bold blue]Fugu Local MoA[/bold blue]")
-    console.print(
-        "[dim]Conductor: qwen3:4b  |  "
-        "Proposers: qwen3-coder:30b, phi4, gpt-oss:20b[/dim]"
-    )
-    console.print("[dim]/help でコマンド一覧  |  /exit で終了[/dim]\n")
+    console.rule("[bold blue]🐡 Fugu Local — ターミナル版[/bold blue]")
+    console.print(f"[dim]{_models_line()}[/dim]")
+    console.print(Panel(_HELP, title="はじめての方へ", border_style="dim"))
 
     if _HAS_PT:
         session = PromptSession(
@@ -162,6 +175,12 @@ def repl():
             break
 
         if not raw:
+            continue
+
+        # スラッシュ無しの help も拾う(初心者が最初に打ちがち。
+        # 質問としてモデルに送って数分待たせない)
+        if raw.lower() in ("help", "?", "？", "ヘルプ"):
+            console.print(Panel(_HELP, title="Help", border_style="dim"))
             continue
 
         # ── コマンド処理 ──
@@ -232,6 +251,8 @@ def repl():
             border_style="cyan",
             padding=(0, 1),
         ))
+        console.print("[dim]⏳ 複数のAIが議論して答えを作ります"
+                      "(数分〜十数分)。Ctrl+C で中断できます。[/dim]")
 
         ask_rich(raw, use_search=use_search,
                  rag_dirs=rag_dirs or None, out_file=out_file)
