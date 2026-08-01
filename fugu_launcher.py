@@ -422,9 +422,20 @@ def _ask(prompt, default=""):
     return answer or default
 
 
+#: 全角の数字・記号・よく使う英字を半角に寄せる(メニュー入力の表記ゆれ対策)
+_ZENKAKU = str.maketrans("０１２３４５６７８９ｑｔｖｕｒｙｎ）．", "0123456789qtvuryn).")
+
+
+def _choice(prompt):
+    """メニュー選択を 1 つ読む。「2)」「２」「 2. 」のような入力も「2」に正規化する
+    — 実際に『2)』と打たれて何も起動しない事故があった。"""
+    raw = _ask(prompt).translate(_ZENKAKU).lower()
+    return raw.strip().rstrip(").。.").strip()
+
+
 def _yes(prompt, default=False):
     suffix = "[Y/n]" if default else "[y/N]"
-    answer = _ask(f"{prompt} {suffix}: ").lower()
+    answer = _ask(f"{prompt} {suffix}: ").translate(_ZENKAKU).lower()
     if not answer:
         return default
     return answer.startswith("y")
@@ -476,7 +487,7 @@ def bench_menu(settings):
  6) 手元の評価セット            eval_fugu.py
  7) 実行時間の内訳レポート      bench_profile_report.py
  0) 戻る""")
-        choice = _ask("選択> ")
+        choice = _choice("選択> ")
         if choice in ("0", ""):
             return
         if choice == "1":
@@ -518,7 +529,7 @@ def evolve_menu(settings):
  4) プロンプト定数を進化させる   --prompts NAME
  0) 戻る
  ※ 2/3 は auto-evolve/* ブランチ上でのみ編集・commit されます。""")
-        choice = _ask("選択> ")
+        choice = _choice("選択> ")
         if choice in ("0", ""):
             return
         if choice == "1":
@@ -550,7 +561,7 @@ def rag_menu(settings):
  4) 生成品質の評価            eval-gen
  5) 棄却性能の評価(CRAG)      eval-crag
  0) 戻る""")
-        choice = _ask("選択> ")
+        choice = _choice("選択> ")
         if choice in ("0", ""):
             return
         if choice == "1":
@@ -585,7 +596,7 @@ def settings_menu(settings):
         print(f" u) Ollama     OLLAMA_URL           = {settings['ollama_url']}")
         print(f" r) fugu-rag のパス                 = {settings['rag_repo']}")
         print(" 0) 戻る(保存されます)")
-        choice = _ask("選択(番号でトグル)> ").lower()
+        choice = _choice("選択(番号でトグル)> ")
         if choice in ("0", ""):
             save_settings(settings)
             return
@@ -626,7 +637,7 @@ def main_menu(settings, report):
  8) 設定(機能フラグ / 思考の深さ / OLLAMA_URL)
  9) 環境チェックをやり直す
  0) 終了""")
-        choice = _ask("選択> ")
+        choice = _choice("選択> ")
         if choice in ("0", "q"):
             return 0
         if choice == "1":
@@ -655,6 +666,9 @@ def main_menu(settings, report):
             report = check_env(settings)
             print("\n" + format_check(report))
             _pause()
+        elif choice:
+            print(f"⚠ 「{choice}」は選択肢にありません。0〜9 の番号だけを入力して"
+                  "ください(例: 2)。")
 
 
 def main(argv=None):

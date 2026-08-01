@@ -262,6 +262,27 @@ def test_run_server_refuses_to_spawn_on_busy_port(server_env, monkeypatch):
 
 # ------------------------------------------------------------------ 入力処理
 
+@pytest.mark.parametrize("typed,expected", [
+    ("2", "2"),
+    ("2)", "2"),        # 実際にあった: メニュー表記どおり「2)」と打った
+    ("２）", "2"),      # 全角
+    (" 2. ", "2"),
+    ("２", "2"),
+    ("0", "0"),
+    ("q", "q"),
+    ("ｑ", "q"),
+    ("t", "t"),
+])
+def test_choice_normalizes_menu_input(monkeypatch, typed, expected):
+    monkeypatch.setattr("builtins.input", lambda prompt="": typed)
+    assert L._choice("選択> ") == expected
+
+
+def test_yes_accepts_fullwidth_y(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "ｙ")
+    assert L._yes("続行?") is True
+
+
 def test_ask_exits_instead_of_looping_on_eof(monkeypatch):
     """パイプ実行などで stdin が閉じたとき、空文字を返して無限ループしないこと。"""
     def eof(prompt=""):
