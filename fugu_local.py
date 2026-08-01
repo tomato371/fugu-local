@@ -4873,11 +4873,14 @@ def _adversarial_check(question, answer, ok, issue):
 
 def _mav_verifiers():
     """MAV / 探索共用: 小型モデル(FALLBACK_MODEL)で回す既定 5 検証者。
-    検証者に大型モデルを使うと予算が溶けるため、意図的に小型へ固定する。"""
+    検証者に大型モデルを使うと予算が溶けるため、意図的に小型へ固定する。
+    think=False も同じ理由(critique() の高速パスと同じ設計判断)——
+    思考ONの qwen3:4b はスキーマ判定 1 回に数分かかることが実測されている。
+    計算の厳密さは ComputationalVerifier の sandbox 検算(PoT)が担う。"""
     import fugu_llm
     import fugu_verify
     return fugu_verify.default_verifiers(
-        lambda aspect: fugu_llm.AskChat(model=FALLBACK_MODEL,
+        lambda aspect: fugu_llm.AskChat(model=FALLBACK_MODEL, think=False,
                                         label=f"verify-{aspect}"))
 
 

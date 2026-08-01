@@ -167,3 +167,6 @@ def test_mav_verifiers_use_the_small_model():
                        "constraint", "codetest"]
     for v in verifiers:
         assert v.chat.model == f.FALLBACK_MODEL
+        # 思考ONの4bはスキーマ判定1回に数分かかる(実測) — critique() の
+        # 高速パスと同じく think=False で回す
+        assert v.chat.think is False
