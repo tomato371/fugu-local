@@ -58,6 +58,14 @@ On 8 GB VRAM, large models run with automatic RAM offload (absorbed by 48 GB RAM
 - 💬 **Session memory** — persistent conversation history, per-project sessions
 - 🖥️ **Three front-ends** — CLI, a **Gradio web UI** (`fugu_web.py`), and a **TUI** (`fugu_tui.py`)
 - 📊 **Benchmark suite** — `bench_fugu.py` / `eval_fugu.py` for accuracy evaluation
+- 🖼️ **Vision input** — `--image photo.png` routes to a local vision model (`FUGU_VISION_MODEL`)
+- 🛠️ **Sandbox + self-debug** — generated code runs in a subprocess sandbox; failures are fed back to the model for repair (`fugu_sandbox.py`), with **test-driven criticism** drafting pytest tests before approval (`fugu_tdc.py`)
+- 🤔 **Thinking budget** — `--thinking-budget low|medium|high|auto` scales final-answer self-reflection (test-time compute)
+- 🌐 **Browser layer** — Playwright → httpx+bs4 → stdlib fallback fetches page bodies to enrich search snippets (`FUGU_BROWSER=1`)
+- 🎨 **Canvas / Artifacts** — the web UI gets a right-hand pane with live HTML/SVG preview, code view, version diff, and export
+- 📡 **Real-time streaming** — pipeline events (plan / proposals / aggregate / sandbox / critic / final) over SSE and WebSocket
+- 🧬 **Self-evolution** — `python -m fugu_evolve` profiles the repo, proposes improvements, implements them on guarded `auto-evolve/*` branches, verifies in the sandbox, and merges only on critic approval
+- 🧩 **fugu_core middleware** — episodic memory, multi-round state compression, speculative prefetching, and a structured debate protocol (all opt-in env flags)
 
 ## Requirements
 
@@ -90,9 +98,53 @@ python fugu_local.py --search "What is the latest S&P 500 level?"
 # With RAG over a docs folder
 python fugu_local.py --rag ./docs "Implement a PINN for this problem"
 
-# Web UI (Gradio)
+# Spend more test-time compute on a hard question
+python fugu_local.py --thinking-budget high "Prove that sqrt(2) is irrational"
+
+# Describe an image with a local vision model
+python fugu_local.py --image photo.png "What is in this picture?"
+
+# Web UI (Gradio) — includes the Canvas/Artifacts pane
 python fugu_web.py
 ```
+
+## Opt-in feature flags
+
+Every new capability ships behind an env flag + lazy import: **with no flags set,
+behavior is byte-identical to the classic pipeline.**
+
+| Flag | Effect |
+|---|---|
+| `FUGU_SANDBOX=1` | Route generated-code execution through the subprocess sandbox |
+| `FUGU_TDC=1` | Critic drafts pytest tests and runs them before approving code answers |
+| `FUGU_THINKING_BUDGET=low\|medium\|high\|auto` | Final-answer self-reflection budget (also `--thinking-budget`) |
+| `FUGU_BROWSER=1` | Enrich web-search snippets with fetched page bodies (`FUGU_BROWSER_BACKEND` picks playwright/httpx/urllib) |
+| `FUGU_MEMORY=1` | Record sandbox/evolution episodes and inject past lessons into new questions (`FUGU_MEMORY_PATH`) |
+| `FUGU_COMPRESS=1` | Compress the running draft into a structured digest before round ≥ 2 (protects the pinned `num_ctx`) |
+| `FUGU_SPECULATE=1` | Prefetch web/RAG context concurrently with Conductor planning |
+| `FUGU_DEBATE=1` | Mutual-critique debate when proposals diverge + per-domain model score matrix (`FUGU_SCORE_PATH`) |
+| `FUGU_VISION_MODEL=<model>` | Vision model for `--image` (default `llama3.2-vision`) |
+| `FUGU_HIGH_VRAM=1` | Relax the 8 GB context limits on bigger GPUs |
+
+## Self-evolution (fugu_evolve)
+
+```bash
+# Propose improvements only (no branch, no edits)
+python -m fugu_evolve --repo . --dry-run
+
+# Full loop: profile -> plan -> implement on auto-evolve/* branch -> verify -> critic -> merge
+python -m fugu_evolve --repo . --max-proposals 1
+
+# Leave verified branches for human review instead of merging
+python -m fugu_evolve --repo . --pr-mode
+
+# Evolve a prompt constant (adopted only if it beats the baseline)
+python -m fugu_evolve --prompts PRESENTATION_STYLE
+```
+
+Safety: edits, commits, and every destructive git operation are structurally
+restricted to `auto-evolve/*` branches; verification requires 100% tests passing
+and bench non-regression; adopted merges are logged to `docs/evolution_history.md`.
 
 ## Run with Docker
 
@@ -139,20 +191,37 @@ curl -X POST http://localhost:8000/ask \
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Is the Ollama backend reachable? |
-| `POST` | `/ask` | Answer a question via the full MoA pipeline |
+| `POST` | `/ask` | Answer a question via the full MoA pipeline (accepts `thinking_budget`) |
+| `GET` | `/ask/stream` | Same, streaming real-time pipeline events as Server-Sent Events |
+| `WS` | `/ws/ask` | Same event stream over WebSocket |
+| `POST` | `/completion` | Inline code completion (single coder-model call, IDE-oriented) |
+| `POST` | `/refactor` | Instructed rewrite + unified diff |
+| `POST` | `/test-run` | Sandboxed execution with optional pytest tests / self-debug retries |
+
+IDE endpoint schemas and curl examples: `docs/api_ide.md`.
 
 ## Project structure
 
 | File | Purpose |
 |---|---|
 | `fugu_local.py` | Core orchestrator + CLI (Conductor / Critic / Proposers / Aggregator) |
-| `fugu_web.py` | Gradio web front-end |
-| `fugu_api.py` | FastAPI REST API (`POST /ask`, `GET /health`) |
+| `fugu_web.py` | Gradio web front-end (chat + Canvas/Artifacts pane) |
+| `fugu_api.py` | FastAPI REST API (ask / SSE / WebSocket / IDE endpoints) |
 | `fugu_tui.py` | Terminal UI front-end |
+| `fugu_llm.py` | `Chat` protocol + `AskChat` adapter (injection seam for every new module) |
+| `fugu_sandbox.py` | Subprocess execution sandbox + self-debug repair loop |
+| `fugu_tdc.py` | Test-driven criticism (draft pytest tests, approve only on green) |
+| `fugu_thinking.py` | Dynamic thinking budget (reflection loop, auto classification) |
+| `fugu_browser.py` | Pluggable browser: playwright / httpx+bs4 / stdlib fallbacks |
+| `fugu_artifacts.py` | Canvas logic: artifact extraction, preview HTML, diffs (no Gradio dependency) |
+| `fugu_core/` | Middleware: episodic memory, state compression, speculative execution, debate |
+| `fugu_evolve/` | Self-improvement loop: profiler / planner / workspace / evaluator / CLI / prompt evolver |
+| `fugu_prompts/` | Prompt-override layer written by the prompt evolver |
 | `bench_fugu.py` | Benchmark runner (accuracy) |
 | `bench_queue.py` | Batch/queue benchmarking |
 | `eval_fugu.py` | Evaluation utilities |
-| `test_fugu_offline.py` | Offline unit tests (no model required) |
+| `test_fugu_offline.py` | Offline characterization checks (no model required) |
+| `tests/` | Offline pytest suite for every module above |
 | `Dockerfile` | Container image for the app (web UI by default) |
 | `docker-compose.yml` | One-command stack: Ollama + fugu web UI |
 | `requirements.txt` | Optional deps (web UI + file I/O); core needs none |
