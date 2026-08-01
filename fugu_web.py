@@ -39,9 +39,10 @@ SESS_DIR = Path.home() / ".fugu_sessions"
 
 THINK_CHOICES = ["モデル既定", "OFF（高速）"]
 
-# 思考予算(fugu_thinking): OFF なら従来動作。値は FUGU_THINKING_BUDGET env 経由で
-# fugu_answer のフックに伝わる（CLI --thinking-budget と同じ経路）。
-BUDGET_CHOICES = ["OFF", "low", "medium", "high", "auto"]
+# 拡張思考(fugu_thinking): OFF なら従来動作。6段階+auto。値は
+# FUGU_THINKING_BUDGET env 経由で fugu_answer のフックに伝わる
+# （CLI --thinking-budget と同じ経路）。
+BUDGET_CHOICES = ["OFF", "minimal", "low", "medium", "high", "ultra", "max", "auto"]
 
 # Canvas エクスポートの書き出し先（gr.File はパスを受けるためファイル化が必要）
 ARTIFACT_DIR = Path(tempfile.gettempdir()) / "fugu_artifacts"

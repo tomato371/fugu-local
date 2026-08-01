@@ -46,8 +46,11 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, examples=["Is 91 a prime number?"])
     use_search: bool = Field(False, description="Inject DuckDuckGo web-search context")
     rag_dirs: Optional[List[str]] = Field(None, description="Local document dirs for RAG")
-    thinking_budget: Optional[Literal["low", "medium", "high", "auto"]] = Field(
-        None, description="Self-reflection budget for the final answer (auto = classify)")
+    thinking_budget: Optional[Literal["minimal", "low", "medium", "high",
+                                      "ultra", "max", "auto"]] = Field(
+        None, description="Extended-thinking depth, 6 levels + auto "
+                          "(controls think mode, reflection count, and the "
+                          "MoA round floor)")
 
 
 class AskResponse(BaseModel):

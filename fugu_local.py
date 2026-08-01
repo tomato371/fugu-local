@@ -4781,6 +4781,24 @@ def _finish_answer(question, answer):
     return answer
 
 
+def _thinking_rounds_floor(question):
+    """FUGU_THINKING_BUDGET 設定時のみ、予算の min_rounds(MoA ラウンド下限)を返す。
+    拡張思考: ultra/max はリフレクションだけでなく合議の反復も深くする (Doc B2拡張)。
+    auto はヒューリスティック分類のみ(ここで追加の LLM 呼び出しをしない)。
+    未設定・失敗は 0(計画に介入しない)。"""
+    mode = os.environ.get("FUGU_THINKING_BUDGET", "")
+    if not mode or mode == "off":
+        return 0
+    try:
+        import fugu_thinking
+    except ImportError:
+        return 0
+    try:
+        return fugu_thinking.decide_budget(question, None, mode).min_rounds
+    except Exception:
+        return 0
+
+
 def _apply_thinking(question, answer):
     """FUGU_THINKING_BUDGET 設定時のみ、最終回答に思考予算(fugu_thinking)を適用する。
     未設定/off なら answer をそのまま返す(既定経路はこの分岐に一切入らない)。
@@ -4905,7 +4923,8 @@ def fugu_answer(question, plan=None, history=None):
 
     # ---------- 合議(MoA)モード：選抜した分だけ、必要なら再帰的に反復 ----------
     models = plan["selected_proposers"] or PROPOSERS[:3]
-    planned = min(MAX_ROUNDS, max(1, plan["rounds"]))
+    # 拡張思考: 深い予算(high/ultra/max)は MoA ラウンド数の下限も引き上げる(既定は 0=不介入)
+    planned = min(MAX_ROUNDS, max(1, plan["rounds"], _thinking_rounds_floor(question)))
     reference = seed_answer  # エスカレーションなら単体回答を初期ドラフトとして再利用
     issue_hint = seed_issue
     final = None
@@ -6096,9 +6115,12 @@ def main():
                         help=f"会話履歴ファイルパス（既定: {HISTORY_FILE}）")
     parser.add_argument("--image", nargs="+", metavar="PATH",
                         help=f"画像ファイルを vision モデル({VISION_MODEL})へ渡す（複数可）")
-    parser.add_argument("--thinking-budget", choices=["low", "medium", "high", "auto", "off"],
+    parser.add_argument("--thinking-budget",
+                        choices=["minimal", "low", "medium", "high", "ultra", "max",
+                                 "auto", "off"],
                         default=None,
-                        help="思考予算: 最終回答への自己リフレクション量（auto=質問で自動判定。"
+                        help="拡張思考の深さ6段階+off（think・自己リフレクション回数・"
+                             "MoAラウンド下限を段階制御。auto=質問で自動判定。"
                              "既定は無効＝従来動作）")
     parser.add_argument("--resume", metavar="BOARD_ID",
                         help="中断したタスクボードを未完了サブタスクから再開する"

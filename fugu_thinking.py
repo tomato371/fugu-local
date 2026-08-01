@@ -24,23 +24,39 @@ from typing import Callable, Dict, Optional
 
 @dataclass(frozen=True)
 class Budget:
-    """思考予算1段分。reflections=0 は「追加の熟考なし」を意味する。"""
+    """思考予算1段分。reflections=0 は「追加の熟考なし」を意味する。
+
+    min_rounds は MoA モード時のラウンド数の下限(拡張思考: 深い予算は最終回答の
+    リフレクションだけでなく合議の反復も深くする)。0 は「計画に介入しない」。
+    """
 
     name: str
     reflections: int            # 最終回答へのリフレクション回数
     think: Optional[bool]       # ask() の think(None=モデル既定)
     num_predict: Optional[int]  # 生成トークン上限(None=既定)
+    min_rounds: int = 0         # MoA ラウンド数の下限(MAX_ROUNDS でキャップ)
 
 
-#: 3段の思考予算。low は速度優先(リフレクションなし・think OFF・短い生成)、
-#: high は精度優先(2回リフレクション・think ON)。think=True は思考対応モデル
-#: (既定の AskChat は CONDUCTOR=qwen3:4b)前提 — 非対応モデルなら ask() が
-#: __ERROR__ → RuntimeError となり reflect が安全に打ち切る。
+#: 拡張思考の6段階(off を含めて7構成)。深くなるほど think・リフレクション回数・
+#: MoA 最低ラウンドが増える。think=True は思考対応モデル(既定の AskChat は
+#: CONDUCTOR=qwen3:4b)前提 — 非対応モデルなら ask() が __ERROR__ →
+#: RuntimeError となり reflect が安全に打ち切る。
+#: 旧3段からの移行: 旧 low(リフレクションなしの速度優先)は "minimal" に改名され、
+#: 新 "low" は軽い自己点検1回を持つ。medium/high は従来と同一。
 BUDGETS: Dict[str, Budget] = {
-    "low": Budget("low", reflections=0, think=False, num_predict=1024),
+    "minimal": Budget("minimal", reflections=0, think=False, num_predict=1024),
+    "low": Budget("low", reflections=1, think=False, num_predict=1024),
     "medium": Budget("medium", reflections=1, think=None, num_predict=None),
-    "high": Budget("high", reflections=2, think=True, num_predict=None),
+    "high": Budget("high", reflections=2, think=True, num_predict=None,
+                   min_rounds=1),
+    "ultra": Budget("ultra", reflections=3, think=True, num_predict=None,
+                    min_rounds=2),
+    "max": Budget("max", reflections=4, think=True, num_predict=None,
+                  min_rounds=3),
 }
+
+#: 深さの順序(auto 分類・ドキュメント・UI 表示の共通基準)。
+LEVELS: tuple = ("minimal", "low", "medium", "high", "ultra", "max")
 
 DEFAULT_BUDGET: str = "medium"
 
@@ -61,19 +77,30 @@ _WORD = re.compile(r"[a-z0-9]+")
 #: 「これ以下なら短い質問」とみなす文字数(日本語は語分割できないため文字数基準)。
 _SHORT_CHARS: int = 40
 
+#: 挨拶・雑談級の合図(minimal 判定用。部分一致)。
+_TRIVIAL_CUES: frozenset = frozenset(
+    {"hello", "hi ", "thanks", "thank you",
+     "こんにちは", "こんばんは", "おはよう", "ありがとう", "やあ"}
+)
+
+#: ultra 判定: 高予算語彙に加えて本文がこの文字数を超える(多段の重い問題)。
+_ULTRA_CHARS: int = 200
+
 _CLASSIFY_SCHEMA: Dict[str, object] = {
     "type": "object",
-    "properties": {"budget": {"type": "string", "enum": ["low", "medium", "high"]}},
+    "properties": {"budget": {"type": "string", "enum": list(LEVELS)}},
     "required": ["budget"],
 }
 
 _CLASSIFY_SYSTEM: str = (
     "You are a task-complexity classifier for a local reasoning system. Classify "
     "how much thinking budget the question needs. Reply with JSON only.\n"
+    "- minimal: greetings or trivial chat.\n"
     "- low: simple lookups or short factual questions.\n"
     "- medium: ordinary questions needing some reasoning.\n"
-    "- high: math, proofs, algorithm design, physics derivations, or multi-step "
-    "engineering problems."
+    "- high: math, proofs, algorithm design, physics derivations.\n"
+    "- ultra: long multi-step engineering or research problems.\n"
+    "- max: only when the user explicitly demands maximum-effort reasoning."
 )
 
 _REFLECT_SYSTEM: str = (
@@ -85,19 +112,26 @@ _REFLECT_SYSTEM: str = (
 
 
 def heuristic_budget(question: str) -> str:
-    """LLM 不要の決定的フォールバック分類。
+    """LLM 不要の決定的フォールバック分類(6段階)。
 
-    1. 高予算語彙(数学/証明/実装系)を含む -> "high"
-    2. 短い質問(:data:`_SHORT_CHARS` 文字以下) -> "low"
-    3. それ以外 -> "medium"
+    1. 高予算語彙(数学/証明/実装系)を含む -> 本文が :data:`_ULTRA_CHARS` 文字を
+       超えるなら "ultra"、それ以外は "high"
+    2. 挨拶・雑談級の合図 -> "minimal"
+    3. 短い質問(:data:`_SHORT_CHARS` 文字以下) -> "low"
+    4. それ以外 -> "medium"
+
+    "max" はヒューリスティックでは選ばない(明示指定か auto の LLM 分類のみ —
+    最大予算を誤発火させない)。
     """
     q = question.lower()
     for cue in _HIGH_CUES:
         if cue.isascii():
             if re.search(r"\b" + re.escape(cue) + r"\b", q):
-                return "high"
+                return "ultra" if len(q.strip()) > _ULTRA_CHARS else "high"
         elif cue in q:
-            return "high"
+            return "ultra" if len(q.strip()) > _ULTRA_CHARS else "high"
+    if any(cue in q for cue in _TRIVIAL_CUES):
+        return "minimal"
     if len(q.strip()) <= _SHORT_CHARS:
         return "low"
     return "medium"
@@ -106,7 +140,7 @@ def heuristic_budget(question: str) -> str:
 def decide_budget(question: str, chat=None, mode: str = "auto") -> Budget:
     """mode に応じた :class:`Budget` を返す。
 
-    明示指定("low"/"medium"/"high")はそのまま。"auto"(および未知値)は
+    明示指定(:data:`LEVELS` の6段階)はそのまま。"auto"(および未知値)は
     chat があれば JSON スキーマ制約付き分類、chat が無い・失敗・語彙外なら
     :func:`heuristic_budget` に落ちる — 常に有効な Budget を返す。
     """
@@ -115,8 +149,9 @@ def decide_budget(question: str, chat=None, mode: str = "auto") -> Budget:
         return BUDGETS[key]
     if chat is not None:
         try:
+            options = " | ".join(f'"{level}"' for level in LEVELS)
             raw = chat.complete(
-                f'Question: {question}\n\nRespond with {{"budget": "low" | "medium" | "high"}}.',
+                f'Question: {question}\n\nRespond with {{"budget": {options}}}.',
                 system=_CLASSIFY_SYSTEM,
                 fmt=_CLASSIFY_SCHEMA,
                 temperature=0.0,

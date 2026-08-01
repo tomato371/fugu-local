@@ -5,6 +5,7 @@ from fugu_llm import FakeChat
 from fugu_thinking import (
     BUDGETS,
     DEFAULT_BUDGET,
+    LEVELS,
     Budget,
     decide_budget,
     heuristic_budget,
@@ -19,16 +20,30 @@ def _boom(prompt):
 
 # ------------------------------------------------------------------ BUDGETS
 
-def test_budgets_have_three_increasing_levels():
-    assert set(BUDGETS) == {"low", "medium", "high"}
-    assert BUDGETS["low"].reflections < BUDGETS["medium"].reflections
-    assert BUDGETS["medium"].reflections < BUDGETS["high"].reflections
+def test_budgets_have_six_levels_in_depth_order():
+    assert LEVELS == ("minimal", "low", "medium", "high", "ultra", "max")
+    assert set(BUDGETS) == set(LEVELS)
+    reflections = [BUDGETS[name].reflections for name in LEVELS]
+    assert reflections == sorted(reflections)          # 深いほど非減少
+    assert reflections[0] == 0 and reflections[-1] == 4
+    min_rounds = [BUDGETS[name].min_rounds for name in LEVELS]
+    assert min_rounds == sorted(min_rounds)            # ラウンド下限も非減少
+    assert min_rounds[-1] == 3
     assert DEFAULT_BUDGET in BUDGETS
 
 
-def test_low_budget_is_speed_oriented():
-    assert BUDGETS["low"].think is False
-    assert BUDGETS["low"].num_predict is not None
+def test_minimal_budget_is_speed_oriented():
+    assert BUDGETS["minimal"].think is False
+    assert BUDGETS["minimal"].reflections == 0
+    assert BUDGETS["minimal"].num_predict is not None
+    assert BUDGETS["minimal"].min_rounds == 0
+
+
+def test_deep_budgets_enable_think_and_rounds():
+    for name in ("high", "ultra", "max"):
+        assert BUDGETS[name].think is True
+    assert BUDGETS["ultra"].min_rounds == 2
+    assert BUDGETS["max"].min_rounds == 3
 
 
 # ------------------------------------------------------------------ heuristic
@@ -36,6 +51,24 @@ def test_low_budget_is_speed_oriented():
 def test_heuristic_math_cue_is_high():
     assert heuristic_budget("Prove the theorem that sqrt(2) is irrational") == "high"
     assert heuristic_budget("この方程式を導出してください。境界条件は以下の通りで…") == "high"
+
+
+def test_heuristic_long_hard_problem_is_ultra():
+    q = ("Prove the following theorem and derive every intermediate lemma: " +
+         "consider a compressible fluid in a rotating frame " * 5)
+    assert len(q) > 200
+    assert heuristic_budget(q) == "ultra"
+
+
+def test_heuristic_greeting_is_minimal():
+    assert heuristic_budget("こんにちは！") == "minimal"
+    assert heuristic_budget("thanks a lot") == "minimal"
+
+
+def test_heuristic_never_returns_max():
+    for q in ("hi", "capital of France?", "Prove the theorem",
+              "x" * 500, "Prove " + "y" * 500):
+        assert heuristic_budget(q) != "max"
 
 
 def test_heuristic_word_boundary_avoids_improve_false_positive():
@@ -58,9 +91,14 @@ def test_heuristic_long_prose_is_medium():
 
 def test_decide_budget_explicit_modes_bypass_chat():
     chat = FakeChat(fn=_boom)  # 呼ばれたら失敗
-    for name in ("low", "medium", "high"):
+    for name in LEVELS:
         assert decide_budget("q", chat, name) is BUDGETS[name]
     assert not chat.calls
+
+
+def test_decide_budget_auto_accepts_new_levels():
+    chat = FakeChat(responses=[json.dumps({"budget": "ultra"})])
+    assert decide_budget("long hard problem", chat, "auto") is BUDGETS["ultra"]
 
 
 def test_decide_budget_auto_uses_chat_classification():
@@ -113,8 +151,14 @@ def test_reflect_bounded_by_budget_reflections():
 
 def test_reflect_zero_reflections_never_calls_chat():
     chat = FakeChat(fn=_boom)
-    assert reflect("q", "draft", chat, BUDGETS["low"]) == "draft"
+    assert reflect("q", "draft", chat, BUDGETS["minimal"]) == "draft"
     assert not chat.calls
+
+
+def test_reflect_max_budget_allows_four_rounds():
+    chat = FakeChat(fn=lambda p: "always different " + str(len(p)))
+    reflect("q", "draft", chat, BUDGETS["max"])
+    assert len(chat.calls) == 4
 
 
 def test_reflect_chat_failure_returns_current_best():
@@ -125,10 +169,22 @@ def test_reflect_chat_failure_returns_current_best():
 
 # ------------------------------------------------------------------ refine_answer
 
-def test_refine_answer_low_mode_is_passthrough():
+def test_refine_answer_minimal_mode_is_passthrough():
     def factory(budget):
-        raise AssertionError("low は chat を作らない")
-    assert refine_answer("q", "ans", "low", factory) == "ans"
+        raise AssertionError("minimal は chat を作らない")
+    assert refine_answer("q", "ans", "minimal", factory) == "ans"
+
+
+def test_refine_answer_low_now_reflects_once():
+    chats = []
+
+    def factory(budget):
+        chat = FakeChat(responses=["polished", "OK"])
+        chats.append(budget.name)
+        return chat
+
+    assert refine_answer("q", "ans", "low", factory) == "polished"
+    assert chats == ["low"]
 
 
 def test_refine_answer_high_mode_reflects():
@@ -175,6 +231,31 @@ def test_budget_dataclass_is_frozen():
     import pytest
     with pytest.raises(Exception):
         Budget("x", 0, None, None).reflections = 5  # type: ignore[misc]
+
+
+# ------------------------------------------------------------------ rounds floor
+
+def test_thinking_rounds_floor_disabled_by_default(monkeypatch):
+    import fugu_local
+    monkeypatch.delenv("FUGU_THINKING_BUDGET", raising=False)
+    assert fugu_local._thinking_rounds_floor("q") == 0
+
+
+def test_thinking_rounds_floor_by_level(monkeypatch):
+    import fugu_local
+    for mode, expected in (("minimal", 0), ("medium", 0), ("high", 1),
+                           ("ultra", 2), ("max", 3), ("off", 0)):
+        monkeypatch.setenv("FUGU_THINKING_BUDGET", mode)
+        assert fugu_local._thinking_rounds_floor("q") == expected, mode
+
+
+def test_thinking_rounds_floor_auto_is_heuristic_only(monkeypatch):
+    import fugu_local
+    monkeypatch.setenv("FUGU_THINKING_BUDGET", "auto")
+    monkeypatch.setattr(fugu_local, "ask",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("ラウンド下限判定で LLM を呼ばない")))
+    assert fugu_local._thinking_rounds_floor("Prove the theorem now") == 1  # high
 
 
 # ------------------------------------------------------------------ fugu_local hook

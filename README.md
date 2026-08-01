@@ -60,7 +60,7 @@ On 8 GB VRAM, large models run with automatic RAM offload (absorbed by 48 GB RAM
 - 📊 **Benchmark suite** — `bench_fugu.py` / `eval_fugu.py` for accuracy evaluation
 - 🖼️ **Vision input** — `--image photo.png` routes to a local vision model (`FUGU_VISION_MODEL`)
 - 🛠️ **Sandbox + self-debug** — generated code runs in a subprocess sandbox; failures are fed back to the model for repair (`fugu_sandbox.py`), with **test-driven criticism** drafting pytest tests before approval (`fugu_tdc.py`)
-- 🤔 **Thinking budget** — `--thinking-budget low|medium|high|auto` scales final-answer self-reflection (test-time compute)
+- 🤔 **Extended thinking** — `--thinking-budget minimal|low|medium|high|ultra|max|auto` scales test-time compute across 6 depth levels (+off): thinking mode, self-reflection count, and the MoA round floor deepen together
 - 🌐 **Browser layer** — Playwright → httpx+bs4 → stdlib fallback fetches page bodies to enrich search snippets (`FUGU_BROWSER=1`)
 - 🎨 **Canvas / Artifacts** — the web UI gets a right-hand pane with live HTML/SVG preview, code view, version diff, and export
 - 📡 **Real-time streaming** — pipeline events (plan / proposals / aggregate / sandbox / critic / final) over SSE and WebSocket
@@ -127,7 +127,7 @@ behavior is byte-identical to the classic pipeline.**
 |---|---|
 | `FUGU_SANDBOX=1` | Route generated-code execution through the subprocess sandbox |
 | `FUGU_TDC=1` | Critic drafts pytest tests and runs them before approving code answers |
-| `FUGU_THINKING_BUDGET=low\|medium\|high\|auto` | Final-answer self-reflection budget (also `--thinking-budget`) |
+| `FUGU_THINKING_BUDGET=minimal\|low\|medium\|high\|ultra\|max\|auto` | Extended-thinking depth, 6 levels + off (also `--thinking-budget`): think mode / reflections (0→4) / MoA round floor (0→3) |
 | `FUGU_BROWSER=1` | Enrich web-search snippets with fetched page bodies (`FUGU_BROWSER_BACKEND` picks playwright/httpx/urllib) |
 | `FUGU_MEMORY=1` | Record sandbox/evolution episodes and inject past lessons into new questions (`FUGU_MEMORY_PATH`) |
 | `FUGU_COMPRESS=1` | Compress the running draft into a structured digest before round ≥ 2 (protects the pinned `num_ctx`) |
