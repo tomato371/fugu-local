@@ -64,8 +64,13 @@ On 8 GB VRAM, large models run with automatic RAM offload (absorbed by 48 GB RAM
 - 🌐 **Browser layer** — Playwright → httpx+bs4 → stdlib fallback fetches page bodies to enrich search snippets (`FUGU_BROWSER=1`)
 - 🎨 **Canvas / Artifacts** — the web UI gets a right-hand pane with live HTML/SVG preview, code view, version diff, and export
 - 📡 **Real-time streaming** — pipeline events (plan / proposals / aggregate / sandbox / critic / final) over SSE and WebSocket
-- 🧬 **Self-evolution** — `python -m fugu_evolve` profiles the repo, proposes improvements, implements them on guarded `auto-evolve/*` branches, verifies in the sandbox, and merges only on critic approval
-- 🧩 **fugu_core middleware** — episodic memory, multi-round state compression, speculative prefetching, and a structured debate protocol (all opt-in env flags)
+- 🧬 **Self-evolution** — `python -m fugu_evolve` profiles the repo, proposes improvements, implements them (unified-diff patches with whole-file fallback) on guarded `auto-evolve/*` branches, verifies in the sandbox, and merges only on critic approval
+- 🧩 **fugu_core middleware** — episodic memory (with consolidation), multi-round state compression, speculative prefetching, and a structured debate protocol (all opt-in env flags)
+- 🔧 **Tool registry** — an MCP-style catalog the model picks from at runtime; new tools are one `register()` call, no orchestrator edits (`FUGU_TOOL_CALLING=1`)
+- 📋 **Persistent task board** — multi-step requests are decomposed into checkpointed subtasks; an interrupted run resumes from where it died with `--resume BOARD_ID` (`FUGU_TASKS=1`)
+- 🛑 **Human approval gate** — arbitrary-code execution and self-evolution merges can block until a human hits `POST /approve/{run_id}` (`FUGU_REQUIRE_APPROVAL=1`)
+- 🕵️ **Adversarial verification** — independent skeptics (logical / computational / factual lenses) must fail to refute an answer before it ships (`FUGU_ADVERSARIAL=1`)
+- 🧑‍🔬 **Dynamic subagents** — a task-specific specialist persona is designed on the fly and joins the proposal council (`FUGU_DYNAMIC_SUBAGENTS=1`)
 
 ## Requirements
 
@@ -104,6 +109,11 @@ python fugu_local.py --thinking-budget high "Prove that sqrt(2) is irrational"
 # Describe an image with a local vision model
 python fugu_local.py --image photo.png "What is in this picture?"
 
+# Decompose a multi-step request into a checkpointed task board...
+FUGU_TASKS=1 python fugu_local.py "Research X, then implement Y, then summarize"
+# ...and resume an interrupted board right where it died
+python fugu_local.py --resume <BOARD_ID>
+
 # Web UI (Gradio) — includes the Canvas/Artifacts pane
 python fugu_web.py
 ```
@@ -125,6 +135,14 @@ behavior is byte-identical to the classic pipeline.**
 | `FUGU_DEBATE=1` | Mutual-critique debate when proposals diverge + per-domain model score matrix (`FUGU_SCORE_PATH`) |
 | `FUGU_VISION_MODEL=<model>` | Vision model for `--image` (default `llama3.2-vision`; use `llava` on Ollama builds that lack `mllama` support — e.g. some Vulkan/D3D12 builds) |
 | `FUGU_HIGH_VRAM=1` | Relax the 8 GB context limits on bigger GPUs |
+| `FUGU_TOOL_CALLING=1` | Runtime tool selection from the registry (`fugu_tools.py`); results injected into the context |
+| `FUGU_TASKS=1` | Decompose multi-step requests into a persistent, checkpointed task board (`FUGU_TASKS_DIR` sets the board directory; resume with `--resume BOARD_ID`) |
+| `FUGU_REQUIRE_APPROVAL=1` | Block arbitrary-code execution and evolve merges until `POST /approve/{run_id}` (timeout = deny; `FUGU_APPROVAL_TIMEOUT` seconds) |
+| `FUGU_DYNAMIC_SUBAGENTS=1` | Design a task-specific specialist persona per council round and add it to the proposal panel |
+| `FUGU_ADVERSARIAL=1` | After the critic passes an answer, a skeptic panel must fail to refute it; refutations trigger another round |
+| `FUGU_MEMORY_CONSOLIDATE=1` | Merge old episodic memories into summaries past a per-kind threshold (`FUGU_MEMORY_THRESHOLD`, default 20) |
+| `FUGU_SANDBOX_BACKEND=docker` | Run generated code in Docker (`--network none`); point `FUGU_SANDBOX_IMAGE` at an image with pytest/sympy — a bare slim image breaks TDC/PoT |
+| `FUGU_SANDBOX_MEMORY_MB=<n>` | Memory cap for sandboxed child processes (default 1024; 0 disables) |
 
 ## Self-evolution (fugu_evolve)
 
@@ -197,6 +215,8 @@ curl -X POST http://localhost:8000/ask \
 | `POST` | `/completion` | Inline code completion (single coder-model call, IDE-oriented) |
 | `POST` | `/refactor` | Instructed rewrite + unified diff |
 | `POST` | `/test-run` | Sandboxed execution with optional pytest tests / self-debug retries |
+| `GET` | `/approvals` | Pending human-approval requests (`FUGU_REQUIRE_APPROVAL=1`) |
+| `POST` | `/approve/{run_id}` | Approve or deny a blocked action (`{"approve": true\|false}`) |
 
 IDE endpoint schemas and curl examples: `docs/api_ide.md`.
 
@@ -214,9 +234,11 @@ IDE endpoint schemas and curl examples: `docs/api_ide.md`.
 | `fugu_thinking.py` | Dynamic thinking budget (reflection loop, auto classification) |
 | `fugu_browser.py` | Pluggable browser: playwright / httpx+bs4 / stdlib fallbacks |
 | `fugu_artifacts.py` | Canvas logic: artifact extraction, preview HTML, diffs (no Gradio dependency) |
-| `fugu_core/` | Middleware: episodic memory, state compression, speculative execution, debate |
-| `fugu_evolve/` | Self-improvement loop: profiler / planner / workspace / evaluator / CLI / prompt evolver |
+| `fugu_core/` | Middleware: episodic memory, state compression, speculative execution, debate + adversarial verify, task board, dynamic subagents |
+| `fugu_evolve/` | Self-improvement loop: profiler / planner / workspace / evaluator / diff patcher / CLI / prompt evolver |
 | `fugu_prompts/` | Prompt-override layer written by the prompt evolver |
+| `fugu_tools.py` | Runtime tool registry + schema-constrained tool selection |
+| `fugu_approval.py` | Blocking human-approval gate resolved via the REST API |
 | `bench_fugu.py` | Benchmark runner (accuracy) |
 | `bench_queue.py` | Batch/queue benchmarking |
 | `eval_fugu.py` | Evaluation utilities |
