@@ -66,7 +66,9 @@ def test_build_command_cli_interactive_has_no_positional():
 @pytest.mark.parametrize("action,expected_tail", [
     ("web", ["fugu_web.py"]),
     ("tui", ["fugu_tui.py"]),
-    ("api", ["-m", "uvicorn", "fugu_api:app", "--host", "0.0.0.0",
+    # 0.0.0.0 ではなく 127.0.0.1: uvicorn がログに出す URL をそのまま
+    # ブラウザで開けるようにする(Windows は 0.0.0.0 に接続できない)
+    ("api", ["-m", "uvicorn", "fugu_api:app", "--host", "127.0.0.1",
              "--port", "8000"]),
     ("bench-list", ["bench_fugu.py", "list"]),
     ("bench-report", ["bench_fugu.py", "report"]),
@@ -178,6 +180,84 @@ def test_load_settings_ignores_unknown_keys_and_bad_budget(tmp_path):
 
 def test_load_settings_missing_file_is_defaults(tmp_path):
     assert L.load_settings(tmp_path / "nope.json") == L.DEFAULT_SETTINGS
+
+
+# ----------------------------------------------------------------- run_server
+
+class _FakeProc:
+    """Popen の代役: poll() が None を返す間は生存、その後 returncode で死ぬ。"""
+
+    def __init__(self, alive_polls=0, returncode=0):
+        self._alive_polls = alive_polls
+        self.returncode = returncode
+        self.waited = self.terminated = False
+
+    def poll(self):
+        if self._alive_polls > 0:
+            self._alive_polls -= 1
+            return None
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        pass
+
+
+@pytest.fixture()
+def server_env(monkeypatch):
+    """run_server をオフラインで駆動するための共通スタブ一式。"""
+    state = {"opened": [], "popen": [], "sleep": 0}
+    monkeypatch.setattr(L.webbrowser, "open", lambda url: state["opened"].append(url))
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+    monkeypatch.setattr(L, "missing_packages", lambda action: [])
+    return state
+
+
+def test_run_server_opens_browser_only_after_port_is_ready(server_env, monkeypatch):
+    # 1回目の probe(起動前チェック)は閉じている → spawn → 2回目で開く
+    probes = iter([False, True])
+    monkeypatch.setattr(L, "_port_open", lambda *a, **k: next(probes))
+    proc = _FakeProc(alive_polls=99)
+    monkeypatch.setattr(L.subprocess, "Popen", lambda *a, **k: proc)
+    rc = L.run_server("api", L.DEFAULT_SETTINGS, port=8000,
+                      url="http://localhost:8000/docs")
+    assert server_env["opened"] == ["http://localhost:8000/docs"]
+    assert proc.waited and rc == 0
+
+
+def test_run_server_does_not_double_open_when_gradio_opens_itself(server_env, monkeypatch):
+    probes = iter([False, True])
+    monkeypatch.setattr(L, "_port_open", lambda *a, **k: next(probes))
+    monkeypatch.setattr(L.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(alive_polls=99))
+    L.run_server("web", L.DEFAULT_SETTINGS, port=7860,
+                 url="http://localhost:7860", auto_opens_browser=True)
+    assert server_env["opened"] == []          # gradio に任せる
+
+
+def test_run_server_reports_early_death_without_opening_browser(server_env, monkeypatch):
+    monkeypatch.setattr(L, "_port_open", lambda *a, **k: False)
+    monkeypatch.setattr(L.subprocess, "Popen",
+                        lambda *a, **k: _FakeProc(alive_polls=1, returncode=3))
+    rc = L.run_server("api", L.DEFAULT_SETTINGS, port=8000,
+                      url="http://localhost:8000/docs")
+    assert rc == 3 and server_env["opened"] == []
+
+
+def test_run_server_refuses_to_spawn_on_busy_port(server_env, monkeypatch):
+    monkeypatch.setattr(L, "_port_open", lambda *a, **k: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    def boom(*a, **k):
+        raise AssertionError("must not spawn when the port is busy")
+    monkeypatch.setattr(L.subprocess, "Popen", boom)
+    assert L.run_server("api", L.DEFAULT_SETTINGS, port=8000,
+                        url="http://localhost:8000/docs") is None
 
 
 # ------------------------------------------------------------------ 入力処理

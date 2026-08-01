@@ -18,10 +18,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
+import webbrowser
 
 # Windows の cp932 パイプで ✓ ⚠ ❌ などを出しても落ちないようにする(fugu_local と同じ作法)
 for _stream in (sys.stdout, sys.stderr):
@@ -151,8 +154,11 @@ def build_command(action, params=None):
     if action == "tui":
         return [py, "fugu_tui.py"]
     if action == "api":
+        # 127.0.0.1 に束縛する: uvicorn がログに出す URL がそのままブラウザで
+        # 開ける(0.0.0.0 だと Windows のブラウザは「到達できません」になる)。
+        # LAN に公開したい場合は手動で `uvicorn fugu_api:app --host 0.0.0.0`。
         return [py, "-m", "uvicorn", "fugu_api:app",
-                "--host", "0.0.0.0", "--port", str(p.get("port", 8000))]
+                "--host", "127.0.0.1", "--port", str(p.get("port", 8000))]
 
     if action == "bench-list":
         return [py, "bench_fugu.py", "list"]
@@ -334,6 +340,73 @@ def run(action, settings, params=None):
     except OSError as exc:
         print(f"\n❌ 起動に失敗しました: {exc}")
         return 1
+
+
+def _port_open(port, host="127.0.0.1", timeout=1.0):
+    """ポートが LISTEN しているか(=サーバーが応答するか)。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def run_server(action, settings, port, url, auto_opens_browser=False,
+               startup_timeout=120.0):
+    """Web UI / REST API 用: ポートが開くまで待ってからブラウザを開く。
+
+    「起動前に URL を案内する」と、初回起動の数十秒の間にユーザーがページを
+    開いて『このページに到達できません』になるため、こちらで待つ。
+    """
+    missing = missing_packages(action)
+    if missing:
+        print(f"\n⚠ この機能には {', '.join(missing)} が必要です。")
+        print(f"  pip install {' '.join(missing)}")
+        return None
+    if _port_open(port):
+        print(f"\n⚠ ポート {port} は既に使われています — 前回の分が動いたままの"
+              f"可能性があります。")
+        if _yes(f"{url} をブラウザで開いてみる?", True):
+            webbrowser.open(url)
+        return None
+    argv = build_command(action, {"port": port})
+    print(f"\n$ {' '.join(argv[1:])}   (cwd={REPO})", flush=True)
+    print("起動中です… 初回は数十秒かかることがあります。", flush=True)
+    try:
+        proc = subprocess.Popen(argv, cwd=REPO, env=build_env(settings))
+    except OSError as exc:
+        print(f"❌ 起動に失敗しました: {exc}")
+        return 1
+    try:
+        deadline = time.monotonic() + startup_timeout
+        ready = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:          # 起動前に死んだ
+                print(f"\n❌ サーバーが終了しました(終了コード {proc.returncode})。"
+                      "上のエラーメッセージを確認してください。")
+                return proc.returncode
+            if _port_open(port):
+                ready = True
+                break
+            time.sleep(0.5)
+        if ready:
+            print(f"\n✓ 起動しました: {url}")
+            if not auto_opens_browser:
+                webbrowser.open(url)
+            print("止めるにはこのウィンドウで Ctrl+C を押してください。", flush=True)
+        else:
+            print(f"\n⚠ {int(startup_timeout)} 秒待ちましたがまだ応答がありません。"
+                  "そのまま待ちます(Ctrl+C で中止)。", flush=True)
+        proc.wait()
+        return proc.returncode
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        print("\n(サーバーを停止しました)")
+        return 130
 
 
 # ---------------------------------------------------------------- 画面
@@ -559,15 +632,16 @@ def main_menu(settings, report):
         if choice == "1":
             cli_menu(settings)
         elif choice == "2":
-            print("\nブラウザが自動で開きます。止めるにはこのウィンドウで Ctrl+C。")
-            run("web", settings)
+            # gradio 側(inbrowser=True)がブラウザを開くので、こちらでは開かない
+            run_server("web", settings, port=7860,
+                       url="http://localhost:7860", auto_opens_browser=True)
             _pause()
         elif choice == "3":
             run("tui", settings)
             _pause()
         elif choice == "4":
-            print("\nhttp://localhost:8000/docs を開いてください。止めるには Ctrl+C。")
-            run("api", settings)
+            run_server("api", settings, port=8000,
+                       url="http://localhost:8000/docs")
             _pause()
         elif choice == "5":
             bench_menu(settings)
