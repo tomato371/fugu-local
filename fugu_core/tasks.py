@@ -141,6 +141,21 @@ class TaskBoard:
             item.result = result
         self.save()  # チェックポイント: 毎遷移で永続化(途中死しても再開可能)
 
+    def reset_stale(self) -> int:
+        """クラッシュ・強制終了で in_progress のまま残った項目を pending に戻す。
+
+        実測 2026-08-01: 実行中プロセスを kill すると当該サブタスクが
+        in_progress で永続化され、next_ready()(pending のみ対象)が二度と
+        拾えず、依存する後続も永久に ready にならなかった。再開の入口で必ず
+        呼ぶこと。戻り値はリセットした件数。
+        """
+        stale = [item for item in self.items if item.status == "in_progress"]
+        for item in stale:
+            item.status = "pending"
+        if stale:
+            self.save()
+        return len(stale)
+
     def next_ready(self) -> Optional[TodoItem]:
         """依存が全て completed の pending を(定義順で)1件返す。無ければ None。
 

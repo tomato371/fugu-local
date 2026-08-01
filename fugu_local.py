@@ -4580,6 +4580,9 @@ def _run_board(board, history=None):
     from fugu_core import tasks as fugu_tasks
     _TASKS_ACTIVE = True
     try:
+        stale = board.reset_stale()  # kill 残骸の in_progress を再開可能に戻す
+        if stale:
+            print(f"   [tasks] 中断されていた {stale} 件を pending に戻して再開")
         while True:
             item = board.next_ready()
             if item is None:

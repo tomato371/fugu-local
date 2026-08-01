@@ -194,6 +194,38 @@ def test_tasked_answer_failed_subtask_reported_not_silent(monkeypatch, tmp_path)
     assert "[pending] step two" in out              # 依存先が失敗 → 未実行のまま報告
 
 
+def test_reset_stale_recovers_killed_in_progress(tmp_path):
+    # 2026-08-01 ライブ実測: プロセス kill で in_progress が残ると next_ready が
+    # 二度と拾えず resume が永久スタックしていた
+    board = TaskBoard.new(
+        "q", [TodoItem(id="t1", subject="a", status="in_progress"),
+              TodoItem(id="t2", subject="b", blocked_by=["t1"])],
+        directory=str(tmp_path))
+    assert board.next_ready() is None          # バグの再現: 拾えない
+    assert board.reset_stale() == 1
+    assert board.next_ready().id == "t1"       # 復活
+    reloaded = TaskBoard.load(board.board_id, directory=str(tmp_path))
+    assert reloaded.items[0].status == "pending"  # 永続化にも反映
+
+
+def test_run_board_resumes_after_kill(monkeypatch, tmp_path):
+    import fugu_local
+    board = TaskBoard.new(
+        "killed run",
+        [TodoItem(id="t1", subject="done part", status="completed",
+                  result="already done"),
+         TodoItem(id="t2", subject="was running", status="in_progress",
+                  blocked_by=["t1"]),
+         TodoItem(id="t3", subject="never started", blocked_by=["t2"])],
+        directory=str(tmp_path))
+    monkeypatch.setattr(fugu_local, "fugu_answer",
+                        lambda q, plan=None, history=None: "finished")
+    out = fugu_local._run_board(board)
+    assert board.all_done() is True            # t2 も t3 も消化された
+    assert "## was running\nfinished" in out
+    assert "## never started\nfinished" in out
+
+
 def test_run_board_resume_completes_remaining(monkeypatch, tmp_path):
     import fugu_local
     board = TaskBoard.new(
