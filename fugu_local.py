@@ -4697,6 +4697,10 @@ def _run_board(board, history=None):
     各遷移はボード側で永続化されるため、途中で落ちても --resume で再開できる。"""
     global _TASKS_ACTIVE
     from fugu_core import tasks as fugu_tasks
+    try:
+        retries = max(0, int(os.environ.get("FUGU_TASK_RETRIES") or 1))
+    except ValueError:
+        retries = 1
     _TASKS_ACTIVE = True
     try:
         stale = board.reset_stale()  # kill 残骸の in_progress を再開可能に戻す
@@ -4712,13 +4716,23 @@ def _run_board(board, history=None):
             sub_question = f"{prior}\n\n{item.subject}" if prior else item.subject
             try:
                 answer = fugu_answer(sub_question, history=history)
+                ok = bool(answer) and not str(answer).startswith("__ERROR__")
+                failure_note = strip_think(str(answer or ""))[:300]
             except Exception as e:
-                board.update(item.id, "failed", result=f"error: {e}")
+                ok, answer, failure_note = False, "", f"error: {e}"
+            if not ok:
+                # 一過性の失敗(モデル不通・タイムアウト等)でチェーンを止めない:
+                # FUGU_TASK_RETRIES 回(既定1)まで pending に戻して取り直す
+                if board.retry(item.id, retries):
+                    print(f"   [tasks] ↻ {item.id} リトライ "
+                          f"({board.get(item.id).attempts}/{retries})")
+                    continue
+                board.update(item.id, "failed", result=failure_note)
+                print(f"   [tasks] ✗ {item.id}  ({board.progress()})")
                 continue
-            ok = bool(answer) and not str(answer).startswith("__ERROR__")
-            board.update(item.id, "completed" if ok else "failed",
-                         result=strip_think(str(answer or ""))[:2000])
-            print(f"   [tasks] {'✓' if ok else '✗'} {item.id}  ({board.progress()})")
+            board.update(item.id, "completed",
+                         result=strip_think(str(answer))[:2000])
+            print(f"   [tasks] ✓ {item.id}  ({board.progress()})")
     finally:
         _TASKS_ACTIVE = False
     return fugu_tasks.synthesize_board(board)

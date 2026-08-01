@@ -133,12 +133,13 @@ def test_render_results_format_and_empty():
     assert render_results([]) == ""
 
 
-# ------------------------------------------------------------------ gather
+# ------------------------------------------------------------------ gather (ReAct)
 
 def test_gather_tool_context_end_to_end():
     registry = _registry(_echo_spec("search", required=("query",)))
     chat = FakeChat(responses=[_calls_json({"name": "search",
-                                            "args": {"query": "flood"}})])
+                                            "args": {"query": "flood"}}),
+                               _calls_json()])  # 2巡目は「追加不要」
     ctx = gather_tool_context("q", chat, registry=registry)
     assert "### search" in ctx and "flood" in ctx
 
@@ -147,6 +148,65 @@ def test_gather_returns_empty_when_no_tools_needed():
     registry = _registry(_echo_spec("search", required=("query",)))
     assert gather_tool_context("q", FakeChat(responses=[_calls_json()]),
                                registry=registry) == ""
+
+
+def test_gather_react_second_round_sees_prior_results():
+    registry = _registry(_echo_spec("search", required=("query",)),
+                         _echo_spec("fetch", required=("url",)))
+    chat = FakeChat(responses=[
+        _calls_json({"name": "search", "args": {"query": "flood"}}),
+        _calls_json({"name": "fetch", "args": {"url": "http://a"}}),
+    ])
+    ctx = gather_tool_context("q", chat, registry=registry, max_rounds=2)
+    assert "### search" in ctx and "### fetch" in ctx      # 2巡分が実行された
+    round2_prompt = chat.calls[1]["prompt"]
+    assert "Results from tools already executed" in round2_prompt
+    assert "flood" in round2_prompt                        # 前巡の結果を見ている
+    assert "ADDITIONAL tools ONLY" in round2_prompt
+
+
+def test_gather_react_stops_when_router_is_satisfied():
+    registry = _registry(_echo_spec("search", required=("query",)))
+    chat = FakeChat(responses=[
+        _calls_json({"name": "search", "args": {"query": "x"}}),
+        _calls_json(),                                     # 追加不要 → 打ち切り
+    ])
+    gather_tool_context("q", chat, registry=registry, max_rounds=5)
+    assert len(chat.calls) == 2                            # 3巡目は走らない
+
+
+def test_gather_react_dedupes_repeated_calls():
+    registry = _registry(_echo_spec("search", required=("query",)))
+    chat = FakeChat(responses=[
+        _calls_json({"name": "search", "args": {"query": "same"}}),
+        _calls_json({"name": "search", "args": {"query": "same"}}),  # 同一呼び出し
+    ])
+    ctx = gather_tool_context("q", chat, registry=registry, max_rounds=3)
+    assert ctx.count("### search") == 1                    # 再実行されない
+    assert len(chat.calls) == 2                            # 新規ゼロで終了
+
+
+def test_gather_react_rounds_capped(monkeypatch):
+    registry = _registry(_echo_spec("t", required=()))
+    counter = {"n": 0}
+
+    def always_new(prompt):
+        counter["n"] += 1
+        return _calls_json({"name": "t", "args": {"i": counter["n"]}})
+
+    gather_tool_context("q", FakeChat(fn=always_new), registry=registry,
+                        max_rounds=2)
+    assert counter["n"] == 2                               # 上限で必ず停止
+
+
+def test_gather_react_env_rounds(monkeypatch):
+    import fugu_tools
+    monkeypatch.setenv("FUGU_TOOL_ROUNDS", "1")
+    assert fugu_tools._max_rounds() == 1
+    monkeypatch.setenv("FUGU_TOOL_ROUNDS", "junk")
+    assert fugu_tools._max_rounds() == fugu_tools.DEFAULT_MAX_ROUNDS
+    monkeypatch.setenv("FUGU_TOOL_ROUNDS", "0")
+    assert fugu_tools._max_rounds() == 1                   # 最低1巡
 
 
 # ------------------------------------------------------------------ default registry

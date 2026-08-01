@@ -243,6 +243,69 @@ def test_run_board_resume_completes_remaining(monkeypatch, tmp_path):
     assert reloaded.all_done() is True
 
 
+def test_board_retry_within_budget(tmp_path):
+    board = _board(tmp_path)
+    board.update("t1", "failed", result="boom")
+    assert board.retry("t1", max_retries=1) is True
+    item = board.get("t1")
+    assert item.status == "pending" and item.attempts == 1 and item.result == ""
+    reloaded = TaskBoard.load(board.board_id, directory=str(tmp_path))
+    assert reloaded.items[0].attempts == 1                 # 永続化される
+    assert board.retry("t1", max_retries=1) is False       # 枠を使い切った
+
+
+def test_run_board_retries_transient_failure(monkeypatch, tmp_path):
+    import fugu_local
+    monkeypatch.setenv("FUGU_TASKS_DIR", str(tmp_path))
+    monkeypatch.setenv("FUGU_TASK_RETRIES", "1")
+    board = TaskBoard.new("q", [TodoItem(id="t1", subject="flaky step")],
+                          directory=str(tmp_path))
+    calls = {"n": 0}
+
+    def flaky_answer(question, plan=None, history=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "__ERROR__: transient"
+        return "recovered answer"
+
+    monkeypatch.setattr(fugu_local, "fugu_answer", flaky_answer)
+    out = fugu_local._run_board(board)
+    assert calls["n"] == 2                                 # 1回リトライして成功
+    assert "## flaky step\nrecovered answer" in out
+    assert board.get("t1").status == "completed"
+
+
+def test_run_board_retry_budget_exhausted(monkeypatch, tmp_path):
+    import fugu_local
+    monkeypatch.setenv("FUGU_TASKS_DIR", str(tmp_path))
+    monkeypatch.setenv("FUGU_TASK_RETRIES", "1")
+    board = TaskBoard.new("q", [TodoItem(id="t1", subject="always broken")],
+                          directory=str(tmp_path))
+    monkeypatch.setattr(fugu_local, "fugu_answer",
+                        lambda q, plan=None, history=None: "__ERROR__: down")
+    out = fugu_local._run_board(board)
+    assert board.get("t1").status == "failed"
+    assert board.get("t1").attempts == 1                   # 枠は消費済み
+    assert "[failed] always broken" in out
+
+
+def test_run_board_retry_disabled(monkeypatch, tmp_path):
+    import fugu_local
+    monkeypatch.setenv("FUGU_TASKS_DIR", str(tmp_path))
+    monkeypatch.setenv("FUGU_TASK_RETRIES", "0")
+    board = TaskBoard.new("q", [TodoItem(id="t1", subject="s")],
+                          directory=str(tmp_path))
+    calls = {"n": 0}
+
+    def failing(question, plan=None, history=None):
+        calls["n"] += 1
+        return "__ERROR__: down"
+
+    monkeypatch.setattr(fugu_local, "fugu_answer", failing)
+    fugu_local._run_board(board)
+    assert calls["n"] == 1                                 # リトライなしで即 failed
+
+
 def test_reentrancy_guard_restored_after_run(monkeypatch, tmp_path):
     import fugu_local
     board = TaskBoard.new("q", [TodoItem(id="t1", subject="s")],

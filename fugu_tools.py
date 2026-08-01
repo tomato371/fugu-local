@@ -20,12 +20,15 @@ MCP 的な「実行時にモデルがツール一覧を見て選ぶ」層を提�
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 #: 1回の質問で許すツール呼び出し数と、1ツール出力の注入上限(num_ctx 予算)。
 DEFAULT_MAX_CALLS = 3
 DEFAULT_OUTPUT_CHARS = 2000
+#: 選択→実行の反復上限(ReAct 型)。env FUGU_TOOL_ROUNDS で上書き可。
+DEFAULT_MAX_ROUNDS = 2
 
 
 @dataclass
@@ -98,18 +101,27 @@ _SYSTEM = (
 
 def decide_tool_calls(question: str, registry: ToolRegistry, chat,
                       max_calls: int = DEFAULT_MAX_CALLS,
+                      prior_results: str = "",
                       ) -> List[Tuple[ToolSpec, Dict[str, object]]]:
     """質問に対して実行すべきツール呼び出し列を LLM に選ばせる。
 
+    ``prior_results`` が与えられた場合(ReAct の2巡目以降)は前巡の実行結果を
+    提示し、「まだ足りない情報がある場合のみ追加ツールを選べ」と求める。
     未知ツール名・非 dict 引数・required 欠落は黙って落とす。モデル障害・
     パース失敗は空リスト(ツール無しで従来どおり回答が続く — 選択層の失敗が
     回答自体を止めることはない)。
     """
     if not registry.list_specs():
         return []
+    prior_block = (
+        f"Results from tools already executed:\n{prior_results}\n\n"
+        "Select ADDITIONAL tools ONLY if the results above are insufficient "
+        "to answer; otherwise return an empty list.\n\n"
+        if prior_results else "")
     prompt = (
         f"Question: {question}\n\n"
         f"Tool catalog:\n{registry.render_catalog()}\n\n"
+        + prior_block +
         'Respond with {"tool_calls": [{"name": ..., "args": {...}}]} '
         "(empty list if no tool is needed)."
     )
@@ -168,15 +180,43 @@ def render_results(results: List[Tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _max_rounds() -> int:
+    try:
+        value = int(os.environ.get("FUGU_TOOL_ROUNDS") or DEFAULT_MAX_ROUNDS)
+        return max(1, value)
+    except ValueError:
+        return DEFAULT_MAX_ROUNDS
+
+
 def gather_tool_context(question: str, chat,
                         registry: Optional[ToolRegistry] = None,
-                        max_calls: int = DEFAULT_MAX_CALLS) -> str:
-    """フックの入口: 選択→実行→整形をまとめて行う(ツール不要なら "")。"""
+                        max_calls: int = DEFAULT_MAX_CALLS,
+                        max_rounds: Optional[int] = None) -> str:
+    """フックの入口: 選択→実行を最大 ``max_rounds`` 回反復する(ReAct 型)。
+
+    2巡目以降はそれまでの実行結果をルーターに提示し、不足があるときだけ追加
+    ツールを選ばせる。同一(ツール名, 引数)の再実行は抑止。追加選択が空に
+    なった時点で終了(単純な質問は従来どおり1巡で済む)。ツール不要なら ""。
+    """
     registry = registry if registry is not None else build_default_registry()
-    calls = decide_tool_calls(question, registry, chat, max_calls=max_calls)
-    if not calls:
-        return ""
-    return render_results(execute_tool_calls(calls))
+    if max_rounds is None:
+        max_rounds = _max_rounds()
+    all_results: List[Tuple[str, str]] = []
+    executed = set()
+    for _ in range(max_rounds):
+        prior = render_results(all_results) if all_results else ""
+        calls = decide_tool_calls(question, registry, chat,
+                                  max_calls=max_calls, prior_results=prior)
+        fresh = []
+        for spec, args in calls:
+            key = (spec.name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+            if key not in executed:
+                executed.add(key)
+                fresh.append((spec, args))
+        if not fresh:
+            break
+        all_results.extend(execute_tool_calls(fresh))
+    return render_results(all_results)
 
 
 # ------------------------------------------------------------------ 既定レジストリ

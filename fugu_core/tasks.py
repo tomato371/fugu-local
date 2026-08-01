@@ -63,7 +63,8 @@ class TodoItem:
     subject: str
     status: str = "pending"
     blocked_by: List[str] = field(default_factory=list)
-    result: str = ""  # 完了時の成果(後続タスクへのコンテキスト)
+    result: str = ""   # 完了時の成果(後続タスクへのコンテキスト)
+    attempts: int = 0  # リトライで消費した回数(チェックポイントに永続化)
 
 
 def _slugify(text: str) -> str:
@@ -112,6 +113,7 @@ class TaskBoard:
                 status=str(raw.get("status", "pending")),
                 blocked_by=[str(x) for x in raw.get("blocked_by", [])],
                 result=str(raw.get("result", "")),
+                attempts=int(raw.get("attempts", 0) or 0),
             ) for raw in obj["items"]]
             return cls(str(obj["board_id"]), str(obj.get("question", "")),
                        items, directory=directory)
@@ -140,6 +142,18 @@ class TaskBoard:
         if result:
             item.result = result
         self.save()  # チェックポイント: 毎遷移で永続化(途中死しても再開可能)
+
+    def retry(self, item_id: str, max_retries: int) -> bool:
+        """失敗した項目をリトライ枠内なら pending に戻す(完走性: 一過性の失敗で
+        依存チェーンを永久停止させない)。枠超過・未知 id は False。"""
+        item = self.get(item_id)
+        if item is None or item.attempts >= max(0, max_retries):
+            return False
+        item.attempts += 1
+        item.status = "pending"
+        item.result = ""
+        self.save()
+        return True
 
     def reset_stale(self) -> int:
         """クラッシュ・強制終了で in_progress のまま残った項目を pending に戻す。
