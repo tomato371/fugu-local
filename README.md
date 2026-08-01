@@ -87,6 +87,19 @@ On 8 GB VRAM, large models run with automatic RAM offload (absorbed by 48 GB RAM
 
 ## Quick start
 
+**Not sure which file to run? Start here.** Double-click `START_FUGU.bat`
+(or run `python fugu_launcher.py`) — a menu checks your environment and launches any
+front-end for you: CLI, Web UI, TUI, REST API, benchmarks, self-evolution, and the sibling
+[fugu-rag](https://github.com/tomato371/fugu-rag). The feature flags in the table below are
+ON/OFF toggles in its settings screen, so you never have to set env vars by hand.
+
+```
+$ python fugu_launcher.py --check     # just verify Ollama, models and optional deps
+✓ Ollama OK (http://localhost:11434) — 26 models
+```
+
+The individual entry points are all still there:
+
 ```bash
 # Interactive mode
 python fugu_local.py
@@ -121,7 +134,8 @@ python fugu_web.py
 ## Opt-in feature flags
 
 Every new capability ships behind an env flag + lazy import: **with no flags set,
-behavior is byte-identical to the classic pipeline.**
+behavior is byte-identical to the classic pipeline.** All of them can also be toggled
+from `fugu_launcher.py`'s settings screen (option `8`) instead of exporting them by hand.
 
 | Flag | Effect |
 |---|---|
@@ -224,6 +238,8 @@ IDE endpoint schemas and curl examples: `docs/api_ide.md`.
 
 | File | Purpose |
 |---|---|
+| `START_FUGU.bat` | **Double-click entry point** — opens the launcher menu |
+| `fugu_launcher.py` | Launcher: environment preflight, feature-flag toggles, starts every front-end |
 | `fugu_local.py` | Core orchestrator + CLI (Conductor / Critic / Proposers / Aggregator) |
 | `fugu_web.py` | Gradio web front-end (chat + Canvas/Artifacts pane) |
 | `fugu_api.py` | FastAPI REST API (ask / SSE / WebSocket / IDE endpoints) |

@@ -22,6 +22,9 @@ backups/
 iterations/
 *.log
 
+# Launcher's per-machine settings (機能フラグの ON/OFF など)
+fugu_launcher.json
+
 # OS
 .DS_Store
 Thumbs.db
