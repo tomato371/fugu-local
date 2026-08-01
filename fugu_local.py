@@ -4622,6 +4622,34 @@ def _tool_context(question):
         return ""
 
 
+def _dynamic_specialist(question, proposals, models=None):
+    """FUGU_DYNAMIC_SUBAGENTS=1 のときだけ、質問専用の専門家ペルソナをその場で
+    設計し、提案パネルに1体追加する (Doc E4)。失敗時は proposals をそのまま返す。
+    実行モデルは選抜済みプロポーザーの先頭(無ければ CONDUCTOR)を使う。"""
+    if os.environ.get("FUGU_DYNAMIC_SUBAGENTS") != "1":
+        return proposals
+    try:
+        import fugu_llm
+        from fugu_core import subagents as fugu_subagents
+    except ImportError:
+        return proposals
+    try:
+        spec = fugu_subagents.design_subagent(
+            question, fugu_llm.AskChat(label="subagent-design"))
+        if spec is None:
+            return proposals
+        model = (models or [None])[0]
+        agent = fugu_subagents.spawn(
+            spec, lambda: fugu_llm.AskChat(model=model, label="subagent"))
+        print(f"   [subagent] 動的専門家を投入: {spec.role}")
+        answer = strip_think(agent.complete(question))
+        if answer and not answer.startswith("__ERROR__"):
+            return list(proposals) + [(f"dynamic:{spec.role}", answer)]
+        return proposals
+    except Exception:
+        return proposals
+
+
 def _debate_proposals(question, proposals):
     """FUGU_DEBATE=1 のときだけ、意見が割れた提案群に相互批評ターンを挟む (Doc D4)。
     未設定・全員一致・失敗時は proposals をそのまま返す(既定経路は不変)。"""
@@ -4857,6 +4885,7 @@ def fugu_answer(question, plan=None, history=None):
     r = 0
     while True:
         proposals = get_proposals(models, question, reference, issue_hint, history=history)
+        proposals = _dynamic_specialist(question, proposals, models)  # FUGU_DYNAMIC_SUBAGENTS=1 のみ
         proposals = _debate_proposals(question, proposals)  # FUGU_DEBATE=1 のみ
         _emit("proposals", round=r + 1, models=[m for m, _ in proposals])
         if SHOW_PROPOSALS:
