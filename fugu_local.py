@@ -1867,9 +1867,45 @@ def _score_chunk(query_tokens: set, chunk: str) -> float:
     return overlap / (len(chunk_tokens) ** 0.5 + 1) * 100
 
 
+_RAG_ADAPTIVE_CACHE = {}
+
+
+def _rag_adaptive(question, chunks, top_k):
+    """FUGU_RAG=1 のときだけ、fugu-rag の adaptive 検索(ルーティング+HyDE+RRF)へ
+    委譲する (配線1c)。chunks は [(path, chunk)]、返り値は上位 [(path, chunk)]。
+    fugu_rag 未インストール・埋め込みモデル不可・失敗時は None
+    (従来のキーワード検索がそのまま続く — 純アップグレードとして振る舞う)。"""
+    if os.environ.get("FUGU_RAG") != "1" or not chunks:
+        return None
+    try:
+        import fugu_rag_retriever
+    except ImportError:
+        return None
+    try:
+        retriever = _RAG_ADAPTIVE_CACHE.get(top_k)
+        if retriever is None:
+            retriever = fugu_rag_retriever.fugu_rag_retriever(k=top_k)
+            if retriever is None:
+                return None
+            _RAG_ADAPTIVE_CACHE[top_k] = retriever
+        corpus, by_key = {}, {}
+        for i, (path, chunk) in enumerate(chunks):
+            key = f"{path}#{i}"
+            corpus[key] = chunk
+            by_key[key] = (path, chunk)
+        ids = retriever(question, corpus)
+        hits = [by_key[doc_id] for doc_id in ids if doc_id in by_key][:top_k]
+        if hits:
+            print(f"   [RAG] fugu-rag adaptive 検索を使用 ({len(hits)} 件)")
+        return hits or None
+    except Exception:
+        return None
+
+
 def rag_search(question: str, dirs: list = None, top_k: int = None) -> str:
-    """ローカル文書をキーワード検索して上位チャンクをフォーマット済み文字列で返す。
-    dirs が空（RAG_DIRS も空）なら空文字を返す。"""
+    """ローカル文書を検索して上位チャンクをフォーマット済み文字列で返す。
+    dirs が空（RAG_DIRS も空）なら空文字を返す。既定はキーワード検索。
+    FUGU_RAG=1 かつ fugu-rag 導入済みなら adaptive 検索へ昇格する (配線1c)。"""
     dirs = dirs or RAG_DIRS
     if not dirs:
         return ""
@@ -1877,6 +1913,11 @@ def rag_search(question: str, dirs: list = None, top_k: int = None) -> str:
     chunks = _get_rag_chunks(dirs)
     if not chunks:
         return ""
+    adaptive = _rag_adaptive(question, chunks, top_k)  # FUGU_RAG=1 のみ、失敗時 None
+    if adaptive is not None:
+        parts = [f"[Source: {Path(path).name}]\n{chunk.strip()}"
+                 for path, chunk in adaptive]
+        return "## Relevant Document Context (RAG)\n\n" + "\n\n---\n\n".join(parts)
     query_tokens = _tokenize(question)
     scored = [(path, chunk, _score_chunk(query_tokens, chunk))
               for path, chunk in chunks]
@@ -1894,6 +1935,73 @@ def rag_search(question: str, dirs: list = None, top_k: int = None) -> str:
     for path, chunk, score in top:
         parts.append(f"[Source: {Path(path).name}]\n{chunk.strip()}")
     return "## Relevant Document Context (RAG)\n\n" + "\n\n---\n\n".join(parts)
+
+
+def _research_search_fn(query):
+    """B1 research の search_fn 互換アダプタ: _search_raw の整形済み結果を
+    (url, snippet) 対に分解する (配線1d)。非HTTPソース・空スニペットは捨てる。"""
+    hits = []
+    for item in _search_raw(query):
+        if not isinstance(item, str):
+            continue
+        m = re.search(r"Source: (\S+)", item)
+        url = m.group(1) if m else ""
+        snippet = re.sub(r"\s*Source: \S+\s*$", "", item).strip()
+        if url.startswith(("http://", "https://")) and snippet:
+            hits.append((url, snippet))
+    return hits
+
+
+def _make_research_retrieve_fn(rag_dirs):
+    """B1 research の retrieve_fn 互換アダプタ: ローカルRAGチャンクの上位を
+    (source, text) 対で返す closure を作る。RAG 未設定なら None (配線1d)。"""
+    dirs = rag_dirs or RAG_DIRS
+    if not dirs:
+        return None
+
+    def retrieve_fn(query):
+        chunks = _get_rag_chunks(dirs)
+        if not chunks:
+            return []
+        query_tokens = _tokenize(query)
+        scored = sorted(((path, chunk, _score_chunk(query_tokens, chunk))
+                         for path, chunk in chunks), key=lambda x: -x[2])
+        return [(Path(path).name, chunk)
+                for path, chunk, score in scored[:RAG_TOP_K] if score > 0]
+
+    return retrieve_fn
+
+
+def run_deep_research(question, rag_dirs=None):
+    """fugu_rag.research.run_research を fugu-local の実装で駆動する (配線1d)。
+
+    web検索 = _search_raw / ページ取得 = fugu_browser / ローカルRAG = 既存チャンク /
+    LLM = AskChat(think=False: プランナー JSON の安定性)。8GB 環境の実測に従い
+    max_workers=1(並列ブランチはタイムアウト退化する)。fugu_rag 不在時は
+    __ERROR__ センチネル(導入手順付き)を返す。"""
+    try:
+        from fugu_rag.research import run_research
+    except ImportError:
+        return ("__ERROR__: fugu_rag が見つかりません。"
+                "`pip install -e D:/repos/fugu-rag` で導入してください")
+    import fugu_llm
+    fetch_fn = None
+    try:
+        import fugu_browser
+        fetch_fn = fugu_browser.as_fetcher(max_chars=2000)
+    except ImportError:
+        pass
+    chat = fugu_llm.AskChat(label="research", think=False)
+    try:
+        report = run_research(
+            question, chat,
+            retrieve_fn=_make_research_retrieve_fn(rag_dirs),
+            search_fn=_research_search_fn,
+            fetch_fn=fetch_fn,
+            max_branches=3, max_depth=2, max_workers=1)
+        return report.report
+    except Exception as e:
+        return f"__ERROR__: deep research failed: {e}"
 
 
 def build_context(question: str, use_search: bool = False,
@@ -5088,7 +5196,8 @@ def setup():
 
 def ask_fugu(question, baseline=SHOW_BASELINE, *,
              use_search=False, rag_dirs=None, out_file=None,
-             history_file=None, office_attached=False, images=None):
+             history_file=None, office_attached=False, images=None,
+             deep_research=False):
     """質問を Fugu パイプラインで処理する。
     use_search: True なら Web 検索を行いコンテキストに注入する（Conductor が
       search_required=true を出した場合も自動で有効化される）。
@@ -5113,6 +5222,23 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
         if result.startswith("__ERROR__"):
             note = result[len("__ERROR__"):].lstrip(":").strip()
             print(f"画像応答に失敗しました: {note}" if note else "画像応答に失敗しました")
+        else:
+            print(result)
+        print(f"\n(所要 {elapsed} 秒)")
+        if out_file and not result.startswith("__ERROR__"):
+            _save_answer_to_file(question, result, elapsed, out_file, context="")
+        return result
+
+    # --- 経路0.5: Deep Research（--deep-research 明示時のみ。Conductor/MoA バイパス）---
+    if deep_research:
+        print("\n[Fugu] Deep Research モード（計画→ブランチ実行→引用付き統合）...")
+        result = run_deep_research(question, rag_dirs=rag_dirs or RAG_DIRS)
+        elapsed = round(time.time() - t0, 1)
+        print("\n===== 最終回答 (deep research) =====")
+        if result.startswith("__ERROR__"):
+            note = result[len("__ERROR__"):].lstrip(":").strip()
+            print(f"Deep Research に失敗しました: {note}" if note
+                  else "Deep Research に失敗しました")
         else:
             print(result)
         print(f"\n(所要 {elapsed} 秒)")
@@ -6162,6 +6288,10 @@ def main():
     parser.add_argument("--resume", metavar="BOARD_ID",
                         help="中断したタスクボードを未完了サブタスクから再開する"
                              "（FUGU_TASKS のチェックポイントを消化）")
+    parser.add_argument("--deep-research", action="store_true",
+                        help="Deep Research モード: 質問を複数ブランチに分解し、"
+                             "Web検索+ブラウザ+ローカルRAGで引用付きレポートを生成"
+                             "（要 fugu-rag 導入）")
     args = parser.parse_args()
 
     # --- タスクボード再開 (Doc E2): 質問入力より優先して処理する ---

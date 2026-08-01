@@ -38,15 +38,17 @@ def fugu_rag_retriever(
     """
     try:
         from fugu_rag.adapter import as_retriever
-        from fugu_rag.llm import OllamaChat, OllamaEmbedder
+        from fugu_rag.llm import CachingEmbedder, OllamaChat, OllamaEmbedder
     except ImportError:
         return None
 
     embedder = OllamaEmbedder(model=embed_model)
     if not embedder.available():
         return None
+    # dense_search はクエリ毎にコーパス全文を埋め込むため、キャッシュ無しだと
+    # 呼び出しの度に全チャンクを再埋め込みしてしまう(fugu-rag CLI と同じ対策)。
     chat = OllamaChat(model=chat_model) if chat_model else None
-    return as_retriever(embedder, chat, k=k)
+    return as_retriever(CachingEmbedder(embedder), chat, k=k)
 
 
 def get_retriever(
