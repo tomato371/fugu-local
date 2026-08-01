@@ -133,6 +133,24 @@ def fixed_plan(item):
             "reason": f"bench_search", "_fallback": False}
 
 
+def apply_council(council, aggregator=None):
+    """council/aggregator を一時的に差し替え、復元関数を返す。
+
+    フルの council (20b〜35b) は 8GB GPU で 1 問 1 時間級になるため、軽量モデルに
+    落として全セルを実測する用途(--council)。4 構成すべてに同条件で適用されるので
+    「線形再帰 vs 探索」の比較としては公平なまま — ただしフル構成の代表値ではない
+    ことをレポートに明記する(結果行にも council を記録する)。"""
+    if not council:
+        return lambda: None
+    saved = (f.PROPOSERS, f.AGGREGATOR)
+    f.PROPOSERS = list(council)
+    f.AGGREGATOR = aggregator or council[-1]
+
+    def restore():
+        f.PROPOSERS, f.AGGREGATOR = saved
+    return restore
+
+
 def run_one(item, config, mult):
     env, max_rounds = budget_knobs(config, mult)
     saved_env = {k: os.environ.get(k) for k in
@@ -181,7 +199,8 @@ def load_done(dataset, config, mult):
     return done
 
 
-def run(dataset, configs, mults, limit=None, offset=0):
+def run(dataset, configs, mults, limit=None, offset=0, council=None,
+        aggregator=None):
     items = B.load_items(dataset)
     rng = random.Random(42)            # bench_fugu と同じ決定的シャッフル
     rng.shuffle(items)
@@ -189,6 +208,10 @@ def run(dataset, configs, mults, limit=None, offset=0):
     if not f.setup():
         raise SystemExit("fugu setup 失敗（Ollama を確認）")
     f.SHOW_PLAN = f.SHOW_PROPOSALS = False
+    restore = apply_council(council, aggregator)
+    if council:
+        print(f"[bench_search] 軽量council: {council} / "
+              f"aggregator={f.AGGREGATOR}")
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     for mult in mults:
         for config in configs:
@@ -201,11 +224,13 @@ def run(dataset, configs, mults, limit=None, offset=0):
                 rec = {"id": it["id"], "dataset": dataset, "config": config,
                        "mult": mult, "expected": it["answer"],
                        "category": category(dataset),
+                       "council": list(council) if council else None,
                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
                 try:
                     rec.update(run_one(it, config, mult))
                 except KeyboardInterrupt:
                     print("[bench_search] 中断（結果は保存済み・再実行で再開）")
+                    restore()
                     raise
                 except Exception as e:
                     rec.update({"correct": False,
@@ -216,6 +241,7 @@ def run(dataset, configs, mults, limit=None, offset=0):
                 print(f"    -> {'OK' if rec.get('correct') else 'NG'} "
                       f"gen={rec.get('calls_gen')} verify={rec.get('calls_verify')} "
                       f"({rec.get('seconds')}s)")
+    restore()
 
 
 # ------------------------------------------------------------------- 集計
@@ -312,11 +338,21 @@ def verdict(cells):
 # ------------------------------------------------------------------- 出力
 
 def write_md(cells, rows, path=DOCS_MD):
+    councils = sorted({tuple(r["council"]) for r in rows if r.get("council")})
+    council_note = ""
+    if councils:
+        pretty = " / ".join(", ".join(c) for c in councils)
+        council_note = (
+            f"\n\n**⚠ 軽量council での実測**: {pretty}。フル構成(20b〜35b)は "
+            "8GB GPU で 1 問 1 時間級となり行列の完走が現実的でないため、全 4 構成に"
+            "同一の軽量 council を適用して比較した(構成間の比較としては公平だが、"
+            "フル構成での絶対値の代表ではない)。")
     lines = ["# AB-MCTS 探索 A/B ベンチマーク", "",
              "同一の追加生成予算（1x = 追加 5 生成呼び出し）で、線形再帰ラウンド"
              "(baseline) と AB-MCTS 探索(search) を比較する。検証者呼び出し"
              "（小型モデル）は生成予算外・別カラム。トークン数の代理として出力文字数"
-             "を記録（正確なトークン計測は FUGU_PROFILE 系の整備後）。", "",
+             "を記録（正確なトークン計測は FUGU_PROFILE 系の整備後）。"
+             + council_note, "",
              f"総試行: {len(rows)} 行", "",
              "| 構成 | 予算 | n | 正答率 | math | code | 生成/問 | 検証/問 "
              "| 秒/問 | 木(幅×深さ) |",
@@ -490,6 +526,11 @@ def main(argv=None):
     p_run.add_argument("--mults", default="1,2,4")
     p_run.add_argument("--limit", type=int)
     p_run.add_argument("--offset", type=int, default=0)
+    p_run.add_argument("--council", default=None,
+                       help="カンマ区切りで council を軽量モデルに差し替える"
+                            "(4 構成すべてに同一適用。先頭 = 探索の既定生成モデル)")
+    p_run.add_argument("--aggregator", default=None,
+                       help="--council 時の統合モデル(既定: council の末尾)")
     sub.add_parser("report")
     args = ap.parse_args(argv)
     if args.cmd == "run":
@@ -498,7 +539,10 @@ def main(argv=None):
             if c not in CONFIGS:
                 raise SystemExit(f"未知の構成: {c} (choices: {list(CONFIGS)})")
         mults = [int(m) for m in args.mults.split(",")]
-        run(args.dataset, configs, mults, limit=args.limit, offset=args.offset)
+        council = [m.strip() for m in args.council.split(",")] \
+            if args.council else None
+        run(args.dataset, configs, mults, limit=args.limit, offset=args.offset,
+            council=council, aggregator=args.aggregator)
     else:
         report()
 

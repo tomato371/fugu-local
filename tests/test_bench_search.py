@@ -30,6 +30,27 @@ def test_category_mapping():
     assert BS.category("humaneval") == "code"
 
 
+def test_apply_council_overrides_and_restores():
+    import fugu_local as f
+    saved = (f.PROPOSERS, f.AGGREGATOR)
+    restore = BS.apply_council(["a-model", "b-model"], None)
+    assert f.PROPOSERS == ["a-model", "b-model"]
+    assert f.AGGREGATOR == "b-model"          # 既定は末尾
+    restore()
+    assert (f.PROPOSERS, f.AGGREGATOR) == saved
+    assert BS.apply_council(None)() is None   # council 無しは no-op
+
+
+def test_md_report_notes_light_council(tmp_path):
+    rows = [_row("baseline", 1, True)]
+    rows[0]["council"] = ["qwen3:4b", "gpt-oss:20b"]
+    cells = BS.aggregate(rows)
+    md = tmp_path / "r.md"
+    BS.write_md(cells, rows, path=md)
+    text = md.read_text(encoding="utf-8")
+    assert "軽量council" in text and "qwen3:4b, gpt-oss:20b" in text
+
+
 # ------------------------------------------------------------------- 集計
 
 def _row(config, mult, correct, category="math", gen=6, verify=5, secs=100,
