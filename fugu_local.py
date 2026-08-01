@@ -4551,6 +4551,26 @@ def _emit(kind, **data):
         pass
 
 
+def _tool_context(question):
+    """FUGU_TOOL_CALLING=1 のときだけ、汎用ツール呼び出し層 (Doc E1) を起動する。
+    ツール選択・実行・整形は fugu_tools に委譲。未設定・失敗・ツール不要は ""
+    (既定経路は完全に不変。ツール層の失敗が回答を止めることはない)。"""
+    if os.environ.get("FUGU_TOOL_CALLING") != "1":
+        return ""
+    try:
+        import fugu_llm
+        import fugu_tools
+    except ImportError:
+        return ""
+    try:
+        ctx = fugu_tools.gather_tool_context(question, fugu_llm.AskChat(label="tools"))
+        if ctx:
+            print(f"   [tools] ツール実行結果を注入 ({len(ctx)} 文字)")
+        return ctx
+    except Exception:
+        return ""
+
+
 def _debate_proposals(question, proposals):
     """FUGU_DEBATE=1 のときだけ、意見が割れた提案群に相互批評ターンを挟む (Doc D4)。
     未設定・全員一致・失敗時は proposals をそのまま返す(既定経路は不変)。"""
@@ -4975,6 +4995,10 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
     if context is None:  # 投機無効・条件外れ・失敗 → 従来の同期経路
         context = build_context(question, use_search=do_search,
                                 rag_dirs=rag_dirs or RAG_DIRS)
+    # FUGU_TOOL_CALLING=1: 汎用ツール層のコンテキストを追記(既定は空文字で不変)
+    tool_ctx = _tool_context(question)
+    if tool_ctx:
+        context = f"{context}\n\n{tool_ctx}" if context else tool_ctx
     question_with_ctx = _with_context(question, context)
 
     if baseline:
