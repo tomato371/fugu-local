@@ -112,11 +112,19 @@ def _sanitize_edit(path: object, code: object) -> Optional[Tuple[str, str]]:
 
 def implement_proposal(chat, workspace, proposal: Proposal,
                        max_edits: int = 3, context_chars: int = 3000) -> bool:
-    """提案を LLM にファイル編集として実装させ、workspace に適用する。
+    """提案を LLM に実装させ、workspace に適用する。
 
-    対象ファイルの現内容(先頭 ``context_chars`` 文字)をプロンプトに入れる。
-    1件も有効な編集を適用できなければ False(呼び出し側が rollback する)。
+    Doc E4: まず unified diff での精密パッチ(fugu_evolve.patcher)を試み、
+    パース不能・位置解決失敗などで適用できなければ従来のファイル全置換に
+    フォールバックする。1件も適用できなければ False(呼び出し側が rollback)。
     """
+    try:
+        from fugu_evolve import patcher
+        if patcher.implement_with_diff(chat, workspace, proposal,
+                                       max_files=max_edits):
+            return True
+    except Exception:
+        pass  # diff 経路のどんな失敗も全置換フォールバックへ
     sections = []
     for rel in proposal.target_files[:max_edits]:
         target = os.path.join(workspace.repo, rel)

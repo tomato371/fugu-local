@@ -190,7 +190,8 @@ def test_critic_gets_diff_and_evidence():
 def test_implement_proposal_applies_edits(tmp_path):
     (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
     ws = Workspace(str(tmp_path), git=FakeGit(branch=BRANCH_PREFIX + "t-1"))
-    chat = FakeChat(responses=[json.dumps(
+    # 1回目 = diff 試行(非diff応答で失敗) → 2回目 = 全置換フォールバック (Doc E4)
+    chat = FakeChat(responses=["no diff from me", json.dumps(
         {"edits": [{"path": "mod.py", "code": "x = 2\n"}]})])
     assert implement_proposal(chat, ws, PROPOSAL) is True
     assert (tmp_path / "mod.py").read_text(encoding="utf-8") == "x = 2\n"
