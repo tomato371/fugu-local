@@ -53,6 +53,31 @@ def test_completion_returns_inserted_code(monkeypatch):
     assert r.json()["completion"] == "return n * 2"
 
 
+def test_completion_strips_fenced_wrapper_and_prefix_echo(monkeypatch):
+    # 2026-08-01 ライブ実測: qwen3-coder は指示に反し fence + prefix 復唱で返すことがある
+    monkeypatch.setattr(fugu_api.fugu, "setup", lambda: True)
+    monkeypatch.setattr(
+        fugu_api.fugu, "ask",
+        lambda *a, **k: "```python\ndef double(n):\n    return n * 2\n```")
+    r = client.post("/completion", json={"prefix": "def double(n):\n    "})
+    assert r.json()["completion"] == "return n * 2"
+
+
+def test_completion_plain_reply_unchanged(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "setup", lambda: True)
+    monkeypatch.setattr(fugu_api.fugu, "ask", lambda *a, **k: "return n * 2")
+    r = client.post("/completion", json={"prefix": "def double(n):\n    "})
+    assert r.json()["completion"] == "return n * 2"
+
+
+def test_completion_prefix_echo_without_fence_stripped(monkeypatch):
+    monkeypatch.setattr(fugu_api.fugu, "setup", lambda: True)
+    monkeypatch.setattr(fugu_api.fugu, "ask",
+                        lambda *a, **k: "x = 1\ny = 2\n")
+    r = client.post("/completion", json={"prefix": "x = 1\n"})
+    assert r.json()["completion"] == "y = 2"
+
+
 def test_completion_model_error_is_502(monkeypatch):
     monkeypatch.setattr(fugu_api.fugu, "setup", lambda: True)
     monkeypatch.setattr(fugu_api.fugu, "ask",

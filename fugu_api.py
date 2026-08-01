@@ -24,6 +24,7 @@ import difflib
 import json
 import os
 import queue
+import re
 import threading
 import time
 from typing import List, Literal, Optional
@@ -250,6 +251,26 @@ def _single_model_call(system: str, prompt: str, max_tokens: int) -> str:
     return out
 
 
+#: Any-language fenced block (fugu_sandbox's regex only matches python/bash tags).
+_FENCE_ANY_RE = re.compile(r"```[A-Za-z0-9_+-]*[ \t]*\r?\n(.*?)```", re.DOTALL)
+
+
+def _clean_completion(out: str, prefix: str) -> str:
+    """Normalize a completion reply to pure insertion text.
+
+    Live finding 2026-08-01: qwen3-coder sometimes ignores the no-fence /
+    no-repetition instruction and returns the whole function fenced. IDE
+    clients need only the text to insert at the cursor, so strip one fenced
+    wrapper and, if the reply restates the prefix verbatim, drop that echo.
+    """
+    m = _FENCE_ANY_RE.search(out)
+    if m:
+        out = m.group(1)
+    if prefix and out.startswith(prefix):
+        out = out[len(prefix):]
+    return out.rstrip("\n")
+
+
 @app.post("/completion", response_model=CompletionResponse)
 def completion(req: CompletionRequest):
     """Inline code completion: continue the code at the cursor. No MoA."""
@@ -260,7 +281,8 @@ def completion(req: CompletionRequest):
         "no explanations, no repetition of the prefix."
     )
     prompt = f"<prefix>\n{req.prefix}\n</prefix>\n<suffix>\n{req.suffix}\n</suffix>"
-    out = _single_model_call(system, prompt, req.max_tokens)
+    out = _clean_completion(_single_model_call(system, prompt, req.max_tokens),
+                            req.prefix)
     return CompletionResponse(completion=out,
                               elapsed_seconds=round(time.time() - t0, 2))
 
