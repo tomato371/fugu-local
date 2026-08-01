@@ -123,7 +123,7 @@ behavior is byte-identical to the classic pipeline.**
 | `FUGU_COMPRESS=1` | Compress the running draft into a structured digest before round ≥ 2 (protects the pinned `num_ctx`) |
 | `FUGU_SPECULATE=1` | Prefetch web/RAG context concurrently with Conductor planning |
 | `FUGU_DEBATE=1` | Mutual-critique debate when proposals diverge + per-domain model score matrix (`FUGU_SCORE_PATH`) |
-| `FUGU_VISION_MODEL=<model>` | Vision model for `--image` (default `llama3.2-vision`) |
+| `FUGU_VISION_MODEL=<model>` | Vision model for `--image` (default `llama3.2-vision`; use `llava` on Ollama builds that lack `mllama` support — e.g. some Vulkan/D3D12 builds) |
 | `FUGU_HIGH_VRAM=1` | Relax the 8 GB context limits on bigger GPUs |
 
 ## Self-evolution (fugu_evolve)
