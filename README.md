@@ -157,6 +157,8 @@ from `fugu_launcher.py`'s settings screen (option `8`) instead of exporting them
 | `FUGU_MEMORY_CONSOLIDATE=1` | Merge old episodic memories into summaries past a per-kind threshold (`FUGU_MEMORY_THRESHOLD`, default 20) |
 | `FUGU_SANDBOX_BACKEND=docker` | Run generated code in Docker (`--network none`); point `FUGU_SANDBOX_IMAGE` at an image with pytest/sympy — a bare slim image breaks TDC/PoT |
 | `FUGU_SANDBOX_MEMORY_MB=<n>` | Memory cap for sandboxed child processes (default 1024; 0 disables) |
+| `FUGU_SLACK_WEBHOOK=<url>` | Post a completion notice to a Slack Incoming Webhook when an answer finishes (answers can take many minutes — get pinged when you step away) |
+| `FUGU_SLACK_FULL=1` | Include the **full answer text** in the Slack notice, split into ~3,500-char messages (default: first 500 chars only) |
 
 ## Self-evolution (fugu_evolve)
 

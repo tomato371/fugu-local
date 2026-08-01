@@ -39,6 +39,17 @@ def test_build_env_sets_enabled_flags_and_budget():
     assert "FUGU_BROWSER" not in env          # off のものは残さない
 
 
+def test_build_env_slack_webhook_set_only_when_configured():
+    s = _settings(slack_webhook="https://hooks.slack.com/services/T/B/x")
+    s["flags"]["FUGU_SLACK_FULL"] = True
+    env = L.build_env(s, base={})
+    assert env["FUGU_SLACK_WEBHOOK"] == "https://hooks.slack.com/services/T/B/x"
+    assert env["FUGU_SLACK_FULL"] == "1"
+    # ランチャー設定が空ならシェル側の FUGU_SLACK_WEBHOOK は消さずに尊重する
+    env2 = L.build_env(_settings(), base={"FUGU_SLACK_WEBHOOK": "http://from-shell"})
+    assert env2["FUGU_SLACK_WEBHOOK"] == "http://from-shell"
+
+
 def test_build_env_clears_inherited_flag_when_toggled_off():
     """親シェルに残った FUGU_SANDBOX=1 が、OFF 設定を上書きしないこと。"""
     env = L.build_env(_settings(), base={"FUGU_SANDBOX": "1",

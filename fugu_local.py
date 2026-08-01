@@ -437,7 +437,9 @@ def save_history_file(history: list, path: Path = None, force: bool = False):
 SLACK_WEBHOOK_URL = os.environ.get("FUGU_SLACK_WEBHOOK", "")
 SLACK_NOTIFY_TIMEOUT = 10    # 秒。通知は本処理を止めない
 SLACK_Q_PREVIEW = 200        # 通知に載せる質問の文字数上限
-SLACK_A_PREVIEW = 500        # 通知に載せる回答の文字数上限
+SLACK_A_PREVIEW = 500        # 通知に載せる回答の文字数上限(プレビューモード時)
+SLACK_CHUNK_CHARS = 3500     # 全文モード: 1メッセージあたりの本文上限(Slack の表示折畳み対策)
+SLACK_MAX_CHUNKS = 10        # 全文モード: 分割数の上限。超過分は末尾を落として明記する
 
 
 def _slack_truncate(text: str, limit: int) -> str:
@@ -445,18 +447,8 @@ def _slack_truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def notify_slack(question: str, answer: str, elapsed: float):
-    """完了通知を Slack Incoming Webhook へ送る。失敗しても本処理には影響させない。"""
-    if not SLACK_WEBHOOK_URL:
-        return
-    ok = not (answer or "").startswith("__ERROR__")
-    icon = ":white_check_mark:" if ok else ":x:"
-    head = f"Fugu {'完了' if ok else '失敗'} ({elapsed} 秒)"
-    text = (
-        f"{icon} *{head}*\n"
-        f"*Q:* {_slack_truncate(question, SLACK_Q_PREVIEW)}\n"
-        f"*A:* {_slack_truncate(answer, SLACK_A_PREVIEW)}"
-    )
+def _slack_post(text: str) -> bool:
+    """1 メッセージを Webhook へ POST する。失敗しても例外は投げない。"""
     req = urllib.request.Request(
         SLACK_WEBHOOK_URL,
         data=json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"),
@@ -465,9 +457,55 @@ def notify_slack(question: str, answer: str, elapsed: float):
     )
     try:
         urllib.request.urlopen(req, timeout=SLACK_NOTIFY_TIMEOUT)
-        print("   [Slack 通知を送信しました]")
+        return True
     except Exception as e:
         print(f"   [Slack 通知エラー: {e}]")
+        return False
+
+
+def notify_slack(question: str, answer: str, elapsed: float):
+    """完了通知を Slack Incoming Webhook へ送る。失敗しても本処理には影響させない。
+
+    既定では回答を SLACK_A_PREVIEW 文字に切り詰めた 1 通のプレビュー。
+    ``FUGU_SLACK_FULL=1`` なら回答全文を SLACK_CHUNK_CHARS 文字ずつに分割して
+    送る(離席中でも Slack だけで結果を読み切れるようにする)。
+    """
+    if not SLACK_WEBHOOK_URL:
+        return
+    ok = not (answer or "").startswith("__ERROR__")
+    icon = ":white_check_mark:" if ok else ":x:"
+    head = f"Fugu {'完了' if ok else '失敗'} ({elapsed} 秒)"
+    header = f"{icon} *{head}*\n*Q:* {_slack_truncate(question, SLACK_Q_PREVIEW)}\n"
+
+    if os.environ.get("FUGU_SLACK_FULL", "") != "1":
+        if _slack_post(header + f"*A:* {_slack_truncate(answer, SLACK_A_PREVIEW)}"):
+            print("   [Slack 通知を送信しました]")
+        return
+
+    # ---- 全文モード ----
+    body = (answer or "").strip()
+    chunks = [body[i:i + SLACK_CHUNK_CHARS]
+              for i in range(0, len(body), SLACK_CHUNK_CHARS)] or [""]
+    dropped = len(chunks) - SLACK_MAX_CHUNKS
+    chunks = chunks[:SLACK_MAX_CHUNKS]
+    total = len(chunks)
+    sent = 0
+    for i, chunk in enumerate(chunks, start=1):
+        if total > 1:
+            prefix = header + f"*A:* ({i}/{total})\n" if i == 1 \
+                else f"({i}/{total} 続き)\n"
+        else:
+            prefix = header + "*A:*\n"
+        text = prefix + chunk
+        if i == total and dropped > 0:
+            text += (f"\n…(長すぎるため残り約 {dropped * SLACK_CHUNK_CHARS} 文字を"
+                     "省略。全文は手元の出力/履歴を参照)")
+        if not _slack_post(text):
+            break                      # 途中で失敗したらそこで打ち切る
+        sent += 1
+    if sent:
+        print(f"   [Slack 通知を送信しました ({sent}/{total} 通)]"
+              if total > 1 else "   [Slack 通知を送信しました]")
 
 
 # ==================================================

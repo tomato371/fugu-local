@@ -62,6 +62,7 @@ FLAGS = [
     ("FUGU_REQUIRE_APPROVAL", False, "コード実行と自己進化 merge を人間承認までブロックする"),
     ("FUGU_HIGH_VRAM", False, "8GB 前提の context 制限を緩める(大きい GPU 向け)"),
     ("FUGU_PROFILE", False, "LLM 呼び出しの時間内訳を JSONL に記録する"),
+    ("FUGU_SLACK_FULL", False, "Slack 通知に回答の全文を分割して載せる(既定は先頭500字)"),
 ]
 
 THINKING_CHOICES = ["off", "minimal", "low", "medium", "high", "ultra", "max", "auto"]
@@ -72,6 +73,7 @@ DEFAULT_SETTINGS = {
     "vision_model": "",
     "ollama_url": "http://localhost:11434",
     "rag_repo": DEFAULT_RAG_REPO,
+    "slack_webhook": "",
 }
 
 
@@ -122,6 +124,9 @@ def build_env(settings, base=None):
         env["FUGU_VISION_MODEL"] = settings["vision_model"]
     if settings.get("ollama_url"):
         env["OLLAMA_URL"] = settings["ollama_url"]
+    # Webhook はランチャー設定が空ならシェル側の値をそのまま尊重する
+    if settings.get("slack_webhook"):
+        env["FUGU_SLACK_WEBHOOK"] = settings["slack_webhook"]
     return env
 
 
@@ -423,7 +428,7 @@ def _ask(prompt, default=""):
 
 
 #: 全角の数字・記号・よく使う英字を半角に寄せる(メニュー入力の表記ゆれ対策)
-_ZENKAKU = str.maketrans("０１２３４５６７８９ｑｔｖｕｒｙｎ）．", "0123456789qtvuryn).")
+_ZENKAKU = str.maketrans("０１２３４５６７８９ｑｔｖｕｒｓｙｎ）．", "0123456789qtvursyn).")
 
 
 def _choice(prompt):
@@ -595,6 +600,9 @@ def settings_menu(settings):
         print(f" v) 画像モデル FUGU_VISION_MODEL    = {settings['vision_model'] or '(既定)'}")
         print(f" u) Ollama     OLLAMA_URL           = {settings['ollama_url']}")
         print(f" r) fugu-rag のパス                 = {settings['rag_repo']}")
+        hook = settings.get("slack_webhook", "")
+        hook_disp = (hook[:38] + "…") if len(hook) > 39 else (hook or "(なし=通知しない)")
+        print(f" s) Slack Webhook FUGU_SLACK_WEBHOOK = {hook_disp}")
         print(" 0) 戻る(保存されます)")
         choice = _choice("選択(番号でトグル)> ")
         if choice in ("0", ""):
@@ -611,6 +619,13 @@ def settings_menu(settings):
             settings["ollama_url"] = _ask("URL: ", settings["ollama_url"])
         elif choice == "r":
             settings["rag_repo"] = _ask("パス: ", settings["rag_repo"])
+        elif choice == "s":
+            print("  Slack で App を作らず使える Incoming Webhook の URL を貼ります。")
+            print("  作り方: https://api.slack.com/messages/webhooks (空 Enter で解除)")
+            settings["slack_webhook"] = _ask("URL: ").strip()
+            if settings["slack_webhook"] and not settings["flags"].get("FUGU_SLACK_FULL"):
+                if _yes("回答の全文も Slack に送る? (OFF だと先頭500字のみ)", True):
+                    settings["flags"]["FUGU_SLACK_FULL"] = True
         elif choice.isdigit() and 1 <= int(choice) <= len(FLAGS):
             name = FLAGS[int(choice) - 1][0]
             settings["flags"][name] = not settings["flags"].get(name)
