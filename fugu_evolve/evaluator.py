@@ -124,6 +124,7 @@ def _record_episode(repo: str, verification: "Verification") -> None:
             outcome="success" if verification.verdict == VERIFIED else "failure",
             lesson=("; ".join(verification.notes)[:300]
                     or f"verdict={verification.verdict}")))
+        fugu_memory.maybe_consolidate(fugu_memory.get_default_memory())
     except Exception:
         pass
 

@@ -178,6 +178,91 @@ def reset_default_memory() -> None:
     _DEFAULT.clear()
 
 
+#: kind ごとにこの件数を超えたら統合対象(env FUGU_MEMORY_THRESHOLD で変更可)。
+DEFAULT_CONSOLIDATE_THRESHOLD = 20
+#: 統合時も直近この件数は生のまま残す(新鮮な教訓は要約で薄めない)。
+CONSOLIDATE_KEEP_RECENT = 5
+
+_CONSOLIDATE_SYSTEM = (
+    "You are a memory consolidator. Merge the listed past lessons into ONE "
+    "short lesson (a few sentences) that preserves every recurring, actionable "
+    "insight and drops one-off noise. Reply with the merged lesson text only."
+)
+
+
+def _rewrite_jsonl(memory: LexicalMemory) -> None:
+    """episodes の現状態で JSONL を書き直す(統合後の圧縮反映)。"""
+    if not memory.path:
+        return
+    os.makedirs(os.path.dirname(memory.path) or ".", exist_ok=True)
+    with open(memory.path, "w", encoding="utf-8", newline="\n") as fh:
+        for episode in memory.episodes:
+            fh.write(json.dumps(asdict(episode), ensure_ascii=False) + "\n")
+
+
+def consolidate(memory: LexicalMemory, chat,
+                threshold: Optional[int] = None,
+                keep_recent: int = CONSOLIDATE_KEEP_RECENT) -> bool:
+    """kind ごとに閾値超過分の古いエピソードを1件の要約に統合する (Doc E5)。
+
+    平坦ログの無限成長で lessons_for の検索精度が薄まるのを防ぐ。要約は LLM に
+    依頼し、**失敗・空応答ならその kind は無傷のまま何もしない**(記憶の破壊は
+    要約の失敗より常に悪い)。統合できたら JSONL を書き直して True を返す。
+    """
+    if threshold is None:
+        try:
+            threshold = int(os.environ.get("FUGU_MEMORY_THRESHOLD")
+                            or DEFAULT_CONSOLIDATE_THRESHOLD)
+        except ValueError:
+            threshold = DEFAULT_CONSOLIDATE_THRESHOLD
+    changed = False
+    for kind in sorted({ep.kind for ep in memory.episodes}):
+        of_kind = [ep for ep in memory.episodes if ep.kind == kind]
+        if len(of_kind) <= threshold:
+            continue
+        old = of_kind[:-keep_recent] if keep_recent > 0 else of_kind
+        digest = "\n".join(f"- [{ep.outcome}] {ep.lesson}" for ep in old)[:4000]
+        try:
+            summary = chat.complete(
+                f"Past lessons (kind={kind}):\n{digest}\n\n"
+                f"Return the single merged lesson.",
+                system=_CONSOLIDATE_SYSTEM, temperature=0.2).strip()
+        except Exception:
+            continue
+        if not summary:
+            continue
+        merged = Episode(kind=kind,
+                         task=f"consolidated {len(old)} past episodes",
+                         outcome="summary", lesson=summary,
+                         ts=memory._now())
+        removed = set(map(id, old))
+        memory.episodes = ([merged]
+                           + [ep for ep in memory.episodes
+                              if id(ep) not in removed])
+        changed = True
+    if changed:
+        _rewrite_jsonl(memory)
+    return changed
+
+
+def maybe_consolidate(memory: MemoryStore) -> None:
+    """FUGU_MEMORY_CONSOLIDATE=1 のときだけ既定記憶の統合を試みる(record 後用)。
+    LexicalMemory 以外・LLM 不可・失敗は何もしない(記録経路を絶対に止めない)。"""
+    if os.environ.get("FUGU_MEMORY_CONSOLIDATE") != "1":
+        return
+    if not isinstance(memory, LexicalMemory):
+        return
+    try:
+        import fugu_llm
+        chat = fugu_llm.AskChat(label="memory-consolidate")
+    except ImportError:
+        return
+    try:
+        consolidate(memory, chat)
+    except Exception:
+        pass
+
+
 def lessons_for(memory: MemoryStore, query: str, k: int = 3) -> str:
     """query に関連する過去の教訓を注入用テキストに整形する(無関連なら空)。"""
     episodes = memory.search(query, k=k)

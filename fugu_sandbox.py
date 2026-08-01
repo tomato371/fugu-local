@@ -392,6 +392,7 @@ def _record_episode(task: str, result: SandboxResult, attempts: int) -> None:
         fugu_memory.get_default_memory().record(fugu_memory.Episode(
             kind="sandbox", task=task[:200],
             outcome="success" if result.ok else "failure", lesson=lesson))
+        fugu_memory.maybe_consolidate(fugu_memory.get_default_memory())
     except Exception:
         pass
 

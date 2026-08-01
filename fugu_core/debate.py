@@ -150,6 +150,63 @@ def should_debate(proposals: List[Tuple[str, str]],
     return False
 
 
+_VERIFY_SCHEMA: Dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "refuted": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["refuted"],
+}
+
+_SKEPTIC_SYSTEM = (
+    "You are an independent skeptic auditing an answer through the {lens} "
+    "lens. Try to REFUTE it: find a concrete error of that kind. If you find "
+    "one, refuted=true with the reason. If you cannot confidently CONFIRM the "
+    "answer, default to refuted=true. Only refuted=false when you actively "
+    "verified it. Reply with JSON only."
+)
+
+#: 懐疑者に配る観点(冗長な同型批評ではなく、失敗モードの多様性を稼ぐ)。
+SKEPTIC_LENSES: Tuple[str, ...] = ("logical", "computational", "factual")
+
+
+def adversarial_verify(question: str, claim: str,
+                       chat_factory: Callable[[int], object],
+                       n: int = 3) -> Tuple[bool, List[str]]:
+    """独立した懐疑者 n 体に反証を試みさせる (Doc E5)。
+
+    各懐疑者は異なる観点(:data:`SKEPTIC_LENSES` を巡回)で「反証できるか」を
+    判定する。**判定不能(junk・例外)は反証成立として数える(安全側)**。
+    過半数が反証しなければ (True, []) — つまり採用には積極的な生存が要る。
+    戻り値は (verified, 反証理由リスト)。
+    """
+    refutations: List[str] = []
+    total = max(1, n)
+    for index in range(total):
+        lens = SKEPTIC_LENSES[index % len(SKEPTIC_LENSES)]
+        prompt = (
+            f"Question:\n{question}\n\n"
+            f"Answer under audit:\n{claim}\n\n"
+            f'Respond with {{"refuted": true|false, "reason": ...}}.'
+        )
+        try:
+            raw = chat_factory(index).complete(
+                prompt, system=_SKEPTIC_SYSTEM.format(lens=lens),
+                fmt=_VERIFY_SCHEMA, temperature=0.3)
+            obj = json.loads(raw)
+            refuted = obj.get("refuted") if isinstance(obj, dict) else None
+            if not isinstance(refuted, bool):
+                refuted = True  # 語彙外 = 判定不能 → 安全側
+            reason = str(obj.get("reason") or "") if isinstance(obj, dict) else ""
+        except Exception:
+            refuted, reason = True, "skeptic unavailable"
+        if refuted:
+            refutations.append(f"[{lens}] {reason or 'refuted'}")
+    verified = len(refutations) * 2 < total
+    return verified, refutations
+
+
 _DEBATE_SYSTEM = (
     "You are one proposer in a structured multi-agent debate. Read the rival "
     "answers, identify concrete errors or omissions in them and in your own "

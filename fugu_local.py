@@ -4671,6 +4671,30 @@ def _debate_proposals(question, proposals):
         return proposals
 
 
+def _adversarial_check(question, answer, ok, issue):
+    """FUGU_ADVERSARIAL=1 のときだけ、Critic 合格後に独立懐疑者パネルで再審する (Doc E5)。
+    Critic が既に不合格なら何もしない。パネルの過半数が反証したら不合格に反転し、
+    反証理由を issue として追加ラウンドへ渡す。失敗時は Critic 判定を維持。"""
+    if os.environ.get("FUGU_ADVERSARIAL") != "1" or not ok:
+        return ok, issue
+    try:
+        import fugu_llm
+        from fugu_core import debate as fugu_debate
+    except ImportError:
+        return ok, issue
+    try:
+        verified, refutations = fugu_debate.adversarial_verify(
+            question, answer,
+            lambda i: fugu_llm.AskChat(label=f"skeptic{i}"))
+        if verified:
+            return ok, issue
+        reason = "; ".join(refutations)[:300]
+        print(f"   [adversarial] 懐疑者パネルが反証 → 追加ラウンドへ ({reason})")
+        return False, reason
+    except Exception:
+        return ok, issue
+
+
 def _debate_record(question, models, ok):
     """FUGU_DEBATE=1 のときだけ、Critic 判定の合否をスコア行列に記録する (Doc D4)。"""
     if os.environ.get("FUGU_DEBATE") != "1":
@@ -4939,6 +4963,7 @@ def fugu_answer(question, plan=None, history=None):
             need_more = True
         elif ALLOW_RECURSION:
             ok, issue = critique(question, fin)
+            ok, issue = _adversarial_check(question, fin, ok, issue)  # FUGU_ADVERSARIAL=1 のみ
             _emit("critic", ok=ok, issue=(issue or "")[:200])
             _debate_record(question, models, ok)  # FUGU_DEBATE=1 のみ
             need_more = not ok
