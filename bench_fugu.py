@@ -386,6 +386,10 @@ CONFIGS.update({
     "think@nim": run_think,
     "sc@nim": lambda it: run_sc(it, pot=True),
     "coder@nim": lambda it: run_coder(it, single=False),
+    # sc2@nim (2026-08-03): runner は sc@nim と同一。429ストーム修正(指数バックオフ+
+    # グローバルクールダウン)と第3系統復活(minimax-m3)後の再測定を、修正前の sc@nim
+    # 結果と別ファイルで比較するための名前。主用途は嵐で無投票敗退した問題の --ids 再挑戦。
+    "sc2@nim": lambda it: run_sc(it, pot=True),
 })
 
 # ==================================================
