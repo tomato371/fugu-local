@@ -69,9 +69,12 @@ NIM_RATE_RETRIES = 10         # 429/503 専用リトライ予算（通常予算�
 # __ERROR__ 化 →「票割れ」と誤解して追加バッチ投入 → それも全滅 → 1問171リクエスト
 # 消費して無投票敗退、という連鎖を実測した（aime26/25 の敗因12問中11問がこれ）。
 # 対策は二段: (1) Retry-After 無し 429 は指数バックオフ(20,40,80,120…cap)で下がる
-# (2) 全スレッド共有のクールダウン時刻 _NIM_COOLDOWN[0] を設け、誰かが 429 を見たら
-#     全員が送信前にその時刻まで待つ（4本が独立に叩き続けるのを止める）。
-_NIM_COOLDOWN = [0.0]         # epoch秒。この時刻まで全ワーカーが新規送信を控える
+# (2) スレッド共有のクールダウン時刻を設け、429 を見たら同じモデルへの送信を全員が控える。
+# 【モデル別である理由 (2026-08-03 実測)】: NIM の 429 はアカウント上限だけでなく
+# 「特定モデルの混雑」でも出る（llama-8b が即 OK の同時刻に deepseek-v4-pro だけ即 429 を
+# 確認）。全モデル一括のクールダウンにすると、混雑した1モデルが健全なモデルの送信まで
+# 道連れにして SC 全体が凍る。キーはモデル ID、値は「その時刻まで送信を控える」epoch 秒。
+_NIM_COOLDOWN = {}            # model_id -> epoch秒
 _NIM_COOLDOWN_LOCK = threading.Lock()
 NIM_MODEL_IDS = set()         # apply_nim_profile() が投入するディスパッチ実体
 NIM_STRUCTURED_OK = set()     # response_format=json_object を受けるモデル (プロファイルが投入)
@@ -2339,10 +2342,10 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         if NIM_BUDGET > 0 and _nim_usage_total() >= NIM_BUDGET:
             print(f"[nim] リクエスト予算 {NIM_BUDGET} に到達 → 送信せず終了 (rc=42)")
             raise SystemExit(42)
-        # グローバルクールダウン: 誰かが 429 を踏んだら全ワーカーが送信を控える
-        # （セマフォ取得前に待つ = 待機中も他リクエストをブロックしない）
+        # モデル別クールダウン: 誰かがこのモデルで 429 を踏んだら同モデルへの送信を控える
+        # （セマフォ取得前に待つ = 待機中も他モデルのリクエストをブロックしない）
         while True:
-            wait = _NIM_COOLDOWN[0] - time.time()
+            wait = _NIM_COOLDOWN.get(model, 0.0) - time.time()
             if wait <= 0:
                 break
             time.sleep(min(wait, 5.0))
@@ -2387,9 +2390,10 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                     used = NIM_RATE_RETRIES - rate_budget   # 1,2,3,...
                     wait = min(20.0 * (2 ** (used - 1)), NIM_RETRY_AFTER_CAP)
                 wait = max(wait, 1.0)
-                # 全ワーカー共有のクールダウンを延長（他スレッドの新規送信も止める）
+                # 同一モデルのクールダウンを延長（他スレッドの同モデル新規送信も止める）
                 with _NIM_COOLDOWN_LOCK:
-                    _NIM_COOLDOWN[0] = max(_NIM_COOLDOWN[0], time.time() + wait)
+                    _NIM_COOLDOWN[model] = max(_NIM_COOLDOWN.get(model, 0.0),
+                                               time.time() + wait)
                 time.sleep(wait)
                 continue
             if (e.code == 400 and not dropped_params
@@ -4552,7 +4556,9 @@ def _arbitrate(question, task_type, samples, classes):
     if ARBITER_MODEL and is_installed(ARBITER_MODEL, inst):
         chain.append(ARBITER_MODEL)
     for m in REASONING_MODELS:                 # 120b が失敗しても軽い思考モデルで必ず裁く
-        if m in PROPOSERS and m not in chain:
+        # NIM 補足 (2026-08-03): solve_verifiable の系統フィルタと同じ理由で _is_nim も許可
+        # （NIM 第3系統 minimax-m3 を裁定フォールバックから漏らさない。ローカルでは不変）
+        if (m in PROPOSERS or _is_nim(m)) and m not in chain:
             chain.append(m)
     if not chain:
         return None

@@ -81,7 +81,7 @@ def run_mocked(responses, fn):
     f.urllib.request.urlopen = fake_open
     f.time.sleep = fake_sleep
     f.time.time = lambda: clock[0]
-    f._NIM_COOLDOWN[0] = 0.0
+    f._NIM_COOLDOWN.clear()
     try:
         out = fn()
     except SystemExit as e:
@@ -90,7 +90,7 @@ def run_mocked(responses, fn):
         f.urllib.request.urlopen = orig_open
         f.time.sleep = orig_sleep
         f.time.time = orig_time
-        f._NIM_COOLDOWN[0] = 0.0
+        f._NIM_COOLDOWN.clear()
     return out, sent, sleeps
 
 
@@ -172,11 +172,13 @@ check("429: Retry-After無しは指数バックオフ(20,40)", out == "calm" and
 _cool_seen = []
 def _cool_probe():
     r = f.ask("test/model", MSGS, 0.5)
-    _cool_seen.append(f._NIM_COOLDOWN[0])
+    _cool_seen.append(dict(f._NIM_COOLDOWN))
     return r
 out, _, _ = run_mocked([http_error(429), FakeResponse(ok_body())], _cool_probe)
-check("429: グローバルクールダウンが将来時刻に設定される(全ワーカー抑制)",
-      _cool_seen and _cool_seen[0] > 1_000_000.0)
+check("429: モデル別クールダウンが将来時刻に設定される(同モデルの全ワーカー抑制)",
+      _cool_seen and _cool_seen[0].get("test/model", 0) > 1_000_000.0)
+check("429: 他モデルのクールダウンは汚さない(per-model分離)",
+      _cool_seen and list(_cool_seen[0].keys()) == ["test/model"])
 
 # ---------- 5. length 打ち切り ----------
 out, _, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
