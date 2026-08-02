@@ -210,6 +210,101 @@ def apply_high_vram_profile():
           f"cheap_votes={SC_CHEAP_VOTES} arbiter={ARBITER_MODEL}")
 
 
+# ==================================================
+# NIM クラウドプロファイル（FUGU_BACKEND=nim・一発切り替え）
+# ==================================================
+# ハード（DGX Spark 等）導入前に「スケールアップしたら精度がどこまで伸びるか」を
+# NVIDIA NIM API で実測するためのプロファイル。apply_high_vram_profile と同型の
+# global 一括上書き。setup() が FUGU_BACKEND=="nim" を判定して呼ぶ。
+# モデル ID は 2026-08 時点の build.nvidia.com カタログ準拠。実在照合は本関数内で
+# /v1/models と突合して警告する（ネットワーク不通なら黙ってスキップ＝致命でない）。
+def apply_nim_profile():
+    """全ロールを NIM クラウドモデルへ一括切替。キー未設定なら False（setup() が中断）。"""
+    global DESIRED_PROPOSERS, DESIRED_AGGREGATOR, DESIRED_CONDUCTOR, FALLBACK_MODEL
+    global PERSONA_MODELS, PERSONA_IDENTITY, MODEL_TO_PERSONA, PROPOSER_PROFILES
+    global JP_AGGREGATOR, JP_AGGREGATOR_STRONG, AGGREGATOR_REASONING, SECOND_OPINION_MODEL
+    global MODEL_CONFIG, PARALLEL_PROPOSERS, REASONING_MODELS, ARBITER_MODEL
+    global SC_CHEAP_VOTES, SC_PARALLEL, NIM_MODEL_IDS, NIM_STRUCTURED_OK
+    if not NIM_API_KEY:
+        print("❌ FUGU_BACKEND=nim ですが NVIDIA_API_KEY が未設定です。"
+              "build.nvidia.com でキー(nvapi-...)を生成し $env:NVIDIA_API_KEY へ設定してください。")
+        return False
+    print("[setup] FUGU_BACKEND=nim → NIM クラウドプロファイルを適用します")
+
+    # ID は 2026-08-02 に /v1/models で実在確認済み（計画時の r1/v3.1/405b/qwen3-235b/
+    # kimi-k2-instruct は現行カタログから消えており、後継へ差し替えた）。
+    cond = "meta/llama-3.1-8b-instruct"                    # Conductor/Critic: JSON 安定・軽量
+    prop_a = "openai/gpt-oss-120b"                         # 汎用推論 (reasoning_effort=high)
+    prop_b = "moonshotai/kimi-k2.6"                        # コード最強格 (kimi-k2-instruct 後継)
+    prop_c = "nvidia/llama-3.1-nemotron-ultra-253b-v1"     # 集約・大規模 (405b 廃止の後継枠)
+    prop_d = "deepseek-ai/deepseek-v4-pro"                 # 理数・思考 (deepseek-r1 系後継)
+    agg = "z-ai/glm-5.2"                                   # 統合 (v3.1 廃止 → GLM フラッグシップ)
+    jp_agg = "z-ai/glm-5.2"        # 日本語統合。qwen 系がカタログから消滅したため GLM で代替。
+                                   # 「JP は qwen3 で統合」のローカル教訓 (deepseek-r1 蒸留の
+                                   # 中国語混入) とは別物のフラッグシップだが、jmmlu ベンチと
+                                   # 対話 JP 1 問で実地検証すること。不良なら gemma-4-31b-it へ。
+    second = "mistralai/mistral-large-2-instruct"  # conductor(llama系)と別系統の独立チェック
+    sc_third = "minimaxai/minimax-m3"              # SC 第3系統 (思考型・独立系譜)
+
+    DESIRED_PROPOSERS = [prop_a, prop_b, prop_c, prop_d]
+    DESIRED_AGGREGATOR = agg
+    DESIRED_CONDUCTOR = cond
+    FALLBACK_MODEL = cond
+    PERSONA_MODELS = {
+        "Proposer A": prop_a,
+        "Proposer B": prop_b,
+        "Proposer C": prop_c,
+        "Proposer D": prop_d,
+    }
+    PERSONA_IDENTITY = {
+        prop_a: "あなたは『ChatGPT(GPT)の存在』。バランス感覚に優れ、一般的な対話と文章の骨組み作りを担当する。",
+        prop_b: "あなたは『Claudeの存在』。高度なプログラミング、厳密な論理チェック、コードの自己修復を担当する。",
+        prop_c: "あなたは『Geminiの存在』。RAG(Office文書)のコンテキスト分析、大量ドキュメントとWeb検索結果の集約を担当する。",
+        prop_d: "あなたは理数・物理・PINN(物理情報ニューラルネット)・偏微分方程式の専門家。厳密に段階を追って考える。",
+    }
+    # ロード時導出 (:82 相当) は旧ローカル ID で陳腐化するため必ず再導出する
+    MODEL_TO_PERSONA = {v: k for k, v in PERSONA_MODELS.items()}
+    PROPOSER_PROFILES = {
+        prop_a: "ChatGPT(GPT)の存在。バランス・一般的な対話・文章の骨組み (OpenAI OSS MoE 120B・思考high対応)",
+        prop_b: "Claudeの存在。高度なプログラミング・厳密な論理チェック・自己修復 (Kimi K2.6・SWE最強クラスMoE)",
+        prop_c: "Geminiの存在。RAG(Office文書)分析・大量ドキュメント・Web検索結果の集約 (Nemotron Ultra 253B)",
+        prop_d: "理数・物理・PINN・偏微分方程式・アルゴリズム証明に強い思考型 (DeepSeek V4 Pro)",
+    }
+    JP_AGGREGATOR = jp_agg
+    JP_AGGREGATOR_STRONG = jp_agg
+    AGGREGATOR_REASONING = prop_a
+    SECOND_OPINION_MODEL = second
+    REASONING_MODELS = [prop_d, prop_a, sc_third]  # SC 主力 3 系統（多様性＝投票の独立性）
+    ARBITER_MODEL = prop_d
+    SC_CHEAP_VOTES = 0              # クラウドでは「安価票」の意味が消える
+    PARALLEL_PROPOSERS = True
+    SC_PARALLEL = True
+    # num_ctx はクラウドでは送らない（_ask_nim が無視）。num_predict→max_tokens のみ意味を持つ。
+    # 思考モデルは打ち切り(finish_reason=length・本文空)回避のため厚めに取る。
+    for m in (cond, prop_a, prop_b, prop_c, prop_d, agg, second, sc_third):
+        MODEL_CONFIG[m] = {"num_predict": 16384}
+    MODEL_CONFIG[prop_a]["think"] = "high"     # gpt-oss 系のみ reasoning_effort が効く
+    NIM_MODEL_IDS = {cond, prop_a, prop_b, prop_c, prop_d, agg, jp_agg, second, sc_third}
+    # response_format={"type":"json_object"} を受ける保守的な集合。外れても 400 drop 再送 +
+    # スキーマ文字列注入 + 既存 _fallback 経路の三段防衛があるため致命でない。
+    NIM_STRUCTURED_OK = {cond, agg, second}
+    # タイポ検出: /v1/models と一度だけ突合（不通・失敗は警告なしでスキップ）
+    try:
+        req = urllib.request.Request(
+            f"{NIM_URL}/models", headers={"Authorization": f"Bearer {NIM_API_KEY}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            catalog = {m.get("id") for m in json.loads(r.read().decode()).get("data", [])
+                       if isinstance(m, dict)}
+        missing = sorted(NIM_MODEL_IDS - catalog)
+        if catalog and missing:
+            print(f"⚠ [nim] /v1/models に存在しない ID（タイポ/廃止の可能性）: {missing}")
+    except Exception:
+        pass
+    print(f"[setup] nim: proposers=4クラウド並列 SC_PARALLEL=ON workers={SC_WORKERS} "
+          f"arbiter={ARBITER_MODEL} 予算={'無制限' if NIM_BUDGET == 0 else NIM_BUDGET}")
+    return True
+
+
 def proposer_think_for(model):
     """proposer の think 解決: グローバル PROPOSER_THINK(≠None) > MODEL_CONFIG > モデル既定。"""
     if PROPOSER_THINK is not None:
@@ -3680,6 +3775,11 @@ SC_MIN_VOTES = 3        # 全会一致で確定してよい最小サンプル数
 # 黙って捨てず _arbitrate 内でログに出す。
 ARBITRATE_MAX_CANDIDATES = 4
 SC_TEMP = 0.7           # 多様性確保（投票の独立性）
+# SC バッチ内サンプリングの並列化 (2026-08-02, NIM クラウド向け)。既定 False で既存の
+# 逐次経路（モデルごとにまとめて再ロードを最小化する 8GB 最適化）は無改修のまま。
+# クラウドではモデルロードが存在しないため並列化が純粋に壁時計短縮になる。
+SC_PARALLEL = False
+SC_WORKERS = 4          # 並列時の同時サンプル数（NIM 側セマフォと二段構え）
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4800,7 +4900,12 @@ def setup():
         return False
     if os.environ.get("FUGU_HIGH_VRAM") in ("1", "true", "True"):
         apply_high_vram_profile()
-    print("[setup] ローカルモデル構成を確認します…")
+    if FUGU_BACKEND == "nim":
+        if not apply_nim_profile():
+            return False
+        print("[setup] NIM クラウドモデル構成を確認します…")
+    else:
+        print("[setup] ローカルモデル構成を確認します…")
     PROPOSERS, AGGREGATOR, CONDUCTOR = resolve_models()
     if not PROPOSERS or AGGREGATOR is None or CONDUCTOR is None:
         print("利用可能なモデルを用意できませんでした。")
@@ -4810,9 +4915,15 @@ def setup():
         + ("" if model in PROPOSERS else "  [未導入]")
         for label, model in PERSONA_MODELS.items()
     )
+    if FUGU_BACKEND == "nim":
+        title = "🐡 Fugu-style MoA Orchestrator [NIM CLOUD BACKEND]"
+        footer = f" backend: {NIM_URL}  (≈40 RPM / semaphore={NIM_MAX_CONCURRENCY})"
+    else:
+        title = "🐡 Local Fugu-style MoA Orchestrator (3大AIオールスター)"
+        footer = " OLLAMA_MAX_LOADED_MODELS=1 は恒久設定済み（ユーザー環境変数）。"
     print(f"""
 ===================================================
- 🐡 Local Fugu-style MoA Orchestrator (3大AIオールスター)
+ {title}
   conductor : {CONDUCTOR}   (動的に委譲を決定)
   proposers :
 {persona_lines}
@@ -4821,7 +4932,7 @@ def setup():
   max_rounds: {MAX_ROUNDS}  escalation: {ADAPTIVE_ESCALATION}  recursion: {ALLOW_RECURSION}
   mode      : {"並列" if PARALLEL_PROPOSERS else "逐次"}
 ===================================================
- OLLAMA_MAX_LOADED_MODELS=1 は恒久設定済み（ユーザー環境変数）。
+{footer}
 """)
     _READY = True
     return True
