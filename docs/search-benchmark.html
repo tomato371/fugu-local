@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AB-MCTS 探索ベンチ</title>
+<style>
+.viz-root{color-scheme:light;
+ --surface-1:#fcfcfb;--page:#f9f9f7;--ink:#0b0b0b;--ink-2:#52514e;
+ --muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;
+ --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;}
+@media (prefers-color-scheme: dark){:root:where(:not([data-theme="light"])) .viz-root{
+ color-scheme:dark;--surface-1:#1a1a19;--page:#0d0d0d;--ink:#ffffff;--ink-2:#c3c2b7;
+ --muted:#898781;--grid:#2c2c2a;--axis:#383835;
+ --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;}}
+:root[data-theme="dark"] .viz-root{
+ color-scheme:dark;--surface-1:#1a1a19;--page:#0d0d0d;--ink:#ffffff;--ink-2:#c3c2b7;
+ --muted:#898781;--grid:#2c2c2a;--axis:#383835;
+ --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;}
+body{margin:0}
+.viz-root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+ background:var(--page);color:var(--ink);padding:24px;min-height:100vh}
+.viz-root h1{font-size:20px;margin:0 0 4px}
+.viz-root .sub{color:var(--ink-2);font-size:13px;margin-bottom:20px}
+.card{background:var(--surface-1);border:1px solid var(--grid);border-radius:10px;
+ padding:16px;margin-bottom:16px;max-width:960px}
+.card h2{font-size:14px;margin:0 0 10px;color:var(--ink-2);font-weight:600}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--ink-2);
+ margin-bottom:8px}
+.legend .sw{display:inline-block;width:10px;height:10px;border-radius:3px;
+ margin-right:5px;vertical-align:-1px}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{color:var(--muted);font-weight:500;text-align:right;padding:6px 8px;
+ border-bottom:1px solid var(--axis)}
+.tbl td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--grid);
+ font-variant-numeric:tabular-nums}
+.tbl th:first-child,.tbl td:first-child{text-align:left}
+.verdict{font-size:14px;padding:12px 16px;border-left:3px solid var(--s1);
+ background:var(--surface-1)}
+svg text{fill:var(--muted);font-size:11px;font-family:inherit}
+svg .lbl{fill:var(--ink-2);font-size:11px}
+.tip{position:fixed;pointer-events:none;background:var(--surface-1);
+ border:1px solid var(--axis);border-radius:6px;padding:6px 9px;font-size:12px;
+ color:var(--ink);display:none;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.wrap{overflow-x:auto}
+</style></head><body><div class="viz-root">
+<h1>AB-MCTS 探索 — 予算対精度スケーリング</h1>
+<div class="sub" id="sub"></div>
+<div class="card"><h2>正答率 × 追加生成予算（1x = +5 生成呼び出し/問）</h2>
+<div class="legend" id="legend"></div>
+<div class="wrap"><svg id="curve" width="640" height="300"
+ viewBox="0 0 640 300" role="img" aria-label="予算対精度の折れ線"></svg></div></div>
+<div class="card"><h2>セル別の実測値（表ビュー）</h2>
+<div class="wrap"><table class="tbl" id="table"></table></div></div>
+<div class="card verdict" id="verdict"></div>
+<div class="tip" id="tip"></div>
+<script>
+const DATA = {"generated": "2026-08-02 12:23", "rows": 18, "verdict": "不採用: 同一予算で search は baseline を上回らなかった（勝ち 0/1 予算点）。（ただし各セル n=4 — 有意性を語るには標本を増やすこと）", "cells": [{"config": "baseline", "mult": 1, "n": 4, "acc": 0.75, "gen": 5.0, "verify": 0.0, "secs": 679.0250000000001, "chars": 3494.0, "cats": {"code": {"n": 2, "acc": 1.0}, "math": {"n": 2, "acc": 0.5}}}, {"config": "mav", "mult": 1, "n": 4, "acc": 0.5, "gen": 5.0, "verify": 19.75, "secs": 4063.625, "chars": 160710.0, "cats": {"code": {"n": 2, "acc": 1.0}, "math": {"n": 2, "acc": 0.0}}}, {"config": "search", "mult": 1, "n": 4, "acc": 0.5, "gen": 5.0, "verify": 0.0, "secs": 569.825, "chars": 3254.75, "cats": {"code": {"n": 2, "acc": 1.0}, "math": {"n": 2, "acc": 0.0}}}, {"config": "search-multi", "mult": 1, "n": 4, "acc": 0.5, "gen": 5.0, "verify": 0.0, "secs": 732.425, "chars": 3606.75, "cats": {"code": {"n": 2, "acc": 1.0}, "math": {"n": 2, "acc": 0.0}}}, {"config": "baseline", "mult": 2, "n": 2, "acc": 0.0, "gen": 5.0, "verify": 0.0, "secs": 467.8, "chars": 4304.0, "cats": {"math": {"n": 2, "acc": 0.0}}}]};
+const ORDER = ["baseline","mav","search","search-multi"];
+const COLOR = {baseline:"var(--s1)",mav:"var(--s2)",search:"var(--s3)","search-multi":"var(--s4)"};
+document.getElementById("sub").textContent =
+  `生成 ${DATA.generated} · ${DATA.rows} 試行`;
+document.getElementById("verdict").textContent = `判定: ${DATA.verdict}`;
+const mults=[...new Set(DATA.cells.map(c=>c.mult))].sort((a,b)=>a-b);
+const svg=document.getElementById("curve"), tip=document.getElementById("tip");
+const L=52,R=90,T=16,BT=262,W=640;
+const x=m=>{const i=mults.indexOf(m);return L+(W-L-R)*(mults.length<2?0.5:i/(mults.length-1));};
+const y=a=>BT-(BT-T)*a;
+let g="";
+for(const t of [0,0.25,0.5,0.75,1])
+  g+=`<line x1="${L}" x2="${W-R}" y1="${y(t)}" y2="${y(t)}" stroke="var(--grid)"/>`+
+     `<text x="${L-8}" y="${y(t)+4}" text-anchor="end">${(t*100).toFixed(0)}%</text>`;
+g+=`<line x1="${L}" x2="${W-R}" y1="${BT}" y2="${BT}" stroke="var(--axis)"/>`;
+for(const m of mults) g+=`<text x="${x(m)}" y="${BT+18}" text-anchor="middle">${m}x</text>`;
+const legend=document.getElementById("legend");
+for(const cfg of ORDER){
+  const pts=mults.map(m=>DATA.cells.find(c=>c.config===cfg&&c.mult===m))
+                 .map((c,i)=>c?[x(mults[i]),y(c.acc),c]:null).filter(Boolean);
+  if(!pts.length) continue;
+  legend.insertAdjacentHTML("beforeend",
+    `<span><span class="sw" style="background:${COLOR[cfg]}"></span>${cfg}</span>`);
+  if(pts.length>1)
+    g+=`<polyline fill="none" stroke="${COLOR[cfg]}" stroke-width="2" `+
+       `points="${pts.map(p=>p[0]+","+p[1]).join(" ")}"/>`;
+  for(const p of pts)
+    g+=`<circle cx="${p[0]}" cy="${p[1]}" r="4.5" fill="${COLOR[cfg]}" `+
+       `stroke="var(--surface-1)" stroke-width="2" data-cfg="${cfg}" `+
+       `data-mult="${p[2].mult}" data-acc="${p[2].acc}" data-n="${p[2].n}"/>`;
+  const last=pts[pts.length-1];
+  g+=`<text class="lbl" x="${last[0]+10}" y="${last[1]+4}">${cfg}</text>`;
+}
+svg.innerHTML=g;
+svg.addEventListener("mousemove",e=>{
+  const c=e.target.closest("circle");
+  if(!c){tip.style.display="none";return;}
+  tip.style.display="block";
+  tip.style.left=(e.clientX+14)+"px"; tip.style.top=(e.clientY+14)+"px";
+  tip.textContent=`${c.dataset.cfg} ${c.dataset.mult}x — 正答率 `+
+    `${(100*+c.dataset.acc).toFixed(0)}% (n=${c.dataset.n})`;});
+svg.addEventListener("mouseleave",()=>tip.style.display="none");
+const tbl=document.getElementById("table");
+tbl.innerHTML="<tr><th>構成</th><th>予算</th><th>n</th><th>正答率</th>"+
+ "<th>math</th><th>code</th><th>生成/問</th><th>検証/問</th><th>秒/問</th>"+
+ "<th>幅×深さ</th></tr>"+DATA.cells.map(c=>{
+  const f=v=>v==null?"—":(typeof v==="number"?v.toFixed(2):v);
+  const cat=k=>c.cats&&c.cats[k]?c.cats[k].acc.toFixed(2):"—";
+  const tr=c.tree?`${c.tree.width.toFixed(1)}×${c.tree.depth.toFixed(1)}`:"—";
+  return `<tr><td>${c.config}</td><td>${c.mult}x</td><td>${c.n}</td>`+
+   `<td>${c.acc.toFixed(2)}</td><td>${cat("math")}</td><td>${cat("code")}</td>`+
+   `<td>${c.gen.toFixed(1)}</td><td>${c.verify.toFixed(1)}</td>`+
+   `<td>${c.secs.toFixed(0)}</td><td>${tr}</td></tr>`;}).join("");
+</script></div></body></html>
