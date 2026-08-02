@@ -63,6 +63,7 @@ NIM_TIMEOUT = 600             # クラウドはローカル逐次 (7200) と違�
 NIM_MAX_CONCURRENCY = 4       # ≈40 RPM 制限下で 429 を踏みすぎない同時送信数
 NIM_RETRY_AFTER_CAP = 120     # Retry-After をそのまま信じる上限秒
 NIM_RATE_RETRIES = 10         # 429/503 専用リトライ予算（通常予算とは別勘定）
+NIM_MAX_TOKENS_CAP = 32768    # 打ち切り自動増額の上限（思考が16kを食い尽くす難問対策）
 # 429 対策の要（2026-08-03 実測）: NIM の 429 は Retry-After ヘッダを付けてこない。
 # 旧実装の「既定10秒待ちで各ワーカーが独立に再送」は、並列4本の再送(毎10秒×4)自体が
 # 40 RPM 制限を叩き続けてスロットルが解けない自己増幅ループになり、SC全票が
@@ -2372,9 +2373,20 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     attempt = 1
     rate_budget = NIM_RATE_RETRIES
     dropped_params = False
+    escalated_tokens = False
     while True:
         try:
             out = _send(payload)
+            # 打ち切り自動増額 (2026-08-03 実測対応): AIME 級の難問では思考が max_tokens
+            # 16384 を食い尽くし finish_reason=length・本文ゼロ → 無効票、が gpt-oss 系で
+            # 頻発した。1回だけ上限を倍に増額して再送し、票を救済する（attempt 不消費。
+            # 増額しても打ち切られるなら実力として諦め、既存の __ERROR__ 契約に従う）。
+            if (out.startswith("__ERROR__: truncated") and not escalated_tokens
+                    and payload.get("max_tokens")
+                    and payload["max_tokens"] < NIM_MAX_TOKENS_CAP):
+                escalated_tokens = True
+                payload["max_tokens"] = min(payload["max_tokens"] * 2, NIM_MAX_TOKENS_CAP)
+                continue
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")

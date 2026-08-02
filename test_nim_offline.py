@@ -180,11 +180,24 @@ check("429: モデル別クールダウンが将来時刻に設定される(同�
 check("429: 他モデルのクールダウンは汚さない(per-model分離)",
       _cool_seen and list(_cool_seen[0].keys()) == ["test/model"])
 
-# ---------- 5. length 打ち切り ----------
-out, _, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
-                       lambda: f.ask("test/model", MSGS, 0.5))
-check("length: 本文空 + finish_reason=length は __ERROR__: truncated（SC 無効票化）",
-      isinstance(out, str) and out.startswith("__ERROR__") and "truncated" in out)
+# ---------- 5. length 打ち切り + max_tokens 自動増額 ----------
+out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length")),
+                           FakeResponse(ok_body("rescued"))],
+                          lambda: f.ask("test/model", MSGS, 0.5, num_predict=16384))
+check("length: 打ち切り時は max_tokens 倍増で1回だけ再送し票を救済",
+      out == "rescued" and len(sent) == 2
+      and payload_of(sent[1])["max_tokens"] == 32768)
+out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
+                          lambda: f.ask("test/model", MSGS, 0.5, num_predict=16384))
+check("length: 増額後も打ち切りなら __ERROR__: truncated（SC 無効票化・再送は1回のみ）",
+      isinstance(out, str) and out.startswith("__ERROR__") and "truncated" in out
+      and len(sent) == 2)
+out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
+                          lambda: f.ask("test/model", MSGS, 0.5, num_predict=32768))
+check("length: 既に上限なら増額しない", len(sent) == 1 and out.startswith("__ERROR__"))
+out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
+                          lambda: f.ask("test/model", MSGS, 0.5))
+check("length: max_tokens未指定は増額対象外", len(sent) == 1 and out.startswith("__ERROR__"))
 out, _, _ = run_mocked([FakeResponse(ok_body("partial answer", finish="length"))],
                        lambda: f.ask("test/model", MSGS, 0.5))
 check("length: 本文が一部でもあればそのまま使う", out == "partial answer")
