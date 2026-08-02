@@ -57,12 +57,15 @@ def http_error(code, body=b"err", headers=None):
 
 
 def run_mocked(responses, fn):
-    """urlopen と time.sleep をモックして fn() を実行。
+    """urlopen / time.sleep / time.time をモックして fn() を実行。
+    sleep は仮想時計を進める（進めないと 429 グローバルクールダウンの送信前待機が
+    「時刻が進まないのに sleep だけ空回りする」無限ループになる）。
     responses: 各送信に対する応答のリスト。FakeResponse か callable(raise 用)。
     リストが尽きたら最後の要素を繰り返す。
     戻り値: (fn の結果 or 送出された SystemExit, 送信された Request のリスト, sleep 秒のリスト)"""
     sent, sleeps = [], []
-    orig_open, orig_sleep = f.urllib.request.urlopen, f.time.sleep
+    clock = [1_000_000.0]
+    orig_open, orig_sleep, orig_time = f.urllib.request.urlopen, f.time.sleep, f.time.time
 
     def fake_open(req, timeout=None):
         sent.append(req)
@@ -71,8 +74,14 @@ def run_mocked(responses, fn):
             return r()
         return r
 
+    def fake_sleep(s):
+        sleeps.append(s)
+        clock[0] += max(float(s), 0.001)
+
     f.urllib.request.urlopen = fake_open
-    f.time.sleep = lambda s: sleeps.append(s)
+    f.time.sleep = fake_sleep
+    f.time.time = lambda: clock[0]
+    f._NIM_COOLDOWN[0] = 0.0
     try:
         out = fn()
     except SystemExit as e:
@@ -80,6 +89,8 @@ def run_mocked(responses, fn):
     finally:
         f.urllib.request.urlopen = orig_open
         f.time.sleep = orig_sleep
+        f.time.time = orig_time
+        f._NIM_COOLDOWN[0] = 0.0
     return out, sent, sleeps
 
 
@@ -152,6 +163,20 @@ check("429: Retry-After を尊重", sleeps and sleeps[0] == 3.0)
 check("429: Retry-After は cap で抑える", len(sleeps) >= 2 and sleeps[1] == f.NIM_RETRY_AFTER_CAP)
 check("429: 通常予算の指数バックオフは混ざらない",
       all(s not in f.ASK_RETRY_BACKOFF for s in sleeps))
+
+# Retry-After 無し(NIM の実挙動): 指数バックオフ 20→40→… + グローバルクールダウン
+out, sent, sleeps = run_mocked(
+    [http_error(429), http_error(429), FakeResponse(ok_body("calm"))],
+    lambda: f.ask("test/model", MSGS, 0.5))
+check("429: Retry-After無しは指数バックオフ(20,40)", out == "calm" and sleeps[:2] == [20.0, 40.0])
+_cool_seen = []
+def _cool_probe():
+    r = f.ask("test/model", MSGS, 0.5)
+    _cool_seen.append(f._NIM_COOLDOWN[0])
+    return r
+out, _, _ = run_mocked([http_error(429), FakeResponse(ok_body())], _cool_probe)
+check("429: グローバルクールダウンが将来時刻に設定される(全ワーカー抑制)",
+      _cool_seen and _cool_seen[0] > 1_000_000.0)
 
 # ---------- 5. length 打ち切り ----------
 out, _, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
@@ -327,6 +352,21 @@ try:
           order == ["m/a", "m/a", "m/b", "m/b", "m/c", "m/c", "m/a"])
     check("sc-par: PoT は末尾で先頭モデル", "(PoT)" in lines[-1] and lines[-1].split("]")[1].split("(")[0].strip() == "m/a")
     check("sc-par: 投票は通常どおり成立", res is not None and res["answer"] == "X")
+    # 2026-08-03: REASONING_MODELS のフィルタは PROPOSERS 外でも NIM レジストリ登録済み
+    # なら通す（minimax-m3 第3系統が黙って脱落し SC が2系統で回っていた実測バグの回帰）
+    used = set()
+    def fake_sc2(model, q, tt, pot=False, history=None):
+        used.add(model)
+        return ("Y", "t")
+    f._sc_sample = fake_sc2
+    f.REASONING_MODELS = ["m/a", "nim/only"]
+    f.PROPOSERS = ["m/a"]
+    _saved_ids = set(f.NIM_MODEL_IDS)
+    f.NIM_MODEL_IDS = {"nim/only"}
+    with contextlib.redirect_stdout(io.StringIO()):
+        f.solve_verifiable("dummy", "math")
+    f.NIM_MODEL_IDS = _saved_ids
+    check("sc-filter: NIMレジスタ登録モデルはPROPOSERS外でもSC系統に参加", "nim/only" in used)
 finally:
     f._sc_sample = _orig_sc_sample
     for k, v in _saved_sc.items():

@@ -62,7 +62,17 @@ FUGU_BACKEND = os.environ.get("FUGU_BACKEND", "ollama")
 NIM_TIMEOUT = 600             # クラウドはローカル逐次 (7200) と違い 10 分あれば十分
 NIM_MAX_CONCURRENCY = 4       # ≈40 RPM 制限下で 429 を踏みすぎない同時送信数
 NIM_RETRY_AFTER_CAP = 120     # Retry-After をそのまま信じる上限秒
-NIM_RATE_RETRIES = 6          # 429/503 専用リトライ予算（通常予算とは別勘定）
+NIM_RATE_RETRIES = 10         # 429/503 専用リトライ予算（通常予算とは別勘定）
+# 429 対策の要（2026-08-03 実測）: NIM の 429 は Retry-After ヘッダを付けてこない。
+# 旧実装の「既定10秒待ちで各ワーカーが独立に再送」は、並列4本の再送(毎10秒×4)自体が
+# 40 RPM 制限を叩き続けてスロットルが解けない自己増幅ループになり、SC全票が
+# __ERROR__ 化 →「票割れ」と誤解して追加バッチ投入 → それも全滅 → 1問171リクエスト
+# 消費して無投票敗退、という連鎖を実測した（aime26/25 の敗因12問中11問がこれ）。
+# 対策は二段: (1) Retry-After 無し 429 は指数バックオフ(20,40,80,120…cap)で下がる
+# (2) 全スレッド共有のクールダウン時刻 _NIM_COOLDOWN[0] を設け、誰かが 429 を見たら
+#     全員が送信前にその時刻まで待つ（4本が独立に叩き続けるのを止める）。
+_NIM_COOLDOWN = [0.0]         # epoch秒。この時刻まで全ワーカーが新規送信を控える
+_NIM_COOLDOWN_LOCK = threading.Lock()
 NIM_MODEL_IDS = set()         # apply_nim_profile() が投入するディスパッチ実体
 NIM_STRUCTURED_OK = set()     # response_format=json_object を受けるモデル (プロファイルが投入)
 # 「無制限」が実はクレジット制だった場合の保険。0=無制限(既定)。上限到達で送信せず
@@ -2329,6 +2339,13 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         if NIM_BUDGET > 0 and _nim_usage_total() >= NIM_BUDGET:
             print(f"[nim] リクエスト予算 {NIM_BUDGET} に到達 → 送信せず終了 (rc=42)")
             raise SystemExit(42)
+        # グローバルクールダウン: 誰かが 429 を踏んだら全ワーカーが送信を控える
+        # （セマフォ取得前に待つ = 待機中も他リクエストをブロックしない）
+        while True:
+            wait = _NIM_COOLDOWN[0] - time.time()
+            if wait <= 0:
+                break
+            time.sleep(min(wait, 5.0))
         req = urllib.request.Request(
             f"{NIM_URL}/chat/completions",
             data=json.dumps(pl).encode("utf-8"),
@@ -2365,8 +2382,15 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                 try:
                     wait = min(float(retry_after), NIM_RETRY_AFTER_CAP)
                 except (TypeError, ValueError):
-                    wait = 10.0
-                time.sleep(max(wait, 1.0))
+                    # Retry-After 無し(NIM の 429 は常にこれ): 指数バックオフ。
+                    # 10秒固定は再送ハンマリングでスロットルを永続化させた実測があるため不可。
+                    used = NIM_RATE_RETRIES - rate_budget   # 1,2,3,...
+                    wait = min(20.0 * (2 ** (used - 1)), NIM_RETRY_AFTER_CAP)
+                wait = max(wait, 1.0)
+                # 全ワーカー共有のクールダウンを延長（他スレッドの新規送信も止める）
+                with _NIM_COOLDOWN_LOCK:
+                    _NIM_COOLDOWN[0] = max(_NIM_COOLDOWN[0], time.time() + wait)
+                time.sleep(wait)
                 continue
             if (e.code == 400 and not dropped_params
                     and ("reasoning_effort" in payload or "response_format" in payload
@@ -4632,7 +4656,11 @@ def solve_verifiable(question, task_type="math", history=None):
     """Self-Consistency + PoT で math/mcq を解く。
     戻り値: {"answer", "text", "votes", "n_samples"}。票が全く得られなければ None
     （呼び出し側が通常の MoA へフォールバックする）。"""
-    models = [m for m in REASONING_MODELS if m in PROPOSERS]
+    # NIM 補足 (2026-08-03): _is_nim も許可する。NIM プロファイルの第3系統 minimax-m3 は
+    # PROPOSERS(4ペルソナ)に居ないため旧フィルタで黙って脱落し、SC が2系統だけで
+    # 回っていた（レジストリ登録済み=呼べるモデルなので除外する理由がない）。
+    # ローカルではレジストリが空 → _is_nim は常に False で挙動不変。
+    models = [m for m in REASONING_MODELS if m in PROPOSERS or _is_nim(m)]
     if not models:
         models = list(PROPOSERS[:2])
     if not models:
