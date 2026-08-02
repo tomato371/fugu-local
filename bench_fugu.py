@@ -376,6 +376,18 @@ CONFIGS = {
     "vibe": run_vibe,
 }
 
+# NIM クラウド構成 (2026-08-02): runner は既存を完全再利用し、run_bench が構成名の
+# @nim サフィックスで FUGU_BACKEND=nim を setup() 前に適用する。別名にするのは結果
+# ファイル <dataset>__<config>.jsonl をローカル結果と分離するため（report でも別行になる）。
+# sc@nim は PoT 込み（PoT のコード実行は backend に関係なくローカル subprocess であり、
+# 機械検証票はクラウドでも純増の強み）。
+CONFIGS.update({
+    "fugu@nim": run_fugu,
+    "think@nim": run_think,
+    "sc@nim": lambda it: run_sc(it, pot=True),
+    "coder@nim": lambda it: run_coder(it, single=False),
+})
+
 # ==================================================
 # ランナー（1問ずつ JSONL 追記・再開可能）
 # ==================================================
@@ -407,6 +419,17 @@ def run_bench(dataset, config, limit=None, ids=None, offset=0, notify=False,
               shuffle_seed=42):
     if config not in CONFIGS:
         raise SystemExit(f"未知の構成: {config} (choices: {list(CONFIGS)})")
+    nim_cfg = config.endswith("@nim")
+    if nim_cfg:
+        # setup() より前にバックエンドを切替（apply_nim_profile が setup 内で適用される）
+        if not f.NIM_API_KEY:
+            raise SystemExit("@nim 構成には NVIDIA_API_KEY が必要です（build.nvidia.com で生成）")
+        f.FUGU_BACKEND = "nim"
+    elif f.FUGU_BACKEND == "nim":
+        # 逆方向の事故: NIM バックエンドのまま非 @nim 構成を走らせるとローカル結果
+        # ファイルがクラウド実測で汚染される。黙って続行せず明示的に止める。
+        raise SystemExit(f"FUGU_BACKEND=nim ですが構成 {config} は @nim ではありません"
+                         "（ローカル結果の汚染防止のため中止。env を外すか @nim 構成を指定）")
     items = load_items(dataset)
     if ids:
         want = set(ids)
@@ -429,6 +452,7 @@ def run_bench(dataset, config, limit=None, ids=None, offset=0, notify=False,
     for k, it in enumerate(todo, 1):
         print(f"\n=== [{k}/{len(todo)}] {it['id']} ({dataset}/{config}) ===")
         t0 = time.time()
+        nim_req0 = f.NIM_REQUEST_COUNT
         rec = {"id": it["id"], "dataset": dataset, "config": config,
                "expected": it["answer"], "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
         try:
@@ -445,10 +469,14 @@ def run_bench(dataset, config, limit=None, ids=None, offset=0, notify=False,
                         "error": f"{type(e).__name__}: {e}"})
             err_count += 1
         rec["seconds"] = round(time.time() - t0, 1)
+        if nim_cfg:
+            rec["nim_requests"] = f.NIM_REQUEST_COUNT - nim_req0
         append_result(dataset, config, rec)
         ok_count += int(rec.get("correct", False))
+        nim_note = (f"  nim_req={rec['nim_requests']} (累計 {f.NIM_REQUEST_COUNT})"
+                    if nim_cfg else "")
         print(f"    -> {'OK' if rec.get('correct') else 'NG'} "
-              f"got={rec.get('got')} expected={it['answer']} ({rec['seconds']}s)")
+              f"got={rec.get('got')} expected={it['answer']} ({rec['seconds']}s){nim_note}")
         if notify and (k % NOTIFY_EVERY == 0 or k == len(todo)):
             f.notify_slack(f"bench {dataset}/{config}",
                            f"{k}/{len(todo)} 完了  acc={ok_count}/{k}  err={err_count}",
@@ -522,11 +550,13 @@ def report():
         n = len(recs)
         ok = sum(1 for r in recs if r.get("correct"))
         secs = [r.get("seconds", 0) for r in recs if r.get("seconds")]
-        rows[key] = (n, ok, (sum(secs) / len(secs)) if secs else 0)
-    print(f"{'dataset':12} {'config':10} {'acc':>14} {'avg_sec':>9}")
-    print("-" * 50)
-    for (ds, cfg), (n, ok, avg) in sorted(rows.items()):
-        print(f"{ds:12} {cfg:10} {ok:>4}/{n:<4} ({ok / n * 100:5.1f}%) {avg:>8.1f}")
+        nim_total = sum(r.get("nim_requests", 0) for r in recs)
+        rows[key] = (n, ok, (sum(secs) / len(secs)) if secs else 0, nim_total)
+    print(f"{'dataset':12} {'config':10} {'acc':>14} {'avg_sec':>9} {'nim_req':>8}")
+    print("-" * 60)
+    for (ds, cfg), (n, ok, avg, nim_total) in sorted(rows.items()):
+        nim_col = str(nim_total) if nim_total else "-"
+        print(f"{ds:12} {cfg:10} {ok:>4}/{n:<4} ({ok / n * 100:5.1f}%) {avg:>8.1f} {nim_col:>8}")
 
 
 # ==================================================
