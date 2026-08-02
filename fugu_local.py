@@ -23,6 +23,7 @@ import time
 import shutil
 import tempfile
 import argparse
+import threading
 import subprocess
 import urllib.request
 import urllib.parse
@@ -47,6 +48,30 @@ for _stream in (sys.stdout, sys.stderr):
 # ==================================================
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+# --- NVIDIA NIM クラウドバックエンド (2026-08-02) ---
+# FUGU_BACKEND=nim + NVIDIA_API_KEY で全ロールを NIM API (integrate.api.nvidia.com、
+# OpenAI 互換 /chat/completions) に切り替える。ディスパッチはレジストリ方式
+# (`model in NIM_MODEL_IDS`) で、apply_nim_profile() が呼ばれない限りレジストリは
+# 空 → 全分岐が不活性で Ollama 経路は 1 バイトも変わらない。
+# 「`/` を含むか」でのクラウド判定は `NitrAI/VibeThinker-3B` (ローカル) で誤爆するため不可。
+NIM_URL = os.environ.get("NIM_URL", "https://integrate.api.nvidia.com/v1")
+NIM_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+FUGU_BACKEND = os.environ.get("FUGU_BACKEND", "ollama")
+NIM_TIMEOUT = 600             # クラウドはローカル逐次 (7200) と違い 10 分あれば十分
+NIM_MAX_CONCURRENCY = 4       # ≈40 RPM 制限下で 429 を踏みすぎない同時送信数
+NIM_RETRY_AFTER_CAP = 120     # Retry-After をそのまま信じる上限秒
+NIM_RATE_RETRIES = 6          # 429/503 専用リトライ予算（通常予算とは別勘定）
+NIM_MODEL_IDS = set()         # apply_nim_profile() が投入するディスパッチ実体
+NIM_STRUCTURED_OK = set()     # response_format=json_object を受けるモデル (プロファイルが投入)
+# 「無制限」が実はクレジット制だった場合の保険。0=無制限(既定)。上限到達で送信せず
+# SystemExit(42) — センチネル文字列で返すと SC 全滅→フォールバック→さらに消費の
+# 枯渇スパイラルになるため、ここだけ意図的にプロセス即死させる (bench_queue が rc=42 で halt)。
+NIM_BUDGET = int(os.environ.get("FUGU_NIM_BUDGET", "0") or "0")
+NIM_BUDGET_FILE = Path.home() / "fugu_bench" / "nim_usage.json"
+NIM_REQUEST_COUNT = 0         # 本プロセスの HTTP 送信数（リトライ込み）。bench が毎問差分を記録
+_NIM_SEMAPHORE = threading.Semaphore(NIM_MAX_CONCURRENCY)
+_NIM_COUNT_LOCK = threading.Lock()
 
 # --- モデルの役割 ---
 # Conductor + Critic: qwen3:4b（軽量・高速・JSON安定。ルーティング専用、VRAM常駐最小化）
@@ -2066,6 +2091,166 @@ ASK_RETRY_ATTEMPTS = 4        # 旧: 固定2回 (iteration 9 / 35 が意図的�
 ASK_RETRY_BACKOFF = (2, 5, 10)  # 各要素はその回の失敗直後に待つ秒数。len == ASK_RETRY_ATTEMPTS - 1
 
 
+def _is_nim(model):
+    """NIM ディスパッチ判定。apply_nim_profile() 未適用ならレジストリが空で常に False。"""
+    return model in NIM_MODEL_IDS
+
+
+def _nim_usage_total():
+    """nim_usage.json の累計リクエスト数（読めなければ 0）。プロセス跨ぎの予算判定に使う。"""
+    try:
+        data = json.loads(NIM_BUDGET_FILE.read_text(encoding="utf-8"))
+        return int(data.get("total_requests", 0))
+    except Exception:
+        return 0
+
+
+def _nim_count_request():
+    """HTTP 送信 1 回ごと（リトライ込み）の課金カウンタ。累計を nim_usage.json に永続化する。
+    永続化失敗（ディスク満杯等）はカウント自体を止めない — 予算はあくまで保険であり、
+    本線の推論を道連れにしない。"""
+    global NIM_REQUEST_COUNT
+    with _NIM_COUNT_LOCK:
+        NIM_REQUEST_COUNT += 1
+        try:
+            data = {}
+            if NIM_BUDGET_FILE.exists():
+                loaded = json.loads(NIM_BUDGET_FILE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            data["total_requests"] = int(data.get("total_requests", 0)) + 1
+            NIM_BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            NIM_BUDGET_FILE.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
+             num_predict=None, num_ctx=None):
+    """NIM (OpenAI 互換 /chat/completions) 送信層。シグネチャと「失敗は例外でなく
+    __ERROR__: 文字列を返す」契約は ask() と完全に同一（13 呼び出し箇所を無改修で通すため）。
+    num_ctx / keep_alive はクラウドでは意味を持たないので受けて無視する。
+
+    パラメータマップ:
+      num_predict → max_tokens / temperature そのまま
+      think → gpt-oss 系は reasoning_effort ("low"/"medium"/"high"、True は "high")。
+              非対応モデルに送って 400 が返ったら該当キーを落として再送する安全網つき
+              （既存 Ollama 経路の「thinking 非対応 400」処理と同型）。deepseek-r1 系は
+              常時思考でパラメータ不要 → MODEL_CONFIG に think を持たせないことで自然に不送信。
+      fmt(dict schema) → schema を system 末尾に文字列注入（NIM の json_object は schema を
+              受けないため、形は注入で伝える）。加えて NIM_STRUCTURED_OK のモデルには
+              response_format={"type":"json_object"} も併用。既存 _fallback 経路が最終防衛線。
+
+    レスポンス: choices[0].message.content のみ採用（reasoning_content は無視）。content 内の
+    <think> は Ollama 経路と同じく呼び出し側の strip_think() が処理する（責務分担を揃える）。
+    finish_reason=="length" かつ本文空は __ERROR__: truncated（SC の無効票化を正しく機能させる）。
+
+    リトライ: 通常失敗は ASK_RETRY_ATTEMPTS/ASK_RETRY_BACKOFF 踏襲。429/503 は別予算
+    (NIM_RATE_RETRIES) で Retry-After を尊重して待つ — レート制限は待てば直るので、通常予算と
+    混ぜると SC 票が黙って死ぬ。セマフォは urlopen 区間のみ保持（sleep 中は解放）。"""
+    if think is None:
+        think = model_cfg(model, "think")
+    msgs = messages
+    if fmt is not None and isinstance(fmt, dict):
+        schema_note = ("\n\n出力は次の JSON スキーマに厳密に従う単一の JSON オブジェクト"
+                       "のみとせよ（前置き・コードフェンス禁止）: "
+                       + json.dumps(fmt, ensure_ascii=False))
+        msgs = [dict(m) for m in messages]
+        for m in msgs:
+            if m.get("role") == "system":
+                m["content"] = (m.get("content") or "") + schema_note
+                break
+        else:
+            msgs.insert(0, {"role": "system", "content": schema_note.strip()})
+    payload = {
+        "model": model,
+        "messages": msgs,
+        "temperature": temperature,
+        "stream": False,
+    }
+    if num_predict is not None:
+        payload["max_tokens"] = num_predict
+    if fmt is not None and model in NIM_STRUCTURED_OK:
+        payload["response_format"] = {"type": "json_object"}
+    if isinstance(think, str):
+        payload["reasoning_effort"] = think
+    elif think is True:
+        payload["reasoning_effort"] = "high"
+    # think=False/None は不送信（deepseek-r1 は常時思考、非思考モデルはそもそも不要）
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {NIM_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    def _send(pl):
+        if NIM_BUDGET > 0 and _nim_usage_total() >= NIM_BUDGET:
+            print(f"[nim] リクエスト予算 {NIM_BUDGET} に到達 → 送信せず終了 (rc=42)")
+            raise SystemExit(42)
+        req = urllib.request.Request(
+            f"{NIM_URL}/chat/completions",
+            data=json.dumps(pl).encode("utf-8"),
+            headers=headers, method="POST",
+        )
+        _nim_count_request()
+        with _NIM_SEMAPHORE:
+            with urllib.request.urlopen(req, timeout=NIM_TIMEOUT) as r:
+                body = json.loads(r.read().decode("utf-8"))
+        choices = body.get("choices") or [{}]
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        msg = choice.get("message") or {}
+        result = (msg.get("content") or "").strip()
+        if not result and choice.get("finish_reason") == "length":
+            result = ("__ERROR__: truncated by max_tokens during thinking "
+                      "(no content was generated)")
+        return result
+
+    t0 = time.time()
+    out = "__ERROR__: unreachable"
+    attempt = 1
+    rate_budget = NIM_RATE_RETRIES
+    dropped_params = False
+    while True:
+        try:
+            out = _send(payload)
+            break
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            if e.code in (429, 503) and rate_budget > 0:
+                # レート制限は「待てば直る」ので attempt を消費しない別予算で吸収する
+                rate_budget -= 1
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    wait = min(float(retry_after), NIM_RETRY_AFTER_CAP)
+                except (TypeError, ValueError):
+                    wait = 10.0
+                time.sleep(max(wait, 1.0))
+                continue
+            if (e.code == 400 and not dropped_params
+                    and ("reasoning_effort" in payload or "response_format" in payload)):
+                # 非対応モデルへの拡張パラメータが 400 の原因である可能性 → 落として
+                # 即再送（attempt 不消費・高々 1 回。既存 thinking 非対応 400 処理と同型）
+                dropped_params = True
+                payload.pop("reasoning_effort", None)
+                payload.pop("response_format", None)
+                continue
+            out = f"__ERROR__: {e} {err_body}"
+            if attempt >= ASK_RETRY_ATTEMPTS:
+                break
+            time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
+            attempt += 1
+        except Exception as e:
+            out = f"__ERROR__: {e}"
+            if attempt >= ASK_RETRY_ATTEMPTS:
+                break
+            time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
+            attempt += 1
+    if SHOW_TIMING:
+        _TIMINGS.append((label or "?", model, round(time.time() - t0, 1)))
+    return out
+
+
 def ask(model, messages, temperature, think=None, fmt=None, label=None, num_predict=None,
         num_ctx=None):
     """Ollama native /api/chat を叩く。num_ctx を必ず options で渡して context を安全域に固定する
@@ -2088,6 +2273,9 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
       Conductor/Critic では think=False + スキーマの併用が要点:
       think=False 単独だと qwen3 は思考を content に地の文で垂れ流して JSON が壊れるが、
       スキーマを与えると enum 値まで含めて妥当な JSON に拘束され、かつ高速（実測 ~14s）。"""
+    if _is_nim(model):   # NIM レジストリ登録モデルはクラウド送信層へ（未登録なら完全不活性）
+        return _ask_nim(model, messages, temperature, think=think, fmt=fmt, label=label,
+                        num_predict=num_predict, num_ctx=num_ctx)
     if think is None:
         think = model_cfg(model, "think")   # 呼び出し側が未指定ならモデル別設定を適用
     payload = {
