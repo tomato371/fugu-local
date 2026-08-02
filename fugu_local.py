@@ -250,7 +250,9 @@ def apply_nim_profile():
     # kimi-k2-instruct は現行カタログから消えており、後継へ差し替えた）。
     cond = "meta/llama-3.1-8b-instruct"                    # Conductor/Critic: JSON 安定・軽量
     prop_a = "openai/gpt-oss-120b"                         # 汎用推論 (reasoning_effort=high)
-    prop_b = "moonshotai/kimi-k2.6"                        # コード最強格 (kimi-k2-instruct 後継)
+    prop_b = "mistralai/mistral-medium-3.5-128b"           # コード/論理 (2026-08-03: kimi-k2.6 が
+                                                           # /v1/models 掲載のまま 404 を返す実測
+                                                           # により差し替え。思考型・可用性確認済)
     prop_c = "nvidia/nemotron-3-ultra-550b-a55b"           # 集約・大規模 (550B A55B MoE 思考型。
                                                            # 思考は nim_extra の
                                                            # chat_template_kwargs で有効化)
@@ -281,11 +283,15 @@ def apply_nim_profile():
         prop_c: "あなたは『Geminiの存在』。RAG(Office文書)のコンテキスト分析、大量ドキュメントとWeb検索結果の集約を担当する。",
         prop_d: "あなたは理数・物理・PINN(物理情報ニューラルネット)・偏微分方程式の専門家。厳密に段階を追って考える。",
     }
+    # 混雑・可用性メモ (2026-08-03 朝): deepseek-v4-pro は時間帯によりモデル単体で 429 が
+    # 続く（アカウント上限とは別のキャパシティ throttle）。MoA の Proposer D としては残す
+    # （落ちても MoA は縮退で耐える）が、精度の生命線である SC 投票系統と裁定からは外し、
+    # 可用性実測済みの nemotron-3-ultra 550B (prop_c, 思考型) を昇格させる。
     # ロード時導出 (:82 相当) は旧ローカル ID で陳腐化するため必ず再導出する
     MODEL_TO_PERSONA = {v: k for k, v in PERSONA_MODELS.items()}
     PROPOSER_PROFILES = {
         prop_a: "ChatGPT(GPT)の存在。バランス・一般的な対話・文章の骨組み (OpenAI OSS MoE 120B・思考high対応)",
-        prop_b: "Claudeの存在。高度なプログラミング・厳密な論理チェック・自己修復 (Kimi K2.6・SWE最強クラスMoE)",
+        prop_b: "Claudeの存在。高度なプログラミング・厳密な論理チェック・自己修復 (Mistral Medium 3.5 128B 思考型)",
         prop_c: "Geminiの存在。RAG(Office文書)分析・大量ドキュメント・Web検索結果の集約 (Nemotron-3 Ultra 550B 思考型)",
         prop_d: "理数・物理・PINN・偏微分方程式・アルゴリズム証明に強い思考型 (DeepSeek V4 Pro)",
     }
@@ -293,8 +299,9 @@ def apply_nim_profile():
     JP_AGGREGATOR_STRONG = jp_agg
     AGGREGATOR_REASONING = prop_a
     SECOND_OPINION_MODEL = second
-    REASONING_MODELS = [prop_d, prop_a, sc_third]  # SC 主力 3 系統（多様性＝投票の独立性）
-    ARBITER_MODEL = prop_d
+    REASONING_MODELS = [prop_c, prop_a, sc_third]  # SC 主力 3 系統（nemotron/gpt-oss/minimax。
+                                                   # deepseek は混雑実測により SC から除外）
+    ARBITER_MODEL = prop_c
     SC_CHEAP_VOTES = 0              # クラウドでは「安価票」の意味が消える
     PARALLEL_PROPOSERS = True
     SC_PARALLEL = True
