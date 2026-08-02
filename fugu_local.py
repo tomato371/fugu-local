@@ -23,6 +23,7 @@ import time
 import shutil
 import tempfile
 import argparse
+import copy
 import threading
 import subprocess
 import urllib.request
@@ -236,14 +237,18 @@ def apply_nim_profile():
     cond = "meta/llama-3.1-8b-instruct"                    # Conductor/Critic: JSON 安定・軽量
     prop_a = "openai/gpt-oss-120b"                         # 汎用推論 (reasoning_effort=high)
     prop_b = "moonshotai/kimi-k2.6"                        # コード最強格 (kimi-k2-instruct 後継)
-    prop_c = "nvidia/llama-3.1-nemotron-ultra-253b-v1"     # 集約・大規模 (405b 廃止の後継枠)
-    prop_d = "deepseek-ai/deepseek-v4-pro"                 # 理数・思考 (deepseek-r1 系後継)
+    prop_c = "nvidia/nemotron-3-ultra-550b-a55b"           # 集約・大規模 (550B A55B MoE 思考型。
+                                                           # 思考は nim_extra の
+                                                           # chat_template_kwargs で有効化)
+    prop_d = "deepseek-ai/deepseek-v4-pro"                 # 理数・思考 (deepseek-r1 系後継。
+                                                           # 思考は既定 ON なのでパラメータ不要)
     agg = "z-ai/glm-5.2"                                   # 統合 (v3.1 廃止 → GLM フラッグシップ)
     jp_agg = "z-ai/glm-5.2"        # 日本語統合。qwen 系がカタログから消滅したため GLM で代替。
                                    # 「JP は qwen3 で統合」のローカル教訓 (deepseek-r1 蒸留の
                                    # 中国語混入) とは別物のフラッグシップだが、jmmlu ベンチと
                                    # 対話 JP 1 問で実地検証すること。不良なら gemma-4-31b-it へ。
-    second = "mistralai/mistral-large-2-instruct"  # conductor(llama系)と別系統の独立チェック
+    second = "mistralai/mistral-medium-3.5-128b"   # conductor(llama系)と別系統の独立チェック
+                                                   # (思考型。reasoning_effort が効く実サンプル確認済)
     sc_third = "minimaxai/minimax-m3"              # SC 第3系統 (思考型・独立系譜)
 
     DESIRED_PROPOSERS = [prop_a, prop_b, prop_c, prop_d]
@@ -267,7 +272,7 @@ def apply_nim_profile():
     PROPOSER_PROFILES = {
         prop_a: "ChatGPT(GPT)の存在。バランス・一般的な対話・文章の骨組み (OpenAI OSS MoE 120B・思考high対応)",
         prop_b: "Claudeの存在。高度なプログラミング・厳密な論理チェック・自己修復 (Kimi K2.6・SWE最強クラスMoE)",
-        prop_c: "Geminiの存在。RAG(Office文書)分析・大量ドキュメント・Web検索結果の集約 (Nemotron Ultra 253B)",
+        prop_c: "Geminiの存在。RAG(Office文書)分析・大量ドキュメント・Web検索結果の集約 (Nemotron-3 Ultra 550B 思考型)",
         prop_d: "理数・物理・PINN・偏微分方程式・アルゴリズム証明に強い思考型 (DeepSeek V4 Pro)",
     }
     JP_AGGREGATOR = jp_agg
@@ -283,7 +288,13 @@ def apply_nim_profile():
     # 思考モデルは打ち切り(finish_reason=length・本文空)回避のため厚めに取る。
     for m in (cond, prop_a, prop_b, prop_c, prop_d, agg, second, sc_third):
         MODEL_CONFIG[m] = {"num_predict": 16384}
-    MODEL_CONFIG[prop_a]["think"] = "high"     # gpt-oss 系のみ reasoning_effort が効く
+    MODEL_CONFIG[prop_a]["think"] = "high"     # reasoning_effort=high (gpt-oss)
+    MODEL_CONFIG[second]["think"] = "high"     # mistral-medium-3.5 も reasoning_effort 対応
+    # nemotron-3 系の思考は chat_template_kwargs で有効化（build.nvidia.com サンプル準拠）
+    MODEL_CONFIG[prop_c]["nim_extra"] = {
+        "chat_template_kwargs": {"enable_thinking": True},
+        "reasoning_budget": 16384,
+    }
     NIM_MODEL_IDS = {cond, prop_a, prop_b, prop_c, prop_d, agg, jp_agg, second, sc_third}
     # response_format={"type":"json_object"} を受ける保守的な集合。外れても 400 drop 再送 +
     # スキーマ文字列注入 + 既存 _fallback 経路の三段防衛があるため致命でない。
@@ -2299,7 +2310,14 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         payload["reasoning_effort"] = think
     elif think is True:
         payload["reasoning_effort"] = "high"
-    # think=False/None は不送信（deepseek-r1 は常時思考、非思考モデルはそもそも不要）
+    # think=False/None は不送信（deepseek-v4 は既定で思考ON、非思考モデルはそもそも不要）
+    # モデル別の追加ペイロード（OpenAI SDK の extra_body 相当）。nemotron 系の
+    # {"chat_template_kwargs": {"enable_thinking": true}, "reasoning_budget": N} 等、
+    # NIM 独自キーは MODEL_CONFIG の "nim_extra" で渡す（build.nvidia.com のサンプル準拠）。
+    extra = model_cfg(model, "nim_extra")
+    extra_keys = tuple(extra) if isinstance(extra, dict) else ()
+    if extra_keys:
+        payload.update(copy.deepcopy(extra))
 
     headers = {
         "Content-Type": "application/json",
@@ -2351,12 +2369,15 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                 time.sleep(max(wait, 1.0))
                 continue
             if (e.code == 400 and not dropped_params
-                    and ("reasoning_effort" in payload or "response_format" in payload)):
+                    and ("reasoning_effort" in payload or "response_format" in payload
+                         or extra_keys)):
                 # 非対応モデルへの拡張パラメータが 400 の原因である可能性 → 落として
                 # 即再送（attempt 不消費・高々 1 回。既存 thinking 非対応 400 処理と同型）
                 dropped_params = True
                 payload.pop("reasoning_effort", None)
                 payload.pop("response_format", None)
+                for k in extra_keys:
+                    payload.pop(k, None)
                 continue
             out = f"__ERROR__: {e} {err_body}"
             if attempt >= ASK_RETRY_ATTEMPTS:

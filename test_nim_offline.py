@@ -208,6 +208,27 @@ p = payload_of(sent[0])
 check("fmt: NIM_STRUCTURED_OK は response_format=json_object 併用",
       p.get("response_format") == {"type": "json_object"})
 
+# ---------- 8b. nim_extra（モデル別追加ペイロード, nemotron 系の思考有効化等）----------
+_saved_mc = copy.deepcopy(f.MODEL_CONFIG)
+try:
+    f.MODEL_CONFIG["test/model"] = {
+        "nim_extra": {"chat_template_kwargs": {"enable_thinking": True},
+                      "reasoning_budget": 999}}
+    out, sent, _ = run_mocked([FakeResponse(ok_body())],
+                              lambda: f.ask("test/model", MSGS, 0.5))
+    p = payload_of(sent[0])
+    check("nim_extra: トップレベルにマージされる",
+          p.get("chat_template_kwargs") == {"enable_thinking": True}
+          and p.get("reasoning_budget") == 999)
+    out, sent, _ = run_mocked([http_error(400), FakeResponse(ok_body("ok3"))],
+                              lambda: f.ask("test/model", MSGS, 0.5))
+    check("nim_extra: 400 なら extra キーも落として再送・成功",
+          out == "ok3" and len(sent) == 2
+          and all(k not in payload_of(sent[1])
+                  for k in ("chat_template_kwargs", "reasoning_budget")))
+finally:
+    f.MODEL_CONFIG = _saved_mc
+
 # ---------- 9. <think> 混入は呼び出し側 strip_think の責務（Ollama 経路と同一分担）----------
 out, _, _ = run_mocked([FakeResponse(ok_body("<think>reasoning...</think>42"))],
                        lambda: f.ask("test/model", MSGS, 0.5))
@@ -242,9 +263,9 @@ try:
             [lambda: FakeResponse({"data": [{"id": m} for m in
                                             ("meta/llama-3.1-8b-instruct", "openai/gpt-oss-120b",
                                              "moonshotai/kimi-k2.6",
-                                             "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+                                             "nvidia/nemotron-3-ultra-550b-a55b",
                                              "deepseek-ai/deepseek-v4-pro", "z-ai/glm-5.2",
-                                             "mistralai/mistral-large-2-instruct",
+                                             "mistralai/mistral-medium-3.5-128b",
                                              "minimaxai/minimax-m3")]})],
             _profile)
     check("profile: 適用成功 (True)", applied is True)
