@@ -4634,12 +4634,29 @@ def solve_verifiable(question, task_type="math", history=None):
     # 最小化する（多様性は temp=0.7 の複数サンプルで確保）。各モデルから同数ずつ引く。
     def add_batch(n):
         per = max(1, n // len(models))
-        for m in models:
-            for _ in range(per):
-                add(m)
+        jobs = [(m, False) for m in models for _ in range(per)]
         # PoT は先頭モデルがロード済みのうちに末尾で実行（追加ロードなし）
         if SC_POT and task_type == "math":
-            add(models[0], pot=True)
+            jobs.append((models[0], True))
+        # SC_PARALLEL (クラウド/NIM 向け, 2026-08-02): モデルロードが存在しない環境では
+        # バッチ内サンプリングを並列化すると純粋に壁時計が縮む。samples への append と
+        # print は投入順にメインスレッドで行い、決定性(投票・PoT位置の既存契約)と
+        # ログの非交錯を保つ。逐次経路(既定)は jobs 列を順に回すだけで従来と同一挙動。
+        if SC_PARALLEL and len(jobs) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=SC_WORKERS) as ex:
+                futs = [ex.submit(_sc_sample, m, question, task_type,
+                                  pot=pot, history=history) for m, pot in jobs]
+                for (m, pot), fut in zip(jobs, futs):
+                    try:
+                        ans, text = fut.result()
+                    except Exception as exc:   # スレッド死は無効票1票に留める（バッチは道連れにしない）
+                        ans, text = None, f"__ERROR__: {exc}"
+                    samples.append({"answer": ans, "text": text, "model": m, "pot": pot})
+                    kind = "PoT" if pot else "CoT"
+                    print(f"   [SC {len(samples)}] {m} ({kind}) -> {ans if ans else '(抽出失敗)'}")
+            return
+        for m, pot in jobs:
+            add(m, pot=pot)
 
     add_batch(SC_INITIAL)
     if cheap_ok:                       # 安価票は最後にまとめて（VibeThinker を1回ロード）
