@@ -2034,7 +2034,21 @@ def _trim_history(history):
             history.pop(0)
 
 
+def _nim_up():
+    """NIM API の到達性チェック（server_up の NIM 版）。認証不要の /models を軽く叩く。"""
+    try:
+        req = urllib.request.Request(
+            f"{NIM_URL}/models",
+            headers={"Authorization": f"Bearer {NIM_API_KEY}"} if NIM_API_KEY else {})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def server_up():
+    if FUGU_BACKEND == "nim":
+        return _nim_up()   # fugu_api.py の /health もこの分岐で無改修のまま追随する
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as r:
             return r.status == 200
@@ -2043,6 +2057,12 @@ def server_up():
 
 
 def ensure_server():
+    if FUGU_BACKEND == "nim":
+        # クラウドは「起動」という概念がない。ollama serve は絶対に踏まない。
+        if _nim_up():
+            return True
+        print(f"⚠ NIM API ({NIM_URL}) に到達できません。ネットワーク接続を確認してください。")
+        return False
     if server_up():
         return True
     if shutil.which("ollama") is None:
@@ -2066,6 +2086,11 @@ def ensure_server():
 
 
 def installed_models():
+    if FUGU_BACKEND == "nim":
+        # 毎回 API を叩かずレジストリをそのまま返す（タイポ検出は apply_nim_profile が
+        # /v1/models と一度だけ突合済み）。is_installed は NIM ID が `:` 無しでも厳密一致で
+        # 成立するため無改修 → _arbitrate / solve_verifiable のゲートが自動で通る。
+        return sorted(NIM_MODEL_IDS)
     # 2026-07-25 (iter152): 素のリスト内包表記 [m["name"] for m in ...] は、
     # /api/tags の応答中の1件でも壊れている（要素がdictでない、"name"キーが
     # 無い、"name"が非文字列、"name"が空文字列）と内包表記の途中でその場で
@@ -2126,6 +2151,9 @@ def pull(model):
 
 
 def resolve_models():
+    if FUGU_BACKEND == "nim":
+        # クラウドに pull は存在しない。apply_nim_profile 済みの DESIRED_* をそのまま使う。
+        return list(DESIRED_PROPOSERS), DESIRED_AGGREGATOR, DESIRED_CONDUCTOR
     inst = installed_models()
     pool = []
     for m in DESIRED_PROPOSERS:
