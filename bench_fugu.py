@@ -335,6 +335,28 @@ def run_sc(item, pot, cheap=0):
         f.SC_POT, f.SC_CHEAP_VOTES = saved_pot, saved_cheap
 
 
+def run_sc3(item):
+    """強化 SC (2026-08-04): 実力負け問題の再攻略用。4系統(deepseek/nemotron/gpt-oss/minimax)・
+    初回8票・上限32票・思考32kトークン開始。通常 sc@nim(3系統・6/20票・16k開始)で
+    票が散った問題に test-time compute を積み増して挑む。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 8, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+
+
 def run_vibe(item):
     """VibeThinker-3B 単発（汚染検証）。AIME26(カットオフ後)も高得点なら実力、
     24/25 だけ高得点なら学習データ汚染 → SC_CHEAP_VOTES は封印のまま。"""
@@ -390,6 +412,8 @@ CONFIGS.update({
     # グローバルクールダウン)と第3系統復活(minimax-m3)後の再測定を、修正前の sc@nim
     # 結果と別ファイルで比較するための名前。主用途は嵐で無投票敗退した問題の --ids 再挑戦。
     "sc2@nim": lambda it: run_sc(it, pot=True),
+    # sc3@nim (2026-08-04): 4系統・32票・思考32k の強化構成。実力負け問題の再攻略用。
+    "sc3@nim": run_sc3,
 })
 
 # ==================================================
