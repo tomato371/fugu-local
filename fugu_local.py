@@ -239,6 +239,27 @@ def apply_high_vram_profile():
 # global 一括上書き。setup() が FUGU_BACKEND=="nim" を判定して呼ぶ。
 # モデル ID は 2026-08 時点の build.nvidia.com カタログ準拠。実在照合は本関数内で
 # /v1/models と突合して警告する（ネットワーク不通なら黙ってスキップ＝致命でない）。
+def _nim_model_available(model):
+    """モデル可用性の軽量プローブ（1リクエスト・非ストリーム・max_tokens=4）。
+    2026-08-03 実測: NIM はモデル単位で混雑 429 / カタログ掲載のまま 404 を返すことが
+    あり、時間帯で回復する。プロファイル適用時（=ジョブごとの新プロセス起動時）に
+    プローブし、その時点で使える最強布陣を組む。"""
+    try:
+        payload = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+                   "max_tokens": 4, "stream": False}
+        req = urllib.request.Request(
+            f"{NIM_URL}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {NIM_API_KEY}"},
+            method="POST")
+        _nim_count_request()
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def apply_nim_profile():
     """全ロールを NIM クラウドモデルへ一括切替。キー未設定なら False（setup() が中断）。"""
     global DESIRED_PROPOSERS, DESIRED_AGGREGATOR, DESIRED_CONDUCTOR, FALLBACK_MODEL
@@ -256,9 +277,12 @@ def apply_nim_profile():
     # kimi-k2-instruct は現行カタログから消えており、後継へ差し替えた）。
     cond = "meta/llama-3.1-8b-instruct"                    # Conductor/Critic: JSON 安定・軽量
     prop_a = "openai/gpt-oss-120b"                         # 汎用推論 (reasoning_effort=high)
-    prop_b = "mistralai/mistral-medium-3.5-128b"           # コード/論理 (2026-08-03: kimi-k2.6 が
-                                                           # /v1/models 掲載のまま 404 を返す実測
-                                                           # により差し替え。思考型・可用性確認済)
+    # 可用性プローブ (2026-08-03): kimi-k2.6 はカタログ掲載のまま 404、deepseek-v4-pro は
+    # 時間帯混雑 429 を実測。どちらも回復し次第この分岐が自動で強い方を選ぶ。
+    kimi = "moonshotai/kimi-k2.6"
+    kimi_ok = _nim_model_available(kimi)
+    prop_b = kimi if kimi_ok else "mistralai/mistral-medium-3.5-128b"
+    print(f"[setup] nim probe: kimi-k2.6={'OK' if kimi_ok else 'NG'} -> Proposer B = {prop_b}")
     prop_c = "nvidia/nemotron-3-ultra-550b-a55b"           # 集約・大規模 (550B A55B MoE 思考型。
                                                            # 思考は nim_extra の
                                                            # chat_template_kwargs で有効化)
@@ -305,9 +329,14 @@ def apply_nim_profile():
     JP_AGGREGATOR_STRONG = jp_agg
     AGGREGATOR_REASONING = prop_a
     SECOND_OPINION_MODEL = second
-    REASONING_MODELS = [prop_c, prop_a, sc_third]  # SC 主力 3 系統（nemotron/gpt-oss/minimax。
-                                                   # deepseek は混雑実測により SC から除外）
-    ARBITER_MODEL = prop_c
+    # SC 主力 3 系統: 理数最強の deepseek が使える時間帯はそれを第1系統+裁定に、
+    # 混雑中は nemotron-550b で代替（可用性プローブで自動選択）
+    deepseek_ok = _nim_model_available(prop_d)
+    sc_lead = prop_d if deepseek_ok else prop_c
+    print(f"[setup] nim probe: deepseek-v4-pro={'OK' if deepseek_ok else 'NG'} "
+          f"-> SC第1系統/裁定 = {sc_lead}")
+    REASONING_MODELS = [sc_lead, prop_a, sc_third]
+    ARBITER_MODEL = sc_lead
     SC_CHEAP_VOTES = 0              # クラウドでは「安価票」の意味が消える
     PARALLEL_PROPOSERS = True
     SC_PARALLEL = True

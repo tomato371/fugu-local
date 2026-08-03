@@ -339,19 +339,20 @@ _g = ("DESIRED_PROPOSERS", "DESIRED_AGGREGATOR", "DESIRED_CONDUCTOR", "FALLBACK_
       "ARBITER_MODEL", "SC_CHEAP_VOTES", "SC_PARALLEL", "NIM_MODEL_IDS", "NIM_STRUCTURED_OK")
 _saved_profile = {k: copy.deepcopy(getattr(f, k)) for k in _g}
 try:
+    _catalog = FakeResponse({"data": [{"id": m} for m in
+                                      ("meta/llama-3.1-8b-instruct", "openai/gpt-oss-120b",
+                                       "moonshotai/kimi-k2.6",
+                                       "nvidia/nemotron-3-ultra-550b-a55b",
+                                       "deepseek-ai/deepseek-v4-pro", "z-ai/glm-5.2",
+                                       "mistralai/mistral-medium-3.5-128b",
+                                       "minimaxai/minimax-m3")]})
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        # タイポ検出の /v1/models 照合もモック経由（全 ID 実在扱い）
+        # 送信順: kimi プローブ → deepseek プローブ → /v1/models 照合（全部可用の想定）
         def _profile():
             return f.apply_nim_profile()
         applied, _, _ = run_mocked(
-            [lambda: FakeResponse({"data": [{"id": m} for m in
-                                            ("meta/llama-3.1-8b-instruct", "openai/gpt-oss-120b",
-                                             "moonshotai/kimi-k2.6",
-                                             "nvidia/nemotron-3-ultra-550b-a55b",
-                                             "deepseek-ai/deepseek-v4-pro", "z-ai/glm-5.2",
-                                             "mistralai/mistral-medium-3.5-128b",
-                                             "minimaxai/minimax-m3")]})],
+            [FakeResponse({"ok": True}), FakeResponse({"ok": True}), _catalog],
             _profile)
     check("profile: 適用成功 (True)", applied is True)
     check("profile: タイポ警告なし（採用 ID は全て実在扱い）", "⚠" not in buf.getvalue())
@@ -374,6 +375,19 @@ try:
           all("num_ctx" not in f.MODEL_CONFIG[m] for m in f.NIM_MODEL_IDS))
     check("profile: SC_CHEAP_VOTES=0 / 並列 ON",
           f.SC_CHEAP_VOTES == 0 and f.PARALLEL_PROPOSERS and f.SC_PARALLEL)
+    check("profile: 可用プローブOKなら kimi が Proposer B・deepseek がSC第1系統/裁定",
+          f.PERSONA_MODELS["Proposer B"] == "moonshotai/kimi-k2.6"
+          and f.REASONING_MODELS[0] == "deepseek-ai/deepseek-v4-pro"
+          and f.ARBITER_MODEL == "deepseek-ai/deepseek-v4-pro")
+    # 混雑/404 時の縮退: kimi 404 → mistral、deepseek 429 → nemotron が代替
+    with contextlib.redirect_stdout(io.StringIO()):
+        applied2, _, _ = run_mocked(
+            [http_error(404), http_error(429), _catalog], _profile)
+    check("profile: プローブNGなら mistral / nemotron へ自動縮退",
+          applied2 is True
+          and f.PERSONA_MODELS["Proposer B"] == "mistralai/mistral-medium-3.5-128b"
+          and f.REASONING_MODELS[0] == "nvidia/nemotron-3-ultra-550b-a55b"
+          and f.ARBITER_MODEL == "nvidia/nemotron-3-ultra-550b-a55b")
     # キー未設定なら False
     f.NIM_API_KEY = ""
     with contextlib.redirect_stdout(io.StringIO()):
