@@ -446,6 +446,20 @@ finally:
     for k, v in _saved_sc.items():
         setattr(f, k, v)
 
+# ---------- 13. 採点正規化の表記ゆれ吸収 (2026-08-04, math500実測NGの回帰) ----------
+check("norm: 度数 30^\\circ == 30", f.answers_equivalent("30", "30^\\circ"))
+check("norm: 度数 90^{\\circ} == 90", f.answers_equivalent("90", "90^{\\circ}"))
+check("norm: 度数 30° == 30", f.answers_equivalent("30", "30°"))
+check("norm: x \\in [-2,7] == [-2,7]", f.answers_equivalent("[-2,7]", "x \\in [-2,7]"))
+check("norm: \\text{(C)} == C", f.answers_equivalent("C", "\\text{(C)}"))
+check("norm: 288 \\pi == 288\\pi", f.answers_equivalent("288\\pi", "288 \\pi"))
+check("norm: % は従来どおり保持(50% != 50)", not f.answers_equivalent("50%", "50"))
+check("norm: 別の度数値は不一致のまま", not f.answers_equivalent("30", "60^\\circ"))
+check("norm: 式中間の^\\circは触らない",
+      f.normalize_answer("30^\\circ + 5") == "30^\\circ + 5")
+check("norm: (C)単独はC", f.normalize_answer("(C)") == "C")
+check("norm: 散文の括弧は触らない", f.normalize_answer("(see C)") == "(see C)")
+
 # ---------- 後始末・結果 ----------
 for k, v in _SAVED.items():
     setattr(f, k, v)
