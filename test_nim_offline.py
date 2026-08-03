@@ -288,6 +288,32 @@ try:
 finally:
     f.MODEL_CONFIG = _saved_mc
 
+# ---------- 8c. ストリーミング暴走ガード（壁時計上限・ping飢餓） ----------
+def _slow_sse(advance, lines):
+    """イテレートのたびに仮想時計を advance 秒進める SSE モック。"""
+    def gen():
+        for l in lines:
+            f.time.sleep(advance)   # run_mocked の fake_sleep が仮想時計を進める
+            yield l
+    r = FakeResponse()
+    r.__iter__ = None
+    class _R(FakeResponse):
+        def __iter__(self):
+            return gen()
+    return _R()
+
+out, sent, _ = run_mocked(
+    [_slow_sse(f.NIM_STREAM_MAX_S / 2 + 1,
+               [b": ping\n", b": ping\n", b": ping\n", b": ping\n"])],
+    lambda: f.ask("test/model", MSGS, 0.5))
+check("stream: 壁時計上限超過は __ERROR__ に落ちる（無期限張り付き防止）",
+      isinstance(out, str) and out.startswith("__ERROR__"))
+out, sent, _ = run_mocked(
+    [_slow_sse(f.NIM_STREAM_IDLE_S + 1, [b": ping\n", b": ping\n"])],
+    lambda: f.ask("test/model", MSGS, 0.5))
+check("stream: data 行が来ない ping 飢餓も __ERROR__ に落ちる",
+      isinstance(out, str) and out.startswith("__ERROR__"))
+
 # ---------- 9. <think> 混入は呼び出し側 strip_think の責務（Ollama 経路と同一分担）----------
 out, _, _ = run_mocked([(ok_body("<think>reasoning...</think>42"))],
                        lambda: f.ask("test/model", MSGS, 0.5))

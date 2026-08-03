@@ -64,6 +64,12 @@ NIM_MAX_CONCURRENCY = 4       # ≈40 RPM 制限下で 429 を踏みすぎない
 NIM_RETRY_AFTER_CAP = 120     # Retry-After をそのまま信じる上限秒
 NIM_RATE_RETRIES = 10         # 429/503 専用リトライ予算（通常予算とは別勘定）
 NIM_MAX_TOKENS_CAP = 32768    # 打ち切り自動増額の上限（思考が16kを食い尽くす難問対策）
+# ストリーミングの暴走ガード (2026-08-03 実測): SSE 化でゲートウェイ 504 が消えた副作用と
+# して、サーバーがキープアライブ行だけ送り続ける/生成が異常に長いケースで 1 リクエストが
+# 無期限に張り付く穴ができた（31分無進捗を実測）。ソケット timeout はチャンクが届く限り
+# リセットされるため、壁時計上限と「data 行が一定時間来ない」検知の二段で有界化する。
+NIM_STREAM_MAX_S = 2400       # 1ストリームの壁時計上限（40分。minimax の正当な長考は ~30分）
+NIM_STREAM_IDLE_S = 600       # data 行が途絶えてよい最大秒数（ping だけの状態を切る）
 # 429 対策の要（2026-08-03 実測）: NIM の 429 は Retry-After ヘッダを付けてこない。
 # 旧実装の「既定10秒待ちで各ワーカーが独立に再送」は、並列4本の再送(毎10秒×4)自体が
 # 40 RPM 制限を叩き続けてスロットルが解けない自己増幅ループになり、SC全票が
@@ -2373,12 +2379,22 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         _nim_count_request()
         parts = []
         finish = None
+        t_stream = time.time()
+        last_data = t_stream
         with _NIM_SEMAPHORE:
             with urllib.request.urlopen(req, timeout=NIM_TIMEOUT) as r:
                 for raw_line in r:
+                    now = time.time()
+                    if now - t_stream > NIM_STREAM_MAX_S:
+                        raise TimeoutError(
+                            f"stream exceeded {NIM_STREAM_MAX_S}s (wall clock cap)")
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
+                        if now - last_data > NIM_STREAM_IDLE_S:
+                            raise TimeoutError(
+                                f"stream idle >{NIM_STREAM_IDLE_S}s (keepalive only)")
                         continue
+                    last_data = now
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
