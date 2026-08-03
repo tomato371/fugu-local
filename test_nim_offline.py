@@ -28,12 +28,18 @@ def check(name, cond):
 # ---------- モック部品 ----------
 
 class FakeResponse:
-    def __init__(self, body):
-        self._body = json.dumps(body).encode("utf-8")
+    """非ストリーム応答 (read) と SSE ストリーム応答 (行イテレート) の両対応モック。
+    _ask_nim は常に stream=True で送り応答を行単位でイテレートする。/models 等は read()。"""
+    def __init__(self, body=None, sse_lines=None):
+        self._body = json.dumps(body).encode("utf-8") if body is not None else b""
+        self._sse = sse_lines or []
         self.status = 200
 
     def read(self):
         return self._body
+
+    def __iter__(self):
+        return iter(self._sse)
 
     def __enter__(self):
         return self
@@ -43,7 +49,20 @@ class FakeResponse:
 
 
 def ok_body(content="hello", finish="stop"):
-    return {"choices": [{"message": {"content": content}, "finish_reason": finish}]}
+    """content を2チャンクに割った SSE ストリーム応答を作る（実 NIM の形を模す）。"""
+    lines = []
+    half = max(1, len(content) // 2)
+    for piece in (content[:half], content[half:]):
+        if piece:
+            lines.append(("data: " + json.dumps(
+                {"choices": [{"delta": {"content": piece}}]}) + "\n").encode())
+    # reasoning_content チャンクは無視されるべきノイズとして混ぜる
+    lines.insert(0, ("data: " + json.dumps(
+        {"choices": [{"delta": {"reasoning_content": "thinking..."}}]}) + "\n").encode())
+    lines.append(("data: " + json.dumps(
+        {"choices": [{"delta": {}, "finish_reason": finish}]}) + "\n").encode())
+    lines.append(b"data: [DONE]\n")
+    return FakeResponse(sse_lines=lines)
 
 
 def http_error(code, body=b"err", headers=None):
@@ -115,7 +134,7 @@ f.NIM_STRUCTURED_OK = {"test/structured"}
 MSGS = [{"role": "user", "content": "hi"}]
 
 # ---------- 1. 送信 payload の形 ----------
-out, sent, _ = run_mocked([FakeResponse(ok_body("world"))],
+out, sent, _ = run_mocked([(ok_body("world"))],
                           lambda: f.ask("test/model", MSGS, 0.5,
                                         num_predict=123, num_ctx=8192))
 check("payload: 応答 content がそのまま返る", out == "world")
@@ -147,7 +166,7 @@ check("error: HTTP 500 連発は __ERROR__: 文字列（例外を上げない）
       isinstance(out, str) and out.startswith("__ERROR__"))
 check("error: 通常リトライ予算は ASK_RETRY_ATTEMPTS 回",
       len(sent) == f.ASK_RETRY_ATTEMPTS)
-out, sent, _ = run_mocked([FakeResponse({"choices": []})],
+out, sent, _ = run_mocked([FakeResponse(sse_lines=[b"data: [DONE]\n"])],
                           lambda: f.ask("test/model", MSGS, 0.5))
 check("error: choices 空でもクラッシュせず空文字/エラー", isinstance(out, str))
 
@@ -155,7 +174,7 @@ check("error: choices 空でもクラッシュせず空文字/エラー", isinst
 out, sent, sleeps = run_mocked(
     [http_error(429, headers={"Retry-After": "3"}),
      http_error(429, headers={"Retry-After": "999"}),
-     FakeResponse(ok_body("recovered"))],
+     (ok_body("recovered"))],
     lambda: f.ask("test/model", MSGS, 0.5))
 check("429: 待って成功すれば通常の応答", out == "recovered")
 check("429: 送信は 3 回（初回+リトライ2）", len(sent) == 3)
@@ -166,7 +185,7 @@ check("429: 通常予算の指数バックオフは混ざらない",
 
 # Retry-After 無し(NIM の実挙動): 指数バックオフ 20→40→… + グローバルクールダウン
 out, sent, sleeps = run_mocked(
-    [http_error(429), http_error(429), FakeResponse(ok_body("calm"))],
+    [http_error(429), http_error(429), (ok_body("calm"))],
     lambda: f.ask("test/model", MSGS, 0.5))
 check("429: Retry-After無しは指数バックオフ(20,40)", out == "calm" and sleeps[:2] == [20.0, 40.0])
 _cool_seen = []
@@ -174,45 +193,45 @@ def _cool_probe():
     r = f.ask("test/model", MSGS, 0.5)
     _cool_seen.append(dict(f._NIM_COOLDOWN))
     return r
-out, _, _ = run_mocked([http_error(429), FakeResponse(ok_body())], _cool_probe)
+out, _, _ = run_mocked([http_error(429), (ok_body())], _cool_probe)
 check("429: モデル別クールダウンが将来時刻に設定される(同モデルの全ワーカー抑制)",
       _cool_seen and _cool_seen[0].get("test/model", 0) > 1_000_000.0)
 check("429: 他モデルのクールダウンは汚さない(per-model分離)",
       _cool_seen and list(_cool_seen[0].keys()) == ["test/model"])
 
 # ---------- 5. length 打ち切り + max_tokens 自動増額 ----------
-out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length")),
-                           FakeResponse(ok_body("rescued"))],
+out, sent, _ = run_mocked([(ok_body("", finish="length")),
+                           (ok_body("rescued"))],
                           lambda: f.ask("test/model", MSGS, 0.5, num_predict=16384))
 check("length: 打ち切り時は max_tokens 倍増で1回だけ再送し票を救済",
       out == "rescued" and len(sent) == 2
       and payload_of(sent[1])["max_tokens"] == 32768)
-out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
+out, sent, _ = run_mocked([(ok_body("", finish="length"))],
                           lambda: f.ask("test/model", MSGS, 0.5, num_predict=16384))
 check("length: 増額後も打ち切りなら __ERROR__: truncated（SC 無効票化・再送は1回のみ）",
       isinstance(out, str) and out.startswith("__ERROR__") and "truncated" in out
       and len(sent) == 2)
-out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
+out, sent, _ = run_mocked([(ok_body("", finish="length"))],
                           lambda: f.ask("test/model", MSGS, 0.5, num_predict=32768))
 check("length: 既に上限なら増額しない", len(sent) == 1 and out.startswith("__ERROR__"))
-out, sent, _ = run_mocked([FakeResponse(ok_body("", finish="length"))],
+out, sent, _ = run_mocked([(ok_body("", finish="length"))],
                           lambda: f.ask("test/model", MSGS, 0.5))
 check("length: max_tokens未指定は増額対象外", len(sent) == 1 and out.startswith("__ERROR__"))
-out, _, _ = run_mocked([FakeResponse(ok_body("partial answer", finish="length"))],
+out, _, _ = run_mocked([(ok_body("partial answer", finish="length"))],
                        lambda: f.ask("test/model", MSGS, 0.5))
 check("length: 本文が一部でもあればそのまま使う", out == "partial answer")
 
 # ---------- 6. リクエスト予算（SystemExit 42・送信前ブロック）----------
 f.NIM_BUDGET_FILE.write_text(json.dumps({"total_requests": 2}), encoding="utf-8")
 f.NIM_BUDGET = 2
-out, sent, _ = run_mocked([FakeResponse(ok_body())],
+out, sent, _ = run_mocked([(ok_body())],
                           lambda: f.ask("test/model", MSGS, 0.5))
 check("budget: 上限到達で SystemExit(42)",
       isinstance(out, SystemExit) and out.code == 42)
 check("budget: 送信自体が行われない", len(sent) == 0)
 f.NIM_BUDGET = 0
 before = f.NIM_REQUEST_COUNT
-out, sent, _ = run_mocked([FakeResponse(ok_body())],
+out, sent, _ = run_mocked([(ok_body())],
                           lambda: f.ask("test/model", MSGS, 0.5))
 check("budget: カウンタは送信ごとに増える", f.NIM_REQUEST_COUNT == before + 1)
 check("budget: nim_usage.json に累計が永続化される",
@@ -220,7 +239,7 @@ check("budget: nim_usage.json に累計が永続化される",
 
 # ---------- 7. reasoning_effort / response_format の 400 落とし再送 ----------
 out, sent, _ = run_mocked([http_error(400, body=b"param not supported"),
-                           FakeResponse(ok_body("ok2"))],
+                           (ok_body("ok2"))],
                           lambda: f.ask("test/model", MSGS, 0.5, think="high"))
 check("400drop: 1回目に reasoning_effort を送る",
       "reasoning_effort" in payload_of(sent[0]))
@@ -228,13 +247,13 @@ check("400drop: 400 なら落として即再送・成功", out == "ok2" and len(
 check("400drop: 再送 payload に拡張パラメータが無い",
       "reasoning_effort" not in payload_of(sent[1]))
 check("400drop: think=True は high に写像",
-      payload_of(run_mocked([FakeResponse(ok_body())],
+      payload_of(run_mocked([(ok_body())],
                             lambda: f.ask("test/model", MSGS, 0.5, think=True))[1][0]
                  ).get("reasoning_effort") == "high")
 
 # ---------- 8. スキーマ（fmt）の扱い ----------
 schema = {"type": "object", "properties": {"mode": {"type": "string"}}}
-out, sent, _ = run_mocked([FakeResponse(ok_body())],
+out, sent, _ = run_mocked([(ok_body())],
                           lambda: f.ask("test/model", MSGS, 0.5, fmt=schema))
 p = payload_of(sent[0])
 check("fmt: 非対応モデルは response_format を送らない", "response_format" not in p)
@@ -242,7 +261,7 @@ check("fmt: schema は system へ文字列注入される",
       any(m["role"] == "system" and "mode" in m["content"] for m in p["messages"]))
 check("fmt: 元の messages リストは破壊しない（コピーに注入）",
       all(m["role"] != "system" for m in MSGS))
-out, sent, _ = run_mocked([FakeResponse(ok_body())],
+out, sent, _ = run_mocked([(ok_body())],
                           lambda: f.ask("test/structured", MSGS, 0.5, fmt=schema))
 p = payload_of(sent[0])
 check("fmt: NIM_STRUCTURED_OK は response_format=json_object 併用",
@@ -254,13 +273,13 @@ try:
     f.MODEL_CONFIG["test/model"] = {
         "nim_extra": {"chat_template_kwargs": {"enable_thinking": True},
                       "reasoning_budget": 999}}
-    out, sent, _ = run_mocked([FakeResponse(ok_body())],
+    out, sent, _ = run_mocked([(ok_body())],
                               lambda: f.ask("test/model", MSGS, 0.5))
     p = payload_of(sent[0])
     check("nim_extra: トップレベルにマージされる",
           p.get("chat_template_kwargs") == {"enable_thinking": True}
           and p.get("reasoning_budget") == 999)
-    out, sent, _ = run_mocked([http_error(400), FakeResponse(ok_body("ok3"))],
+    out, sent, _ = run_mocked([http_error(400), (ok_body("ok3"))],
                               lambda: f.ask("test/model", MSGS, 0.5))
     check("nim_extra: 400 なら extra キーも落として再送・成功",
           out == "ok3" and len(sent) == 2
@@ -270,7 +289,7 @@ finally:
     f.MODEL_CONFIG = _saved_mc
 
 # ---------- 9. <think> 混入は呼び出し側 strip_think の責務（Ollama 経路と同一分担）----------
-out, _, _ = run_mocked([FakeResponse(ok_body("<think>reasoning...</think>42"))],
+out, _, _ = run_mocked([(ok_body("<think>reasoning...</think>42"))],
                        lambda: f.ask("test/model", MSGS, 0.5))
 check("think: _ask_nim は content を素通し", out == "<think>reasoning...</think>42")
 check("think: strip_think が除去（SC 抽出を汚染しない）", f.strip_think(out) == "42")

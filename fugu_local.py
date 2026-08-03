@@ -2343,7 +2343,7 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {NIM_API_KEY}",
-        "Accept": "application/json",
+        "Accept": "text/event-stream",   # _send は常に stream=True で送る
     }
 
     def _send(pl):
@@ -2357,20 +2357,46 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
             if wait <= 0:
                 break
             time.sleep(min(wait, 5.0))
+        # 【ストリーミング必須 (2026-08-03 実測)】非ストリーミングだと、思考モデルの長い
+        # 生成中に NIM のゲートウェイが応答を待ちきれず HTTP 504 を返す（nemotron-550b ×
+        # AIME 難問で再現。NVIDIA 公式サンプルが全て stream=True なのはこのため）。
+        # SSE をチャンクごとに受信していればゲートウェイは切らない。urlopen の timeout は
+        # 「1回の読み取り」に効くソケットタイムアウトなので、チャンクが届き続ける限り
+        # 長時間生成でも安全。delta.reasoning_content は捨て、delta.content のみ集める。
+        pl = dict(pl)
+        pl["stream"] = True
         req = urllib.request.Request(
             f"{NIM_URL}/chat/completions",
             data=json.dumps(pl).encode("utf-8"),
             headers=headers, method="POST",
         )
         _nim_count_request()
+        parts = []
+        finish = None
         with _NIM_SEMAPHORE:
             with urllib.request.urlopen(req, timeout=NIM_TIMEOUT) as r:
-                body = json.loads(r.read().decode("utf-8"))
-        choices = body.get("choices") or [{}]
-        choice = choices[0] if isinstance(choices[0], dict) else {}
-        msg = choice.get("message") or {}
-        result = (msg.get("content") or "").strip()
-        if not result and choice.get("finish_reason") == "length":
+                for raw_line in r:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    chs = chunk.get("choices") or []
+                    if not chs or not isinstance(chs[0], dict):
+                        continue
+                    delta = chs[0].get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        parts.append(piece)
+                    if chs[0].get("finish_reason"):
+                        finish = chs[0]["finish_reason"]
+        result = "".join(parts).strip()
+        if not result and finish == "length":
             result = ("__ERROR__: truncated by max_tokens during thinking "
                       "(no content was generated)")
         return result
@@ -2397,7 +2423,7 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            if e.code in (429, 503) and rate_budget > 0:
+            if e.code in (429, 502, 503, 504) and rate_budget > 0:
                 # レート制限は「待てば直る」ので attempt を消費しない別予算で吸収する
                 rate_budget -= 1
                 retry_after = e.headers.get("Retry-After") if e.headers else None
