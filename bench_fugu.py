@@ -411,6 +411,36 @@ def run_sc6(item):
         f.SC_COURT, f.SC_RESCUE_VOTES = saved_court
 
 
+def run_sc7(item):
+    """S3C + SC-Court v2 構成 (2026-08-05, fugu独自設計): sc6 に加えて
+    - SC_STRATIFY: 戦略層化サンプリング。強モデルが「本質的に異なる攻め方」を列挙し
+      各CoTサンプルへ強制割当。温度多様性が探索できない「別の解法流域」を被覆する
+      (sc6実測の核心: 全38サンプル中に正解が一度も生成されない問題は集約では救えない)
+    - Court v2: 裁判官棄権時の補充 / 審理スキップ条件に真過半数を要求 / 評決不成立でも
+      悪魔の代弁人発動 (aime26-15 のマージン自己封殺・aime24-I-12 の棄権機会損失の修正)"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        f.SC_STRATIFY = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY = saved_court
+
+
 def run_vibe(item):
     """VibeThinker-3B 単発（汚染検証）。AIME26(カットオフ後)も高得点なら実力、
     24/25 だけ高得点なら学習データ汚染 → SC_CHEAP_VOTES は封印のまま。"""
@@ -473,6 +503,8 @@ CONFIGS.update({
     "sc4@nim": run_sc4,
     # sc6@nim (2026-08-05): SC-Court 対審集約 + 抽出失敗票救済 (fugu独自設計)。
     "sc6@nim": run_sc6,
+    # sc7@nim (2026-08-05): S3C 戦略層化サンプリング + SC-Court v2 (fugu独自設計)。
+    "sc7@nim": run_sc7,
 })
 
 # ==================================================

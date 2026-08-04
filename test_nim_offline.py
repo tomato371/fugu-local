@@ -639,13 +639,95 @@ try:
     check("court: 悪魔の代弁人ラウンドがログに出る",
           "悪魔の代弁人ラウンド" in buf.getvalue())
 
-    # --- court: 判決が割れて過半数なし → 既存経路へフォールバック(床で MoA へ) ---
-    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None])
+    # --- court v2: 評決不成立(hung jury)でも悪魔の代弁人が発動、新答不一致なら従来どおり None ---
+    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None],
+                           devil_ans=["901", "777", "555"])   # 一致なし → 採用されない
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["A", "B", "NONE"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("court-v2: 評決不成立で悪魔の代弁人が発動する", "評決不成立" in buf.getvalue())
+    check("court-v2: 悪魔の新答が不一致なら従来どおり床未満でNone", res is None)
+
+    # --- court v2: 評決不成立 + 悪魔の一致新答 → 採用 ---
+    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None],
+                           devil_ans=["901", "901", "555"])
     f._sc_sample = fake
     f.ask, jcalls = _mk_judge_ask(["A", "B", "NONE"])
     with contextlib.redirect_stdout(io.StringIO()):
         res = f.solve_verifiable("dummy", "math")
-    check("court: 判決割れは既存どおり床未満でMoAフォールバック(None)", res is None)
+    check("court-v2: 評決不成立でも悪魔の一致新答901を採用",
+          res is not None and res["answer"] == "901")
+
+    # --- court v2: 棄権は枠を消費せず補充裁判官が審理する ---
+    f.REASONING_MODELS = ["m/a", "m/b", "m/c", "m/d"]
+    f.PROPOSERS = ["m/a", "m/b", "m/c", "m/d"]
+    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["GARBAGE", "A", "A", "NONE"])  # 1人目は書式不正=棄権
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("court-v2: 棄権1名を補充し有効判決3件で248確定",
+          res is not None and res["answer"] == "248" and jcalls["court"] == 4)
+    check("court-v2: 補充のログが出る", "補充裁判官へ" in buf.getvalue())
+    f.REASONING_MODELS = ["m/a", "m/b", "m/c"]
+    f.PROPOSERS = ["m/a", "m/b", "m/c"]
+
+    # --- court v2: 相対的に強いだけの少数派多数(真過半数未満)は審理にかける ---
+    fake, st = _mk_sampler(["7", "7", "7", "8", "9", "10", "11", None])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["A", "A", "A"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("court-v2: 3/7票(真過半数未満)は margin を満たしても審理される",
+          res is not None and res["answer"] == "7" and jcalls["court"] >= 1)
+
+    # --- S3C: 戦略列挙のパース (JSON / 番号付き行 / 失敗) ---
+    f.ARBITER_MODEL = "m/judge"
+    f.installed_models = lambda: ["m/judge"]
+    _orig_is_installed = f.is_installed
+    f.is_installed = lambda m, inst=None: True
+    f.ask = lambda *a, **kw: 'plan... ["casework on loop sizes", "generating functions", "transfer matrix"]'
+    _strats = f._enumerate_strategies("q")
+    check("s3c: JSON配列の戦略列挙をパース", _strats == ["casework on loop sizes",
+          "generating functions", "transfer matrix"])
+    f.ask = lambda *a, **kw: "1. direct casework\n2) complementary counting\nnot a strategy line"
+    _strats2 = f._enumerate_strategies("q")
+    check("s3c: 番号付き行フォールバック",
+          _strats2 == ["direct casework", "complementary counting"])
+    f.ask = lambda *a, **kw: "__ERROR__: down"
+    check("s3c: 列挙失敗は空リスト(従来サンプリングへ劣化)", f._enumerate_strategies("q") == [])
+    f.is_installed = _orig_is_installed
+    f.ARBITER_MODEL = None
+    f.installed_models = lambda: []
+
+    # --- S3C: 各CoTサンプルに戦略指令がラウンドロビンで注入される ---
+    f.SC_STRATIFY, f.SC_COURT, f.SC_RESCUE_VOTES = True, False, False
+    _seen_q = []
+    def fake_strat_sampler(model, q, tt, pot=False, history=None):
+        _seen_q.append((q, pot))
+        return ("5", "trace")
+    f._sc_sample = fake_strat_sampler
+    def fake_strat_ask(model, messages, temp=0.5, **kw):
+        return '["strategy ONE", "strategy TWO"]'
+    f.ask = fake_strat_ask
+    f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 4, 4, 4
+    f.SC_POT = True
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("base-question", "math")
+    _cot_qs = [q for q, pot in _seen_q if not pot]
+    _pot_qs = [q for q, pot in _seen_q if pot]
+    check("s3c: 全CoTサンプルに戦略指令が入る",
+          _cot_qs and all("[Strategy directive:" in q for q in _cot_qs))
+    check("s3c: 2戦略がラウンドロビンで両方使われる",
+          any("strategy ONE" in q for q in _cot_qs) and any("strategy TWO" in q for q in _cot_qs))
+    check("s3c: PoTサンプルは層化しない",
+          _pot_qs and all("[Strategy directive:" not in q for q in _pot_qs))
+    check("s3c: 投票は通常どおり成立", res is not None and res["answer"] == "5")
+    f.SC_STRATIFY = False
+    f.SC_POT = False
 
     # --- 既定OFF: 同条件でも従来挙動(床未満→None、courtは呼ばれない) ---
     f.SC_COURT = False

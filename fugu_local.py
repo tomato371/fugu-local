@@ -4016,6 +4016,15 @@ SC_COURT_DEVILS = 3       # 全候補 FLAWED 時の悪魔の代弁人サンプ�
 # トレース本文に文字通り出現する場合のみ票として採用（出現しない数値は捏造とみなし棄却）。
 SC_RESCUE_VOTES = False
 SC_RESCUE_MODEL = None    # None なら CONDUCTOR（NIM では llama-3.1-8b）を使う
+# S3C 戦略層化サンプリング (2026-08-05, fugu独自設計)。sc6実測の核心的知見への応答:
+# 「集約では選べても、全38サンプル中に正解が一度も生成されない問題(385/315/83)は救えない」。
+# 温度による多様性は支配的な解法流域(basin)の周辺しか探索しない — 全トレースが同じ
+# (誤った)アプローチをなぞるため、正解の流域に一度も入らない。そこで解く前に強モデルが
+# 「本質的に異なる攻め方」を列挙し、各サンプルへ戦略を強制割当してサンプリングを層化する。
+# SCを「最頻値の標本化」から「流域の被覆」へ変える。既定 False。sc7@nim 構成が設定。
+SC_STRATIFY = False
+SC_STRATEGY_MODEL = None  # None なら ARBITER_MODEL → REASONING_MODELS[0]
+SC_STRATEGY_N = 4         # 列挙する戦略数の上限（系統数と同程度が層化効率の均衡点）
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4702,8 +4711,9 @@ def _rescue_vote(text, task_type):
 
 def _court_judges():
     """裁判官チェーン: ARBITER_MODEL 優先 + REASONING_MODELS（solve_verifiable と同じ
-    導入フィルタ）から重複なしで SC_COURT_JUDGES 名。minimax 級の激遅モデルも末尾なら
-    自然に選外になる（REASONING_MODELS の並び順を信頼する）。"""
+    導入フィルタ）。v2 (2026-08-05): 全チェーンを返し、_court_aggregate 側が先頭から
+    SC_COURT_JUDGES 名の「有効判決」を集める（棄権/空応答は枠を消費せず補充裁判官へ回る。
+    aime24-I-12 実測で gpt-oss の空応答1件が悪魔の代弁人発動を阻んだ棄権問題への応答）。"""
     chain = []
     inst = installed_models()
     if ARBITER_MODEL and is_installed(ARBITER_MODEL, inst):
@@ -4711,7 +4721,46 @@ def _court_judges():
     for m in REASONING_MODELS:
         if (m in PROPOSERS or _is_nim(m)) and m not in chain:
             chain.append(m)
-    return chain[:SC_COURT_JUDGES]
+    return chain
+
+
+def _enumerate_strategies(question):
+    """S3C: 問題に対する「本質的に異なる」攻め方を強モデルに列挙させる。
+    JSON 配列を第一候補、番号付き行をフォールバックとして解析。失敗時は [] を返し
+    呼び出し側は層化なしの従来サンプリングに劣化する（決して止めない）。"""
+    model = SC_STRATEGY_MODEL or ARBITER_MODEL or (
+        REASONING_MODELS[0] if REASONING_MODELS else None)
+    if not model:
+        return []
+    prompt = (
+        "You are planning how to attack a hard competition math problem. List up to "
+        f"{SC_STRATEGY_N} GENUINELY DIFFERENT solution strategies -- different "
+        "mathematical representations or tools (e.g. direct casework, complementary "
+        "counting, generating functions, recursion/transfer matrices, coordinates or "
+        "trigonometry, invariants, bijections, extremal arguments), NOT minor "
+        "variations of one approach. Also reconsider whether the obvious reading of "
+        "the problem is the right one; if a different rigorous interpretation exists, "
+        "include one strategy that pursues it.\n\n"
+        f"Problem:\n{question}\n\n"
+        f"Output ONLY a JSON array of up to {SC_STRATEGY_N} short strings, each one "
+        "strategy in at most 25 words.")
+    raw = ask(model, [{"role": "user", "content": prompt}], 0.3,
+              num_predict=4096, label="sc-strat")
+    if not raw or raw.startswith("__ERROR__"):
+        return []
+    text = strip_think(raw)
+    m = re.search(r"\[.*\]", text, re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            out = [str(s).strip() for s in arr if str(s).strip()]
+            if out:
+                return out[:SC_STRATEGY_N]
+        except Exception:
+            pass
+    lines = [re.sub(r"^\s*\d+[.)]\s*", "", l).strip() for l in text.splitlines()
+             if re.match(r"\s*\d+[.)]\s+\S", l)]
+    return lines[:SC_STRATEGY_N]
 
 
 def _court_aggregate(question, task_type, samples, classes):
@@ -4749,40 +4798,49 @@ def _court_aggregate(question, task_type, samples, classes):
         "if every candidate's final answer is wrong.")
     tally = [0] * len(reps)
     none_votes = 0
-    for j in judges:
+    panel = min(SC_COURT_JUDGES, len(judges))
+    got = 0
+    for j in judges:                                # v2: 棄権は枠を消費せず補充裁判官へ
+        if got >= panel:
+            break
         print(f"   [SC/court] {j} が審理します")
         raw = ask(j, [{"role": "user", "content": prompt}], 0.1,
                   num_predict=model_cfg(j, "num_predict", 16384), label="court")
         if not raw or not raw.strip() or raw.startswith("__ERROR__"):
-            print(f"   [SC/court] {j} の判決が空/失敗 → 棄権扱い")
+            print(f"   [SC/court] {j} の判決が空/失敗 → 棄権(補充裁判官へ)")
             continue
         m = None
         for m in re.finditer(r"VERDICT:\s*([A-Za-z]+)", strip_think(raw)):
             pass                                    # 最後の VERDICT 行を採用
         if not m:
-            print(f"   [SC/court] {j} の判決書式が不正 → 棄権扱い")
+            print(f"   [SC/court] {j} の判決書式が不正 → 棄権(補充裁判官へ)")
             continue
         v = m.group(1).upper()
         if v == "NONE":
             none_votes += 1
+            got += 1
             print(f"   [SC/court] {j} の判決: NONE (全候補 FLAWED)")
         elif len(v) == 1 and 0 <= ord(v) - ord('A') < len(reps):
             idx = ord(v) - ord('A')
             tally[idx] += 1
+            got += 1
             print(f"   [SC/court] {j} の判決: {v} = {reps[idx][0]}")
         else:
-            print(f"   [SC/court] {j} の判決 '{v}' が候補外 → 棄権扱い")
-    need = len(judges) // 2 + 1                     # 裁判官の過半数
+            print(f"   [SC/court] {j} の判決 '{v}' が候補外 → 棄権(補充裁判官へ)")
+    need = panel // 2 + 1                           # 予定パネル人数の過半数
     best = max(range(len(reps)), key=lambda i: tally[i]) if reps else None
     if best is not None and tally[best] >= need:
         canon, cnt_i, rep_text = reps[best]
-        print(f"   [SC/court] 判決確定: {canon} (判決 {tally[best]}/{len(judges)}, 生票 {cnt_i})")
+        print(f"   [SC/court] 判決確定: {canon} (判決 {tally[best]}/{panel}, 生票 {cnt_i})")
         return canon, rep_text, tally[best]
-    # 悪魔の代弁人ラウンド: 過半数が NONE = 提示候補は全て誤りの疑い（合意型誤答パターン）。
-    # 候補答を明示的に「誤り」と仮定させ、共有された誤読の特定と再解答を求める。
-    if none_votes >= need and SC_COURT_DEVILS > 0:
+    # 悪魔の代弁人ラウンド v2: 「NONE 過半数」に加え「評決不成立(hung jury)」でも発動する。
+    # どちらも裁判官団が既存候補に確信を持てなかった状態であり、候補の外を探すべき局面
+    # (aime24-I-12 実測: C=1/NONE=1/棄権1 の評決不成立で devil 不発 → 機会損失だった)。
+    # 採用条件は従来どおり「独立に2票以上一致した候補外の新答」なので保守性は保たれる。
+    if SC_COURT_DEVILS > 0:
         suspects = ", ".join(str(c) for c, _n, _t in reps)
-        print(f"   [SC/court] 過半数が NONE → 悪魔の代弁人ラウンド (候補 {suspects} を誤りと仮定)")
+        why = "過半数が NONE" if none_votes >= need else "評決不成立"
+        print(f"   [SC/court] {why} → 悪魔の代弁人ラウンド (候補 {suspects} を誤りと仮定)")
         devil_q = (
             f"{question}\n\n[Verification note: the answers {suspects} have each been "
             "proposed for this problem and are all suspected to be WRONG, likely due to "
@@ -5028,11 +5086,32 @@ def solve_verifiable(question, task_type="math", history=None):
                 and is_installed(SC_CHEAP_MODEL, installed_models()))
     samples = []
 
+    # S3C 戦略層化 (2026-08-05, SC_STRATIFY=True の sc7 経路のみ。既定 False で不変):
+    # 解く前に強モデルが「本質的に異なる攻め方」を列挙し、CoT サンプルへラウンドロビンで
+    # 強制割当する。カウンタは itertools.count（GIL 下で並列安全）。列挙失敗時は [] で
+    # 従来サンプリングへ自然劣化。PoT は独自モダリティなので層化しない。
+    strategies = []
+    if SC_STRATIFY and task_type == "math":
+        strategies = _enumerate_strategies(question)
+        if strategies:
+            print(f"   [SC/strat] {len(strategies)} 戦略で層化サンプリング:")
+            for k, s in enumerate(strategies):
+                print(f"      #{k + 1}: {s[:90]}")
+        else:
+            print("   [SC/strat] 戦略列挙に失敗 → 層化なしの従来サンプリングへ")
+    import itertools as _itertools
+    _strat_counter = _itertools.count()
+
     def _sample_with_conf(model, pot):
         """_sc_sample + DeepConf 自信度の受け取り。自信度は _ask_nim が呼び出しスレッドの
         TLS に置くため、同一スレッド内で直後に読む（並列時は各ワーカー内で完結させる）。
         PoT はコード生成トレースの自信度と「実行結果の正しさ」が別物なので conf=None（中立票）。"""
-        ans, text = _sc_sample(model, question, task_type, pot=pot, history=history)
+        q = question
+        if strategies and not pot:
+            s = strategies[next(_strat_counter) % len(strategies)]
+            q = (question + "\n\n[Strategy directive: solve using this approach and no "
+                 f"other: {s}]")
+        ans, text = _sc_sample(model, q, task_type, pot=pot, history=history)
         conf = None if pot else getattr(_NIM_TLS, "last_conf", None)
         return ans, text, conf
 
@@ -5148,7 +5227,10 @@ def solve_verifiable(question, task_type="math", history=None):
     court_decided = False
     if SC_COURT and not conf_decided and task_type != "mcq":
         second = classes[1][1] if len(classes) >= 2 else 0
-        decisive = (cnt >= SC_MIN_VOTES
+        # v2 (2026-08-05): 「真の過半数 (cnt*2 > 有効票)」も要求する。aime26-15 実測で
+        # 10/26 票(38%)の誤答がマージン条項だけで審理をスキップし、合意型誤答対策
+        # (悪魔の代弁人)を自己封殺した。相対的に強いだけの少数派多数は審理にかける。
+        decisive = (cnt >= SC_MIN_VOTES and cnt * 2 > len(answers)
                     and (second == 0 or cnt >= SC_COURT_MARGIN * second))
         if not decisive:
             court = _court_aggregate(question, task_type, samples, classes)
