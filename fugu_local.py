@@ -64,6 +64,17 @@ NIM_MAX_CONCURRENCY = 4       # ≈40 RPM 制限下で 429 を踏みすぎない
 NIM_RETRY_AFTER_CAP = 120     # Retry-After をそのまま信じる上限秒
 NIM_RATE_RETRIES = 10         # 429/503 専用リトライ予算（通常予算とは別勘定）
 NIM_MAX_TOKENS_CAP = 32768    # 打ち切り自動増額の上限（思考が16kを食い尽くす難問対策）
+# --- DeepConf 型の自信度収集 (2026-08-04, Meta AI "Deep Think with Confidence" 準拠) ---
+# gpt-oss-120b 単体で AIME25 97.0%→99.9% を実証した手法のオフライン版。トレース生成中の
+# トークン logprob（NIM は logprobs:true で返すことを実測確認済み）からトレース自信度を
+# 計算し、自信の低いトレースを投票から除外 + 残りを自信度で重み付けして集約する。
+# 既定 False で完全不活性（ローカル/既存 NIM 経路は 1 バイトも変わらない）。
+NIM_CAPTURE_LOGPROBS = False  # sc4@nim が True にする。payload に logprobs:true を追加
+_NIM_TLS = threading.local()  # 呼び出しスレッドごとの「直近 ask のトレース自信度」受け渡し
+DEEPCONF_WINDOW = 1024        # スライディング窓幅（論文は2048、我々の16-32kトレースに合わせ縮小）
+DEEPCONF_WINDOW_STRIDE = 256  # 窓のスライド幅（全窓 O(n) を有界化。精度への影響は軽微）
+DEEPCONF_BOTTOM_FRAC = 0.1    # 「最も自信の低い窓群」の割合（論文の bottom-10% group confidence）
+DEEPCONF_FILTER_ETA = 0.5     # 投票前に除外する低自信トレースの割合（少票数向けに保守的な50%）
 # ストリーミングの暴走ガード (2026-08-03 実測): SSE 化でゲートウェイ 504 が消えた副作用と
 # して、サーバーがキープアライブ行だけ送り続ける/生成が異常に長いケースで 1 リクエストが
 # 無期限に張り付く穴ができた（31分無進捗を実測）。ソケット timeout はチャンクが届く限り
@@ -2315,6 +2326,26 @@ def _nim_count_request():
             pass
 
 
+def _deepconf_confidence(logprobs):
+    """DeepConf のトレース自信度: 選択トークン logprob のスライディング窓平均のうち、
+    最も低い DEEPCONF_BOTTOM_FRAC 割の窓の平均を返す（0 に近いほど高自信、常に <=0）。
+    「トレース全体の平均」ではなく「最悪区間」を見るのが要点 — 思考が一箇所でも
+    崩れたトレースは全体平均では隠れるが最悪窓には必ず現れる（論文の実測知見）。
+    logprobs が空なら None（自信度不明 = 中立票として扱う）。"""
+    if not logprobs:
+        return None
+    n = len(logprobs)
+    w = min(DEEPCONF_WINDOW, n)
+    cums = [0.0]
+    for v in logprobs:
+        cums.append(cums[-1] + v)
+    stride = max(1, min(DEEPCONF_WINDOW_STRIDE, w))
+    groups = [(cums[i + w] - cums[i]) / w for i in range(0, n - w + 1, stride)]
+    groups.sort()
+    k = max(1, int(len(groups) * DEEPCONF_BOTTOM_FRAC))
+    return sum(groups[:k]) / k
+
+
 def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
              num_predict=None, num_ctx=None):
     """NIM (OpenAI 互換 /chat/completions) 送信層。シグネチャと「失敗は例外でなく
@@ -2374,6 +2405,9 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     extra_keys = tuple(extra) if isinstance(extra, dict) else ()
     if extra_keys:
         payload.update(copy.deepcopy(extra))
+    if NIM_CAPTURE_LOGPROBS:
+        payload["logprobs"] = True   # DeepConf 用（非対応モデルは 400 drop 再送で自然に外れる）
+    _NIM_TLS.last_conf = None        # 呼び出しごとにリセット（成功ストリームだけが設定する）
 
     headers = {
         "Content-Type": "application/json",
@@ -2408,6 +2442,7 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         _nim_count_request()
         parts = []
         finish = None
+        lps = []                       # DeepConf: 選択トークンの logprob 列
         t_stream = time.time()
         last_data = t_stream
         with _NIM_SEMAPHORE:
@@ -2438,12 +2473,20 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                     piece = delta.get("content")
                     if piece:
                         parts.append(piece)
+                    if NIM_CAPTURE_LOGPROBS:
+                        lp_items = ((chs[0].get("logprobs") or {}).get("content")) or []
+                        for it in lp_items:
+                            v = it.get("logprob") if isinstance(it, dict) else None
+                            if isinstance(v, (int, float)):
+                                lps.append(float(v))
                     if chs[0].get("finish_reason"):
                         finish = chs[0]["finish_reason"]
         result = "".join(parts).strip()
         if not result and finish == "length":
             result = ("__ERROR__: truncated by max_tokens during thinking "
                       "(no content was generated)")
+        if NIM_CAPTURE_LOGPROBS and lps and not result.startswith("__ERROR__"):
+            _NIM_TLS.last_conf = _deepconf_confidence(lps)
         return result
 
     t0 = time.time()
@@ -2488,12 +2531,13 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                 continue
             if (e.code == 400 and not dropped_params
                     and ("reasoning_effort" in payload or "response_format" in payload
-                         or extra_keys)):
+                         or "logprobs" in payload or extra_keys)):
                 # 非対応モデルへの拡張パラメータが 400 の原因である可能性 → 落として
                 # 即再送（attempt 不消費・高々 1 回。既存 thinking 非対応 400 処理と同型）
                 dropped_params = True
                 payload.pop("reasoning_effort", None)
                 payload.pop("response_format", None)
+                payload.pop("logprobs", None)
                 for k in extra_keys:
                     payload.pop(k, None)
                 continue
@@ -3947,6 +3991,10 @@ SC_TEMP = 0.7           # 多様性確保（投票の独立性）
 # クラウドではモデルロードが存在しないため並列化が純粋に壁時計短縮になる。
 SC_PARALLEL = False
 SC_WORKERS = 4          # 並列時の同時サンプル数（NIM 側セマフォと二段構え）
+# DeepConf 型の自信度加重集約 (2026-08-04)。True にすると最終集約で低自信トレースを
+# 除外し自信度重み付き多数決を行う（NIM_CAPTURE_LOGPROBS と併用、sc4@nim 構成が設定）。
+# 既定 False で既存の素の多数決経路は完全不変。
+SC_CONF_VOTE = False
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4568,6 +4616,39 @@ def answers_equivalent(a, b):
         return False
 
 
+def _conf_weighted_vote(samples):
+    """DeepConf のオフライン集約: 自信度つき CoT 票の下位 DEEPCONF_FILTER_ETA 割を除外し、
+    残りを自信度で重み付けして同値クラスへ集約する。
+    戻り値 (top, classes_w)。classes_w は [[代表答え, 重み合計, 生票数], ...] 重み降順。
+    自信度つき有効票が 4 未満なら (None, []) — 少票では加重の分散が大きく、素の多数決に
+    委ねた方が安全（論文は512票、我々は8-32票なので発動下限を設ける）。
+    重み = (conf - 全体最低conf) + ε の線形スケール（conf は平均logprobで常に<=0、
+    0 に近いほど高自信）。exp 系の重みは票数が少ないと1票独裁になりやすいため使わない。"""
+    scored = [s for s in samples
+              if s.get("answer") and s.get("conf") is not None and not s.get("pot")]
+    if len(scored) < 4:
+        return None, []
+    scored.sort(key=lambda s: s["conf"], reverse=True)
+    keep_n = max(2, int(round(len(scored) * (1 - DEEPCONF_FILTER_ETA))))
+    kept = scored[:keep_n]
+    floor = min(s["conf"] for s in scored)
+    eps = 1e-6
+    classes = []   # [代表答え, 重み合計, 生票数]
+    for s in kept:
+        w = (s["conf"] - floor) + eps
+        for c in classes:
+            if answers_equivalent(s["answer"], c[0]):
+                c[1] += w
+                c[2] += 1
+                break
+        else:
+            classes.append([s["answer"], w, 1])
+    if not classes:
+        return None, []
+    classes.sort(key=lambda c: -c[1])
+    return classes[0][0], classes
+
+
 def vote_answers(answers):
     """答えリストを同値クラスへ集約し (最多答, その票数, クラス一覧) を返す。
     クラス一覧は [[代表答え, 票数], ...] 票数降順。答えが無ければ (None, 0, [])。"""
@@ -4785,9 +4866,18 @@ def solve_verifiable(question, task_type="math", history=None):
                 and is_installed(SC_CHEAP_MODEL, installed_models()))
     samples = []
 
-    def add(model, pot=False):
+    def _sample_with_conf(model, pot):
+        """_sc_sample + DeepConf 自信度の受け取り。自信度は _ask_nim が呼び出しスレッドの
+        TLS に置くため、同一スレッド内で直後に読む（並列時は各ワーカー内で完結させる）。
+        PoT はコード生成トレースの自信度と「実行結果の正しさ」が別物なので conf=None（中立票）。"""
         ans, text = _sc_sample(model, question, task_type, pot=pot, history=history)
-        samples.append({"answer": ans, "text": text, "model": model, "pot": pot})
+        conf = None if pot else getattr(_NIM_TLS, "last_conf", None)
+        return ans, text, conf
+
+    def add(model, pot=False):
+        ans, text, conf = _sample_with_conf(model, pot)
+        samples.append({"answer": ans, "text": text, "model": model, "pot": pot,
+                        "conf": conf})
         kind = "PoT" if pot else "CoT"
         print(f"   [SC {len(samples)}] {model} ({kind}) -> {ans if ans else '(抽出失敗)'}")
 
@@ -4809,14 +4899,14 @@ def solve_verifiable(question, task_type="math", history=None):
         # ログの非交錯を保つ。逐次経路(既定)は jobs 列を順に回すだけで従来と同一挙動。
         if SC_PARALLEL and len(jobs) > 1:
             with concurrent.futures.ThreadPoolExecutor(max_workers=SC_WORKERS) as ex:
-                futs = [ex.submit(_sc_sample, m, question, task_type,
-                                  pot=pot, history=history) for m, pot in jobs]
+                futs = [ex.submit(_sample_with_conf, m, pot) for m, pot in jobs]
                 for (m, pot), fut in zip(jobs, futs):
                     try:
-                        ans, text = fut.result()
+                        ans, text, conf = fut.result()
                     except Exception as exc:   # スレッド死は無効票1票に留める（バッチは道連れにしない）
-                        ans, text = None, f"__ERROR__: {exc}"
-                    samples.append({"answer": ans, "text": text, "model": m, "pot": pot})
+                        ans, text, conf = None, f"__ERROR__: {exc}", None
+                    samples.append({"answer": ans, "text": text, "model": m, "pot": pot,
+                                    "conf": conf})
                     kind = "PoT" if pot else "CoT"
                     print(f"   [SC {len(samples)}] {m} ({kind}) -> {ans if ans else '(抽出失敗)'}")
             return
@@ -4848,8 +4938,33 @@ def solve_verifiable(question, task_type="math", history=None):
     top, cnt, classes = vote_answers(answers)
     if top is None:
         return None
+    # DeepConf 集約 (2026-08-04, SC_CONF_VOTE=True の sc4 経路のみ。既定 False で以降は不変):
+    # 低自信トレースを除外した自信度加重多数決が素の多数決と異なる勝者を出したら
+    # そちらを採用し、生票同数タイも加重が 1.1 倍以上離れていれば裁定なしで解消する。
+    # conf_decided が立った場合は SC_MIN_VOTES 床も適用しない（自信度つき有効票 >=4 という
+    # 発動下限が _conf_weighted_vote 側にあり、無効票だらけの疑似確定とは状況が異なる）。
+    conf_decided = False
+    if SC_CONF_VOTE:
+        wtop, wclasses = _conf_weighted_vote(samples)
+        if wtop is not None:
+            raw_tie = len(classes) >= 2 and classes[0][1] == classes[1][1]
+            decisive = (len(wclasses) == 1
+                        or wclasses[0][1] > wclasses[1][1] * 1.1)
+            if not answers_equivalent(wtop, top):
+                print(f"   [SC/conf] 自信度加重が勝者を変更: {top} -> {wtop} "
+                      f"(加重 {wclasses[0][1]:.4f}, 生票 {wclasses[0][2]})")
+                match = next((c for c in classes if answers_equivalent(wtop, c[0])), None)
+                cnt = match[1] if match else 0
+                top = wtop
+                classes = (([match] if match else [[top, cnt]])
+                           + [c for c in classes if c is not match])
+                conf_decided = True
+            elif raw_tie and decisive:
+                print(f"   [SC/conf] 生票同数タイを自信度加重で解消: {top} "
+                      f"(加重 {wclasses[0][1]:.4f} vs {wclasses[1][1]:.4f})")
+                conf_decided = True
     rep = None
-    if len(classes) >= 2 and classes[0][1] == classes[1][1]:
+    if not conf_decided and len(classes) >= 2 and classes[0][1] == classes[1][1]:
         arb_result = _arbitrate(question, task_type, samples, classes)
         if arb_result:
             top, rep = arb_result
@@ -4892,7 +5007,7 @@ def solve_verifiable(question, task_type="math", history=None):
     # いた。理由は違えど中身は同じ疑似全会一致問題なので、最終returnにも同じ床（floor）をかける。
     # ただし裁定（_arbitrate）が成功して rep が既に埋まっている場合は、裁定役が新たに出した
     # answer/text をそのまま尊重し、票数に関わらずここでは弾かない。
-    if rep is None and cnt < SC_MIN_VOTES:
+    if rep is None and cnt < SC_MIN_VOTES and not conf_decided:
         print(f"   [SC] 確定票が {cnt} 票のみ (< SC_MIN_VOTES={SC_MIN_VOTES}) → MoA フォールバックへ")
         return None
     if rep is None:

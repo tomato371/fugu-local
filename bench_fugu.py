@@ -357,6 +357,32 @@ def run_sc3(item):
         f.MODEL_CONFIG = saved_mc
 
 
+def run_sc4(item):
+    """DeepConf 構成 (2026-08-04): sc3(4系統・32票・思考32k) + logprobs 収集 +
+    自信度加重集約(低自信トレース除外つき)。Meta AI 'Deep Think with Confidence' の
+    オフライン版。gpt-oss-120b で AIME25 97.0->99.9% を実証した手法を fugu の SC に接続。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_conf = (f.NIM_CAPTURE_LOGPROBS, f.SC_CONF_VOTE)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.NIM_CAPTURE_LOGPROBS = True
+        f.SC_CONF_VOTE = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        f.NIM_CAPTURE_LOGPROBS, f.SC_CONF_VOTE = saved_conf
+
+
 def run_vibe(item):
     """VibeThinker-3B 単発（汚染検証）。AIME26(カットオフ後)も高得点なら実力、
     24/25 だけ高得点なら学習データ汚染 → SC_CHEAP_VOTES は封印のまま。"""
@@ -414,6 +440,8 @@ CONFIGS.update({
     "sc2@nim": lambda it: run_sc(it, pot=True),
     # sc3@nim (2026-08-04): 4系統・32票・思考32k の強化構成。実力負け問題の再攻略用。
     "sc3@nim": run_sc3,
+    # sc4@nim (2026-08-04): sc3 + DeepConf(logprobs自信度の加重集約・低自信トレース除外)。
+    "sc4@nim": run_sc4,
 })
 
 # ==================================================

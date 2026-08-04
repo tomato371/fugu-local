@@ -446,6 +446,97 @@ finally:
     for k, v in _saved_sc.items():
         setattr(f, k, v)
 
+# ---------- 12b. DeepConf: 自信度計算・logprobs収集・加重投票 (2026-08-04) ----------
+# _deepconf_confidence: 最悪区間を見る(全体平均では隠れる崩れ区間を検出)
+_good = [-0.05] * 3000
+_bad_middle = [-0.05] * 1400 + [-5.0] * 200 + [-0.05] * 1400
+check("deepconf: 均一な高自信トレースは0に近い",
+      f._deepconf_confidence(_good) > -0.1)
+check("deepconf: 途中で崩れたトレースは最悪窓が捉えて大きく下がる",
+      f._deepconf_confidence(_bad_middle) < f._deepconf_confidence(_good) - 0.1)
+check("deepconf: 空はNone", f._deepconf_confidence([]) is None)
+check("deepconf: 窓幅未満の短いトレースも動く",
+      isinstance(f._deepconf_confidence([-0.5] * 10), float))
+
+# SSE に logprobs を混ぜた収集: NIM_CAPTURE_LOGPROBS=True で payload に logprobs:true、
+# TLS にトレース自信度が入る
+def sse_with_logprobs(content, lps):
+    lines = []
+    lines.append(("data: " + json.dumps(
+        {"choices": [{"delta": {"content": content},
+                      "logprobs": {"content": [{"token": "x", "logprob": v} for v in lps]}}]}
+    ) + "\n").encode())
+    lines.append(("data: " + json.dumps(
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]}) + "\n").encode())
+    lines.append(b"data: [DONE]\n")
+    return FakeResponse(sse_lines=lines)
+
+f.NIM_CAPTURE_LOGPROBS = True
+out, sent, _ = run_mocked([sse_with_logprobs("42", [-0.1, -0.2, -0.3])],
+                          lambda: f.ask("test/model", MSGS, 0.5))
+check("deepconf: capture ON で payload に logprobs:true",
+      payload_of(sent[0]).get("logprobs") is True)
+check("deepconf: 応答は従来どおり content", out == "42")
+check("deepconf: TLS にトレース自信度が入る",
+      isinstance(getattr(f._NIM_TLS, "last_conf", None), float))
+f.NIM_CAPTURE_LOGPROBS = False
+out, sent, _ = run_mocked([(ok_body("plain"))], lambda: f.ask("test/model", MSGS, 0.5))
+check("deepconf: capture OFF では logprobs を送らない(既定不変)",
+      "logprobs" not in payload_of(sent[0]))
+
+# _conf_weighted_vote: 多数派だが低自信 vs 少数派だが高自信 → 加重が勝者を反転
+def _mk(ans, conf, pot=False):
+    return {"answer": ans, "text": "t", "model": "m", "pot": pot, "conf": conf}
+_samples = ([_mk("1", -2.0)] * 4 + [_mk("2", -0.05)] * 3)
+wtop, wcl = f._conf_weighted_vote(_samples)
+check("deepconf: 低自信の多数派より高自信の少数派が勝つ", wtop == "2")
+check("deepconf: 下位η除外で低自信票が集約から消える",
+      all(c[0] != "1" or c[2] < 4 for c in wcl))
+wtop2, _ = f._conf_weighted_vote([_mk("1", -0.5)] * 3)   # 有効票3 < 発動下限4
+check("deepconf: 有効conf票4未満は発動しない(素の多数決へ委譲)", wtop2 is None)
+wtop3, _ = f._conf_weighted_vote([_mk("1", None)] * 8 + [_mk("2", -0.1, pot=True)] * 2)
+check("deepconf: conf無し/PoT票のみでは発動しない", wtop3 is None)
+
+# solve_verifiable 統合: fake _sc_sample が TLS 経由で conf を渡し、加重が勝者を変える
+_saved_sc4 = {k: getattr(f, k) for k in
+              ("SC_PARALLEL", "SC_WORKERS", "REASONING_MODELS", "PROPOSERS",
+               "SC_CHEAP_VOTES", "SC_POT", "SC_INITIAL", "SC_STEP", "SC_MAX",
+               "SC_CONF_VOTE")}
+_orig_sc_sample2 = f._sc_sample
+try:
+    _call_no = [0]
+    def fake_sc_conf(model, q, tt, pot=False, history=None):
+        _call_no[0] += 1
+        # 9票: 先の5票は低自信で「7」、後の4票は高自信で「11」(正答想定)
+        if _call_no[0] <= 5:
+            f._NIM_TLS.last_conf = -3.0
+            return ("7", "low-conf")
+        f._NIM_TLS.last_conf = -0.02
+        return ("11", "high-conf")
+    f._sc_sample = fake_sc_conf
+    f.SC_PARALLEL = False
+    f.REASONING_MODELS = ["m/a"]; f.PROPOSERS = ["m/a"]
+    f.SC_CHEAP_VOTES, f.SC_POT = 0, False
+    f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 9, 4, 9
+    f.SC_CONF_VOTE = True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("deepconf: solve_verifiable で加重が勝者を変更(7多数→11高自信)",
+          res is not None and res["answer"] == "11")
+    check("deepconf: 勝者変更がログに出る", "自信度加重が勝者を変更" in buf.getvalue())
+    # 既定OFF: 同条件でも素の多数決のまま
+    _call_no[0] = 0
+    f.SC_CONF_VOTE = False
+    with contextlib.redirect_stdout(io.StringIO()):
+        res2 = f.solve_verifiable("dummy", "math")
+    check("deepconf: SC_CONF_VOTE=False なら従来どおり多数決(7)",
+          res2 is not None and res2["answer"] == "7")
+finally:
+    f._sc_sample = _orig_sc_sample2
+    for k, v in _saved_sc4.items():
+        setattr(f, k, v)
+
 # ---------- 13. 採点正規化の表記ゆれ吸収 (2026-08-04, math500実測NGの回帰) ----------
 check("norm: 度数 30^\\circ == 30", f.answers_equivalent("30", "30^\\circ"))
 check("norm: 度数 90^{\\circ} == 90", f.answers_equivalent("90", "90^{\\circ}"))
