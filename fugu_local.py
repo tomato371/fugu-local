@@ -3994,7 +3994,28 @@ SC_WORKERS = 4          # 並列時の同時サンプル数（NIM 側セマフ�
 # DeepConf 型の自信度加重集約 (2026-08-04)。True にすると最終集約で低自信トレースを
 # 除外し自信度重み付き多数決を行う（NIM_CAPTURE_LOGPROBS と併用、sc4@nim 構成が設定）。
 # 既定 False で既存の素の多数決経路は完全不変。
+# 【実測 2026-08-05 で有害と結論】限界5問全てで「生多数決の勝者」を「少数票の自信ある誤答」
+# へ上書きし、aime25-27 では正解248(4票)を1票の221に置き換えて取り逃した。原因は論文
+# (単一モデルの密なlogprobs)と異なり異種モデル混成では自信尺度が揃わないこと。OFF維持。
 SC_CONF_VOTE = False
+# SC-Court 対審集約 (2026-08-05, fugu独自設計)。DeepConf実測の3つの失敗モードへの応答:
+#   ①票の散逸(正解248が4/38票で確定できない) ②サンプル浪費(38中有効8-16票)
+#   ③合意型誤答(全系統が同じ誤答に収束、投票では原理的に直せない)
+# 多数決を「裁判」に置き換える: 上位候補クラスの代表トレース(生成済み=追加コスト小)を
+# 弁論として異種モデル裁判官団に提示し、解釈の照合と計算検証で判決(VERDICT)を取る。
+# 生成側の内部信号(自信度)ではなく検証側の信号(生成・検証ギャップ)を使うのが DeepConf との
+# 本質的な違い。全候補 FLAWED なら「悪魔の代弁人」ラウンド(候補答を誤りと仮定した
+# 再サンプリング)で③を攻める。既定 False で既存経路は完全不変。sc6@nim 構成が設定。
+SC_COURT = False
+SC_COURT_TOPK = 3         # 審理する候補クラス数の上限（票数降順）
+SC_COURT_JUDGES = 3       # 裁判官の人数（ARBITER_MODEL + REASONING_MODELS から重複なしで選出）
+SC_COURT_MARGIN = 2.0     # 生票トップが2位のこの倍数以上かつ床以上なら審理省略（多数決が明確に強い時は覆さない）
+SC_COURT_DEVILS = 3       # 全候補 FLAWED 時の悪魔の代弁人サンプル数
+# 抽出失敗票の救済 (2026-08-05)。思考打ち切り等で \boxed{} が出なかった非空トレースの末尾から
+# 軽量モデルが「書き手が到達しかけていた最終答」を回収する。幻覚防止のため回収した答えが
+# トレース本文に文字通り出現する場合のみ票として採用（出現しない数値は捏造とみなし棄却）。
+SC_RESCUE_VOTES = False
+SC_RESCUE_MODEL = None    # None なら CONDUCTOR（NIM では llama-3.1-8b）を使う
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4649,6 +4670,147 @@ def _conf_weighted_vote(samples):
     return classes[0][0], classes
 
 
+def _rescue_vote(text, task_type):
+    """抽出失敗した非空トレースの末尾から、書き手が到達しかけていた最終答を軽量モデルで回収する。
+    幻覚ガード: 回収答の数字/文字列がトレース本文に文字通り出現しない場合は棄却して None。
+    （思考打ち切りトレースには途中までの結論が残っていることが多い。捨て票の復活が目的で、
+    無いものを作らせない — 出現チェックが「回収」と「捏造」を分ける決定的ガード。）"""
+    if not text or text.startswith("__ERROR__") or len(text) < 300:
+        return None
+    model = SC_RESCUE_MODEL or CONDUCTOR
+    if not model:
+        return None
+    tail = text[-2500:]
+    prompt = (
+        "The following is the tail of an unfinished solution attempt (it was cut off "
+        "before stating a final boxed answer). If the author had clearly converged on a "
+        "final answer, output ONLY that answer in \\boxed{}. If no final answer is "
+        "clearly implied, output exactly \\boxed{NONE}. Do not solve the problem "
+        "yourself; only report what the author concluded.\n\n---\n" + tail)
+    raw = ask(model, [{"role": "user", "content": prompt}], 0.0,
+              num_predict=512, label="sc-rescue")
+    if not raw or raw.startswith("__ERROR__"):
+        return None
+    ans = extract_final_answer(strip_think(raw), task_type)
+    if not ans or ans.upper() == "NONE":
+        return None
+    # 幻覚ガード: 回収答（正規化前後どちらか）が元トレースに実在すること
+    if ans not in text and normalize_answer(ans) not in text:
+        return None
+    return ans
+
+
+def _court_judges():
+    """裁判官チェーン: ARBITER_MODEL 優先 + REASONING_MODELS（solve_verifiable と同じ
+    導入フィルタ）から重複なしで SC_COURT_JUDGES 名。minimax 級の激遅モデルも末尾なら
+    自然に選外になる（REASONING_MODELS の並び順を信頼する）。"""
+    chain = []
+    inst = installed_models()
+    if ARBITER_MODEL and is_installed(ARBITER_MODEL, inst):
+        chain.append(ARBITER_MODEL)
+    for m in REASONING_MODELS:
+        if (m in PROPOSERS or _is_nim(m)) and m not in chain:
+            chain.append(m)
+    return chain[:SC_COURT_JUDGES]
+
+
+def _court_aggregate(question, task_type, samples, classes):
+    """SC-Court 対審集約 (2026-08-05, fugu独自設計)。票が散逸/拮抗した上位候補クラスを
+    「弁護側の弁論（代表トレース）」として裁判官団に審理させ、判決の多数で確定する。
+    全裁判官が全候補を FLAWED と断じた場合は悪魔の代弁人ラウンド（候補答は誤りと仮定した
+    再サンプリング）で合意型誤答を攻める。
+    戻り値: (answer, rep_text, 判決数) — 確定できなければ None（既存経路へフォールバック）。
+    mcq は候補記号 A-E と選択肢記号が衝突するため対象外（呼び出し側でガード）。"""
+    judges = _court_judges()
+    if not judges:
+        return None
+    cands = classes[:SC_COURT_TOPK]
+    reps = []
+    for canon, cnt_i in cands:
+        rep_text = strip_think(_representative_text(samples, canon) or "")[:3500]
+        reps.append((canon, cnt_i, rep_text))
+    listing = "\n\n".join(
+        f"### Candidate {chr(ord('A') + i)} (final answer: {c}, votes: {n})\n{t}"
+        for i, (c, n, t) in enumerate(reps))
+    letters = ", ".join(chr(ord('A') + i) for i in range(len(reps)))
+    prompt = (
+        f"Problem:\n{question}\n\n"
+        f"{len(reps)} candidate solutions were produced independently and their final "
+        f"answers disagree (vote counts shown are NOT reliable evidence of correctness; "
+        f"a candidate with few votes may still be the correct one):\n\n{listing}\n\n"
+        "You are a judge. Your job is VERIFICATION, not solving from scratch (though you "
+        "may compute whatever is needed to check).\n"
+        "1. First restate the problem's exact conditions in your own words, then check "
+        "each candidate's INTERPRETATION against the problem text -- independent solvers "
+        "often share the same subtle misreading, so agreement alone proves nothing.\n"
+        "2. Check the critical computations and case enumerations of each candidate.\n"
+        f"At the very end output exactly one line: 'VERDICT: X' where X is one of "
+        f"{letters} (the candidate whose FINAL ANSWER is correct), or 'VERDICT: NONE' "
+        "if every candidate's final answer is wrong.")
+    tally = [0] * len(reps)
+    none_votes = 0
+    for j in judges:
+        print(f"   [SC/court] {j} が審理します")
+        raw = ask(j, [{"role": "user", "content": prompt}], 0.1,
+                  num_predict=model_cfg(j, "num_predict", 16384), label="court")
+        if not raw or not raw.strip() or raw.startswith("__ERROR__"):
+            print(f"   [SC/court] {j} の判決が空/失敗 → 棄権扱い")
+            continue
+        m = None
+        for m in re.finditer(r"VERDICT:\s*([A-Za-z]+)", strip_think(raw)):
+            pass                                    # 最後の VERDICT 行を採用
+        if not m:
+            print(f"   [SC/court] {j} の判決書式が不正 → 棄権扱い")
+            continue
+        v = m.group(1).upper()
+        if v == "NONE":
+            none_votes += 1
+            print(f"   [SC/court] {j} の判決: NONE (全候補 FLAWED)")
+        elif len(v) == 1 and 0 <= ord(v) - ord('A') < len(reps):
+            idx = ord(v) - ord('A')
+            tally[idx] += 1
+            print(f"   [SC/court] {j} の判決: {v} = {reps[idx][0]}")
+        else:
+            print(f"   [SC/court] {j} の判決 '{v}' が候補外 → 棄権扱い")
+    need = len(judges) // 2 + 1                     # 裁判官の過半数
+    best = max(range(len(reps)), key=lambda i: tally[i]) if reps else None
+    if best is not None and tally[best] >= need:
+        canon, cnt_i, rep_text = reps[best]
+        print(f"   [SC/court] 判決確定: {canon} (判決 {tally[best]}/{len(judges)}, 生票 {cnt_i})")
+        return canon, rep_text, tally[best]
+    # 悪魔の代弁人ラウンド: 過半数が NONE = 提示候補は全て誤りの疑い（合意型誤答パターン）。
+    # 候補答を明示的に「誤り」と仮定させ、共有された誤読の特定と再解答を求める。
+    if none_votes >= need and SC_COURT_DEVILS > 0:
+        suspects = ", ".join(str(c) for c, _n, _t in reps)
+        print(f"   [SC/court] 過半数が NONE → 悪魔の代弁人ラウンド (候補 {suspects} を誤りと仮定)")
+        devil_q = (
+            f"{question}\n\n[Verification note: the answers {suspects} have each been "
+            "proposed for this problem and are all suspected to be WRONG, likely due to "
+            "a shared subtle misreading of the problem statement. Re-read the statement "
+            "with fresh eyes, state explicitly what the misreading probably was, and "
+            "solve the problem correctly.]")
+        models = [m for m in REASONING_MODELS if m in PROPOSERS or _is_nim(m)]
+        devil_ans = []
+        devil_texts = {}
+        for k in range(SC_COURT_DEVILS):
+            if not models:
+                break
+            dm = models[k % len(models)]
+            ans, text = _sc_sample(dm, devil_q, task_type)
+            print(f"   [SC/court] 悪魔の代弁人 {dm} -> {ans if ans else '(抽出失敗)'}")
+            if ans and not any(answers_equivalent(ans, c) for c, _n, _t in reps):
+                devil_ans.append(ans)
+                devil_texts.setdefault(ans, text)
+        dtop, dcnt, _dcl = vote_answers(devil_ans)
+        if dtop is not None and dcnt >= 2:          # 独立に2票以上一致した新答のみ採用
+            print(f"   [SC/court] 悪魔の代弁人が新答で一致: {dtop} ({dcnt}/{len(devil_ans)})")
+            rep_text = next((t for a, t in devil_texts.items()
+                             if answers_equivalent(a, dtop)), "")
+            return dtop, rep_text, dcnt
+    print("   [SC/court] 判決が過半数に達せず → 既存経路へフォールバック")
+    return None
+
+
 def vote_answers(answers):
     """答えリストを同値クラスへ集約し (最多答, その票数, クラス一覧) を返す。
     クラス一覧は [[代表答え, 票数], ...] 票数降順。答えが無ければ (None, 0, [])。"""
@@ -4934,6 +5096,20 @@ def solve_verifiable(question, task_type="math", history=None):
         print(f"   [SC] 票が割れています {head} → 追加サンプリング")
         add_batch(SC_STEP)
 
+    # 抽出失敗票の救済 (2026-08-05, SC_RESCUE_VOTES=True の sc6 経路のみ。既定 False で不変):
+    # 思考打ち切り等で答えを箱に入れ損ねた非空 CoT トレースから、軽量モデルが結論を回収する。
+    # PoT は除外（コード断片からの回収は実行結果の裏付けがなく捏造リスクが高い）。
+    if SC_RESCUE_VOTES:
+        rescued = 0
+        for s in samples:
+            if s["answer"] is None and not s["pot"]:
+                r = _rescue_vote(s.get("text") or "", task_type)
+                if r:
+                    s["answer"] = r
+                    s["rescued"] = True
+                    rescued += 1
+        if rescued:
+            print(f"   [SC/rescue] 抽出失敗トレースから {rescued} 票を回収")
     answers = [s["answer"] for s in samples if s["answer"]]
     top, cnt, classes = vote_answers(answers)
     if top is None:
@@ -4964,7 +5140,30 @@ def solve_verifiable(question, task_type="math", history=None):
                       f"(加重 {wclasses[0][1]:.4f} vs {wclasses[1][1]:.4f})")
                 conf_decided = True
     rep = None
-    if not conf_decided and len(classes) >= 2 and classes[0][1] == classes[1][1]:
+    # SC-Court 対審集約 (2026-08-05, SC_COURT=True の sc6 経路のみ。既定 False で不変):
+    # 多数決が「明確に強い」(票数床を満たし2位の SC_COURT_MARGIN 倍以上) 場合は覆さない。
+    # それ以外の散逸/拮抗時に裁判官団の審理へ。mcq は候補記号と選択肢記号が衝突するため対象外。
+    # court_decided が立った場合は SC_MIN_VOTES 床も適用しない（裁判官の過半数という
+    # 独立した検証信号で確定しており、無効票だらけの疑似確定とは状況が異なる）。
+    court_decided = False
+    if SC_COURT and not conf_decided and task_type != "mcq":
+        second = classes[1][1] if len(classes) >= 2 else 0
+        decisive = (cnt >= SC_MIN_VOTES
+                    and (second == 0 or cnt >= SC_COURT_MARGIN * second))
+        if not decisive:
+            court = _court_aggregate(question, task_type, samples, classes)
+            if court:
+                top_c, rep_c, _verdicts = court
+                match = next((c for c in classes
+                              if answers_equivalent(top_c, c[0])), None)
+                cnt = match[1] if match else 0
+                top = top_c
+                if match is None:
+                    classes = classes + [[top, cnt]]
+                rep = rep_c or _representative_text(samples, top)
+                court_decided = True
+    if (not conf_decided and not court_decided
+            and len(classes) >= 2 and classes[0][1] == classes[1][1]):
         arb_result = _arbitrate(question, task_type, samples, classes)
         if arb_result:
             top, rep = arb_result
@@ -5007,7 +5206,7 @@ def solve_verifiable(question, task_type="math", history=None):
     # いた。理由は違えど中身は同じ疑似全会一致問題なので、最終returnにも同じ床（floor）をかける。
     # ただし裁定（_arbitrate）が成功して rep が既に埋まっている場合は、裁定役が新たに出した
     # answer/text をそのまま尊重し、票数に関わらずここでは弾かない。
-    if rep is None and cnt < SC_MIN_VOTES and not conf_decided:
+    if rep is None and cnt < SC_MIN_VOTES and not conf_decided and not court_decided:
         print(f"   [SC] 確定票が {cnt} 票のみ (< SC_MIN_VOTES={SC_MIN_VOTES}) → MoA フォールバックへ")
         return None
     if rep is None:

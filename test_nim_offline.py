@@ -537,6 +537,153 @@ finally:
     for k, v in _saved_sc4.items():
         setattr(f, k, v)
 
+# ---------- 12c. SC-Court 対審集約 + 抽出失敗票救済 (2026-08-05) ----------
+_saved_court = {k: getattr(f, k) for k in
+                ("SC_COURT", "SC_RESCUE_VOTES", "SC_COURT_JUDGES", "SC_COURT_TOPK",
+                 "SC_COURT_DEVILS", "SC_COURT_MARGIN", "ARBITER_MODEL",
+                 "REASONING_MODELS", "PROPOSERS", "SC_PARALLEL", "SC_CHEAP_VOTES",
+                 "SC_POT", "SC_INITIAL", "SC_STEP", "SC_MAX", "CONDUCTOR",
+                 "SC_RESCUE_MODEL")}
+_orig_sc_sample3 = f._sc_sample
+_orig_ask = f.ask
+_orig_installed = f.installed_models
+try:
+    f.installed_models = lambda: []
+    f.ARBITER_MODEL = None
+    f.REASONING_MODELS = ["m/a", "m/b", "m/c"]
+    f.PROPOSERS = ["m/a", "m/b", "m/c"]
+    f.SC_PARALLEL = False
+    f.SC_CHEAP_VOTES, f.SC_POT = 0, False
+    f.SC_COURT_JUDGES, f.SC_COURT_TOPK, f.SC_COURT_DEVILS = 3, 3, 3
+    f.SC_COURT_MARGIN = 2.0
+    f.CONDUCTOR, f.SC_RESCUE_MODEL = "m/cond", None
+
+    # --- _rescue_vote: 幻覚ガード ---
+    _long_hit = ("thinking " * 60) + " therefore the count is 248 and then it was cut"
+    _long_miss = ("thinking " * 60) + " nothing conclusive here at all, just musing on"
+    f.ask = lambda *a, **kw: "\\boxed{248}"
+    check("rescue: トレースに実在する答えは回収される",
+          f._rescue_vote(_long_hit, "math") == "248")
+    check("rescue: トレースに無い数値は捏造とみなし棄却",
+          f._rescue_vote(_long_miss, "math") is None)
+    f.ask = lambda *a, **kw: "\\boxed{NONE}"
+    check("rescue: NONE は棄却", f._rescue_vote(_long_hit, "math") is None)
+    check("rescue: 短すぎるトレースは呼ばず棄却", f._rescue_vote("short 248", "math") is None)
+
+    # --- 共通の fake _sc_sample ビルダー: 事前に並べた票列を順に返す(枯渇後は無効票) ---
+    def _mk_sampler(seq, devil_ans=None):
+        state = {"i": 0, "devil": 0, "court_asked": []}
+        def fake(model, q, tt, pot=False, history=None):
+            if "[Verification note" in q:                      # 悪魔の代弁人ラウンド
+                a = devil_ans[state["devil"] % len(devil_ans)] if devil_ans else None
+                state["devil"] += 1
+                return (a, f"devil-text-{a}")
+            a = seq[state["i"]] if state["i"] < len(seq) else None
+            state["i"] += 1
+            return (a, f"trace-{a}-" + "x" * 40)
+        return fake, state
+
+    def _mk_judge_ask(verdicts):
+        calls = {"court": 0, "labels": []}
+        def fake_ask(model, messages, temp=0.5, **kw):
+            lbl = kw.get("label")
+            calls["labels"].append(lbl)
+            if lbl == "court":
+                v = verdicts[calls["court"] % len(verdicts)]
+                calls["court"] += 1
+                return f"analysis...\nVERDICT: {v}"
+            return "\\boxed{NONE}"                              # rescue等は不発
+        return fake_ask, calls
+
+    # --- court: 散逸した少数票の正解候補を判決で確定 (aime25-27 シナリオ) ---
+    f.SC_COURT, f.SC_RESCUE_VOTES = True, False
+    f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 8, 4, 8
+    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["A", "A", "NONE"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("court: 床未満(2票)の散逸でも判決過半数で確定",
+          res is not None and res["answer"] == "248")
+    check("court: 判決確定がログに出る", "[SC/court] 判決確定: 248" in buf.getvalue())
+
+    # --- court: 誤った多数派を少数票の正解へ覆す ---
+    fake, st = _mk_sampler(["7", "7", "7", "385", "385", None, None, None])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["B", "B", "A"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("court: 判決過半数が誤った多数派(7x3)を覆し385を採用",
+          res is not None and res["answer"] == "385")
+
+    # --- court: 多数決が明確に強い時は審理しない(margin skip) ---
+    fake, st = _mk_sampler(["7", "7", "7", "7", "385", None, None, None])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["B"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("court: 4票vs1票(margin 2.0)は審理省略で多数決のまま",
+          res is not None and res["answer"] == "7" and jcalls["court"] == 0)
+
+    # --- court: 全候補 FLAWED → 悪魔の代弁人が新答で一致 → 採用 (合意型誤答の攻略) ---
+    fake, st = _mk_sampler(["16", "16", "1740", "1740", None, None, None, None],
+                           devil_ans=["83", "83", "51"])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["NONE", "NONE", "NONE"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("court: 全候補FLAWED→悪魔の代弁人の一致新答83を採用",
+          res is not None and res["answer"] == "83")
+    check("court: 悪魔の代弁人ラウンドがログに出る",
+          "悪魔の代弁人ラウンド" in buf.getvalue())
+
+    # --- court: 判決が割れて過半数なし → 既存経路へフォールバック(床で MoA へ) ---
+    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["A", "B", "NONE"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("court: 判決割れは既存どおり床未満でMoAフォールバック(None)", res is None)
+
+    # --- 既定OFF: 同条件でも従来挙動(床未満→None、courtは呼ばれない) ---
+    f.SC_COURT = False
+    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None])
+    f._sc_sample = fake
+    f.ask, jcalls = _mk_judge_ask(["A", "A", "A"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("court: SC_COURT=False は完全に従来挙動(None, 審理ゼロ)",
+          res is None and jcalls["court"] == 0)
+
+    # --- rescue 統合: 抽出失敗2票を回収して全会一致で確定 ---
+    f.SC_COURT, f.SC_RESCUE_VOTES = False, True
+    _t248 = ("reasoning " * 40) + " so the answer is 248 clearly but"
+    def fake_rescue_seq(model, q, tt, pot=False, history=None):
+        seq = [("248", "trace-248"), ("248", "trace-248"),
+               (None, _t248), (None, _t248),
+               (None, "__ERROR__: dead"), (None, "short"),
+               (None, _t248.replace("248", "999")), (None, "short2")]
+        i = fake_rescue_seq.i; fake_rescue_seq.i += 1
+        return seq[i] if i < len(seq) else (None, "exhausted")
+    fake_rescue_seq.i = 0
+    f._sc_sample = fake_rescue_seq
+    f.ask = lambda *a, **kw: "\\boxed{248}"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("rescue: 回収2票で 248 が 2→4票になり確定",
+          res is not None and res["answer"] == "248"
+          and res["votes"].get("248") == 4)
+    check("rescue: 回収ログが出る", "[SC/rescue] 抽出失敗トレースから 2 票を回収" in buf.getvalue())
+finally:
+    f._sc_sample = _orig_sc_sample3
+    f.ask = _orig_ask
+    f.installed_models = _orig_installed
+    for k, v in _saved_court.items():
+        setattr(f, k, v)
+
 # ---------- 13. 採点正規化の表記ゆれ吸収 (2026-08-04, math500実測NGの回帰) ----------
 check("norm: 度数 30^\\circ == 30", f.answers_equivalent("30", "30^\\circ"))
 check("norm: 度数 90^{\\circ} == 90", f.answers_equivalent("90", "90^{\\circ}"))

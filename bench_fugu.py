@@ -383,6 +383,34 @@ def run_sc4(item):
         f.NIM_CAPTURE_LOGPROBS, f.SC_CONF_VOTE = saved_conf
 
 
+def run_sc6(item):
+    """SC-Court 構成 (2026-08-05, fugu独自設計): sc3系サンプリング(4系統・初回12票・
+    上限32票・思考32k・生多数決) + 抽出失敗票の救済(SC_RESCUE_VOTES) + 対審集約
+    (SC_COURT: 異種裁判官団が候補トレースを審理し判決、全候補FLAWEDなら悪魔の代弁人)。
+    DeepConf実測(sc4, 0/5で有害)で判明した3失敗モード — 票の散逸・サンプル浪費・
+    合意型誤答 — への fugu 独自の応答。生成側の自信度ではなく検証側の信号を使う。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        f.SC_COURT, f.SC_RESCUE_VOTES = saved_court
+
+
 def run_vibe(item):
     """VibeThinker-3B 単発（汚染検証）。AIME26(カットオフ後)も高得点なら実力、
     24/25 だけ高得点なら学習データ汚染 → SC_CHEAP_VOTES は封印のまま。"""
@@ -441,7 +469,10 @@ CONFIGS.update({
     # sc3@nim (2026-08-04): 4系統・32票・思考32k の強化構成。実力負け問題の再攻略用。
     "sc3@nim": run_sc3,
     # sc4@nim (2026-08-04): sc3 + DeepConf(logprobs自信度の加重集約・低自信トレース除外)。
+    # 【実測 2026-08-05: 0/5 で有害と結論。記録用に構成は残す】
     "sc4@nim": run_sc4,
+    # sc6@nim (2026-08-05): SC-Court 対審集約 + 抽出失敗票救済 (fugu独自設計)。
+    "sc6@nim": run_sc6,
 })
 
 # ==================================================
