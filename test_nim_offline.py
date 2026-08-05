@@ -846,6 +846,59 @@ try:
           res is not None and res["answer"] == "24" and ccalls["runoff"] == 0)
     f.SC_CHALLENGER = False
 
+    # --- 機械検証官 (sc10): 独立プログラム2本の実行一致が全てに優先 ---
+    f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_AUDIT, f.SC_CHALLENGER = True, False, False, False
+    f.SC_MACHINE = True
+    def _mk_machine_ask(verdicts, codes):
+        calls = {"court": 0, "machine": 0}
+        def fake_ask(model, messages, temp=0.5, **kw):
+            lbl = kw.get("label")
+            if lbl == "court":
+                v = verdicts[calls["court"] % len(verdicts)]; calls["court"] += 1
+                return f"...\nVERDICT: {v}"
+            if lbl == "machine":
+                c = codes[calls["machine"] % len(codes)]; calls["machine"] += 1
+                return f"reasoning...\n```python\n{c}\n```"
+            return "\\boxed{NONE}"
+        return fake_ask, calls
+    # 現候補384(悪魔不要: 審理が候補Aを支持)を機械合意385が上書き (I-12 の狙い撃ちシナリオ)
+    fake, st = _mk_sampler(["384", "384", "384", "16", "16", "8", None, None])
+    f._sc_sample = fake
+    f.ask, mcalls = _mk_machine_ask(["A", "A", "A"],
+                                    ["print(385)", "print(385)", "print(999)"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("machine: プログラム2本の実行一致385が言語側の384を上書き",
+          res is not None and res["answer"] == "385")
+    check("machine: 機械合意ログが出る", "実行可能な合意: 385" in buf.getvalue())
+    # プログラム間の合意なし → 言語側の結論を維持
+    fake, st = _mk_sampler(["384", "384", "384", "16", "16", "8", None, None])
+    f._sc_sample = fake
+    f.ask, mcalls = _mk_machine_ask(["A", "A", "A"],
+                                    ["print(1)", "print(2)", "print(3)"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("machine: 合意なしは言語側の384を維持", res is not None and res["answer"] == "384")
+    # 機械合意が現候補と同値なら確定を後押し(床バイパス)
+    fake, st = _mk_sampler(["248", "248", "337", "611", None, None, None, None])
+    f._sc_sample = fake
+    f.ask, mcalls = _mk_machine_ask(["NONE", "NONE", "NONE"],
+                                    ["print(248)", "print(248)", "print(248)"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("machine: 機械合意248が床未満(2票)でも確定させる",
+          res is not None and res["answer"] == "248")
+    # SC_MACHINE=False は不変
+    f.SC_MACHINE = False
+    fake, st = _mk_sampler(["384", "384", "384", "16", "16", "8", None, None])
+    f._sc_sample = fake
+    f.ask, mcalls = _mk_machine_ask(["A", "A", "A"], ["print(385)"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("machine: SC_MACHINE=Falseは機械呼び出しゼロで従来どおり",
+          res is not None and res["answer"] == "384" and mcalls["machine"] == 0)
+
     # --- rescue 統合: 抽出失敗2票を回収して全会一致で確定 ---
     f.SC_COURT, f.SC_RESCUE_VOTES = False, True
     _t248 = ("reasoning " * 40) + " so the answer is 248 clearly but"

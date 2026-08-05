@@ -4040,6 +4040,15 @@ SC_AUDIT_MAX_VOTES = 2    # 生票がこの数以下の court 勝者も監査対
 # あれば決選審理(runoff)で現職と直接対決させる。同数・全棄権は現職維持の保守則。
 # 既定 False。sc9@nim 構成が設定。
 SC_CHALLENGER = False
+# 機械検証官 (2026-08-05, fugu独自設計, 理論#5)。理論#1-4は全て「言語による検証」で、
+# 384→385 の共有オフバイワンは裁判官にも監査人にも不可視だった(監査実験で 384→400 誤修正/
+# 384 確認)。共有盲点は言語では見えなくても総当たりプログラムには存在しない — そこで
+# 難問(court 発動級)の最終確定前に、複数モデルへ「閉形式の推論ではなく直接計算・全数
+# 列挙で答えを数えるプログラム」を独立に書かせて実行し、2 本以上の実行結果が厳密一致
+# したらその値(実行可能な合意)を最終裁定として全てに優先させる。既定 False。sc10@nim。
+SC_MACHINE = False
+SC_MACHINE_N = 3          # プログラムを書かせるモデル数（一致 2 本で確定）
+SC_MACHINE_TIMEOUT = 300  # 総当たりの実行タイムアウト秒（SC_POT_TIMEOUT より長い専用枠）
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4830,6 +4839,62 @@ def _boundary_audit(question, task_type, answer, trace):
     return answer
 
 
+def _machine_verdict(question, current):
+    """機械検証官: 複数モデルに「直接計算・全数列挙で答えを数える自己完結プログラム」を
+    独立に書かせて実行し、2 本以上の実行結果が厳密一致したらその値を返す（無ければ None）。
+    閉形式の推論を禁じるのは、言語的な共有盲点(384→385 型のオフバイワン)をコードに
+    持ち込ませないため。current(現在の候補答)はプロンプトに渡さない — アンカリングを
+    避け、機械だけの独立集計にする。"""
+    coders = _court_judges()[:SC_MACHINE_N]
+    if not coders:
+        return None
+    prompt = (
+        f"Problem:\n{question}\n\n"
+        "Write a single self-contained Python 3 program that computes the EXACT final "
+        "answer to this problem by DIRECT COMPUTATION -- exhaustive enumeration, "
+        "brute-force search, or certified numerical counting (with tolerances chosen "
+        "so the count is provably exact). Do NOT solve the problem in closed form and "
+        "then print a constant; let the machine do the counting. Use only the standard "
+        "library. The program must finish within a few minutes and print ONLY the "
+        "final integer answer on the last line.")
+    outs = []
+    for m in coders:
+        print(f"   [SC/machine] {m} が検証プログラムを作成します")
+        raw = ask(m, [{"role": "user", "content": prompt}], 0.2,
+                  num_predict=model_cfg(m, "num_predict", 16384), label="machine")
+        if not raw or raw.startswith("__ERROR__"):
+            print(f"   [SC/machine] {m} の生成が空/失敗")
+            continue
+        code = extract_code(strip_think(raw))
+        if not code:
+            print(f"   [SC/machine] {m} の応答にコード無し")
+            continue
+        ok, out = run_python(code, timeout=SC_MACHINE_TIMEOUT, stdout_only=True)
+        out = (out or "").strip()
+        if not ok or not out:
+            print(f"   [SC/machine] {m} のプログラムが実行失敗/出力なし")
+            continue
+        val = out.splitlines()[-1].strip()
+        if "\\boxed{" in val:
+            unwrapped = extract_boxed(val)
+            if unwrapped is not None:
+                val = unwrapped
+        val = normalize_answer(val) or val
+        if not val or len(val) > 40:
+            print(f"   [SC/machine] {m} の出力が答えの形でない: {val[:60]!r}")
+            continue
+        print(f"   [SC/machine] {m} のプログラム出力: {val}")
+        outs.append(val)
+    top, cnt, _cl = vote_answers(outs)
+    if top is not None and cnt >= 2:
+        mark = "一致(現候補と同値)" if (current and answers_equivalent(top, current)) \
+            else f"一致(現候補 {current} を機械合意で上書き)"
+        print(f"   [SC/machine] 実行可能な合意: {top} ({cnt}/{len(outs)}) {mark}")
+        return top
+    print("   [SC/machine] プログラム間の合意なし → 機械裁定は棄権")
+    return None
+
+
 def _court_aggregate(question, task_type, samples, classes):
     """SC-Court 対審集約 (2026-08-05, fugu独自設計)。票が散逸/拮抗した上位候補クラスを
     「弁護側の弁論（代表トレース）」として裁判官団に審理させ、判決の多数で確定する。
@@ -5385,7 +5450,27 @@ def solve_verifiable(question, task_type="math", history=None):
                     classes = classes + [[top, cnt]]
                 rep = rep_c or _representative_text(samples, top)
                 court_decided = True
-    if (not conf_decided and not court_decided
+    # 機械検証官 (2026-08-05, SC_MACHINE=True の sc10 経路のみ。既定 False で不変):
+    # court と同じ「多数決が明確でない」ゲートで発動し、独立生成プログラム 2 本以上の
+    # 実行結果一致(実行可能な合意)を court の結論よりも優先して最終裁定にする。
+    machine_decided = False
+    if SC_MACHINE and task_type == "math" and not conf_decided:
+        second_m = classes[1][1] if len(classes) >= 2 else 0
+        decisive_m = (cnt >= SC_MIN_VOTES and cnt * 2 > len(answers)
+                      and (second_m == 0 or cnt >= SC_COURT_MARGIN * second_m))
+        if not decisive_m:
+            mtop = _machine_verdict(question, top)
+            if mtop is not None:
+                if not answers_equivalent(mtop, top):
+                    match = next((c for c in classes
+                                  if answers_equivalent(mtop, c[0])), None)
+                    cnt = match[1] if match else 0
+                    top = mtop
+                    if match is None:
+                        classes = classes + [[top, cnt]]
+                    rep = None          # 機械裁定に弁論テキストは無い → 代表を引き直す
+                machine_decided = True
+    if (not conf_decided and not court_decided and not machine_decided
             and len(classes) >= 2 and classes[0][1] == classes[1][1]):
         arb_result = _arbitrate(question, task_type, samples, classes)
         if arb_result:
@@ -5429,7 +5514,8 @@ def solve_verifiable(question, task_type="math", history=None):
     # いた。理由は違えど中身は同じ疑似全会一致問題なので、最終returnにも同じ床（floor）をかける。
     # ただし裁定（_arbitrate）が成功して rep が既に埋まっている場合は、裁定役が新たに出した
     # answer/text をそのまま尊重し、票数に関わらずここでは弾かない。
-    if rep is None and cnt < SC_MIN_VOTES and not conf_decided and not court_decided:
+    if (rep is None and cnt < SC_MIN_VOTES
+            and not conf_decided and not court_decided and not machine_decided):
         print(f"   [SC] 確定票が {cnt} 票のみ (< SC_MIN_VOTES={SC_MIN_VOTES}) → MoA フォールバックへ")
         return None
     if rep is None:
