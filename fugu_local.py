@@ -4025,6 +4025,15 @@ SC_RESCUE_MODEL = None    # None なら CONDUCTOR（NIM では llama-3.1-8b）�
 SC_STRATIFY = False
 SC_STRATEGY_MODEL = None  # None なら ARBITER_MODEL → REASONING_MODELS[0]
 SC_STRATEGY_N = 4         # 列挙する戦略数の上限（系統数と同程度が層化効率の均衡点）
+# 境界監査 (2026-08-05, fugu独自設計, sc7実測 aime24-I-12 の教訓)。悪魔の代弁人2名が
+# 独立に「384」へ収束したが正解は385だった — 独立解答者が同じ値に一致した時点で残る
+# 主リスクは「共有されたオフバイワン/境界の数え間違い」(inclusive/exclusive・退化ケース・
+# 端点)に絞られる。採用直前の答えに対し、ゼロから解き直させず「この論証の境界処理だけを
+# 監査せよ」と専任監査人を立て、全員が同一の修正値に一致した場合のみ置換する(保守的)。
+# 既定 False。sc8@nim 構成が設定。
+SC_AUDIT = False
+SC_AUDIT_N = 2            # 監査人の数（全員一致でのみ修正採用）
+SC_AUDIT_MAX_VOTES = 2    # 生票がこの数以下の court 勝者も監査対象（多数決勝者は対象外）
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4763,6 +4772,58 @@ def _enumerate_strategies(question):
     return lines[:SC_STRATEGY_N]
 
 
+def _boundary_audit(question, task_type, answer, trace):
+    """境界監査: 採用直前の答えについて、そのトレースの数え上げ境界だけを専任監査させる。
+    SC_AUDIT_N 名全員が同一の修正値に一致した場合のみ置換（1名でも CONFIRMED/不一致なら
+    原案維持 — 正解を「修正」で壊さないための保守則）。監査人には解き直しを禁じ、
+    「アプローチは正しい前提で境界処理のみ」を見させる（流域は既に正しいという状況が前提）。"""
+    if not answer:
+        return answer
+    auditors = _court_judges()[:SC_AUDIT_N]
+    if len(auditors) < SC_AUDIT_N:
+        return answer
+    prompt = (
+        f"Problem:\n{question}\n\n"
+        f"A solution concluded the final answer is {answer}. Independent solvers using "
+        "the same approach agreed on this value, so the main remaining risk is a shared "
+        "off-by-one or boundary error: inclusive vs exclusive counts, degenerate/empty "
+        "cases, endpoints, or a double-counted/missed extreme case.\n\n"
+        f"Solution to audit:\n{(trace or '')[:3500]}\n\n"
+        "Do NOT re-derive the problem from scratch -- assume the approach is correct. "
+        "Audit ONLY the boundary handling and counting edges of THIS argument, checking "
+        "each suspicious edge case explicitly. At the very end output exactly one line: "
+        f"'AUDIT: CONFIRMED {answer}' or 'AUDIT: CORRECTED <value>'.")
+    votes = []
+    for j in auditors:
+        print(f"   [SC/audit] {j} が境界監査します")
+        raw = ask(j, [{"role": "user", "content": prompt}], 0.1,
+                  num_predict=model_cfg(j, "num_predict", 16384), label="audit")
+        if not raw or raw.startswith("__ERROR__"):
+            print(f"   [SC/audit] {j} の監査が空/失敗 → 原案維持側")
+            votes.append(answer)
+            continue
+        m = None
+        for m in re.finditer(r"AUDIT:\s*(CONFIRMED|CORRECTED)[:\s]*(\S+)",
+                             strip_think(raw)):
+            pass                                    # 最後の AUDIT 行を採用
+        if not m:
+            print(f"   [SC/audit] {j} の監査書式が不正 → 原案維持側")
+            votes.append(answer)
+            continue
+        if m.group(1).upper() == "CONFIRMED":
+            print(f"   [SC/audit] {j}: CONFIRMED {answer}")
+            votes.append(answer)
+        else:
+            val = normalize_answer(m.group(2)) or m.group(2)
+            print(f"   [SC/audit] {j}: CORRECTED {answer} -> {val}")
+            votes.append(val)
+    if (votes and all(answers_equivalent(v, votes[0]) for v in votes)
+            and not answers_equivalent(votes[0], answer)):
+        print(f"   [SC/audit] 監査全員一致の修正を採用: {answer} -> {votes[0]}")
+        return votes[0]
+    return answer
+
+
 def _court_aggregate(question, task_type, samples, classes):
     """SC-Court 対審集約 (2026-08-05, fugu独自設計)。票が散逸/拮抗した上位候補クラスを
     「弁護側の弁論（代表トレース）」として裁判官団に審理させ、判決の多数で確定する。
@@ -4832,6 +4893,8 @@ def _court_aggregate(question, task_type, samples, classes):
     if best is not None and tally[best] >= need:
         canon, cnt_i, rep_text = reps[best]
         print(f"   [SC/court] 判決確定: {canon} (判決 {tally[best]}/{panel}, 生票 {cnt_i})")
+        if SC_AUDIT and cnt_i <= SC_AUDIT_MAX_VOTES:
+            canon = _boundary_audit(question, task_type, canon, rep_text)
         return canon, rep_text, tally[best]
     # 悪魔の代弁人ラウンド v2: 「NONE 過半数」に加え「評決不成立(hung jury)」でも発動する。
     # どちらも裁判官団が既存候補に確信を持てなかった状態であり、候補の外を探すべき局面
@@ -4864,6 +4927,8 @@ def _court_aggregate(question, task_type, samples, classes):
             print(f"   [SC/court] 悪魔の代弁人が新答で一致: {dtop} ({dcnt}/{len(devil_ans)})")
             rep_text = next((t for a, t in devil_texts.items()
                              if answers_equivalent(a, dtop)), "")
+            if SC_AUDIT:
+                dtop = _boundary_audit(question, task_type, dtop, rep_text)
             return dtop, rep_text, dcnt
     print("   [SC/court] 判決が過半数に達せず → 既存経路へフォールバック")
     return None

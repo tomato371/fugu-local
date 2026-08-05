@@ -739,6 +739,61 @@ try:
     check("court: SC_COURT=False は完全に従来挙動(None, 審理ゼロ)",
           res is None and jcalls["court"] == 0)
 
+    # --- 境界監査 (sc8): 全員一致の修正のみ採用 ---
+    f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_AUDIT = True, False, True
+    def _mk_audit_ask(verdicts, audits):
+        calls = {"court": 0, "audit": 0}
+        def fake_ask(model, messages, temp=0.5, **kw):
+            lbl = kw.get("label")
+            if lbl == "court":
+                v = verdicts[calls["court"] % len(verdicts)]
+                calls["court"] += 1
+                return f"...\nVERDICT: {v}"
+            if lbl == "audit":
+                a = audits[calls["audit"] % len(audits)]
+                calls["audit"] += 1
+                return f"...\nAUDIT: {a}"
+            return "\\boxed{NONE}"
+        return fake_ask, calls
+    # 悪魔の一致新答384を監査全員一致で385へ修正 (aime24-I-12 シナリオ)
+    fake, st = _mk_sampler(["8", "8", "16", "256", None, None, None, None],
+                           devil_ans=["384", "384", "999"])
+    f._sc_sample = fake
+    f.ask, acalls = _mk_audit_ask(["NONE", "NONE", "NONE"],
+                                  ["CORRECTED 385", "CORRECTED 385"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("audit: 悪魔の一致新答384を全員一致監査で385へ修正採用",
+          res is not None and res["answer"] == "385")
+    check("audit: 修正採用がログに出る", "監査全員一致の修正を採用: 384 -> 385" in buf.getvalue())
+    # 監査が割れたら原案維持
+    fake, st = _mk_sampler(["8", "8", "16", "256", None, None, None, None],
+                           devil_ans=["384", "384", "999"])
+    f._sc_sample = fake
+    f.ask, acalls = _mk_audit_ask(["NONE", "NONE", "NONE"],
+                                  ["CORRECTED 385", "CONFIRMED 384"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("audit: 監査が割れたら原案維持(384)", res is not None and res["answer"] == "384")
+    # 低票の判決勝者も監査対象 (aime26-83 型が誤修正されない: 全員CONFIRMED)
+    fake, st = _mk_sampler(["83", "83", "1740", "16", None, None, None, None])
+    f._sc_sample = fake
+    f.ask, acalls = _mk_audit_ask(["A", "A", "NONE"], ["CONFIRMED 83", "CONFIRMED 83"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("audit: 判決勝者(低票)は監査を通りCONFIRMEDで維持",
+          res is not None and res["answer"] == "83" and acalls["audit"] == 2)
+    # SC_AUDIT=False では監査ゼロ (sc7互換)
+    f.SC_AUDIT = False
+    fake, st = _mk_sampler(["83", "83", "1740", "16", None, None, None, None])
+    f._sc_sample = fake
+    f.ask, acalls = _mk_audit_ask(["A", "A", "NONE"], ["CORRECTED 999"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("audit: SC_AUDIT=Falseは監査ゼロで従来どおり",
+          res is not None and res["answer"] == "83" and acalls["audit"] == 0)
+
     # --- rescue 統合: 抽出失敗2票を回収して全会一致で確定 ---
     f.SC_COURT, f.SC_RESCUE_VOTES = False, True
     _t248 = ("reasoning " * 40) + " so the answer is 248 clearly but"
