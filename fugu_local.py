@@ -4034,6 +4034,12 @@ SC_STRATEGY_N = 4         # 列挙する戦略数の上限（系統数と同程�
 SC_AUDIT = False
 SC_AUDIT_N = 2            # 監査人の数（全員一致でのみ修正採用）
 SC_AUDIT_MAX_VOTES = 2    # 生票がこの数以下の court 勝者も監査対象（多数決勝者は対象外）
+# 挑戦者制度 (2026-08-05, fugu独自設計, sc8実測 aime24-I-12 の教訓)。審理が誤答多数派を
+# 追認(判決2/3で24)すると悪魔ラウンドに進む機会そのものが消える — 追認は探索を殺す。
+# True にすると判決勝者(現職)が立っても悪魔の代弁人を挑戦者として必ず走らせ、悪魔合意が
+# あれば決選審理(runoff)で現職と直接対決させる。同数・全棄権は現職維持の保守則。
+# 既定 False。sc9@nim 構成が設定。
+SC_CHALLENGER = False
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4890,19 +4896,30 @@ def _court_aggregate(question, task_type, samples, classes):
             print(f"   [SC/court] {j} の判決 '{v}' が候補外 → 棄権(補充裁判官へ)")
     need = panel // 2 + 1                           # 予定パネル人数の過半数
     best = max(range(len(reps)), key=lambda i: tally[i]) if reps else None
+    incumbent = None                                 # 判決で立った現職 (canon, 生票, text, 判決数)
     if best is not None and tally[best] >= need:
         canon, cnt_i, rep_text = reps[best]
         print(f"   [SC/court] 判決確定: {canon} (判決 {tally[best]}/{panel}, 生票 {cnt_i})")
-        if SC_AUDIT and cnt_i <= SC_AUDIT_MAX_VOTES:
-            canon = _boundary_audit(question, task_type, canon, rep_text)
-        return canon, rep_text, tally[best]
+        incumbent = (canon, cnt_i, rep_text, tally[best])
+        # 挑戦者制度 (v3) が無効なら従来どおりここで確定
+        if not SC_CHALLENGER:
+            if SC_AUDIT and cnt_i <= SC_AUDIT_MAX_VOTES:
+                canon = _boundary_audit(question, task_type, canon, rep_text)
+            return canon, rep_text, tally[best]
     # 悪魔の代弁人ラウンド v2: 「NONE 過半数」に加え「評決不成立(hung jury)」でも発動する。
     # どちらも裁判官団が既存候補に確信を持てなかった状態であり、候補の外を探すべき局面
     # (aime24-I-12 実測: C=1/NONE=1/棄権1 の評決不成立で devil 不発 → 機会損失だった)。
     # 採用条件は従来どおり「独立に2票以上一致した候補外の新答」なので保守性は保たれる。
-    if SC_COURT_DEVILS > 0:
+    # 挑戦者制度 v3 (2026-08-05): 判決勝者(現職)が立った場合も悪魔を「挑戦者」として必ず
+    # 走らせる。sc8実測 aime24-I-12 で審理2/3が誤答多数派24を追認し、前回発見済みの
+    # 384(→監査で385の芽)への挑戦機会そのものが消えた — 追認は探索を殺すため、
+    # 現職には常に挑戦者をぶつけ、悪魔合意があれば決選審理(runoff)で決める。
+    if SC_COURT_DEVILS > 0 and (incumbent is None or SC_CHALLENGER):
         suspects = ", ".join(str(c) for c, _n, _t in reps)
-        why = "過半数が NONE" if none_votes >= need else "評決不成立"
+        if incumbent is not None:
+            why = f"挑戦者制度: 現職 {incumbent[0]} への挑戦"
+        else:
+            why = "過半数が NONE" if none_votes >= need else "評決不成立"
         print(f"   [SC/court] {why} → 悪魔の代弁人ラウンド (候補 {suspects} を誤りと仮定)")
         devil_q = (
             f"{question}\n\n[Verification note: the answers {suspects} have each been "
@@ -4925,13 +4942,72 @@ def _court_aggregate(question, task_type, samples, classes):
         dtop, dcnt, _dcl = vote_answers(devil_ans)
         if dtop is not None and dcnt >= 2:          # 独立に2票以上一致した新答のみ採用
             print(f"   [SC/court] 悪魔の代弁人が新答で一致: {dtop} ({dcnt}/{len(devil_ans)})")
-            rep_text = next((t for a, t in devil_texts.items()
-                             if answers_equivalent(a, dtop)), "")
-            if SC_AUDIT:
-                dtop = _boundary_audit(question, task_type, dtop, rep_text)
-            return dtop, rep_text, dcnt
+            d_text = next((t for a, t in devil_texts.items()
+                           if answers_equivalent(a, dtop)), "")
+            if incumbent is None:
+                if SC_AUDIT:
+                    dtop = _boundary_audit(question, task_type, dtop, d_text)
+                return dtop, d_text, dcnt
+            # 決選審理: 現職 vs 挑戦者。勝者が挑戦者なら境界監査も通す
+            win_ans, win_text, from_devil = _runoff(
+                question, task_type, incumbent, (dtop, d_text))
+            if SC_AUDIT and (from_devil or incumbent[1] <= SC_AUDIT_MAX_VOTES):
+                win_ans = _boundary_audit(question, task_type, win_ans, win_text)
+            return win_ans, win_text, incumbent[3]
+    if incumbent is not None:                        # 挑戦不成立 → 現職を従来どおり確定
+        canon, cnt_i, rep_text, t = incumbent
+        if SC_AUDIT and cnt_i <= SC_AUDIT_MAX_VOTES:
+            canon = _boundary_audit(question, task_type, canon, rep_text)
+        return canon, rep_text, t
     print("   [SC/court] 判決が過半数に達せず → 既存経路へフォールバック")
     return None
+
+
+def _runoff(question, task_type, incumbent, challenger):
+    """決選審理: 判決で立った現職と悪魔の代弁人の挑戦者を突き合わせ、裁判官団の多数で
+    決める。同数・全棄権は現職維持(保守則)。戻り値 (答え, 代表text, 挑戦者勝利か)。"""
+    inc_ans, _inc_votes, inc_text, _t = incumbent
+    ch_ans, ch_text = challenger
+    listing = (f"### Candidate A (final answer: {inc_ans})\n{strip_think(inc_text or '')[:3000]}\n\n"
+               f"### Candidate B (final answer: {ch_ans})\n{strip_think(ch_text or '')[:3000]}")
+    prompt = (
+        f"Problem:\n{question}\n\n"
+        "Two candidate solutions disagree. Candidate A survived one review round; "
+        "Candidate B was produced by solvers explicitly told to look for a shared "
+        "misreading, and independent solvers agreed on it. Neither pedigree is "
+        f"evidence -- judge ONLY the mathematics.\n\n{listing}\n\n"
+        "Check each candidate's interpretation of the problem statement and its "
+        "critical computations. At the very end output exactly one line: "
+        "'VERDICT: A' or 'VERDICT: B'.")
+    a_votes = b_votes = 0
+    got = 0
+    for j in _court_judges():
+        if got >= SC_COURT_JUDGES:
+            break
+        print(f"   [SC/runoff] {j} が決選審理します ({inc_ans} vs {ch_ans})")
+        raw = ask(j, [{"role": "user", "content": prompt}], 0.1,
+                  num_predict=model_cfg(j, "num_predict", 16384), label="runoff")
+        if not raw or raw.startswith("__ERROR__"):
+            print(f"   [SC/runoff] {j} 棄権")
+            continue
+        m = None
+        for m in re.finditer(r"VERDICT:\s*([AB])\b", strip_think(raw)):
+            pass
+        if not m:
+            print(f"   [SC/runoff] {j} 書式不正で棄権")
+            continue
+        got += 1
+        if m.group(1).upper() == "A":
+            a_votes += 1
+            print(f"   [SC/runoff] {j}: A = {inc_ans}")
+        else:
+            b_votes += 1
+            print(f"   [SC/runoff] {j}: B = {ch_ans}")
+    if b_votes > a_votes:
+        print(f"   [SC/runoff] 挑戦者の勝利: {inc_ans} -> {ch_ans} ({b_votes}-{a_votes})")
+        return ch_ans, ch_text, True
+    print(f"   [SC/runoff] 現職維持: {inc_ans} ({a_votes}-{b_votes})")
+    return inc_ans, inc_text, False
 
 
 def vote_answers(answers):

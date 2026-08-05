@@ -1,4 +1,4 @@
-"""NIM クラウドバックエンドのオフライン回帰テスト。実 API・Ollama 不要・数秒で完走。
+﻿"""NIM クラウドバックエンドのオフライン回帰テスト。実 API・Ollama 不要・数秒で完走。
 実行: python test_nim_offline.py
 
 urllib.request.urlopen をモックして _ask_nim の送信 payload・リトライ・予算・
@@ -793,6 +793,58 @@ try:
         res = f.solve_verifiable("dummy", "math")
     check("audit: SC_AUDIT=Falseは監査ゼロで従来どおり",
           res is not None and res["answer"] == "83" and acalls["audit"] == 0)
+
+    # --- 挑戦者制度 (sc9): 現職追認でも悪魔が挑戦し決選審理で決める ---
+    f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_AUDIT, f.SC_CHALLENGER = True, False, True, True
+    f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 8, 4, 8
+    def _mk_ch_ask(verdicts, runoffs, audits):
+        calls = {"court": 0, "runoff": 0, "audit": 0}
+        def fake_ask(model, messages, temp=0.5, **kw):
+            lbl = kw.get("label")
+            if lbl == "court":
+                v = verdicts[calls["court"] % len(verdicts)]; calls["court"] += 1
+                return f"...\nVERDICT: {v}"
+            if lbl == "runoff":
+                v = runoffs[calls["runoff"] % len(runoffs)]; calls["runoff"] += 1
+                return f"...\nVERDICT: {v}"
+            if lbl == "audit":
+                a = audits[calls["audit"] % len(audits)]; calls["audit"] += 1
+                return f"...\nAUDIT: {a}"
+            return "\\boxed{NONE}"
+        return fake_ask, calls
+    # 現職24(判決2/3)に悪魔合意384が挑戦→決選でB勝利→監査で385へ修正 (I-12完全シナリオ)
+    fake, st = _mk_sampler(["24", "24", "24", "16", "16", "8", None, None],
+                           devil_ans=["384", "384", "999"])
+    f._sc_sample = fake
+    f.ask, ccalls = _mk_ch_ask(["A", "A", "NONE"], ["B", "B", "A"],
+                               ["CORRECTED 385", "CORRECTED 385"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    check("challenger: 現職24を悪魔384が決選で破り監査が385へ修正",
+          res is not None and res["answer"] == "385")
+    check("challenger: 挑戦・決選のログが出る",
+          "挑戦者制度: 現職 24 への挑戦" in buf.getvalue()
+          and "挑戦者の勝利" in buf.getvalue())
+    # 決選で現職勝利なら現職維持(監査は生票多数なのでスキップ)
+    fake, st = _mk_sampler(["24", "24", "24", "16", "16", "8", None, None],
+                           devil_ans=["384", "384", "999"])
+    f._sc_sample = fake
+    f.ask, ccalls = _mk_ch_ask(["A", "A", "NONE"], ["A", "B", "A"], ["CORRECTED 1"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("challenger: 決選で現職勝利なら24を維持(監査スキップ)",
+          res is not None and res["answer"] == "24" and ccalls["audit"] == 0)
+    # 悪魔が合意しなければ現職を従来どおり確定
+    fake, st = _mk_sampler(["24", "24", "24", "16", "16", "8", None, None],
+                           devil_ans=["384", "999", "555"])
+    f._sc_sample = fake
+    f.ask, ccalls = _mk_ch_ask(["A", "A", "NONE"], ["B"], ["CORRECTED 1"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("challenger: 悪魔不一致なら現職24を確定(決選なし)",
+          res is not None and res["answer"] == "24" and ccalls["runoff"] == 0)
+    f.SC_CHALLENGER = False
 
     # --- rescue 統合: 抽出失敗2票を回収して全会一致で確定 ---
     f.SC_COURT, f.SC_RESCUE_VOTES = False, True

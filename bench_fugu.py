@@ -470,6 +470,40 @@ def run_sc8(item):
         f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT = saved_court
 
 
+def run_sc9(item):
+    """挑戦者制度つき構成 (2026-08-05, fugu独自設計): sc8 + SC_CHALLENGER + 候補枠5 +
+    戦略6本。sc8実測で審理が誤答多数派を追認して悪魔ルートが封じられた(aime24-I-12)、
+    1票同士の候補選抜が出現順で正解60が候補枠から漏れうる(aime25-13)への応答。
+    現職には常に挑戦者(悪魔合意)をぶつけ、決選審理で数学だけを見て決める。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+                   f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        f.SC_STRATIFY = True
+        f.SC_AUDIT = True
+        f.SC_CHALLENGER = True
+        f.SC_COURT_TOPK = 5
+        f.SC_STRATEGY_N = 6
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+         f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N) = saved_court
+
+
 def run_vibe(item):
     """VibeThinker-3B 単発（汚染検証）。AIME26(カットオフ後)も高得点なら実力、
     24/25 だけ高得点なら学習データ汚染 → SC_CHEAP_VOTES は封印のまま。"""
@@ -536,6 +570,8 @@ CONFIGS.update({
     "sc7@nim": run_sc7,
     # sc8@nim (2026-08-05): sc7 + 境界監査 (独立一致した答えのオフバイワン監査, fugu独自設計)。
     "sc8@nim": run_sc8,
+    # sc9@nim (2026-08-05): sc8 + 挑戦者制度 (現職への悪魔挑戦+決選審理) + 候補5枠 + 戦略6本。
+    "sc9@nim": run_sc9,
 })
 
 # ==================================================
