@@ -1,0 +1,799 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fugu-nim テストタイム計算量スケーリング実測</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; }
+  img, svg { max-width: 100%; }
+  h1, h2, h3, h4, p, ul, ol, dl, dd, figure, pre { margin: 0; }
+  ul, ol { padding: 0; }
+  table { border-collapse: collapse; }
+</style>
+</head>
+<body>
+<style>
+  :root {
+    color-scheme: light;
+    --ground:      #eef1f3;
+    --panel:       #fafbfc;
+    --panel-2:     #f3f6f7;
+    --ink:         #0b0f11;
+    --ink-2:       #4e585c;
+    --ink-3:       #7d888c;
+    --rule:        #dbe1e4;
+    --grid:        #e6eaec;
+    --axis:        #c2cacd;
+    --s1:          #2a78d6;
+    --s2:          #eb6834;
+    --s3:          #1baf7a;
+    --good:        #0ca30c;
+    --crit:        #d03b3b;
+    --ring:        rgba(11,15,17,.10);
+    --shadow:      0 1px 2px rgba(11,15,17,.05), 0 8px 24px -12px rgba(11,15,17,.14);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --ground:  #0c0f11;
+      --panel:   #171a1c;
+      --panel-2: #1e2225;
+      --ink:     #e9eef0;
+      --ink-2:   #a8b4b8;
+      --ink-3:   #7d888c;
+      --rule:    #272d30;
+      --grid:    #23282b;
+      --axis:    #343b3f;
+      --s1:      #3987e5;
+      --s2:      #d95926;
+      --s3:      #199e70;
+      --good:    #0ca30c;
+      --crit:    #e05a5a;
+      --ring:    rgba(233,238,240,.12);
+      --shadow:  0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:  #0c0f11;
+    --panel:   #171a1c;
+    --panel-2: #1e2225;
+    --ink:     #e9eef0;
+    --ink-2:   #a8b4b8;
+    --ink-3:   #7d888c;
+    --rule:    #272d30;
+    --grid:    #23282b;
+    --axis:    #343b3f;
+    --s1:      #3987e5;
+    --s2:      #d95926;
+    --s3:      #199e70;
+    --good:    #0ca30c;
+    --crit:    #e05a5a;
+    --ring:    rgba(233,238,240,.12);
+    --shadow:  0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.7);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --ground:  #eef1f3;
+    --panel:   #fafbfc;
+    --panel-2: #f3f6f7;
+    --ink:     #0b0f11;
+    --ink-2:   #4e585c;
+    --ink-3:   #7d888c;
+    --rule:    #dbe1e4;
+    --grid:    #e6eaec;
+    --axis:    #c2cacd;
+    --s1:      #2a78d6;
+    --s2:      #eb6834;
+    --s3:      #1baf7a;
+    --crit:    #d03b3b;
+    --ring:    rgba(11,15,17,.10);
+  }
+
+  :root {
+    --sans: system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", "Hiragino Sans", Meiryo, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.72;
+    margin: 0;
+    padding: 0 20px 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+
+  /* ---- masthead ---- */
+  .mast { padding: 56px 0 28px; border-bottom: 2px solid var(--ink); }
+  .kicker {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(28px, 4.4vw, 46px); line-height: 1.15; letter-spacing: -.02em;
+    font-weight: 700; margin: 0 0 14px; text-wrap: balance;
+  }
+  .dek { font-size: 17px; color: var(--ink-2); margin: 0; max-width: 62ch; }
+  .meta {
+    font-family: var(--mono); font-size: 12px; color: var(--ink-3);
+    margin: 20px 0 0; display: flex; flex-wrap: wrap; gap: 6px 20px;
+  }
+
+  /* ---- headline stats ---- */
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 1px; background: var(--rule); border: 1px solid var(--rule);
+    margin: 36px 0 0;
+  }
+  .stat { background: var(--panel); padding: 20px 20px 18px; }
+  .stat .lab {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3); margin: 0 0 8px;
+  }
+  .stat .val { font-size: 34px; font-weight: 700; letter-spacing: -.025em; line-height: 1; margin: 0; }
+  .stat .sub { font-size: 13px; color: var(--ink-2); margin: 8px 0 0; line-height: 1.5; }
+  .win { color: var(--good); }
+
+  /* ---- sections ---- */
+  section { margin: 56px 0 0; }
+  .sec-head { display: flex; align-items: baseline; gap: 14px; margin: 0 0 6px; }
+  .sec-num {
+    font-family: var(--mono); font-size: 12px; color: var(--ink-3);
+    letter-spacing: .1em; flex: none; padding-top: 4px;
+  }
+  h2 { font-size: 23px; font-weight: 700; letter-spacing: -.015em; margin: 0; text-wrap: balance; }
+  h3 { font-size: 16px; font-weight: 700; margin: 30px 0 8px; letter-spacing: -.005em; }
+  p { margin: 12px 0; max-width: 68ch; }
+  .lede { color: var(--ink-2); }
+  code, .m { font-family: var(--mono); font-size: .88em; }
+  code {
+    background: var(--panel-2); padding: .12em .38em; border-radius: 3px;
+    border: 1px solid var(--rule);
+  }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--rule);
+    box-shadow: var(--shadow); margin: 22px 0 0; padding: 22px 22px 18px;
+  }
+  .card-title { font-size: 15px; font-weight: 700; margin: 0 0 3px; }
+  .card-sub { font-size: 13px; color: var(--ink-2); margin: 0 0 16px; }
+
+  .scroller { overflow-x: auto; }
+  svg { display: block; width: 100%; height: auto; }
+  .plot-min { min-width: 640px; }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 14px 0 0;
+    font-size: 13px; color: var(--ink-2);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 13px; height: 13px; border-radius: 3px; flex: none; box-shadow: 0 0 0 1px var(--ring) inset; }
+
+  /* ---- tables ---- */
+  .tbl-wrap { overflow-x: auto; margin: 20px 0 0; }
+  table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 14px; }
+  caption {
+    text-align: left; font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3); padding: 0 0 10px;
+  }
+  th, td { padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    font-size: 12px; color: var(--ink-2); font-weight: 600;
+    border-bottom: 1.5px solid var(--axis); white-space: nowrap;
+  }
+  tbody td { font-variant-numeric: tabular-nums; }
+  tbody tr:hover { background: var(--panel-2); }
+  .num { font-family: var(--mono); }
+  .dim { color: var(--ink-3); }
+  tfoot td { font-weight: 700; border-top: 1.5px solid var(--axis); border-bottom: none; }
+
+  /* ---- callout ---- */
+  .call {
+    border-left: 3px solid var(--s3); background: var(--panel);
+    padding: 16px 20px; margin: 24px 0 0; border-top: 1px solid var(--rule);
+    border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+  }
+  .call.warn { border-left-color: var(--s2); }
+  .call p { margin: 6px 0; }
+  .call p:first-child { margin-top: 0; }
+  .call p:last-child { margin-bottom: 0; }
+  .call strong { font-weight: 700; }
+
+  /* ---- trace strip ---- */
+  .trace { display: flex; flex-wrap: wrap; gap: 6px; margin: 16px 0 0; }
+  .step {
+    font-family: var(--mono); font-size: 12px; padding: 7px 11px;
+    border: 1px solid var(--rule); background: var(--panel-2); color: var(--ink-2);
+    display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+  }
+  .step .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--crit); flex: none; }
+  .step.pass { border-color: var(--s3); color: var(--ink); background: var(--panel); font-weight: 700; }
+  .step.pass .dot { background: var(--s3); }
+
+  /* ---- tooltip ---- */
+  .tip {
+    position: fixed; pointer-events: none; opacity: 0; transition: opacity .1s;
+    background: var(--ink); color: var(--panel); font-family: var(--mono);
+    font-size: 12px; line-height: 1.55; padding: 8px 11px; border-radius: 4px;
+    z-index: 50; max-width: 260px; box-shadow: 0 6px 20px -6px rgba(0,0,0,.5);
+  }
+  .tip.on { opacity: 1; }
+  .hit { cursor: crosshair; }
+  .hit:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+
+  footer {
+    margin: 64px 0 0; padding: 22px 0 0; border-top: 1px solid var(--rule);
+    font-family: var(--mono); font-size: 12px; color: var(--ink-3); line-height: 1.8;
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="mast">
+    <p class="kicker">Benchmark report · 2026-08-05</p>
+    <p style="font-family:ui-monospace,monospace;font-size:12.5px;letter-spacing:.08em;opacity:.75;margin:0 0 14px"><a href="index.html">← fugu-nim</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; SCALING</p>
+<h1>fugu-nim：テストタイム計算量は<br>どこで効かなくなるか</h1>
+    <p class="dek">
+      NVIDIA NIM 上で動かした動的 MoA オーケストレータ fugu の、9 構成・累計 9,486 リクエストの実測。
+      「計算量を積めば精度が上がる」がどこで止まり、そこから先は何が効いたのかを、
+      AIME 90 問の 1 問単位の追跡から再構成する。
+    </p>
+    <p class="meta">
+      <span>SOURCE: fugu_bench/results/*.jsonl</span>
+      <span>AIME24+25+26 = 90問</span>
+      <span>累計 NIM リクエスト 15,000+</span>
+      <span>外部課金 ¥0</span>
+    </p>
+  </header>
+
+  <div class="stats">
+    <div class="stat">
+      <p class="lab">AIME26 最終</p>
+      <p class="val win">30 / 30</p>
+      <p class="sub">Fable 29/30 を上回る。<br>fugu-nim が初めて基準を超えた</p>
+    </div>
+    <div class="stat">
+      <p class="lab">AIME 90問 合計</p>
+      <p class="val">87 / 90</p>
+      <p class="sub">96.7%（Fable 89/90 = 98.9%）</p>
+    </div>
+    <div class="stat">
+      <p class="lab">計算量スケーリングの限界</p>
+      <p class="val">1,149</p>
+      <p class="sub">sc3 段階で 1 問救うのに要した<br>リクエスト数（sc2 の 11 倍）</p>
+    </div>
+    <div class="stat">
+      <p class="lab">設計変更後の限界コスト</p>
+      <p class="val win">140</p>
+      <p class="sub">sc7（戦略層化）で 1 問救済。<br>計算量を積むより 8 倍安い</p>
+    </div>
+  </div>
+
+  <!-- ============ 1 ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><h2>累積スケーリング曲線</h2></div>
+    <p class="lede">
+      横軸は投じた累計 NIM リクエスト、縦軸は AIME 90 問の正答率。各点は 1 構成の実行後の到達点で、
+      左から右へ時間順に積み上がる。<strong>線が寝れば「計算を投じたのに何も救えていない」</strong>ことを意味する。
+    </p>
+
+    <div class="card">
+      <p class="card-title">正答率 vs 累計リクエスト（AIME 90問）</p>
+      <p class="card-sub">段階ごとの色は「何を変えたか」を表す。線の傾きが投資効率そのもの。</p>
+      <div class="scroller">
+        <svg viewBox="0 0 900 400" role="img" aria-label="正答率と累計リクエスト数の関係を示す折れ線グラフ。sc@nimからsc2@nimで大きく上昇し、sc3からsc5の計算量増強区間ではほぼ横ばい、sc6とsc7の設計変更区間で再び上昇する。" class="plot-min">
+          <!-- grid -->
+          <g stroke="var(--grid)" stroke-width="1">
+            <line x1="70" y1="350" x2="860" y2="350"/>
+            <line x1="70" y1="292" x2="860" y2="292"/>
+            <line x1="70" y1="234" x2="860" y2="234"/>
+            <line x1="70" y1="176" x2="860" y2="176"/>
+            <line x1="70" y1="118" x2="860" y2="118"/>
+            <line x1="70" y1="60"  x2="860" y2="60"/>
+          </g>
+          <!-- y labels -->
+          <g font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)" text-anchor="end">
+            <text x="60" y="354">83%</text>
+            <text x="60" y="296">86%</text>
+            <text x="60" y="238">89%</text>
+            <text x="60" y="180">92%</text>
+            <text x="60" y="122">95%</text>
+            <text x="60" y="64">98%</text>
+          </g>
+          <!-- axes -->
+          <line x1="70" y1="30" x2="70" y2="360" stroke="var(--axis)" stroke-width="1.5"/>
+          <line x1="70" y1="360" x2="860" y2="360" stroke="var(--axis)" stroke-width="1.5"/>
+          <!-- x labels -->
+          <g font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)" text-anchor="middle">
+            <text x="70"  y="378">5.4k</text>
+            <text x="254" y="378">6.4k</text>
+            <text x="438" y="378">7.4k</text>
+            <text x="622" y="378">8.4k</text>
+            <text x="806" y="378">9.4k</text>
+            <text x="465" y="396" fill="var(--ink-2)">累計 NIM リクエスト</text>
+          </g>
+
+          <!-- phase bands -->
+          <rect x="273" y="30" width="449" height="330" fill="var(--s2)" opacity=".05"/>
+          <rect x="722" y="30" width="138" height="330" fill="var(--s3)" opacity=".07"/>
+          <text x="497" y="45" font-family="ui-monospace, monospace" font-size="11" fill="var(--s2)" text-anchor="middle">計算量スケーリング区間</text>
+          <text x="791" y="45" font-family="ui-monospace, monospace" font-size="11" fill="var(--s3)" text-anchor="middle">設計変更区間</text>
+
+          <!-- segments -->
+          <polyline points="103,344 273,151" fill="none" stroke="var(--s1)" stroke-width="2.5" stroke-linecap="round"/>
+          <polyline points="273,151 484,130 686,130 722,130" fill="none" stroke="var(--s2)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <polyline points="722,130 767,106 793,85 811,85 821,85" fill="none" stroke="var(--s3)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+          <!-- points -->
+          <g class="pts">
+            <circle cx="103" cy="344" r="5.5" fill="var(--s1)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc@nim — 基準構成&#10;75/90 (83.3%)&#10;累計 5,581 req / 16.0 h&#10;3系統SC + PoT"/>
+            <circle cx="273" cy="151" r="5.5" fill="var(--s1)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc2@nim — 同一設計で再測定&#10;84/90 (93.3%) ＋9問&#10;+923 req → 103 req/1問&#10;429ストーム修正＋第3系統復活"/>
+            <circle cx="484" cy="130" r="5.5" fill="var(--s2)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc3@nim — 4系統・32票・思考32k&#10;85/90 (94.4%) ＋1問&#10;+1,149 req → 1,149 req/1問&#10;効率が11倍悪化"/>
+            <circle cx="686" cy="130" r="5.5" fill="var(--s2)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc4@nim — sc3 + DeepConf&#10;85/90 (94.4%) ±0問&#10;+1,101 req → 救済ゼロ&#10;『異種混成では有害』と結論・記録"/>
+            <circle cx="722" cy="130" r="5.5" fill="var(--s2)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc5@nim&#10;85/90 (94.4%) ±0問&#10;+195 req → 救済ゼロ"/>
+            <circle cx="767" cy="106" r="5.5" fill="var(--s3)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc6@nim — SC-Court 対審集約&#10;86/90 (95.6%) ＋1問&#10;+247 req → 247 req/1問&#10;効率が回復した"/>
+            <circle cx="793" cy="85" r="6.5" fill="var(--s3)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc7@nim — S3C 戦略層化&#10;87/90 (96.7%) ＋1問&#10;+140 req → 140 req/1問&#10;AIME26 が 30/30 に到達"/>
+            <circle cx="811" cy="85" r="5.5" fill="var(--s3)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc8@nim — 境界監査&#10;87/90 (96.7%) ±0問&#10;+100 req（対象1問のみ）"/>
+            <circle cx="821" cy="85" r="5.5" fill="var(--s3)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="sc9@nim — 挑戦者制度&#10;87/90 (96.7%) ±0問&#10;+50 req（対象1問のみ）"/>
+          </g>
+
+          <!-- direct labels -->
+          <g font-family="ui-monospace, monospace" font-size="11.5" fill="var(--ink-2)">
+            <text x="103" y="332" text-anchor="start">sc@nim 83.3%</text>
+            <text x="266" y="141" text-anchor="end">sc2 93.3%</text>
+            <text x="484" y="119" text-anchor="middle">sc3</text>
+            <text x="686" y="119" text-anchor="middle">sc4</text>
+            <text x="757" y="98" text-anchor="end">sc6</text>
+            <text x="790" y="70" text-anchor="middle" fill="var(--ink)" font-weight="700">sc7 → 96.7%</text>
+          </g>
+
+          <!-- annotation -->
+          <path d="M 497 208 L 550 142" stroke="var(--s2)" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+          <text x="480" y="226" font-size="12.5" fill="var(--s2)" text-anchor="middle" font-family="ui-monospace, monospace">2,445 req · 34時間 投じて ＋1問</text>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--s1)"></i>同一設計（基準＋再測定）</span>
+        <span><i class="swatch" style="background:var(--s2)"></i>計算量スケーリング（票数↑・思考長↑・自信度加重）</span>
+        <span><i class="swatch" style="background:var(--s3)"></i>設計変更（対審集約・戦略層化・監査）</span>
+      </div>
+    </div>
+
+    <div class="call warn">
+      <p><strong>読み取り。</strong> この曲線は単調な飽和ではなく、明確な二相構造をしている。</p>
+      <p>sc2 まで（青）は同一設計のまま 923 リクエストで 9 問を救い、1 問あたり 103 リクエスト。ここは投資効率が良い。</p>
+      <p>sc3〜sc5（橙）で票数を 32 まで増やし、思考トークンを 32k から始め、DeepConf による自信度加重を入れた。<strong>2,445 リクエスト・約 34 時間を投じて、救えたのは 1 問。</strong>効率は 11 倍以上悪化した。</p>
+      <p>sc6〜sc7（緑）は計算量ではなく<strong>集約の仕組みを変えた</strong>。SC-Court（候補を対審にかける）と S3C（解法戦略を強制的に散らす）。387 リクエストで 2 問を救い、効率が sc2 に近い水準まで戻った。</p>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <caption>累積スケーリング表（AIME 90問・実測）</caption>
+        <thead>
+          <tr><th>段階</th><th>変更内容</th><th>正答</th><th>正答率</th><th>累計 req</th><th>累計 時間</th><th>限界 req/1問</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">sc@nim</td><td>3系統SC + PoT（基準）</td><td class="num">75/90</td><td class="num">83.3%</td><td class="num">5,581</td><td class="num">16.0 h</td><td class="num dim">—</td></tr>
+          <tr><td class="num">sc2@nim</td><td>同一設計・429修正後の再測定</td><td class="num">84/90</td><td class="num">93.3%</td><td class="num">6,504</td><td class="num">34.7 h</td><td class="num">103</td></tr>
+          <tr><td class="num">sc3@nim</td><td>4系統・32票・思考32k開始</td><td class="num">85/90</td><td class="num">94.4%</td><td class="num">7,653</td><td class="num">51.8 h</td><td class="num">1,149</td></tr>
+          <tr><td class="num">sc4@nim</td><td>sc3 + DeepConf 自信度加重</td><td class="num">85/90</td><td class="num">94.4%</td><td class="num">8,754</td><td class="num">65.0 h</td><td class="num dim">∞</td></tr>
+          <tr><td class="num">sc5@nim</td><td>—</td><td class="num">85/90</td><td class="num">94.4%</td><td class="num">8,949</td><td class="num">67.9 h</td><td class="num dim">∞</td></tr>
+          <tr><td class="num">sc6@nim</td><td>SC-Court 対審集約 + 票救済</td><td class="num">86/90</td><td class="num">95.6%</td><td class="num">9,196</td><td class="num">76.3 h</td><td class="num">247</td></tr>
+          <tr><td class="num">sc7@nim</td><td>S3C 戦略層化 + Court v2</td><td class="num">87/90</td><td class="num">96.7%</td><td class="num">9,336</td><td class="num">82.9 h</td><td class="num">140</td></tr>
+          <tr><td class="num">sc8@nim</td><td>+ 境界監査（オフバイワン）</td><td class="num">87/90</td><td class="num">96.7%</td><td class="num">9,436</td><td class="num">91.2 h</td><td class="num dim">∞</td></tr>
+          <tr><td class="num">sc9@nim</td><td>+ 挑戦者制度・候補5枠</td><td class="num">87/90</td><td class="num">96.7%</td><td class="num">9,486</td><td class="num">95.4 h</td><td class="num dim">∞</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 2 ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><h2>限界コスト——1 問救うのに何リクエスト要したか</h2></div>
+    <p class="lede">
+      同じデータを「その段階で追加した計算量 ÷ その段階で新たに救えた問題数」で見る。
+      棒が低いほど効率が良い。∞ は 1 問も救えなかった段階。
+    </p>
+
+    <div class="card">
+      <p class="card-title">段階別 限界コスト（req / 救済 1 問）</p>
+      <p class="card-sub">橙＝計算量を積んだ段階、緑＝集約設計を変えた段階。</p>
+      <div class="scroller">
+        <svg viewBox="0 0 900 300" role="img" aria-label="段階別の限界コストを示す棒グラフ。sc3が1149で突出して高く、sc4・sc5・sc8・sc9は救済ゼロ。sc2は103、sc6は247、sc7は140と低い。" class="plot-min">
+          <g stroke="var(--grid)" stroke-width="1">
+            <line x1="88" y1="230" x2="870" y2="230"/>
+            <line x1="88" y1="180" x2="870" y2="180"/>
+            <line x1="88" y1="130" x2="870" y2="130"/>
+            <line x1="88" y1="80"  x2="870" y2="80"/>
+            <line x1="88" y1="30"  x2="870" y2="30"/>
+          </g>
+          <g font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)" text-anchor="end">
+            <text x="78" y="234">0</text>
+            <text x="78" y="184">300</text>
+            <text x="78" y="134">600</text>
+            <text x="78" y="84">900</text>
+            <text x="78" y="34">1200</text>
+          </g>
+          <line x1="88" y1="240" x2="870" y2="240" stroke="var(--axis)" stroke-width="1.5"/>
+
+          <!-- bars: x centers at 145,240,335,430,525,620,715,810 (w=66) -->
+          <!-- sc2 103 -> h=17.2 -->
+          <rect x="112" y="222.8" width="66" height="17.2" rx="4" fill="var(--s1)" class="hit" tabindex="0" data-tip="sc2@nim&#10;+923 req で 9問 救済&#10;103 req / 1問"/>
+          <text x="145" y="215" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)" font-weight="700">103</text>
+
+          <!-- sc3 1149 -> h=191.5 -->
+          <rect x="207" y="48.5" width="66" height="191.5" rx="4" fill="var(--s2)" class="hit" tabindex="0" data-tip="sc3@nim&#10;+1,149 req で 1問 救済&#10;1,149 req / 1問&#10;sc2 の 11.2 倍"/>
+          <text x="240" y="41" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)" font-weight="700">1,149</text>
+
+          <!-- sc4 inf -->
+          <rect x="302" y="40" width="66" height="200" rx="4" fill="var(--s2)" opacity=".22" stroke="var(--s2)" stroke-width="1.5" stroke-dasharray="4 3" class="hit" tabindex="0" data-tip="sc4@nim（DeepConf）&#10;+1,101 req で 0問 救済&#10;本人が『異種混成では有害』と結論"/>
+          <text x="335" y="33" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" fill="var(--s2)" font-weight="700">∞</text>
+
+          <!-- sc5 inf -->
+          <rect x="397" y="40" width="66" height="200" rx="4" fill="var(--s2)" opacity=".22" stroke="var(--s2)" stroke-width="1.5" stroke-dasharray="4 3" class="hit" tabindex="0" data-tip="sc5@nim&#10;+195 req で 0問 救済"/>
+          <text x="430" y="33" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" fill="var(--s2)" font-weight="700">∞</text>
+
+          <!-- sc6 247 -> h=41.2 -->
+          <rect x="492" y="198.8" width="66" height="41.2" rx="4" fill="var(--s3)" class="hit" tabindex="0" data-tip="sc6@nim（SC-Court）&#10;+247 req で 1問 救済&#10;247 req / 1問"/>
+          <text x="525" y="191" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)" font-weight="700">247</text>
+
+          <!-- sc7 140 -> h=23.3 -->
+          <rect x="587" y="216.7" width="66" height="23.3" rx="4" fill="var(--s3)" class="hit" tabindex="0" data-tip="sc7@nim（S3C 戦略層化）&#10;+140 req で 1問 救済&#10;140 req / 1問&#10;sc3 の 1/8 のコスト"/>
+          <text x="620" y="209" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)" font-weight="700">140</text>
+
+          <!-- sc8 inf -->
+          <rect x="682" y="40" width="66" height="200" rx="4" fill="var(--s3)" opacity=".22" stroke="var(--s3)" stroke-width="1.5" stroke-dasharray="4 3" class="hit" tabindex="0" data-tip="sc8@nim（境界監査）&#10;+100 req で 0問 救済&#10;※対象1問のみ・試行数不足"/>
+          <text x="715" y="33" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" fill="var(--s3)" font-weight="700">∞</text>
+
+          <!-- sc9 inf -->
+          <rect x="777" y="40" width="66" height="200" rx="4" fill="var(--s3)" opacity=".22" stroke="var(--s3)" stroke-width="1.5" stroke-dasharray="4 3" class="hit" tabindex="0" data-tip="sc9@nim（挑戦者制度）&#10;+50 req で 0問 救済&#10;※対象1問のみ・試行数不足"/>
+          <text x="810" y="33" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" fill="var(--s3)" font-weight="700">∞</text>
+
+          <g font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)" text-anchor="middle">
+            <text x="145" y="258">sc2</text>
+            <text x="240" y="258">sc3</text>
+            <text x="335" y="258">sc4</text>
+            <text x="430" y="258">sc5</text>
+            <text x="525" y="258">sc6</text>
+            <text x="620" y="258">sc7</text>
+            <text x="715" y="258">sc8</text>
+            <text x="810" y="258">sc9</text>
+            <text x="479" y="284" fill="var(--ink-3)" font-size="11">破線＝救済ゼロ（∞）。棒の高さは 1200 でクリップ</text>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 3 ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><h2>予算の逆進性——計算は落とす問題に注がれている</h2></div>
+    <p class="lede">
+      基準構成 <code>sc@nim</code> の 90 問を、1 問ごとの消費リクエストで層別する。
+      多数決が割れると自動で追加サンプリングが走るため、消費量は「その問題の難しさ」の代理変数になる。
+    </p>
+
+    <div class="card">
+      <p class="card-title">消費リクエスト帯 別の正答率</p>
+      <p class="card-sub">sc@nim・AIME 90問。棒の上の数字は各帯の問題数。</p>
+      <div class="scroller">
+        <svg viewBox="0 0 900 300" role="img" aria-label="消費リクエスト帯別の正答率を示す棒グラフ。40から60リクエスト帯と60から100帯は100パーセントだが、100リクエスト超の帯は48パーセントに落ちる。" class="plot-min">
+          <g stroke="var(--grid)" stroke-width="1">
+            <line x1="88" y1="230" x2="870" y2="230"/>
+            <line x1="88" y1="185" x2="870" y2="185"/>
+            <line x1="88" y1="140" x2="870" y2="140"/>
+            <line x1="88" y1="95"  x2="870" y2="95"/>
+            <line x1="88" y1="50"  x2="870" y2="50"/>
+          </g>
+          <g font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)" text-anchor="end">
+            <text x="78" y="234">0%</text>
+            <text x="78" y="189">25%</text>
+            <text x="78" y="144">50%</text>
+            <text x="78" y="99">75%</text>
+            <text x="78" y="54">100%</text>
+          </g>
+          <line x1="88" y1="240" x2="870" y2="240" stroke="var(--axis)" stroke-width="1.5"/>
+
+          <!-- 5 bars: centers 165, 315, 465, 615, 765 ; w=110 ; scale 180px = 100% -->
+          <rect x="110" y="67.2" width="110" height="172.8" rx="4" fill="var(--s1)" class="hit" tabindex="0" data-tip="0–20 req&#10;n=26 / 正答 25&#10;正答率 96%&#10;中央 428 秒"/>
+          <text x="165" y="59" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="var(--ink)">96%</text>
+
+          <rect x="260" y="112.2" width="110" height="127.8" rx="4" fill="var(--s1)" class="hit" tabindex="0" data-tip="20–40 req&#10;n=7 / 正答 5&#10;正答率 71%&#10;中央 828 秒"/>
+          <text x="315" y="104" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="var(--ink)">71%</text>
+
+          <rect x="410" y="60" width="110" height="180" rx="4" fill="var(--s1)" class="hit" tabindex="0" data-tip="40–60 req&#10;n=30 / 正答 30&#10;正答率 100%&#10;中央 159 秒 — 最も安く最も正確"/>
+          <text x="465" y="52" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="var(--ink)">100%</text>
+
+          <rect x="560" y="60" width="110" height="180" rx="4" fill="var(--s1)" class="hit" tabindex="0" data-tip="60–100 req&#10;n=4 / 正答 4&#10;正答率 100%&#10;中央 349 秒"/>
+          <text x="615" y="52" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="var(--ink)">100%</text>
+
+          <rect x="710" y="153.6" width="110" height="86.4" rx="4" fill="var(--s2)" class="hit" tabindex="0" data-tip="100+ req&#10;n=23 / 正答 11&#10;正答率 48%&#10;中央 824 秒&#10;票が最後まで割れ続けた問題群"/>
+          <text x="765" y="145" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="var(--ink)">48%</text>
+
+          <g font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)" text-anchor="middle">
+            <text x="165" y="258">0–20</text>
+            <text x="315" y="258">20–40</text>
+            <text x="465" y="258">40–60</text>
+            <text x="615" y="258">60–100</text>
+            <text x="765" y="258">100+</text>
+            <text x="165" y="276" fill="var(--ink-3)" font-size="11">n=26</text>
+            <text x="315" y="276" fill="var(--ink-3)" font-size="11">n=7</text>
+            <text x="465" y="276" fill="var(--ink-3)" font-size="11">n=30</text>
+            <text x="615" y="276" fill="var(--ink-3)" font-size="11">n=4</text>
+            <text x="765" y="276" fill="var(--ink-3)" font-size="11">n=23</text>
+            <text x="479" y="296" fill="var(--ink-3)" font-size="11">1問あたりの消費 NIM リクエスト</text>
+          </g>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--s1)"></i>票が収束した帯</span>
+        <span><i class="swatch" style="background:var(--s2)"></i>上限（20票）まで割れ続けた帯</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <p class="card-title">正解した問題と落とした問題の消費量</p>
+      <p class="card-sub">単位が異なるため 2 枚に分けた。左＝リクエスト数、右＝壁時計秒。いずれも中央値。</p>
+      <div class="scroller">
+        <svg viewBox="0 0 900 250" role="img" aria-label="正解した問題と不正解の問題の消費量比較。不正解の問題はリクエスト数で4倍、時間で3.1倍を消費している。" class="plot-min">
+          <!-- left: requests -->
+          <text x="60" y="26" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)">中央 リクエスト数</text>
+          <line x1="60" y1="200" x2="410" y2="200" stroke="var(--axis)" stroke-width="1.5"/>
+          <!-- scale: 180px = 180 req -->
+          <rect x="105" y="157" width="90" height="43" rx="4" fill="var(--s1)" class="hit" tabindex="0" data-tip="正解した問題 (n=75)&#10;req 中央 43 / 平均 46.0"/>
+          <text x="150" y="149" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700" fill="var(--ink)">43</text>
+          <rect x="255" y="29" width="90" height="171" rx="4" fill="var(--s2)" class="hit" tabindex="0" data-tip="落とした問題 (n=15)&#10;req 中央 171 / 平均 141.9&#10;正解群の 4.0 倍"/>
+          <text x="300" y="21" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700" fill="var(--ink)">171</text>
+          <text x="150" y="220" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)">正解 n=75</text>
+          <text x="300" y="220" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)">不正解 n=15</text>
+          <text x="225" y="242" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--s2)" font-weight="700">4.0×</text>
+
+          <!-- divider -->
+          <line x1="455" y1="10" x2="455" y2="240" stroke="var(--rule)" stroke-width="1"/>
+
+          <!-- right: seconds -->
+          <text x="500" y="26" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)">中央 壁時計 秒</text>
+          <line x1="500" y1="200" x2="860" y2="200" stroke="var(--axis)" stroke-width="1.5"/>
+          <!-- scale: 171px = 900 s -->
+          <rect x="548" y="149" width="90" height="51" rx="4" fill="var(--s1)" class="hit" tabindex="0" data-tip="正解した問題 (n=75)&#10;秒 中央 268 / 平均 519"/>
+          <text x="593" y="141" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700" fill="var(--ink)">268</text>
+          <rect x="700" y="42" width="90" height="158" rx="4" fill="var(--s2)" class="hit" tabindex="0" data-tip="落とした問題 (n=15)&#10;秒 中央 829 / 平均 1,249&#10;正解群の 3.1 倍"/>
+          <text x="745" y="34" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" font-weight="700" fill="var(--ink)">829</text>
+          <text x="593" y="220" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)">正解 n=75</text>
+          <text x="745" y="220" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink-2)">不正解 n=15</text>
+          <text x="669" y="242" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="var(--s2)" font-weight="700">3.1×</text>
+        </svg>
+      </div>
+    </div>
+
+    <div class="call warn">
+      <p><strong>これが最も実務的な発見だと思う。</strong> 落とした 15 問は、正解した 75 問の <strong>4.0 倍のリクエストと 3.1 倍の時間</strong>を消費している。</p>
+      <p>票が割れる → 追加サンプリング → また割れる、というループが、<strong>解けない問題にこそ予算を集中させている</strong>。40〜60 リクエスト帯が正答率 100%・中央 159 秒で最も安く正確なのに対し、100 リクエストを超えた問題群は 23 問中 11 問しか当たらない。</p>
+      <p>つまり <code>SC_MAX=20</code> の追加サンプリングは、後半ほど期待値が下がる投資になっている。100 リクエストを超えた時点で打ち切り、その予算を別の手（戦略層化・対審）に回すほうが合理的である可能性が高い。</p>
+    </div>
+  </section>
+
+  <!-- ============ 4 ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">04</span><h2>ケーススタディ：aime26-15</h2></div>
+    <p class="lede">
+      5 構成が連続で落とし、6 番目で解けた 1 問。計算量スケーリングの限界と、設計変更が効く理由が、
+      1 問の中に凝縮されている。
+    </p>
+
+    <div class="card">
+      <p class="card-title">aime26-15 の攻略履歴</p>
+      <p class="card-sub">正解 83。sc@nim から sc6@nim まで 5 構成が失敗し、sc7@nim が 47 リクエストで正解に到達した。</p>
+      <div class="trace">
+        <span class="step"><i class="dot"></i>sc@nim &nbsp;3系統・20票上限</span>
+        <span class="step"><i class="dot"></i>sc2@nim &nbsp;同左・再測定</span>
+        <span class="step"><i class="dot"></i>sc3@nim &nbsp;4系統・32票・思考32k</span>
+        <span class="step"><i class="dot"></i>sc4@nim &nbsp;+ DeepConf 自信度加重</span>
+        <span class="step"><i class="dot"></i>sc6@nim &nbsp;+ SC-Court 対審</span>
+        <span class="step pass"><i class="dot"></i>sc7@nim &nbsp;+ S3C 戦略層化 → 83 ✓</span>
+      </div>
+      <p style="margin-top:18px">
+        sc3 は票数を 32 まで積み、思考を 32k トークンから始めた。それでも解けなかった。
+        sc7 が投じたのは <span class="m">47 リクエスト・4,563 秒</span>——sc3 の 1/3 以下である。
+      </p>
+      <p>
+        違いは量ではなく<strong>多様性の作り方</strong>にある。S3C（戦略層化）は解く前に強モデルへ
+        「本質的に異なる攻め方」を列挙させ、各サンプルにラウンドロビンで強制割当する。
+        実装は <code>[Strategy directive: solve using this approach and no other: …]</code> をプロンプトに注入するだけの短いコードだ。
+      </p>
+      <p>
+        温度 0.7 で 32 回サンプリングしても、全系統が同じ筋読みをしていれば票は同じ誤りに揃う。
+        <strong>多数決は確率的な誤りしか直せず、相関した誤りは増幅する。</strong>
+        sc3 が失敗し sc7 が成功したことは、この問題の誤りが確率的ではなく系統的だったことの直接証拠になっている。
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ 5 ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">05</span><h2>ベンチ別の単価と、Fable との最終比較</h2></div>
+
+    <div class="card">
+      <p class="card-title">1 問あたりの NIM リクエスト数と正答率</p>
+      <p class="card-sub">AIME だけが桁違いに高コスト。票が割れやすい問題ほど追加サンプリングが走るため。</p>
+      <div class="scroller">
+        <svg viewBox="0 0 900 280" role="img" aria-label="ベンチマーク別の1問あたりリクエスト数と正答率の散布図。AIMEが62リクエストと突出して高く、HumanEvalは3.7リクエストで最も安い。" class="plot-min">
+          <g stroke="var(--grid)" stroke-width="1">
+            <line x1="90" y1="210" x2="860" y2="210"/>
+            <line x1="90" y1="160" x2="860" y2="160"/>
+            <line x1="90" y1="110" x2="860" y2="110"/>
+            <line x1="90" y1="60"  x2="860" y2="60"/>
+          </g>
+          <g font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)" text-anchor="end">
+            <text x="80" y="214">80%</text>
+            <text x="80" y="164">85%</text>
+            <text x="80" y="114">90%</text>
+            <text x="80" y="64">95%</text>
+          </g>
+          <line x1="90" y1="30" x2="90" y2="222" stroke="var(--axis)" stroke-width="1.5"/>
+          <line x1="90" y1="222" x2="860" y2="222" stroke="var(--axis)" stroke-width="1.5"/>
+          <g font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)" text-anchor="middle">
+            <text x="90" y="240">0</text>
+            <text x="282" y="240">16</text>
+            <text x="474" y="240">32</text>
+            <text x="666" y="240">48</text>
+            <text x="858" y="240">64</text>
+            <text x="475" y="262" fill="var(--ink-2)">1 問あたり NIM リクエスト数</text>
+          </g>
+
+          <!-- points: x = 90 + req/64*768 ; y = 210 - (acc-80)/5*50 -->
+          <!-- humaneval 3.7 req, 93.3% -> x=134, y=77 -->
+          <circle cx="134" cy="77" r="8" fill="var(--s1)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="HumanEval (coder@nim)&#10;28/30 = 93.3%&#10;3.7 req/問 · 中央 317 秒&#10;Fable 28/30 と同点"/>
+          <text x="150" y="72" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)">HumanEval 93.3%</text>
+          <text x="150" y="88" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">3.7 req/問</text>
+
+          <!-- jmmlu 7.2 req, 87.5% -> x=176, y=135 -->
+          <circle cx="176" cy="135" r="8" fill="var(--s1)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="JMMLU (fugu@nim)&#10;35/40 = 87.5%&#10;7.2 req/問 · 中央 95 秒&#10;Fable 33/40 に勝利"/>
+          <text x="194" y="120" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)">JMMLU 87.5%</text>
+          <text x="194" y="134" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">7.2 req/問 · Fable超え</text>
+
+          <!-- math500 8.1 req, 86.0% -> x=187, y=150 -->
+          <circle cx="187" cy="150" r="8" fill="var(--s1)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="Math500 (sc@nim)&#10;43/50 = 86.0%&#10;8.1 req/問 · 中央 163 秒&#10;Fable 99/100 に大差で敗北"/>
+          <text x="205" y="166" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)">Math500 86.0%</text>
+          <text x="205" y="180" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">8.1 req/問 · Fable 99%</text>
+
+          <!-- aime 62.0 req, 83.3% -> x=834, y=177 -->
+          <circle cx="834" cy="177" r="9" fill="var(--s2)" stroke="var(--panel)" stroke-width="2" class="hit" tabindex="0" data-tip="AIME 90問 (sc@nim 単独)&#10;75/90 = 83.3%&#10;62.0 req/問&#10;他ベンチの 8〜17 倍のコスト"/>
+          <text x="820" y="160" text-anchor="end" font-family="ui-monospace, monospace" font-size="12" fill="var(--ink)" font-weight="700">AIME 83.3%</text>
+          <text x="820" y="176" text-anchor="end" font-family="ui-monospace, monospace" font-size="11" fill="var(--s2)">62.0 req/問</text>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--s1)"></i>低コスト帯（3.7–8.1 req/問）</span>
+        <span><i class="swatch" style="background:var(--s2)"></i>AIME（62 req/問）</span>
+      </div>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <caption>最終スコア比較（fugu-nim 全構成合算 vs Fable vs ローカル8GB版）</caption>
+        <thead>
+          <tr><th>ベンチ</th><th>fugu-nim</th><th>Fable</th><th>ローカル(vibe)</th><th>判定</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">AIME26</td><td class="num">30/30</td><td class="num">29/30</td><td class="num">23/30</td><td style="color:var(--good);font-weight:700">勝ち</td></tr>
+          <tr><td class="num">JMMLU</td><td class="num">35/40</td><td class="num">33/40</td><td class="num dim">—</td><td style="color:var(--good);font-weight:700">勝ち</td></tr>
+          <tr><td class="num">HumanEval</td><td class="num">28/30</td><td class="num">28/30</td><td class="num">0/2*</td><td>同点</td></tr>
+          <tr><td class="num">AIME25</td><td class="num">29/30</td><td class="num">30/30</td><td class="num">18/30</td><td class="dim">惜敗</td></tr>
+          <tr><td class="num">AIME24</td><td class="num">28/30</td><td class="num">30/30</td><td class="num">23/30</td><td class="dim">惜敗</td></tr>
+          <tr><td class="num">Math500</td><td class="num">49/50</td><td class="num">99/100</td><td class="num dim">—</td><td>実質同点</td></tr>
+        </tbody>
+        <tfoot>
+          <tr><td>AIME 90問 合計</td><td class="num">87/90 (96.7%)</td><td class="num">89/90 (98.9%)</td><td class="num">64/90 (71.1%)</td><td></td></tr>
+        </tfoot>
+      </table>
+    </div>
+    <p class="lede" style="font-size:13px"><strong>2026-08-06 訂正:</strong> この表の fugu-nim 側は<strong>全構成の和集合</strong>（どれか1構成で解けたら正解）である。単一構成の最良合計は <strong>187/210</strong>（AIME 90問では 75/90）で、単一モデルである Fable の 199.5/210 と直接比較できるのはこちら。和集合はオラクル上限であり到達可能な成績ではない。詳細は <a href="design.html">次期設計ページ</a>。</p>
+    <p class="lede" style="font-size:13px">
+      * ローカル 8GB 版の HumanEval は qwen3.6:35b が HTTP 500 で 2 問とも落ちており、比較に足るデータが無い。
+      未解決の 3 問は <code>aime24-2024-I-12</code>, <code>aime24-2024-II-15</code>, <code>aime25-13</code>。
+    </p>
+    <p class="lede" style="font-size:13px">
+      <strong>2026-08-06 訂正:</strong> Math500 を 43/50 から <strong>49/50</strong> に改めた。
+      43/50 は再採点前の生スコアで、表記ゆれ（<code>30</code> と <code>30^\circ</code> 等）による
+      誤判定 6 問を <code>regrade</code> で戻すと 49/50 になる。
+      これにより判定も「敗北」から「実質同点」に変わる。
+      <strong>総合は 199/210（94.8%）で、Fable の 199/210 と同数。</strong>
+      なお採点器にはまだ穴があり、式中の空白（<code>-13x + 3</code> と <code>-13x+3</code>）は
+      いまも同値と判定されない。
+    </p>
+  </section>
+
+  <!-- ============ 6 ============ -->
+  <section>
+    <div class="sec-head"><span class="sec-num">06</span><h2>この実測が示していること</h2></div>
+
+    <div class="call">
+      <p><strong>1. 計算量スケーリングは 93% 付近で飽和した。</strong> sc2 までで 93.3%。そこから票数を 32 へ、思考を 32k へ積んだ sc3〜sc5 は、2,445 リクエスト・約 34 時間で 1 問しか動かせなかった。<span class="m">test-time compute scaling</span> の飽和点を、自宅で 0 円で実測したことになる。</p>
+      <p><strong>2. 飽和の先を動かしたのは設計変更だった。</strong> SC-Court（対審集約）と S3C（戦略層化）は、計算量ではなく<strong>サンプル間の誤り相関</strong>を壊しにいく手法で、387 リクエストで 2 問を救った。sc3 の 1/6 のコストである。</p>
+      <p><strong>3. 予算配分が逆進的になっている。</strong> 落とす問題に 4 倍のリクエストが注がれている。「割れたら足す」という単純な追加ルールが、期待値の低い方向へ予算を送っている。</p>
+      <p><strong>4. AIME26 で基準を超えた。</strong> 30/30 対 Fable 29/30。ただし n=30 であり、1 問は 3.3 ポイントに相当する。「勝った」ではなく「同水準に到達し、単価を 0 円に抑えた」が正確な主張になる。</p>
+    </div>
+
+    <h3>この結果を外に出すときの主張の立て方</h3>
+    <p>
+      「Fable と同点」は n=30 では弱い。強いのは<strong>曲線そのもの</strong>である。
+      同一設計・同一モデル群で、投じた計算量と到達精度の関係を 9 点測り、飽和点と、
+      飽和後に効く介入を特定した——これは個人で再現している例がほとんどない種類のデータだ。
+    </p>
+    <p>
+      加えて、否定的結果が残っていることに価値がある。DeepConf は正しく実装した上で
+      <span class="m">0/5</span> と測られ、コードには
+      <span class="m">【実測 2026-08-05: 0/5 で有害と結論。記録用に構成は残す】</span>
+      と書かれたまま保存されている。異種混成モデルでは信頼度スケールが揃わない、という知見である。
+    </p>
+
+    <h3>残っている穴</h3>
+    <p>
+      sc8・sc9 の <span class="m">∞</span> は「効かなかった」ではなく<strong>「まだ 1 問ずつしか試していない」</strong>。
+      残り 3 問は 5〜8 構成が連続で落とした最難問であり、ここでの試行数不足は結論を出すには早い。
+      また GPQA は <span class="m">rc=1</span> で失敗したまま（2026-08-04 05:00）で、理数系の難関ベンチが欠けている。
+    </p>
+  </section>
+
+  <footer>
+    根拠ファイル: fugu_bench/results/{aime24,aime25,aime26,math500,humaneval,jmmlu}__*.jsonl（35ファイル・1問単位で再採点）<br>
+    実装: fugu_local.py 5,099行（apply_nim_profile / _ask_nim / solve_verifiable）, bench_fugu.py<br>
+    集計期間: 2026-08-02 〜 2026-08-06 ／ 累計 NIM リクエスト 15,000+ ／ 外部課金 ¥0<br>
+    ※ 限界コスト ∞ は「その段階で新規に救済した問題が 0」を表す。sc5 は AIME25 のみの実行。
+  </footer>
+</div>
+
+<div class="tip" id="tip"></div>
+
+<script>
+  (function () {
+    var tip = document.getElementById('tip');
+    function show(e, text) {
+      tip.textContent = '';
+      text.split('\n').forEach(function (line, i) {
+        if (i) tip.appendChild(document.createElement('br'));
+        tip.appendChild(document.createTextNode(line));
+      });
+      tip.classList.add('on');
+      place(e);
+    }
+    function place(e) {
+      var x, y;
+      if (e.clientX != null) { x = e.clientX; y = e.clientY; }
+      else {
+        var r = e.target.getBoundingClientRect();
+        x = r.left + r.width / 2; y = r.top;
+      }
+      var w = tip.offsetWidth, h = tip.offsetHeight;
+      var left = Math.min(Math.max(8, x + 14), window.innerWidth - w - 8);
+      var top = y - h - 12;
+      if (top < 8) top = y + 20;
+      tip.style.left = left + 'px';
+      tip.style.top = top + 'px';
+    }
+    function hide() { tip.classList.remove('on'); }
+
+    document.querySelectorAll('.hit').forEach(function (el) {
+      var text = el.getAttribute('data-tip') || '';
+      el.addEventListener('mouseenter', function (e) { show(e, text); });
+      el.addEventListener('mousemove', place);
+      el.addEventListener('mouseleave', hide);
+      el.addEventListener('focus', function (e) { show(e, text); });
+      el.addEventListener('blur', hide);
+    });
+    document.addEventListener('scroll', hide, { passive: true });
+  })();
+</script>
+
+</body>
+</html>

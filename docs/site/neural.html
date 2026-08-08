@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fugu-nim をニューラルネットとして見る — 1モデル＝1ニューロンの配線図</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; }
+  img, svg { max-width: 100%; }
+  h1, h2, h3, h4, p, ul, ol, dl, dd, figure, pre { margin: 0; }
+  ul, ol { padding: 0; }
+  table { border-collapse: collapse; }
+</style>
+</head>
+<body>
+<style>
+  :root {
+    color-scheme: light;
+    --ground:#f1f3f1; --panel:#fbfcfb; --panel-2:#eaeeeb;
+    --ink:#131a20; --ink-2:#4a565f; --ink-3:#7c8790; --rule:#d9dfdb;
+    --ai:#1f3a66; --ai-soft:#e3eaf4; --shu:#a83f2a; --shu-soft:#f6e7e2;
+    --moss:#3a6a51; --moss-soft:#e2eee8; --on-ai:#eef2f8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --ground:#0e1216; --panel:#171c21; --panel-2:#1f262c;
+      --ink:#e5eaee; --ink-2:#a3b0b9; --ink-3:#79868f; --rule:#262e35;
+      --ai:#8aaddf; --ai-soft:#1a2739; --shu:#e08163; --shu-soft:#33211c;
+      --moss:#74ab8d; --moss-soft:#1b2b23; --on-ai:#0e1216;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:#0e1216; --panel:#171c21; --panel-2:#1f262c;
+    --ink:#e5eaee; --ink-2:#a3b0b9; --ink-3:#79868f; --rule:#262e35;
+    --ai:#8aaddf; --ai-soft:#1a2739; --shu:#e08163; --shu-soft:#33211c;
+    --moss:#74ab8d; --moss-soft:#1b2b23; --on-ai:#0e1216;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --ground:#f1f3f1; --panel:#fbfcfb; --panel-2:#eaeeeb;
+    --ink:#131a20; --ink-2:#4a565f; --ink-3:#7c8790; --rule:#d9dfdb;
+    --ai:#1f3a66; --ai-soft:#e3eaf4; --shu:#a83f2a; --shu-soft:#f6e7e2;
+    --moss:#3a6a51; --moss-soft:#e2eee8; --on-ai:#eef2f8;
+  }
+  :root {
+    --sans: system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", "Hiragino Sans", Meiryo, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  }
+
+  body { margin:0; background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:16.5px; line-height:1.78; -webkit-font-smoothing:antialiased; }
+  .col { max-width:1040px; margin:0 auto; padding:0 24px; }
+  .prose { max-width:70ch; }
+
+  .top { background:var(--ai); color:var(--on-ai); padding:38px 0 34px; }
+  .crumb { font-family:var(--mono); font-size:12.5px; letter-spacing:.1em; opacity:.75; margin:0 0 22px; }
+  .crumb a { color:inherit; text-decoration:underline; text-underline-offset:3px; }
+  .top h1 { font-size:clamp(28px,5vw,46px); line-height:1.1; letter-spacing:-.03em;
+    font-weight:800; margin:0 0 12px; text-wrap:balance; }
+  .top p { margin:0; max-width:58ch; opacity:.88; font-size:16px; }
+
+  section { padding:56px 0 0; }
+  .eyebrow { font-family:var(--mono); font-size:11.5px; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--ai); font-weight:700; margin:0 0 10px; }
+  h2 { font-size:clamp(22px,3.2vw,29px); line-height:1.28; letter-spacing:-.022em; font-weight:700; margin:0 0 14px; }
+  h3 { font-size:16.5px; font-weight:700; margin:28px 0 6px; }
+  p { margin:14px 0; }
+  a { color:var(--ai); text-underline-offset:3px; }
+  code { font-family:var(--mono); font-size:.86em; background:var(--panel-2); padding:.13em .4em; border-radius:3px; }
+  .rule { height:1px; background:var(--rule); margin:56px 0 0; }
+
+  figure { margin:26px 0 0; }
+  .figwrap { background:var(--panel); border:1px solid var(--rule); padding:24px 18px 16px; overflow-x:auto; }
+  .figwrap > svg { display:block; width:100%; height:auto; min-width:680px; }
+  figcaption { font-size:13.5px; color:var(--ink-2); margin:12px 0 0; line-height:1.66; max-width:76ch; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:10px 24px; margin:14px 0 0; font-size:13px; color:var(--ink-2); }
+  .legend span { display:inline-flex; align-items:center; gap:8px; }
+  .lg-c { width:14px; height:14px; border-radius:50%; border:1.6px solid var(--ai); background:var(--ai-soft); flex:none; }
+  .lg-s { width:14px; height:14px; border:1.6px solid var(--moss); background:var(--moss-soft); flex:none; }
+  .lg-d { width:20px; height:0; border-top:2px dashed var(--shu); flex:none; }
+  .lg-l { width:20px; height:0; border-top:2px solid var(--ink-3); flex:none; }
+
+  .box { background:var(--panel); border:1px solid var(--rule); padding:22px 24px; margin:22px 0 0; }
+  .box.accent { border-left:3px solid var(--ai); }
+  .box.caution { border-left:3px solid var(--shu); }
+  .box.verified { border-left:3px solid var(--moss); }
+  .box > :first-child { margin-top:0; }
+  .box > :last-child { margin-bottom:0; }
+
+  .tw { overflow-x:auto; margin:22px 0 0; }
+  table { border-collapse:collapse; width:100%; min-width:620px; font-size:14px; }
+  th,td { padding:10px 12px; text-align:left; border-bottom:1px solid var(--rule); vertical-align:top; }
+  thead th { font-size:12px; color:var(--ink-2); font-weight:700; white-space:nowrap; border-bottom:1.5px solid var(--ink-3); }
+  tbody tr:hover { background:var(--panel-2); }
+  td.m { font-family:var(--mono); font-size:12.5px; }
+
+  footer { margin:70px 0 0; background:var(--panel); border-top:1px solid var(--rule); padding:32px 0 52px; }
+  footer .col { font-family:var(--mono); font-size:12.5px; color:var(--ink-3); line-height:1.9; }
+  @media (prefers-reduced-motion:reduce){ *{transition:none!important;} }
+</style>
+
+<header class="top">
+  <div class="col">
+    <p class="crumb"><a href="index.html">← fugu-nim</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; NEURAL VIEW</p>
+    <h1>1 モデル＝1 ニューロン<br>として見た配線</h1>
+    <p>deepseek-v4-pro を 1 個の素子とみなしたとき、この系はどんな回路になっているか。
+       実装の制御フローをそのままネットワークとして描き起こした。</p>
+  </div>
+</header>
+
+<main>
+<div class="col">
+
+  <!-- ============ 図1 ============ -->
+  <section>
+    <p class="eyebrow">Figure 1 — Topology</p>
+    <h2>全体の配線</h2>
+
+    <figure>
+      <div class="figwrap">
+        <svg viewBox="0 0 1000 680" role="img" aria-label="fugu-nimをニューラルネットとして描いた配線図。入力はllama-8bのゲートに入り、math/mcq経路では3つのモデルとPython実行が並列に発火して多数決プーリングを経て法廷層へ、それ以外の経路では4つのモデルが並列発火してglm-5.2で統合され、critic層から再帰結合が戻る。">
+          <defs>
+            <marker id="n1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+            </marker>
+            <marker id="n2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--shu)"/>
+            </marker>
+            <marker id="n3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--moss)"/>
+            </marker>
+          </defs>
+
+          <!-- layer captions -->
+          <g font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)" text-anchor="middle">
+            <text x="70" y="24">入力</text>
+            <text x="212" y="24">ゲート層</text>
+            <text x="440" y="24">隠れ層（並列発火）</text>
+            <text x="672" y="24">集約層</text>
+            <text x="872" y="24">検証層</text>
+          </g>
+          <g stroke="var(--rule)" stroke-width="1" stroke-dasharray="3 4">
+            <line x1="140" y1="34" x2="140" y2="650"/>
+            <line x1="292" y1="34" x2="292" y2="650"/>
+            <line x1="580" y1="34" x2="580" y2="650"/>
+            <line x1="768" y1="34" x2="768" y2="650"/>
+          </g>
+
+          <!-- input -->
+          <circle cx="70" cy="330" r="26" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <text x="70" y="335" text-anchor="middle" font-size="13" fill="currentColor">x</text>
+          <text x="70" y="372" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-3)">質問</text>
+
+          <!-- gate -->
+          <line x1="96" y1="330" x2="182" y2="330" stroke="currentColor" stroke-width="1.5" marker-end="url(#n1)"/>
+          <circle cx="212" cy="330" r="30" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="2"/>
+          <text x="212" y="326" text-anchor="middle" font-size="11.5" fill="var(--ai)" font-weight="700">llama</text>
+          <text x="212" y="341" text-anchor="middle" font-size="11.5" fill="var(--ai)" font-weight="700">3.1-8b</text>
+          <text x="212" y="381" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-2)">Conductor</text>
+          <text x="212" y="396" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">疎活性化ゲート</text>
+          <text x="212" y="410" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">どの素子を発火させるか</text>
+
+          <!-- ===== 上段: SC 経路 ===== -->
+          <path d="M 236 312 L 268 200 L 300 172" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#n1)"/>
+          <text x="286" y="196" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">math/mcq</text>
+
+          <rect x="300" y="46" width="280" height="240" rx="4" fill="none" stroke="var(--ai)" stroke-width="1" stroke-dasharray="4 4" opacity=".55"/>
+          <text x="440" y="64" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ai)">SC 経路 — 同一素子を temp 0.7 で多重発火</text>
+
+          <!-- 3 samplers -->
+          <circle cx="360" cy="110" r="29" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="1.8"/>
+          <text x="360" y="106" text-anchor="middle" font-size="10.5" fill="var(--ai)" font-weight="700">deepseek</text>
+          <text x="360" y="120" text-anchor="middle" font-size="10.5" fill="var(--ai)" font-weight="700">v4-pro</text>
+          <circle cx="360" cy="180" r="29" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="1.8"/>
+          <text x="360" y="176" text-anchor="middle" font-size="10.5" fill="var(--ai)" font-weight="700">gpt-oss</text>
+          <text x="360" y="190" text-anchor="middle" font-size="10.5" fill="var(--ai)" font-weight="700">120b</text>
+          <circle cx="360" cy="250" r="29" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="1.8"/>
+          <text x="360" y="246" text-anchor="middle" font-size="10.5" fill="var(--ai)" font-weight="700">minimax</text>
+          <text x="360" y="260" text-anchor="middle" font-size="10.5" fill="var(--ai)" font-weight="700">m3</text>
+
+          <!-- self loops = repeated sampling -->
+          <g stroke="var(--ai)" stroke-width="1.2" fill="none" opacity=".75">
+            <path d="M 344 86 A 20 20 0 1 1 376 86" marker-end="url(#n1)" color="var(--ai)"/>
+            <path d="M 344 156 A 20 20 0 1 1 376 156" marker-end="url(#n1)" color="var(--ai)"/>
+            <path d="M 344 226 A 20 20 0 1 1 376 226" marker-end="url(#n1)" color="var(--ai)"/>
+          </g>
+          <text x="316" y="70" text-anchor="end" font-family="ui-monospace, monospace" font-size="10" fill="var(--ai)">×n 回</text>
+
+          <!-- PoT -->
+          <rect x="332" y="298" width="58" height="46" rx="3" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1.8"/>
+          <text x="361" y="317" text-anchor="middle" font-size="10.5" fill="var(--moss)" font-weight="700">Python</text>
+          <text x="361" y="331" text-anchor="middle" font-size="10.5" fill="var(--moss)" font-weight="700">exec</text>
+          <text x="361" y="358" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--moss)">非ニューロン・決定的</text>
+          <path d="M 300 300 L 330 314" fill="none" stroke="var(--moss)" stroke-width="1.4" marker-end="url(#n3)"/>
+
+          <!-- vote pooling -->
+          <g stroke="currentColor" stroke-width="1.3" fill="none">
+            <line x1="389" y1="110" x2="608" y2="168" marker-end="url(#n1)"/>
+            <line x1="389" y1="180" x2="608" y2="176" marker-end="url(#n1)"/>
+            <line x1="389" y1="250" x2="608" y2="186" marker-end="url(#n1)"/>
+          </g>
+          <line x1="390" y1="318" x2="608" y2="196" stroke="var(--moss)" stroke-width="1.4" marker-end="url(#n3)"/>
+
+          <rect x="610" y="146" width="120" height="62" rx="3" fill="var(--panel)" stroke="currentColor" stroke-width="2"/>
+          <text x="670" y="170" text-anchor="middle" font-size="12" fill="currentColor" font-weight="700">多数決</text>
+          <text x="670" y="187" text-anchor="middle" font-family="ui-monospace, monospace" font-size="9.5" fill="var(--ink-3)">非微分・同値類化</text>
+          <text x="670" y="200" text-anchor="middle" font-family="ui-monospace, monospace" font-size="9.5" fill="var(--ink-3)">学習された重みなし</text>
+
+          <!-- court -->
+          <line x1="730" y1="177" x2="806" y2="177" stroke="currentColor" stroke-width="1.5" marker-end="url(#n1)"/>
+          <circle cx="838" cy="150" r="24" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="1.6"/>
+          <text x="838" y="154" text-anchor="middle" font-size="10" fill="var(--ai)" font-weight="700">判事1</text>
+          <circle cx="892" cy="177" r="24" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="1.6"/>
+          <text x="892" y="181" text-anchor="middle" font-size="10" fill="var(--ai)" font-weight="700">判事2</text>
+          <circle cx="838" cy="206" r="24" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="1.6"/>
+          <text x="838" y="210" text-anchor="middle" font-size="10" fill="var(--ai)" font-weight="700">判事3</text>
+          <text x="878" y="240" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">SC-Court（票が割れたときだけ）</text>
+
+          <!-- ===== 下段: MoA 経路 ===== -->
+          <path d="M 236 350 L 268 452 L 300 476" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#n1)"/>
+          <text x="284" y="452" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">それ以外</text>
+
+          <rect x="300" y="400" width="280" height="242" rx="4" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="4 4" opacity=".5"/>
+          <text x="440" y="418" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-3)">MoA 経路 — 4 素子が 1 回ずつ発火</text>
+
+          <circle cx="360" cy="460" r="29" fill="var(--panel)" stroke="currentColor" stroke-width="1.6"/>
+          <text x="360" y="456" text-anchor="middle" font-size="10.5" fill="currentColor">gpt-oss</text>
+          <text x="360" y="470" text-anchor="middle" font-size="10.5" fill="currentColor">120b</text>
+          <circle cx="360" cy="518" r="29" fill="var(--panel)" stroke="currentColor" stroke-width="1.6"/>
+          <text x="360" y="514" text-anchor="middle" font-size="10.5" fill="currentColor">kimi /</text>
+          <text x="360" y="528" text-anchor="middle" font-size="10.5" fill="currentColor">mistral</text>
+          <circle cx="360" cy="576" r="29" fill="var(--panel)" stroke="currentColor" stroke-width="1.6"/>
+          <text x="360" y="572" text-anchor="middle" font-size="10.5" fill="currentColor">nemotron</text>
+          <text x="360" y="586" text-anchor="middle" font-size="10.5" fill="currentColor">550b</text>
+          <circle cx="360" cy="628" r="26" fill="var(--panel)" stroke="currentColor" stroke-width="1.6"/>
+          <text x="360" y="624" text-anchor="middle" font-size="10" fill="currentColor">deepseek</text>
+          <text x="360" y="637" text-anchor="middle" font-size="10" fill="currentColor">v4-pro</text>
+
+          <g stroke="currentColor" stroke-width="1.3" fill="none">
+            <line x1="389" y1="460" x2="608" y2="512" marker-end="url(#n1)"/>
+            <line x1="389" y1="518" x2="608" y2="520" marker-end="url(#n1)"/>
+            <line x1="389" y1="576" x2="608" y2="530" marker-end="url(#n1)"/>
+            <line x1="386" y1="628" x2="608" y2="540" marker-end="url(#n1)"/>
+          </g>
+
+          <circle cx="670" cy="524" r="34" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="2"/>
+          <text x="670" y="520" text-anchor="middle" font-size="11.5" fill="var(--ai)" font-weight="700">glm-5.2</text>
+          <text x="670" y="535" text-anchor="middle" font-size="10" fill="var(--ai)">統合</text>
+          <text x="670" y="576" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">Aggregator</text>
+
+          <line x1="704" y1="524" x2="806" y2="524" stroke="currentColor" stroke-width="1.5" marker-end="url(#n1)"/>
+          <circle cx="840" cy="524" r="27" fill="var(--panel)" stroke="currentColor" stroke-width="1.6"/>
+          <text x="840" y="520" text-anchor="middle" font-size="10" fill="currentColor">llama</text>
+          <text x="840" y="533" text-anchor="middle" font-size="10" fill="currentColor">8b</text>
+          <text x="840" y="568" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">Critic</text>
+          <circle cx="916" cy="470" r="24" fill="var(--panel)" stroke="currentColor" stroke-width="1.4"/>
+          <text x="916" y="466" text-anchor="middle" font-size="9.5" fill="currentColor">mistral</text>
+          <text x="916" y="478" text-anchor="middle" font-size="9.5" fill="currentColor">med</text>
+          <line x1="862" y1="508" x2="898" y2="486" stroke="currentColor" stroke-width="1.3" marker-end="url(#n1)"/>
+          <text x="946" y="440" text-anchor="middle" font-family="ui-monospace, monospace" font-size="9.5" fill="var(--ink-3)">第二意見</text>
+
+          <!-- recurrent edge -->
+          <path d="M 840 551 L 840 664 L 330 664 L 330 646" fill="none"
+                stroke="var(--shu)" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#n2)"/>
+          <text x="600" y="659" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--shu)" font-weight="700">再帰結合 — 統合結果を入力へ戻す（最大 4 展開）</text>
+
+          <!-- output -->
+          <path d="M 916 194 L 962 194 L 962 340" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M 940 470 L 962 470 L 962 366" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <circle cx="962" cy="352" r="22" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <text x="962" y="357" text-anchor="middle" font-size="13" fill="currentColor">ŷ</text>
+        </svg>
+      </div>
+      <div class="legend">
+        <span><i class="lg-c"></i>LLM 素子（1 発火 = 1 API 呼び出し）</span>
+        <span><i class="lg-s"></i>非ニューロン素子（決定的・外部オラクル）</span>
+        <span><i class="lg-l"></i>順伝播（運ぶのは自然言語テキスト）</span>
+        <span><i class="lg-d"></i>再帰結合</span>
+      </div>
+      <figcaption>
+        制御フローをそのまま回路として描いたもの。深さ 3〜4 層、ゲート 1 個、再帰結合 1 本、
+        そして<strong>学習されていない集約ノードが 1 個</strong>。SC 経路の自己ループは
+        「同一素子を temp 0.7 で繰り返し発火させる」ことを表す——同じニューロンを何度も撃つ操作であり、
+        別の素子を足しているわけではない。
+      </figcaption>
+    </figure>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 対応表 ============ -->
+  <section>
+    <p class="eyebrow">Mapping</p>
+    <h2>対応関係と、対応しないもの</h2>
+
+    <div class="tw">
+      <table>
+        <thead>
+          <tr><th>ニューラルネットの概念</th><th>fugu-nim での対応物</th><th>成立</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ニューロン</td><td class="m">deepseek-v4-pro / gpt-oss-120b / …</td><td>○</td></tr>
+          <tr><td>ゲーティングネットワーク（MoE）</td><td class="m">Conductor（llama-3.1-8b）が発火する素子を選ぶ</td><td>○ ほぼそのまま</td></tr>
+          <tr><td>並列な隠れユニット</td><td class="m">Proposer A–D / SC の 3 系統</td><td>○</td></tr>
+          <tr><td>確率的発火（dropout 的）</td><td class="m">temp 0.7 で同一素子を n 回サンプリング</td><td>○</td></tr>
+          <tr><td>プーリング</td><td class="m">vote_answers() — 同値類でまとめて argmax</td><td>△ <strong>微分不可・学習なし</strong></td></tr>
+          <tr><td>再帰結合</td><td class="m">統合結果を次ラウンドの入力へ（最大 4 展開）</td><td>○</td></tr>
+          <tr><td>早期終了カスケード</td><td class="m">single → verify_single → NG なら MoA へ格上げ</td><td>○</td></tr>
+          <tr><td>外部オラクル</td><td class="m">PoT（Python 実行）</td><td>○ 微分不可・決定的</td></tr>
+          <tr><td><strong>重み w</strong></td><td class="m">存在しない。エッジはプロンプト文字列</td><td>✕</td></tr>
+          <tr><td><strong>学習・誤差逆伝播</strong></td><td class="m">存在しない</td><td>✕</td></tr>
+          <tr><td><strong>スカラー活性</strong></td><td class="m">エッジが運ぶのは自然言語テキスト</td><td>✕</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box caution">
+      <h3>この比喩が破れる 3 点</h3>
+      <p>
+        <strong>① 重みが学習されていない。</strong> 素子間の結合強度にあたるものは
+        <code>SC_MIN_VOTES=3</code>、<code>SC_COURT_MARGIN=2.0</code>、<code>SC_MAX=20</code> といった
+        <strong>手書きの定数</strong>です。つまりこれは訓練されたネットワークではなく、
+        <strong>重みを人手で置いた計算グラフ</strong>です。
+      </p>
+      <p>
+        <strong>② エッジがベクトルではなくテキスト。</strong> シナプスは実数倍ではなくプロンプトテンプレートです。
+        情報は圧縮されず、そのぶん劣化もしませんが、代わりに<strong>次元という概念がありません</strong>。
+      </p>
+      <p>
+        <strong>③ 発火コストが桁違い。</strong> 1 ニューロンの 1 回の発火が API 呼び出し 1 回＝数秒〜数分。
+        生物ニューロンでもニューラルネットでもなく、<strong>1 素子が組織の 1 人に近い</strong>スケールです。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 図2 ============ -->
+  <section>
+    <p class="eyebrow">Figure 2 — Why widening failed</p>
+    <h2>幅を増やしても張れない空間</h2>
+    <div class="prose">
+      <p>
+        この見方をすると、実測で起きたことが一目でわかります。<code>sc3</code> は
+        <strong>隠れ層の幅を 32 に広げた</strong>構成でした。結果は 1 問救うのに 1,149 リクエスト——
+        <code>sc2</code> の 11 倍です。
+      </p>
+      <p>
+        理由はコードのコメントに書かれています。
+      </p>
+      <p style="font-family:var(--mono);font-size:14px;border-left:3px solid var(--shu);padding-left:16px;color:var(--ink-2)">
+        sc6 実測の核心: 全 38 サンプル中に正解が一度も生成されない問題は集約では救えない
+      </p>
+      <p>
+        集約は「生成された候補の中から選ぶ」操作です。<strong>正解が候補集合に一度も現れなければ、
+        多数決も対審も自信度加重も、原理的に救えません。</strong>
+        ニューラルネットの言葉なら、出力は隠れ層の張る空間に閉じ込められている、ということです。
+      </p>
+    </div>
+
+    <figure>
+      <div class="figwrap">
+        <svg viewBox="0 0 900 340" role="img" aria-label="幅を広げた場合と戦略層化した場合の比較図。左は32サンプルが狭い扇形に集中し正解がその外にある。右は12サンプルが広い角度に散らされ正解を覆っている。">
+          <defs>
+            <marker id="s1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--shu)"/>
+            </marker>
+            <marker id="s2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--moss)"/>
+            </marker>
+          </defs>
+
+          <!-- LEFT -->
+          <text x="220" y="28" text-anchor="middle" font-size="14" font-weight="700" fill="var(--shu)">sc3 — 幅を 32 に広げる</text>
+          <text x="220" y="48" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">温度だけで多様性を出す</text>
+          <circle cx="70" cy="190" r="9" fill="var(--ink-3)"/>
+          <text x="70" y="216" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">問題</text>
+
+          <!-- narrow fan -->
+          <g stroke="var(--shu)" stroke-width="1.1" opacity=".75">
+            <line x1="80" y1="190" x2="330" y2="152" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="332" y2="160" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="334" y2="168" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="335" y2="176" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="336" y2="184" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="336" y2="192" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="335" y2="200" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="334" y2="208" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="332" y2="216" marker-end="url(#s1)"/>
+            <line x1="80" y1="190" x2="330" y2="224" marker-end="url(#s1)"/>
+          </g>
+          <path d="M 80 190 L 340 146 L 340 230 Z" fill="var(--shu)" opacity=".07"/>
+          <text x="250" y="252" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--shu)">32 サンプル ＝ ほぼ同じ筋読み</text>
+
+          <!-- true answer outside -->
+          <g transform="translate(300,86)">
+            <path d="M 0 -13 L 3.8 -4 L 13.5 -4 L 5.8 2 L 8.5 11 L 0 5.5 L -8.5 11 L -5.8 2 L -13.5 -4 L -3.8 -4 Z"
+                  fill="var(--moss)"/>
+          </g>
+          <text x="300" y="70" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11.5" fill="var(--moss)" font-weight="700">正解</text>
+          <text x="300" y="118" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">候補集合の外</text>
+
+          <text x="220" y="296" text-anchor="middle" font-size="13" fill="var(--shu)" font-weight="700">→ 集約では原理的に届かない</text>
+          <text x="220" y="318" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">実測 1,149 req / 救済1問</text>
+
+          <line x1="450" y1="30" x2="450" y2="326" stroke="var(--rule)" stroke-width="1"/>
+
+          <!-- RIGHT -->
+          <text x="680" y="28" text-anchor="middle" font-size="14" font-weight="700" fill="var(--moss)">sc7 — 戦略を強制的に散らす</text>
+          <text x="680" y="48" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">S3C 層化サンプリング</text>
+          <circle cx="530" cy="190" r="9" fill="var(--ink-3)"/>
+          <text x="530" y="216" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">問題</text>
+
+          <g stroke="var(--moss)" stroke-width="1.3" opacity=".85">
+            <line x1="540" y1="190" x2="742" y2="82" marker-end="url(#s2)"/>
+            <line x1="540" y1="190" x2="778" y2="120" marker-end="url(#s2)"/>
+            <line x1="540" y1="190" x2="796" y2="164" marker-end="url(#s2)"/>
+            <line x1="540" y1="190" x2="796" y2="212" marker-end="url(#s2)"/>
+            <line x1="540" y1="190" x2="778" y2="256" marker-end="url(#s2)"/>
+            <line x1="540" y1="190" x2="742" y2="292" marker-end="url(#s2)"/>
+          </g>
+          <path d="M 540 190 L 750 74 L 806 168 L 806 214 L 750 300 Z" fill="var(--moss)" opacity=".07"/>
+
+          <g transform="translate(748,88)">
+            <path d="M 0 -13 L 3.8 -4 L 13.5 -4 L 5.8 2 L 8.5 11 L 0 5.5 L -8.5 11 L -5.8 2 L -13.5 -4 L -3.8 -4 Z"
+                  fill="var(--moss)"/>
+          </g>
+          <text x="748" y="66" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11.5" fill="var(--moss)" font-weight="700">正解</text>
+
+          <text x="690" y="252" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--moss)">12 サンプル ＝ 別の解法流域を被覆</text>
+          <text x="680" y="296" text-anchor="middle" font-size="13" fill="var(--moss)" font-weight="700">→ 候補集合に入れば集約が効く</text>
+          <text x="680" y="318" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">実測 140 req / 救済1問</text>
+        </svg>
+      </div>
+      <figcaption>
+        左右で変えたのはサンプル数ではなく<strong>張る方向</strong>である。sc3 は 32 本、sc7 は 12 本と
+        <strong>むしろ少ない</strong>にもかかわらず、1 問あたりのコストは 1,149 → 140 と 8 分の 1 になった。
+        図の扇形は概念的な描写だが、根拠は実測にある——「全 38 サンプル中に正解が一度も生成されない問題がある」という観測。
+      </figcaption>
+    </figure>
+
+    <div class="box verified">
+      <h3>ニューラルネットの言葉で言い直すと</h3>
+      <p>
+        <strong>相関したユニットで層を広げても、実効的な容量は増えません。</strong>
+        32 個のユニットがほぼ同じ関数を計算しているなら、実効ランクは 32 ではなく数個です。
+        温度サンプリングは<strong>同じ重みのユニットにノイズを足しているだけ</strong>なので、
+        原理的に新しい基底を張れません。
+      </p>
+      <p>
+        S3C（戦略層化）がやったのは、<strong>ユニットごとに異なる基底を強制的に割り当てること</strong>です。
+        実装はプロンプトへの 1 行注入にすぎません。
+      </p>
+      <p style="font-family:var(--mono);font-size:13px;color:var(--ink-2)">
+        [Strategy directive: solve using this approach and no other: …]
+      </p>
+      <p>
+        そして DeepConf（<code>sc4</code>）が失敗した理由も同じ図で説明できます。
+        あれは<strong>ユニットの出力に重みを付け直す</strong>操作でした。
+        候補集合そのものが正解を含んでいないなら、重み付けをどう変えても答えは変わりません。実測 0/5。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 示唆 ============ -->
+  <section>
+    <p class="eyebrow">Implications</p>
+    <h2>この見方が示す次の一手</h2>
+    <div class="prose">
+      <p>
+        回路として眺めると、まだ手を付けていない構造がいくつか見えます。
+      </p>
+
+      <h3>1. ゲートが 1 層しかなく、しかも一度しか発火しない</h3>
+      <p>
+        Conductor は入口で 1 回だけ動き、以降の経路は固定されます。
+        通常のネットワークなら、各層に独立したゲートが入ります。
+        <strong>「投票が割れたときに、どの素子を追加で発火させるか」を選ぶ第 2 のゲート</strong>は存在せず、
+        現状は全系統から均等に追加サンプリングしています。ここは疎化の余地があります。
+      </p>
+
+      <h3>2. スキップ結合がない</h3>
+      <p>
+        入力 x は Conductor と提案素子には届きますが、<strong>集約層や検証層には直接届いていません</strong>。
+        Aggregator は提案文だけを見て統合し、判事は候補と問題文を見ます。
+        深いネットワークで残差結合が効くのと同じ理由で、
+        元の問題文を後段の全層へ直結させる価値はありそうです。
+      </p>
+
+      <h3>3. 唯一の外部オラクル（PoT）が 1 経路にしか繋がっていない</h3>
+      <p>
+        Python 実行は SC 経路にしか配線されていません。MoA 経路（コード生成・設計・説明）には繋がっていない。
+        <strong>系全体で唯一の決定的な素子が、半分の経路でしか使われていない</strong>のは、
+        回路図にすると不自然に見えます。
+      </p>
+
+      <h3>4. 重みが手書きである以上、律速はそこにある</h3>
+      <p>
+        学習が存在しない以上、この回路の性能を決めているのは
+        <code>SC_MIN_VOTES</code>・<code>SC_COURT_MARGIN</code>・<code>SC_MAX</code> といった定数と、
+        正解判定を行う採点器です。<strong>ネットワークの外側に、人手で置かれた重みがある。</strong>
+        「ボトルネックはモデルではなく報酬シグナル」という以前の結論は、
+        この図では「重みが学習されていないこと」として現れます。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>2026-08-06 追記 — 上の 2 と 3 は実装して測りました</h3>
+      <p>
+        <strong>2（スキップ結合）と 3（外部オラクルの配線）は、統合 MoA（<code>u@nim</code>）として
+        実装済みです。</strong>原問題を全層へ直結する残差結合を入れ、検証層（実行検証・Critic・第二意見）を
+        全経路へ配線しました。ついでに 1 の「ゲートが 1 層しかない」問題も、
+        経路分岐そのものを廃止して<strong>出力の性質で集約方式を決める</strong>方式に置き換えています。
+      </p>
+      <p>
+        結果は<strong>精度で既存を上回りませんでした</strong>——MATH-500 の 42 問で
+        既存 42/42 に対し 41/42、リクエストは 1 問あたり約 7 倍。
+        回帰した問題はいずれも早期確定で軽く終わって誤答しており、
+        <strong>回路を深くする前に、素子の発火失敗（抽出失敗）を直すほうが先だった</strong>
+        というのが実測から出た答えです。
+      </p>
+      <p>
+        この図の言葉で言えば——<strong>ユニットの 2/3 が発火に失敗している層で、
+        配線を増やしても出力は良くならない</strong>。
+        gpt-oss-120b は失敗寄り問題集合で 78%、deepseek-v4-pro は 67% が無効発火でした。
+        4 素子で投票しているつもりが、実際には 2 素子で回っていたことになります。
+        詳細は<a href="index.html">トップページの発見セクション</a>にあります。
+      </p>
+    </div>
+  </section>
+
+</div>
+</main>
+
+<footer>
+  <div class="col">
+    fugu-nim — Neural view<br>
+    図の根拠: fugu_local.py（solve_verifiable / fugu_answer / apply_nim_profile）, bench_fugu.py（run_sc3 / run_sc6 / run_sc7）<br>
+    実測値: fugu_bench/results/*.jsonl より再集計（2026-08-05 時点）<br>
+    <a href="index.html">← 概要</a> ·
+    <a href="architecture.html">アーキテクチャ</a> ·
+    <a href="scaling.html">計算量スケーリングの実測</a>
+  </div>
+</footer>
+
+</body>
+</html>
