@@ -17,6 +17,7 @@ Local Fugu-style Orchestrator (RTX 4060 Laptop 8GB VRAM / RAM 48GB / i7-13700H �
 
 import os
 import re
+import ast
 import sys
 import json
 import time
@@ -2441,6 +2442,7 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         )
         _nim_count_request()
         parts = []
+        rparts = []                    # 思考テキスト(従来は捨てていた。回収用に貯める)
         finish = None
         lps = []                       # DeepConf: 選択トークンの logprob 列
         t_stream = time.time()
@@ -2473,6 +2475,9 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                     piece = delta.get("content")
                     if piece:
                         parts.append(piece)
+                    rpiece = delta.get("reasoning_content")
+                    if rpiece:
+                        rparts.append(rpiece)
                     if NIM_CAPTURE_LOGPROBS:
                         lp_items = ((chs[0].get("logprobs") or {}).get("content")) or []
                         for it in lp_items:
@@ -2482,9 +2487,29 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                     if chs[0].get("finish_reason"):
                         finish = chs[0]["finish_reason"]
         result = "".join(parts).strip()
-        if not result and finish == "length":
-            result = ("__ERROR__: truncated by max_tokens during thinking "
-                      "(no content was generated)")
+        if not result:
+            # 従来はここで全部 "__ERROR__: truncated" に潰していた。内訳を分けて数え、
+            # 思考テキストが残っている場合は回収を試みる(追加リクエストゼロ)。
+            think = "".join(rparts).strip()
+            kind = "A_think_only" if think else "B_both_empty"
+            salvaged, why = (None, "no_thinking")
+            if think:
+                salvaged, why = _salvage_from_thinking(think)
+            with _NIM_FAIL_LOCK:
+                NIM_FAIL_COUNTS[kind] += 1
+                if think:
+                    NIM_FAIL_COUNTS["A_salvaged" if salvaged
+                                    else "A_salvage_failed"] += 1
+            _record_think_trace(model, think)   # 継投の材料として控える(NIM_RELAY 時のみ)
+            if NIM_SALVAGE_LOG:
+                print(f"   [salvage] {model} finish={finish} 型={kind} "
+                      f"思考{len(think)}字 → {salvaged if salvaged else '回収不可'} ({why})")
+            if salvaged and NIM_SALVAGE_THINKING:
+                # 回収成功。呼び出し側の抽出器が拾える形で返す(既存契約を壊さない)
+                return f"\\boxed{{{salvaged}}}"
+            if finish == "length":
+                result = ("__ERROR__: truncated by max_tokens during thinking "
+                          "(no content was generated)")
         if NIM_CAPTURE_LOGPROBS and lps and not result.startswith("__ERROR__"):
             _NIM_TLS.last_conf = _deepconf_confidence(lps)
         return result
@@ -3980,6 +4005,28 @@ SC_MAX = 20             # 主力 CoT サンプルの上限（PoT・安価票は�
 # 扱いになり、事実上 k=1 で確定してしまう（精度優先方針に反する縮退）。過半数側は
 # 既に n>=4 の下限があるため、全会一致側にも同じ考え方の下限を設ける（2026-07-21）。
 SC_MIN_VOTES = 3        # 全会一致で確定してよい最小サンプル数（これ未満は追加サンプリングへ）
+# 票数の均等化 (2026-08-07)。既定 False で従来どおり「呼び出し回数」を揃える。
+# True にすると、この問題での実測死票率から「期待票数」が揃うようスロットを配る。
+SC_EQUALIZE_VOTES = False
+SC_EQ_MAX_MULT = 3      # 死票率100%のモデルが予算を食い尽くさないための上限
+# 思考予算の段階的引き上げ (2026-08-07)。既定 0 で無効。
+# 難問と判明した(=票が割れて第2バッチに入った)時点で初めて予算を積む。
+# 初回バッチは既定のままなので、初回で確定する易問の挙動は 1 バイトも変わらない。
+# これは測定上も重要で、影響範囲が「第2バッチ以降に入った問題」に限定される。
+SC_ESCALATE_PREDICT = 0     # 第2バッチ以降の num_predict(0=据え置き)
+SC_ESCALATE_CAP = 0         # 同、自動増額の上限(0=据え置き)
+# 難問と判明した後の票数上限 (0=据え置き)。根拠は「複数走をプールすると正解が
+# 最頻値になっている」問題が実在すること(aime25-12 の 204 が12票で1位、
+# aime25-27 の 248 が15票で1位)。母集団の最頻値は正解なのに、1走 20 票では
+# 解像度が足りずに拾えていない。標本を増やせば標本最頻値が母集団最頻値へ寄る、
+# という一般的な性質に基づく。特定の問題の正解を見て決めた値ではない。
+SC_ESCALATE_MAX = 0
+# 過半数で確定してよい最小の有効票数。既定 4 は従来と同一。
+# 全会一致経路が「3票で100%一致」を求めるのに対し、過半数経路は「4票中3票」で
+# 通ってしまい、要求する証拠の強さが揃っていない。6 にすると揃う
+# (6票の過半数=4票以上の一致)。変更は過半数経路だけに効き、全会一致で
+# 確定した問題や 6 票以上で確定した問題の結果は原理的に変わらない。
+SC_MAJORITY_MIN = 4
 # 2026-07-22: _arbitrate に同時提示する同数タイ候補の上限。3-way以上の拮抗も正しく
 # 全候補を裁定役に見せるための変更（下記参照）だが、病的に多い同数タイで num_ctx
 # (gotcha #2: 8192/16384 に固定)を溢れさせないよう上限で保護する。超過分は
@@ -4049,6 +4096,266 @@ SC_CHALLENGER = False
 SC_MACHINE = False
 SC_MACHINE_N = 3          # プログラムを書かせるモデル数（一致 2 本で確定）
 SC_MACHINE_TIMEOUT = 300  # 総当たりの実行タイムアウト秒（SC_POT_TIMEOUT より長い専用枠）
+# 機械裁定の強化 (2026-08-06, sc10 実測 aime24-I-12 の教訓)。実測ログ:
+#   deepseek→1 / nemotron→385(正解) / gpt-oss→生成失敗 → 「2本一致」不成立で棄権
+#   → 言語側の誤答 24 が確定。**正解を計算できていたのに集約規則が捨てた。**
+# 3 点を直す:
+#   ① 生成失敗はモデル枠を消費させず、補充モデルへ回す(裁判官の棄権補充と同じ作法)
+#   ② 実行成功本数の上限を増やして「2本一致」が成立する機会を増やす
+#   ③ それでも割れたら**コード審査で決着**する — 解き直しではなく「どのプログラムが
+#      問題文の条件を忠実に実装しているか」だけを判定させる。問題を解くより実装の
+#      照合のほうが容易(生成・検証ギャップ)で、決定的な実行結果に紐づくため幻覚しない。
+SC_MACHINE_ARBITRATE = False   # 出力が割れたときコード審査で決着する。既定 False。sc11@nim が設定
+SC_MACHINE_MAX_TRIES = 6       # 生成失敗を補充するための最大試行数(実行成功 SC_MACHINE_N 本で打切)
+
+# 思考テキストからの答え回収 (2026-08-06)。Phase 0 で測った抽出失敗
+# (gpt-oss-120b 78% / deepseek-v4-pro 67%) の主因は「思考が max_tokens を食い尽くして
+# 本文がゼロ」であり、その時点で **課金済みの思考テキストを丸ごと捨てている**。
+# _send は delta.reasoning_content を明示的に無視しているため、答えに到達済みでも無効票になる。
+# ここでは思考テキストを別バッファに貯め、本文が空のときだけ回収を試みる。
+# 重要: 思考テキストには中間値が大量に含まれるため、本文用の extract_final_answer より
+# **厳しい規則**を使う(明示的な最終解答マーカーがある場合のみ採用。裸の数値は拾わない)。
+NIM_SALVAGE_THINKING = False   # 回収を実際に採用する。既定 False(dry-run はログのみ)
+NIM_SALVAGE_LOG = True         # 回収可否と失敗種別をログに出す(採用しなくても計測はする)
+# 失敗の内訳カウンタ。従来は全部 "__ERROR__: truncated" に潰れていて帰属できなかった。
+#   A: 思考テキストあり・本文空(思考が予算を食い尽くした)
+#   B: 思考も本文も空(混雑・空応答)
+#   C: 本文はあるが呼び出し側の抽出が失敗(ここでは数えない。solve_verifiable 側の責務)
+#   D: PoT のコード実行失敗(同上)
+NIM_FAIL_COUNTS = {"A_think_only": 0, "B_both_empty": 0,
+                   "A_salvaged": 0, "A_salvage_failed": 0,
+                   "relay_tried": 0, "relay_answered": 0, "relay_unknown": 0}
+_NIM_FAIL_LOCK = threading.Lock()
+
+# ============================================================
+# 思考継投 (2026-08-07)
+# 正規表現による回収 (_salvage_from_thinking) は dry-run で 6 件中 0 件だった。
+# 思考は 3.9万〜8.9万字あるのに結論マーカーが 1 つも無い — つまり
+# 「答えを箱に入れ損ねた」のではなく「結論に到達する前に予算が尽きた」。
+# 正規表現に無い結論は書けないので、続きを別の呼び出しに継がせる。
+#
+# 発動条件を「有効票が 1 票も無いとき」だけに限定しているのが要点。こうすると
+# 既存の多数決を絶対に動かせないため、この機構は無回答を回答に変えることしか
+# できない。ゆえに無回答問題だけの部分再測定が測定として正当になる
+# (嵐の再測定と同じ論法。和集合の罠を踏まない)。
+# ============================================================
+NIM_RELAY = False               # 既定 OFF。relay@nim 構成でのみ有効
+NIM_RELAY_MAX = 4               # 継投する思考トレースの本数(古い順に捨てる)
+NIM_RELAY_TAIL = 14000          # 継投側へ渡す思考の末尾文字数
+NIM_RELAY_PREDICT = 6144        # 継投側の出力予算(結論だけなので小さくてよい)
+NIM_RELAY_MODEL = None          # None なら AGGREGATOR → REASONING_MODELS の順で選ぶ
+NIM_TRACE_KEEP = 24             # 1 問あたり保持するトレース上限(メモリ保護)
+NIM_THINK_TRACES = []           # [(model, think_tail)] 問題ごとに reset される
+_NIM_TRACE_LOCK = threading.Lock()
+
+RELAY_SYS = (
+    "You are given a partial chain-of-thought that another model produced for a problem "
+    "but could not finish: it ran out of token budget mid-derivation. "
+    "Do NOT restart the problem and do NOT re-derive from scratch. "
+    "Read the trace, identify the furthest point it actually established, "
+    "and carry out ONLY the remaining steps needed to reach the final answer. "
+    "Be brief. End with the final answer alone inside \\boxed{}. "
+    "If the trace genuinely does not determine an answer, output \\boxed{UNKNOWN} — "
+    "guessing is worse than declining.")
+
+
+# ============================================================
+# 検証選抜 (2026-08-07)
+# 票が完全に散ったとき、多数決には信号が無い。しかし実測では正解が候補の中に
+# 1 票だけ含まれていた(aime25-13 の 60、aime25-27 の 248)。つまり生成能力の
+# 問題ではなく選択能力の問題で、票を数える限り永久に選べない。
+# そこで候補集合を審査員に渡し、数えるのではなく検証させる。
+#
+# 設計上の保守則:
+#   ・発動は「床に弾かれて無回答になる」直前だけ。その時点の点数は確定的に 0。
+#   ・候補は票数を伏せて提示する。票数を見せると多数決を再現するだけになり、
+#     多数決が失敗した状況で使う意味が無くなる。
+#   ・審査員の過半数が同じ候補を選ばなければ棄権して無回答のまま返す。
+#     当てずっぽうで埋めるくらいなら無回答の方が誠実。
+#   ・答えの形が課題に合わない候補(AIME なら 0-999 の整数以外)は先に落とす。
+# ============================================================
+SC_VERIFY_SELECT = False        # 既定 OFF。select 系構成でのみ有効
+SC_SELECT_JUDGES = 3            # 審査員の数
+SC_SELECT_MAX_CAND = 10         # 提示する候補の上限
+SC_SELECT_PREDICT = 12288
+SC_DATASET_HINT = ""            # 答えの形の制約に使う(ベンチ側が問題 id から設定する)
+
+SELECT_SYS = (
+    "Several independent attempts at one problem produced DIFFERENT answers, so voting "
+    "cannot decide. Your job is to VERIFY, not to vote. Work out enough of the problem "
+    "yourself to test the candidates: check each against the constraints, "
+    "substitute back, check magnitudes and parity, rule out ones that are impossible. "
+    "Then name the single candidate you can defend. "
+    "You have not been told how many attempts produced each candidate, and you should "
+    "not try to guess. "
+    "End with exactly one line: 'SELECT: <candidate>' — copied verbatim from the list — "
+    "or 'SELECT: NONE' if you cannot defend any of them. Declining is acceptable; "
+    "an unjustified pick is not.")
+
+
+def _answer_shape_ok(a, task_type, dataset_hint=""):
+    """答えの形が課題に合っているか。AIME は 0..999 の整数しか答えになりえない。
+    形が合わない候補は検証にかける前に落とす(審査員の注意を無駄に割かせない)。"""
+    if not a:
+        return False
+    s = str(a).strip()
+    if len(s) > 60:
+        return False
+    if task_type == "mcq":
+        return bool(re.fullmatch(r"[A-Ea-e]", s))
+    if "aime" in (dataset_hint or "").lower():
+        return bool(re.fullmatch(r"\d{1,3}", s)) and 0 <= int(s) <= 999
+    return True
+
+
+def _verify_select(question, classes, task_type="math", dataset_hint=""):
+    """散票から検証で 1 つ選ぶ。選べなければ None(=無回答のまま)を返す。"""
+    cands, seen = [], set()
+    for c in classes:
+        a = str(c[0]).strip()
+        if a in seen or not _answer_shape_ok(a, task_type, dataset_hint):
+            continue
+        seen.add(a)
+        cands.append(a)
+    if len(cands) < 2:
+        return cands[0] if cands else None
+    # 票数の情報を落とすため文字列順に並べ替える(決定的かつ多数決非依存)
+    cands = sorted(cands[:SC_SELECT_MAX_CAND])
+    listing = "\n".join(f"  - {a}" for a in cands)
+    judges, seenm = [], set()
+    for m in [AGGREGATOR] + list(REASONING_MODELS):
+        if m and m not in seenm:
+            seenm.add(m)
+            judges.append(m)
+    judges = judges[:SC_SELECT_JUDGES]
+    if not judges:
+        return None
+    msg = (f"[Problem]\n{question}\n\n[Candidate answers]\n{listing}\n\n"
+           "Verify and select one, or SELECT: NONE.")
+    votes = {}
+    for m in judges:
+        raw = ask(m, [{"role": "system", "content": SELECT_SYS},
+                      {"role": "user", "content": msg}],
+                  0.3, num_predict=SC_SELECT_PREDICT, label="select")
+        text = strip_think(raw or "")
+        if not text or text.startswith("__ERROR__"):
+            print(f"   [SC/select] {m} -> 応答なし")
+            continue
+        mm = None
+        for mo in re.finditer(r"SELECT\s*[:：]\s*(.+)", text, re.I):
+            mm = mo
+        pick = (mm.group(1).strip().strip("`*. ") if mm else "")
+        if not pick or pick.upper().startswith("NONE"):
+            print(f"   [SC/select] {m} -> 棄権")
+            continue
+        hit = next((a for a in cands if answers_equivalent(pick, a)), None)
+        if hit is None:
+            print(f"   [SC/select] {m} -> 候補外の値 '{pick[:24]}' を出したため無効")
+            continue
+        votes[hit] = votes.get(hit, 0) + 1
+        print(f"   [SC/select] {m} -> {hit}")
+    if not votes:
+        return None
+    best, n = max(votes.items(), key=lambda kv: kv[1])
+    if n * 2 <= len(judges):        # 過半数に満たなければ棄権
+        print(f"   [SC/select] 審査員の過半数が一致せず ({votes}) → 無回答のまま")
+        return None
+    return best
+
+
+def reset_think_traces():
+    with _NIM_TRACE_LOCK:
+        del NIM_THINK_TRACES[:]
+
+
+def _record_think_trace(model, think):
+    """予算切れで捨てられる思考テキストを控えておく。短すぎるものは継投の
+    材料にならないので採らない。"""
+    if not NIM_RELAY or not think or len(think) < 1000:
+        return
+    with _NIM_TRACE_LOCK:
+        if len(NIM_THINK_TRACES) < NIM_TRACE_KEEP:
+            NIM_THINK_TRACES.append((model, think[-NIM_RELAY_TAIL:]))
+
+
+def _relay_model(i=0):
+    cands = [NIM_RELAY_MODEL, AGGREGATOR] + list(REASONING_MODELS)
+    cands = [m for m in cands if m]
+    return cands[i % len(cands)] if cands else None
+
+
+def relay_conclude(question, task_type="math", label="relay"):
+    """控えた思考トレースを別の呼び出しに継がせ、結論だけを書かせる。
+    返り値は抽出できた答えのリスト(UNKNOWN と抽出失敗は除く)。
+    長いトレースほど derivation が進んでいる見込みが高いので長い順に使う。"""
+    with _NIM_TRACE_LOCK:
+        traces = sorted(NIM_THINK_TRACES, key=lambda t: -len(t[1]))[:NIM_RELAY_MAX]
+    if not traces:
+        return []
+    out = []
+    for i, (src, think) in enumerate(traces):
+        model = _relay_model(i)
+        if not model:
+            break
+        with _NIM_FAIL_LOCK:
+            NIM_FAIL_COUNTS["relay_tried"] += 1
+        msg = (f"[Problem]\n{question}\n\n"
+               f"[Partial reasoning trace from {src}, truncated by budget]\n{think}\n\n"
+               "[Your task] Finish it. Output only the remaining steps and the answer.")
+        raw = ask(model, [{"role": "system", "content": RELAY_SYS},
+                          {"role": "user", "content": msg}],
+                  0.3, num_predict=NIM_RELAY_PREDICT, label=f"{label}{i + 1}")
+        text = strip_think(raw or "")
+        ans = extract_final_answer(text, task_type) if text and not text.startswith(
+            "__ERROR__") else None
+        if ans and ans.strip().upper().strip("\\{}") == "UNKNOWN":
+            with _NIM_FAIL_LOCK:
+                NIM_FAIL_COUNTS["relay_unknown"] += 1
+            print(f"   [relay {i + 1}] {model} <- {src} の思考{len(think)}字 → UNKNOWN(棄権)")
+            continue
+        if ans:
+            with _NIM_FAIL_LOCK:
+                NIM_FAIL_COUNTS["relay_answered"] += 1
+            out.append(ans)
+        print(f"   [relay {i + 1}] {model} <- {src} の思考{len(think)}字 → "
+              f"{ans if ans else '(抽出失敗)'}")
+    return out
+
+# 思考テキスト中の「最終解答の宣言」とみなすマーカー。これらの直後の値だけを回収対象にする。
+_SALVAGE_MARKERS = re.compile(
+    r"(?:final\s+answer|the\s+answer\s+is|answer\s*[:：=]|"
+    r"最終解答|最終的な答え|答えは|よって答えは|therefore\s+the\s+answer)",
+    re.I)
+
+
+def _salvage_from_thinking(think_text, task_type="math"):
+    """思考テキストから最終解答を回収する。明示マーカー付きの値のみ採用し、
+    裸の最終数値は拾わない(中間値を誤って採用しないための保守則)。
+    戻り値: (回収値 or None, 判定理由)"""
+    if not think_text or len(think_text) < 40:
+        return None, "too_short"
+    tail = think_text[-4000:]          # 結論は末尾に出る。全文を見ると中間値を拾いやすい
+    # ① \boxed{} が末尾側にあれば最優先(本文用と同じ抽出器を使う)
+    if "\\boxed{" in tail:
+        v = extract_boxed(tail)
+        if v:
+            n = normalize_answer(v)
+            if n and len(n) <= 80:
+                return n, "boxed"
+    # ② 明示マーカーの直後に現れる値
+    best = None
+    for m in _SALVAGE_MARKERS.finditer(tail):
+        seg = tail[m.end():m.end() + 160]
+        mm = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?|\\frac\{[^{}]+\}\{[^{}]+\}|[A-Ea-e]\b", seg)
+        if mm:
+            best = mm.group(0)         # 最後に現れたマーカーを採用(結論はより後ろ)
+    if best:
+        n = normalize_answer(best)
+        if n and len(n) <= 80:
+            if task_type == "mcq" and not re.fullmatch(r"[A-Ea-e]", n):
+                return None, "mcq_shape_mismatch"
+            return n, "marker"
+    return None, "no_marker"
 SC_POT = True           # math で PoT(Python 実行)票を混ぜる
 SC_POT_TIMEOUT = 90     # PoT コードの実行タイムアウト秒（総当たり解法に余裕を持たせる）
 REASONING_MODELS = ["gpt-oss:20b", "qwen3.6:35b"]  # SC の主力（導入済みのものだけ使われる）
@@ -4857,22 +5164,30 @@ def _machine_verdict(question, current):
         "then print a constant; let the machine do the counting. Use only the standard "
         "library. The program must finish within a few minutes and print ONLY the "
         "final integer answer on the last line.")
-    outs = []
-    for m in coders:
+    # 生成失敗は枠を消費させず補充モデルへ回す(2026-08-06)。実行成功が SC_MACHINE_N
+    # 本に達するか、試行が SC_MACHINE_MAX_TRIES に達するまで回す。
+    pool = _court_judges()
+    if not pool:
+        return None
+    outs = []          # 実行に成功した (値, モデル, コード) の列
+    tries = 0
+    while len(outs) < SC_MACHINE_N and tries < SC_MACHINE_MAX_TRIES:
+        m = pool[tries % len(pool)]
+        tries += 1
         print(f"   [SC/machine] {m} が検証プログラムを作成します")
         raw = ask(m, [{"role": "user", "content": prompt}], 0.2,
                   num_predict=model_cfg(m, "num_predict", 16384), label="machine")
         if not raw or raw.startswith("__ERROR__"):
-            print(f"   [SC/machine] {m} の生成が空/失敗")
+            print(f"   [SC/machine] {m} の生成が空/失敗 → 補充へ")
             continue
         code = extract_code(strip_think(raw))
         if not code:
-            print(f"   [SC/machine] {m} の応答にコード無し")
+            print(f"   [SC/machine] {m} の応答にコード無し → 補充へ")
             continue
         ok, out = run_python(code, timeout=SC_MACHINE_TIMEOUT, stdout_only=True)
         out = (out or "").strip()
         if not ok or not out:
-            print(f"   [SC/machine] {m} のプログラムが実行失敗/出力なし")
+            print(f"   [SC/machine] {m} のプログラムが実行失敗/出力なし → 補充へ")
             continue
         val = out.splitlines()[-1].strip()
         if "\\boxed{" in val:
@@ -4881,17 +5196,82 @@ def _machine_verdict(question, current):
                 val = unwrapped
         val = normalize_answer(val) or val
         if not val or len(val) > 40:
-            print(f"   [SC/machine] {m} の出力が答えの形でない: {val[:60]!r}")
+            print(f"   [SC/machine] {m} の出力が答えの形でない: {val[:60]!r} → 補充へ")
             continue
         print(f"   [SC/machine] {m} のプログラム出力: {val}")
-        outs.append(val)
-    top, cnt, _cl = vote_answers(outs)
+        outs.append((val, m, code))
+    top, cnt, _cl = vote_answers([v for v, _m, _c in outs])
     if top is not None and cnt >= 2:
         mark = "一致(現候補と同値)" if (current and answers_equivalent(top, current)) \
             else f"一致(現候補 {current} を機械合意で上書き)"
         print(f"   [SC/machine] 実行可能な合意: {top} ({cnt}/{len(outs)}) {mark}")
         return top
+    # 割れた/1本しか動かなかった場合のコード審査 (2026-08-06)。
+    # 「どのプログラムが問題文の条件を忠実に実装しているか」だけを判定させる。
+    if SC_MACHINE_ARBITRATE and outs:
+        return _machine_code_review(question, outs, current)
     print("   [SC/machine] プログラム間の合意なし → 機械裁定は棄権")
+    return None
+
+
+def _machine_code_review(question, outs, current):
+    """機械裁定のコード審査: 実行済みプログラムとその出力を審査人に見せ、
+    「問題文の条件を忠実に実装しているのはどれか」だけを選ばせる。
+    解き直しは禁止 — 判定するのは実装の忠実さのみ(生成・検証ギャップを使う)。
+    過半数の支持を得たプログラムの出力を採用。得られなければ棄権(従来どおり)。"""
+    letters = [chr(ord('A') + i) for i in range(len(outs))]
+    listing = "\n\n".join(
+        f"### Program {L} (printed: {v})\n```python\n{c[:2500]}\n```"
+        for L, (v, _m, c) in zip(letters, outs))
+    prompt = (
+        f"Problem:\n{question}\n\n"
+        f"{len(outs)} programs were written independently to compute the answer by "
+        "direct enumeration, and each was executed. Their printed results disagree, so "
+        "at most one of them faithfully implements the problem.\n\n"
+        f"{listing}\n\n"
+        "Do NOT solve the problem yourself and do NOT judge by which answer looks "
+        "plausible. Judge ONLY this: which program's code correctly encodes the "
+        "problem's conditions -- the objects it enumerates, the constraints it applies, "
+        "and the quantity it finally prints. A program that enumerates the wrong "
+        "objects, drops a constraint, or prints an intermediate quantity is wrong even "
+        "if its number looks reasonable.\n"
+        f"At the very end output exactly one line: 'PROGRAM: X' where X is one of "
+        f"{', '.join(letters)}, or 'PROGRAM: NONE' if none of them implements the "
+        "problem correctly.")
+    tally = {L: 0 for L in letters}
+    got = 0
+    for j in _court_judges():
+        if got >= SC_COURT_JUDGES:
+            break
+        print(f"   [SC/machine] {j} がコード審査します")
+        raw = ask(j, [{"role": "user", "content": prompt}], 0.1,
+                  num_predict=model_cfg(j, "num_predict", 16384), label="machine-review")
+        if not raw or raw.startswith("__ERROR__"):
+            print(f"   [SC/machine] {j} のコード審査が空/失敗 → 補充へ")
+            continue
+        m = None
+        for m in re.finditer(r"PROGRAM:\s*([A-Za-z]+)", strip_think(raw)):
+            pass
+        if not m:
+            print(f"   [SC/machine] {j} のコード審査の書式が不正 → 補充へ")
+            continue
+        v = m.group(1).upper()
+        got += 1
+        if v in tally:
+            tally[v] += 1
+            print(f"   [SC/machine] {j} の審査: Program {v} = {outs[letters.index(v)][0]}")
+        else:
+            print(f"   [SC/machine] {j} の審査: NONE(どれも不適)")
+    need = min(SC_COURT_JUDGES, max(1, got)) // 2 + 1
+    best = max(tally, key=lambda k: tally[k]) if tally else None
+    if best and tally[best] >= need:
+        val = outs[letters.index(best)][0]
+        mark = "(現候補と同値)" if (current and answers_equivalent(val, current)) \
+            else f"(現候補 {current} をコード審査で上書き)"
+        print(f"   [SC/machine] コード審査で決着: Program {best} → {val} "
+              f"({tally[best]}/{got}) {mark}")
+        return val
+    print("   [SC/machine] コード審査も過半数に達せず → 機械裁定は棄権")
     return None
 
 
@@ -5288,6 +5668,9 @@ def solve_verifiable(question, task_type="math", history=None):
         models = list(PROPOSERS[:2])
     if not models:
         return None
+    if NIM_RELAY:
+        reset_think_traces()   # 前の問題の思考を引き継がない
+    _budget_raised = [False]   # 段階的な予算引き上げを1問あたり1回に限る
     cheap_ok = (SC_CHEAP_VOTES > 0 and SC_CHEAP_MODEL
                 and is_installed(SC_CHEAP_MODEL, installed_models()))
     samples = []
@@ -5334,9 +5717,51 @@ def solve_verifiable(question, task_type="math", history=None):
     # 【重要】OLLAMA_MAX_LOADED_MODELS=1 では毎サンプルでモデルを切り替えると 13〜23GB の
     # 再ロードが多発して致命的に遅い。そこで「モデルごとにまとめて」サンプリングし再ロードを
     # 最小化する（多様性は temp=0.7 の複数サンプルで確保）。各モデルから同数ずつ引く。
+    def _equalized_slots(n):
+        """次バッチのスロットを「票数が揃う」ように配る (2026-08-07, SC_EQUALIZE_VOTES)。
+
+        既存の per = n // len(models) は **呼び出し回数** を揃えている。しかし
+        実測では死票率がモデル間で大きく違う (gpt-oss-120b 65%、minimax-m3 0%)。
+        回数を揃えると票数が揃わず、黙りがちなモデルの声だけが体系的に小さくなる。
+        それは予算の配り方の副作用であって設計意図ではない。
+        そこでこの問題での実測死票率から、期待票数が揃うようスロットを配り直す。
+
+        **精度は一切参照しない**。参照するとテストデータへの当てはめになる。
+        見るのは「票になったか」だけで、「合っていたか」は見ない。
+        初回バッチは実測が無いので従来どおり均等 — つまり早期確定する易問では
+        挙動が 1 バイトも変わらない。効くのは票が割れて追加サンプリングに
+        入った問題だけで、それは今まさに落としている問題である。
+        """
+        base = max(1, n // len(models))
+        stats = {m: [0, 0] for m in models}      # model -> [有効票, 発行]
+        for s in samples:
+            if s["pot"] or s["model"] not in stats:
+                continue
+            stats[s["model"]][1] += 1
+            if s["answer"]:
+                stats[s["model"]][0] += 1
+        slots = {}
+        for m in models:
+            ok, tot = stats[m]
+            if tot < 2:                          # 実測が薄いうちは動かさない
+                slots[m] = base
+                continue
+            rate = ok / tot
+            mult = SC_EQ_MAX_MULT if rate <= 0 else min(SC_EQ_MAX_MULT, 1.0 / rate)
+            slots[m] = max(1, int(round(base * mult)))
+        if slots != {m: base for m in models}:
+            print("   [SC/eq] 票数を揃えるスロット配分: "
+                  + ", ".join(f"{m.split('/')[-1]}×{slots[m]}"
+                              f"(有効{stats[m][0]}/{stats[m][1]})" for m in models))
+        return slots
+
     def add_batch(n):
         per = max(1, n // len(models))
-        jobs = [(m, False) for m in models for _ in range(per)]
+        if SC_EQUALIZE_VOTES:
+            sl = _equalized_slots(n)
+            jobs = [(m, False) for m in models for _ in range(sl[m])]
+        else:
+            jobs = [(m, False) for m in models for _ in range(per)]
         # PoT は先頭モデルがロード済みのうちに末尾で実行（追加ロードなし）
         if SC_POT and task_type == "math":
             jobs.append((models[0], True))
@@ -5371,14 +5796,31 @@ def solve_verifiable(question, task_type="math", history=None):
         n = len(answers)
         # 確定条件: 全会一致（ただし n < SC_MIN_VOTES の疑似全会一致は不可）、
         # または 4 票以上で過半数
+        # 確定の2経路は要求する証拠の強さが揃っていない。全会一致経路は
+        # 「3票で100%一致」を要求するが、過半数経路は「4票中3票」でも通る。
+        # SC_MAJORITY_MIN を上げると後者の床だけが上がる(既定 4 で従来と同一)。
+        # 対称性の議論であって、特定の問題の正解を見て決めた値ではない。
+        maj_floor = SC_MAJORITY_MIN
         if top is not None and n > 0 and (
-            (cnt == n and n >= SC_MIN_VOTES) or (n >= 4 and cnt * 2 > n)
+            (cnt == n and n >= SC_MIN_VOTES) or (n >= maj_floor and cnt * 2 > n)
         ):
             break
-        if main_cot_count() >= SC_MAX:
+        if main_cot_count() >= (SC_ESCALATE_MAX or SC_MAX):
             break
         head = [(c[0], c[1]) for c in classes[:3]]
         print(f"   [SC] 票が割れています {head} → 追加サンプリング")
+        # 難問と判明した時点で思考予算を積む(初回バッチには適用しない)。
+        # gpt-oss-120b は難問で 65% が「思考が max_tokens を食い尽くして本文空」に
+        # なるが、有効票になった分は 85.7% 正解する。予算不足が当たる票を消している。
+        if SC_ESCALATE_PREDICT and not _budget_raised[0]:
+            _budget_raised[0] = True
+            for m in models:
+                MODEL_CONFIG.setdefault(m, {})["num_predict"] = SC_ESCALATE_PREDICT
+            if SC_ESCALATE_CAP:
+                globals()["NIM_MAX_TOKENS_CAP"] = SC_ESCALATE_CAP
+            print(f"   [SC/budget] 難問と判定 → num_predict={SC_ESCALATE_PREDICT} "
+                  f"cap={SC_ESCALATE_CAP or NIM_MAX_TOKENS_CAP} "
+                  f"票上限={SC_ESCALATE_MAX or SC_MAX} へ引き上げ")
         add_batch(SC_STEP)
 
     # 抽出失敗票の救済 (2026-08-05, SC_RESCUE_VOTES=True の sc6 経路のみ。既定 False で不変):
@@ -5397,6 +5839,19 @@ def solve_verifiable(question, task_type="math", history=None):
             print(f"   [SC/rescue] 抽出失敗トレースから {rescued} 票を回収")
     answers = [s["answer"] for s in samples if s["answer"]]
     top, cnt, classes = vote_answers(answers)
+    # 思考継投 (2026-08-07, NIM_RELAY=True の relay 経路のみ。既定 False で不変):
+    # ここに来て top が None なら有効票がゼロ、つまりこの問題は無回答で終わる。
+    # その場合に限り、予算切れで捨てた思考トレースを別の呼び出しに継がせる。
+    # 票が 1 つでもある場合は発動しない — 既存の多数決を動かさないための不変条件。
+    if NIM_RELAY and top is None:
+        relayed = relay_conclude(question, task_type)
+        if relayed:
+            for a in relayed:
+                samples.append({"answer": a, "text": "", "model": "relay",
+                                "pot": False, "conf": None, "relayed": True})
+            answers = [s["answer"] for s in samples if s["answer"]]
+            top, cnt, classes = vote_answers(answers)
+            print(f"   [relay] 無回答を {len(relayed)} 票で救済 → 暫定 {top}")
     if top is None:
         return None
     # DeepConf 集約 (2026-08-04, SC_CONF_VOTE=True の sc4 経路のみ。既定 False で以降は不変):
@@ -5516,6 +5971,24 @@ def solve_verifiable(question, task_type="math", history=None):
     # answer/text をそのまま尊重し、票数に関わらずここでは弾かない。
     if (rep is None and cnt < SC_MIN_VOTES
             and not conf_decided and not court_decided and not machine_decided):
+        # 検証選抜 (2026-08-07, SC_VERIFY_SELECT=True の経路のみ。既定 False で不変)
+        # 実測の根拠: aime25-13(正解60)と aime25-27(正解248)はどちらも 27 サンプル中に
+        # 正解を 1 票だけ生成していたが、全候補が 1 票ずつに散ったため床に弾かれ、
+        # 無回答で終わっていた。多数決に信号が無い以上、票を数えても選べない。
+        # これは「選択損失」であって、追加サンプリングでは解けない。
+        # ここに来た時点で run_sc の返り値は確定的にゼロ点なので、選抜を足しても
+        # 原理的に退行しない(だから無回答問題だけの部分再測定が正当になる)。
+        if SC_VERIFY_SELECT and classes:
+            picked = _verify_select(question, classes, task_type, SC_DATASET_HINT)
+            if picked is not None:
+                match = next((c for c in classes
+                              if answers_equivalent(picked, c[0])), None)
+                print(f"   [SC/select] 散票から検証で選抜: {picked} "
+                      f"(票 {match[1] if match else 0}/{len(answers)})")
+                return {"answer": picked,
+                        "text": _representative_text(samples, picked) or "",
+                        "votes": {c[0]: c[1] for c in classes},
+                        "n_samples": len(samples), "selected": True}
         print(f"   [SC] 確定票が {cnt} 票のみ (< SC_MIN_VOTES={SC_MIN_VOTES}) → MoA フォールバックへ")
         return None
     if rep is None:
@@ -6884,6 +7357,655 @@ def main():
         else:
             print("質問が入力されませんでした。")
             parser.print_help()
+
+
+# ==================================================
+# 統合 MoA (docs/UNIFIED_MOA_SPEC.md, 2026-08-05)
+# 経路分岐(task_type)の廃止 + 合成性(段分解・段別プーリング)の導入。
+# FUGU_UNIFIED=False(既定)では以下は一切呼ばれず、既存経路はビット同一。
+# 全て追記のみ・既存関数は無変更(仕様§1/§5)。
+# ==================================================
+
+# ---- 統合 MoA フラグ(§4) ----
+FUGU_UNIFIED = False          # fugu_solve 経路を使う(マスタスイッチ)
+FUGU_DECOMPOSE = True         # 段分解(UNIFIED 内で有効)
+FUGU_HIERARCHICAL = True      # 割れた段の再分解(dilation)
+FUGU_RESIDUAL = True          # 原問題を全層へ直結(残差結合)
+FUGU_EXEC_KEY = True          # 実行等価性によるキー抽出
+FUGU_EARLY_UNANIMOUS = True   # 全会一致での早期確定
+
+POOL_MIN_KEYS = 3             # ハードプーリングに必要な有効キー数
+POOL_EXEC_TIMEOUT = 20        # exec キー生成の実行タイムアウト秒
+DECOMP_VOTES = 3              # 分解自体のサンプル数(段数の最頻を採用)
+DECOMP_MAX_STEPS = 8          # 段数の上限
+DECOMP_MAX_DEPTH = 2          # 階層再分解の深さ上限
+STEP_VOTES_INIT = 4           # 1 段あたり初期票数
+STEP_VOTES_STEP = 2           # 追加票の単位
+STEP_VOTES_MAX = 12           # 1 段あたり上限
+STEP_BEAM = 2                 # 確定できない段で保持する候補数(現実装は最良1+文脈明記)
+
+UNIFIED_STEP_PROMPT = (
+    "Work carefully and rigorously on exactly the sub-goal you are given, using any "
+    "confirmed context provided. State only what this sub-goal asks you to establish. "
+    "End with one line starting 'CONCLUSION:'; if the conclusion is a definite value, "
+    "expression, or choice, also put ONLY it in \\boxed{}.")
+
+
+def _doctest_examples(question):
+    """question 中の '>>> 式' 形式の実行例を抽出(実行等価キー用)。最大6例。"""
+    return re.findall(r"^\s*>>>\s*(.+)$", question or "", re.M)[:6]
+
+
+# ============================================================
+# 実行例による自己検証つきコード生成 (2026-08-07)
+# 動機は測定から出ている。HumanEval の残り2敗はどちらも問題文に実行可能な例が
+# 書かれており、実行すれば API 0 円で偽と分かった:
+#   HumanEval_132  is_nested('[[]]') ➞ True            (矢印形・6例)
+#   HumanEval_145  >>> order_by_points([..]) == [..]   (比較形・2例)
+# 既存の _doctest_examples は '>>>' 形しか見ないため 132 では 0 件になる。
+# ここでは 3 形式を扱い、期待値が Python リテラルとして読めるものだけ採る
+# (散文を式と誤認して偽の不合格を作らないための保守則)。
+# 既定 OFF。coder2 構成でのみ有効化し、既存の coder@nim の結果は変えない。
+# ============================================================
+CODE_EXEC_VERIFY = False        # 実行検証を使う(既定 OFF)
+CODE_REPAIR_ROUNDS = 2          # 失敗トレースを返して直させる最大回数
+CODE_VERIFY_TIMEOUT = 12        # 検証ハーネス1本あたりの秒数
+CODE_VERIFY_MAX_EX = 8          # 使う実行例の上限
+CODE_CANDIDATES = 5             # 生成する候補プログラムの本数
+
+# f(x) ➞ 期待値 / => / -> / →  (HumanEval の docstring に多い矢印形)
+_EX_ARROW = re.compile(
+    r"^[ \t]*([A-Za-z_]\w*\s*\(.*\))\s*(?:➞|→|==>|=>|->)\s*(\S.*?)[ \t]*$", re.M)
+# >>> f(x) == 期待値  /  f(x) == 期待値   (比較形。評価して True になるべき)
+_EX_EQEQ = re.compile(
+    r"^[ \t]*(?:>>>[ \t]*)?([A-Za-z_]\w*\s*\(.*\))\s*==\s*(\S.*?)[ \t]*$", re.M)
+# 【採用しない】単一イコール形 'f(1) = 3' は試したが撤回した。
+# HumanEval_130 の仕様は tri(1) = 3 / tri(2) = 2 と書くが、これは **数列の要素** の
+# 定義であって関数の戻り値ではない(tri(n) は長さ n+1 のリストを返す)。
+# 参照解を当てると 1/4 しか通らず、正しい実装を落とす抽出器になっていた。
+# '=' は「数学的定義」と「関数の戻り値」を区別できない。'➞' と '==' は区別できる。
+
+
+def _literal_ok(s):
+    """期待値が Python リテラルとして読めるかを見る。読めない散文は例にしない。"""
+    s = s.strip().rstrip(".,;")
+    if not s:
+        return None
+    try:
+        ast.literal_eval(s)
+        return s
+    except Exception:
+        return None
+
+
+def _callable_ok(s):
+    """呼び出し式として構文が通り、かつ **引数がすべてリテラル** かを見る。
+    引数に変数が混じった仕様の書き方(例: 'tri(n) = 1 + n / 2')を実行例として
+    拾うと、実行時に NameError になって正しい実装まで不合格にしてしまう。"""
+    s = s.strip()
+    try:
+        node = ast.parse(s, mode="eval")
+    except Exception:
+        return None
+    if not isinstance(node.body, ast.Call):
+        return None
+    for a in list(node.body.args) + [k.value for k in node.body.keywords]:
+        try:
+            ast.literal_eval(a)
+        except Exception:
+            return None
+    return s
+
+
+def code_examples(question):
+    """問題文から (呼び出し式, 期待値式) の実行例を抽出する。重複は落とす。
+    取れなければ空リスト — これは「検証不能」であって「不正解」ではない。"""
+    q = question or ""
+    out, seen = [], set()
+    for rx in (_EX_EQEQ, _EX_ARROW):
+        for call, exp in rx.findall(q):
+            c, e = _callable_ok(call), _literal_ok(exp)
+            if not c or e is None or c in seen:
+                continue
+            seen.add(c)
+            out.append((c, e))
+    # 素の doctest ('>>> f(x)' の次行が期待 repr) も拾う
+    lines = q.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^[ \t]*>>>[ \t]*(.+?)[ \t]*$", line)
+        if not m or "==" in m.group(1):
+            continue
+        c = _callable_ok(m.group(1))
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if not c or c in seen or nxt.lstrip().startswith(">>>"):
+            continue
+        e = _literal_ok(nxt)
+        if e is not None:
+            seen.add(c)
+            out.append((c, e))
+    return out[:CODE_VERIFY_MAX_EX]
+
+
+def verify_code_examples(code, examples, timeout=None):
+    """候補コードを実行例に当てる。(通過数, 総数, 失敗の要約) を返す。
+    総数 0 は検証不能。ハーネス自体が落ちた場合は全滅として扱う(構文エラー等)。"""
+    if not code or not examples:
+        return 0, 0, None
+    src = [code, "\n\n_R = []\n"]
+    for i, (call, exp) in enumerate(examples):
+        src.append(
+            "try:\n"
+            "    _g = ({c})\n"
+            "    _e = ({e})\n"
+            "    _R.append(('PASS' if _g == _e else 'FAIL', {i}, repr(_g)[:120],"
+            " repr(_e)[:120]))\n"
+            "except Exception as _x:\n"
+            "    _R.append(('ERR', {i}, type(_x).__name__ + ': ' + str(_x)[:100], ''))\n"
+            .format(c=call, e=exp, i=i))
+    src.append("for _r in _R:\n    print('\\x1f'.join(map(str, _r)))\n")
+    ok, out = run_python("".join(src),
+                         timeout=timeout or CODE_VERIFY_TIMEOUT, stdout_only=True)
+    if not ok or not out:
+        head = (out or "").strip().splitlines()
+        why = head[-1][:160] if head else "実行不能(タイムアウトまたは構文エラー)"
+        return 0, len(examples), f"コードが実行できません: {why}"
+    passed, fails = 0, []
+    for line in out.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 4:
+            continue
+        status, idx, got, exp = parts
+        try:
+            call = examples[int(idx)][0]
+        except Exception:
+            call = "?"
+        if status == "PASS":
+            passed += 1
+        elif status == "ERR":
+            fails.append(f"  {call}  -> 例外 {got}")
+        else:
+            fails.append(f"  {call}  -> {got}  (期待 {exp})")
+    return passed, len(examples), ("\n".join(fails[:5]) if fails else None)
+
+
+CODE_INPUT_SYS = (
+    "You generate ONLY test INPUTS for a Python function — never expected outputs. "
+    "Output a JSON array of strings, each a complete call expression using the exact "
+    "function name from the problem, e.g. [\"f([1,2,3])\", \"f([])\"]. "
+    "Cover edge cases and, where the specification has subtle rules, inputs that would "
+    "distinguish a correct implementation from a plausible-but-wrong one. "
+    "8 to 12 calls. Output the JSON array and nothing else.")
+
+
+def generate_test_inputs(question, model, n=12, label="c2-inputs"):
+    """関数への入力だけを作らせる。期待出力は作らせないのが要点 —
+    出力まで作らせると、その期待値自体が誤っていたときに正しい実装を落とす
+    (テスト生成の古典的な失敗モード)。入力だけなら「正解を知らないまま
+    振る舞いの違いを見る」ことができる。"""
+    raw = ask(model, [{"role": "system", "content": CODE_INPUT_SYS},
+                      {"role": "user", "content": question}],
+              0.7, num_predict=2048, label=label)
+    text = strip_think(raw or "")
+    if not text or text.startswith("__ERROR__"):
+        return []
+    m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except Exception:
+        return []
+    out = []
+    for s in arr:
+        if isinstance(s, str) and _callable_ok(s) and s not in out:
+            out.append(s)
+    return out[:n]
+
+
+def behavior_key(code, calls, timeout=None):
+    """候補コードの「振る舞い指紋」。与えた呼び出し列に対する出力ベクトルの
+    ハッシュ。実装が違っても全入力で同出力なら同じ鍵になる。実行不能は None。"""
+    if not code or not calls:
+        return None
+    import hashlib
+    src = [code, "\n\n_O = []\n"]
+    for c in calls:
+        src.append("try:\n    _O.append(repr({c})[:200])\n"
+                   "except Exception as _x:\n    _O.append('ERR:' + type(_x).__name__)\n"
+                   .format(c=c))
+        src.append("")
+    src.append("print('\\x1e'.join(_O))\n")
+    ok, out = run_python("".join(src),
+                         timeout=timeout or CODE_VERIFY_TIMEOUT, stdout_only=True)
+    if not ok or out is None:
+        return None
+    return hashlib.sha1(out.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+CODE_REPAIR_SYS = (
+    "You are fixing a Python function that fails its own specification examples. "
+    "The examples below were executed; the observed values are real, not hypothetical. "
+    "Diagnose why the current implementation produces them, then output the COMPLETE "
+    "corrected function in ONE ```python block. Keep the signature exactly. "
+    "No prints, no tests, no example usage outside the function.")
+
+
+def solve_code_verified(question, models=None, rounds=None, label="coder2"):
+    """実行例で自己検証しながらコードを書く。
+
+    1) 複数モデルで候補を生成する
+    2) 問題文の実行例で全候補を実行し、通過数で順位付けする
+    3) 全通過が出た時点で採用する(残りは走らせない)
+    4) 出なければ最良候補の実測失敗を添えて修復を要求する(最大 rounds 回)
+    5) 実行例が 1 件も取れない問題は候補の 1 本目をそのまま返す
+       — 検証できないものを検証したふりはしない
+
+    返り値は (回答テキスト, 実行例の統計dict)。
+    """
+    rounds = CODE_REPAIR_ROUNDS if rounds is None else rounds
+    examples = code_examples(question)
+    lineup = [m for m in (models or PROPOSERS) if m][:CODE_CANDIDATES] or PROPOSERS[:1]
+    # 候補が足りなければ先頭モデルを高温で引き直して数を揃える。
+    # 誤りは互いに異なる振る舞いになるが正答は必ず同一の振る舞いになるので、
+    # 候補が増えるほど正解クラスが多数派になりやすい(SC 投票と同じ原理)。
+    draws = [(m, 0.3) for m in lineup]
+    while len(draws) < CODE_CANDIDATES and lineup:
+        draws.append((lineup[len(draws) % len(lineup)], 0.8))
+    stat = {"n_examples": len(examples), "best": (0, len(examples)),
+            "repairs": 0, "verified": False, "candidates": len(draws)}
+
+    cands = []
+    for m, temp in draws:
+        raw = ask(m, [{"role": "system", "content": PROPOSER_SYS},
+                      {"role": "user", "content": question}],
+                  temp, num_predict=proposer_predict_for(m), label=f"{label}-gen")
+        text = strip_think(raw or "")
+        if not text or text.startswith("__ERROR__"):
+            continue
+        code = extract_code(text)
+        p, n, why = verify_code_examples(code, examples)
+        cands.append({"model": m, "text": text, "code": code,
+                      "pass": p, "n": n, "why": why})
+        print(f"   [C2] {m}: 実行例 {p}/{n} 通過")
+    if not cands:
+        return None, stat
+    if not examples:
+        # 実行例が取れない問題は検証しようがない。ここで候補の 1 本目を返すと
+        # 従来の MoA 合議より弱くなる(実測: HumanEval_130 が coder@nim で正解・
+        # coder3@nim で回帰。この問題の仕様は 'tri(2) = 1 + (2 / 2) = 2' の形で
+        # 実行例が 0 件だった)。None を返して呼び出し側に従来経路を選ばせる。
+        stat["no_examples"] = True
+        return None, stat
+
+    cands.sort(key=lambda c: -c["pass"])
+    survivors = [c for c in cands if c["n"] and c["pass"] == c["n"]]
+
+    # 公開例を通っただけでは足りない。HumanEval_145 の実測がそれを示した:
+    # 候補は公開例 2/2 を通しながら隠れテストで落ちた。余計な同点処理を足して
+    # 「公開例だけ偶然通る」実装になっていたためで、例が 2 件では早期確定の
+    # 根拠として弱すぎる。そこで公開例を通った候補が複数あるときは、
+    # **入力だけを生成**して振る舞いで多数決を取る。期待出力は作らせないので、
+    # 生成したテストが誤っていて正しい実装を落とす事故が起きない。
+    if len(survivors) >= 2:
+        probes = generate_test_inputs(question, lineup[0])
+        keys = {}
+        if probes:
+            for c in survivors:
+                c["bkey"] = behavior_key(c["code"], probes)
+                if c["bkey"]:
+                    keys.setdefault(c["bkey"], []).append(c)
+        if keys:
+            groups = sorted(keys.values(), key=lambda g: -len(g))
+            stat["probe_inputs"] = len(probes)
+            stat["behavior_classes"] = len(groups)
+            if len(groups) == 1:
+                print(f"   [C2] 生成入力 {len(probes)} 件で全候補の振る舞いが一致 → 確定")
+            else:
+                print(f"   [C2] 生成入力 {len(probes)} 件で振る舞いが "
+                      f"{len(groups)} 通りに分岐 (票 {[len(g) for g in groups]}) "
+                      f"→ 多数派を採用")
+            best = groups[0][0]
+            stat.update(best=(best["pass"], best["n"]), verified=True,
+                        agreed=len(groups[0]))
+            return best["text"], stat
+    if survivors:
+        best = survivors[0]
+        stat.update(best=(best["pass"], best["n"]), verified=True,
+                    survivors=len(survivors))
+        why = ("公開例を通ったのは1本だけ" if len(survivors) == 1
+               else f"公開例を{len(survivors)}本が通過したが振る舞い多数決が"
+                    "成立しなかった(生成入力が使えず)")
+        print(f"   [C2] {why} → {best['model']} を採用")
+        return best["text"], stat
+
+    best = cands[0]
+    stat["best"] = (best["pass"], best["n"])
+    print(f"   [C2] 最良 {best['model']} が {best['pass']}/{best['n']} 通過 → 修復へ")
+
+    for r in range(rounds):
+        fixer = lineup[r % len(lineup)]
+        msg = (f"{question}\n\n"
+               f"--- 現在の実装 ---\n```python\n{best['code']}\n```\n\n"
+               f"--- 実行した結果、次の例が不合格 ---\n{best['why']}\n")
+        raw = ask(fixer, [{"role": "system", "content": CODE_REPAIR_SYS},
+                          {"role": "user", "content": msg}],
+                  0.2, num_predict=proposer_predict_for(fixer),
+                  label=f"{label}-fix{r + 1}")
+        text = strip_think(raw or "")
+        if not text or text.startswith("__ERROR__"):
+            continue
+        code = extract_code(text)
+        p, n, why = verify_code_examples(code, examples)
+        stat["repairs"] = r + 1
+        print(f"   [C2] 修復{r + 1} ({fixer}): {p}/{n} 通過")
+        if p > best["pass"]:                   # 後退は採らない(単調性)
+            best = {"model": fixer, "text": text, "code": code,
+                    "pass": p, "n": n, "why": why}
+            stat["best"] = (p, n)
+        if best["pass"] == best["n"]:
+            stat["verified"] = True
+            break
+    return best["text"], stat
+
+
+def _exec_key(text, question=None):
+    """コード候補の振る舞い等価性ハッシュ。実装が違っても同入力→同出力なら同一キー。
+    問題文の doctest 例に対する出力ベクトルの sha1 先頭16桁。例が無ければ AST 正規化
+    文字列のハッシュ(弱いが無いよりよい)。失敗は None。"""
+    code = extract_code(text)
+    if not code:
+        return None
+    import hashlib
+    examples = _doctest_examples(question or "")
+    if examples:
+        harness = code + "\n\n" + "\n".join(
+            "try:\n    print(repr({e}))\nexcept Exception as _e:\n"
+            "    print('ERR:' + type(_e).__name__)".format(e=e)
+            for e in examples)
+        ok, out = run_python(harness, timeout=POOL_EXEC_TIMEOUT, stdout_only=True)
+        if ok and out is not None:
+            return hashlib.sha1(out.encode("utf-8", "replace")).hexdigest()[:16]
+        return None
+    try:
+        import ast as _ast
+        return hashlib.sha1(_ast.dump(_ast.parse(code)).encode()).hexdigest()[:16]
+    except Exception:
+        return None
+
+
+def extract_key(text, question=None):
+    """候補から「比較可能な結論」を取り出す(§3.1)。(kind, key) — kind は
+    "math"|"mcq"|"exec"。取れなければ None。これが task_type 分岐を置き換える。"""
+    if not text or text.startswith("__ERROR__"):
+        return None
+    k = extract_final_answer(text, "math")
+    # math 抽出のフォールバックはコードブロック断片('```python' 等)や長文を拾うことが
+    # あるため、答えの形をしていないものは棄却して次の抽出器へ流す。単一の選択肢文字は
+    # 意味論的に mcq キーとして扱う(math 抽出器が \boxed{C} を先に拾うため)。
+    if k and "```" not in k and len(k) <= 80:
+        if re.fullmatch(r"[A-Ea-e]", k):
+            return ("mcq", k.upper())
+        return ("math", k)
+    k = extract_final_answer(text, "mcq")
+    if k:
+        return ("mcq", k)
+    if FUGU_EXEC_KEY:
+        k = _exec_key(text, question)
+        if k:
+            return ("exec", k)
+    return None
+
+
+class PoolResult:
+    """遅延束縛プーリングの結果(§3.2)。"""
+    def __init__(self, answer, key, kind, agreement, n_valid, n_total,
+                 confirmed, classes):
+        self.answer = answer
+        self.key = key
+        self.kind = kind              # "hard" | "soft"
+        self.agreement = agreement
+        self.n_valid = n_valid
+        self.n_total = n_total
+        self.confirmed = confirmed
+        self.classes = classes
+
+
+def pool(question, candidates):
+    """遅延束縛プーリング: 有効キー >= POOL_MIN_KEYS でハード(既存SCと同一の確定条件)、
+    未満でソフト(aggregate 統合、confirmed=True)。kind 混在時は多数派 kind のみ有効票。"""
+    keyed = [(extract_key(c, question), c) for c in candidates]
+    valid = [(k, c) for k, c in keyed if k is not None]
+    if valid:
+        from collections import Counter
+        major_kind = Counter(k[0] for k, _c in valid).most_common(1)[0][0]
+        valid = [(k, c) for k, c in valid if k[0] == major_kind]
+    if len(valid) >= POOL_MIN_KEYS:
+        classes = []                     # [key, votes, 代表text]
+        for (kind, key), c in valid:
+            for cl in classes:
+                same = (key == cl[0]) if kind == "exec" else answers_equivalent(key, cl[0])
+                if same:
+                    cl[1] += 1
+                    break
+            else:
+                classes.append([key, 1, c])
+        classes.sort(key=lambda x: -x[1])
+        top_key, cnt, top_text = classes[0]
+        n = len(valid)
+        confirmed = (cnt == n and n >= SC_MIN_VOTES) or (n >= 4 and cnt * 2 > n)
+        return PoolResult(top_text, top_key, "hard", cnt / n, n, len(candidates),
+                          confirmed, [[cl[0], cl[1]] for cl in classes])
+    texts = [c for _k, c in keyed if c and not c.startswith("__ERROR__")]
+    if not texts:
+        return PoolResult("", None, "soft", None, 0, len(candidates), True, [])
+    merged = aggregate(question, [(f"cand-{i + 1}", t) for i, t in enumerate(texts)])
+    return PoolResult(merged, None, "soft", None, len(texts), len(candidates),
+                      True, [])
+
+
+def decompose(question, parent=None, depth=0):
+    """推論の段への分解(§3.3)。分解自体を DECOMP_VOTES 本引き、段数が最頻の分解を採用。
+    取れない/2段未満/深さ上限なら [{"goal": question}] へ縮退(=丸ごと解く。分岐ではなく縮退)。"""
+    if depth >= DECOMP_MAX_DEPTH:
+        return [{"goal": question}]
+    model = None
+    if ARBITER_MODEL and is_installed(ARBITER_MODEL, installed_models()):
+        model = ARBITER_MODEL
+    elif REASONING_MODELS:
+        model = REASONING_MODELS[0]
+    if not model:
+        return [{"goal": question}]
+    ctx_note = (f"\nThis sub-problem arises inside a larger problem:\n{parent}\n"
+                if parent else "")
+    prompt = (
+        f"Decompose the following problem into the sequence of reasoning stages needed "
+        f"to solve it (at most {DECOMP_MAX_STEPS}). Each stage is something to "
+        "ESTABLISH (a fact, value, or structure), not a vague hint, and stage k may "
+        "depend only on stages before it. If the problem is genuinely one-step, return "
+        "a single stage.\n"
+        'Output ONLY JSON: {"steps": [{"goal": "...", "depends_on": [0]}]}\n\n'
+        f"Problem:{ctx_note}\n{question}")
+    plans = []
+    for _ in range(DECOMP_VOTES):
+        raw = ask(model, [{"role": "user", "content": prompt}], 0.3,
+                  num_predict=2048, label="decomp")
+        if not raw or raw.startswith("__ERROR__"):
+            continue
+        m = re.search(r"\{.*\}", strip_think(raw), re.S)
+        if not m:
+            continue
+        try:
+            steps = json.loads(m.group(0)).get("steps") or []
+        except Exception:
+            continue
+        goals = [s.get("goal") for s in steps
+                 if isinstance(s, dict) and s.get("goal")]
+        if goals:
+            plans.append(goals[:DECOMP_MAX_STEPS])
+    if not plans:
+        return [{"goal": question}]
+    from collections import Counter
+    best_len = Counter(len(p) for p in plans).most_common(1)[0][0]
+    chosen = next(p for p in plans if len(p) == best_len)
+    if len(chosen) < 2:
+        return [{"goal": question}]
+    return [{"goal": g} for g in chosen]
+
+
+def sample_step(step, question, ctx, n, models=None):
+    """1 段を n 本サンプリング(§3.4)。models 省略時は REASONING_MODELS(重み共有)。
+    プロンプトは残差結合(FUGU_RESIDUAL)+因果文脈(段1..k-1のみ)。並列時も回収は投入順。"""
+    if models is None:
+        models = ([m for m in REASONING_MODELS if m in PROPOSERS or _is_nim(m)]
+                  or list(PROPOSERS[:2]))
+    if not models:
+        return []
+    ctx_txt = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(ctx)) or "(none yet)"
+    parts = []
+    if FUGU_RESIDUAL:
+        parts.append(f"## Original problem\n{question}\n")
+    parts.append(f"## Established so far (earlier stages only)\n{ctx_txt}\n")
+    parts.append(f"## Your task for THIS stage\n{step['goal']}")
+    user = "\n".join(parts)
+    strategies = _enumerate_strategies(question) if SC_STRATIFY else []
+
+    def one(i):
+        m = models[i % len(models)]
+        u = user
+        if strategies:
+            u += ("\n\n[Strategy directive: prefer this approach: "
+                  f"{strategies[i % len(strategies)]}]")
+        raw = ask(m, [{"role": "system", "content": UNIFIED_STEP_PROMPT},
+                      {"role": "user", "content": u}],
+                  SC_TEMP, think=proposer_think_for(m),
+                  num_predict=proposer_predict_for(m), label="u-step")
+        if not raw or raw.startswith("__ERROR__"):
+            return ""
+        return strip_think(raw)
+
+    outs = []
+    if SC_PARALLEL and n > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SC_WORKERS) as ex:
+            futs = [ex.submit(one, i) for i in range(n)]
+            for fut in futs:                       # 投入順回収 = 決定性(§3.4)
+                try:
+                    outs.append(fut.result())
+                except Exception:
+                    outs.append("")
+    else:
+        for i in range(n):
+            outs.append(one(i))
+    return outs
+
+
+def compose(question, steps, ctx):
+    """確定した段の結論を統合して最終解答を作る(§3.5)。原問題+全段の結論(残差結合)。"""
+    listing = "\n".join(ctx) or "(no confirmed stages)"
+    prompt = (f"## Original problem\n{question}\n\n"
+              f"## Established conclusions of each reasoning stage\n{listing}\n\n"
+              "Combine these into the final answer to the original problem. Be "
+              "rigorous; resolve any inconsistency by recomputing. End with the final "
+              "answer; if it is a definite value, expression, or choice, put ONLY it "
+              "in \\boxed{}. If the task asks for code, provide the complete final "
+              "code in a ```python block.")
+    model = AGGREGATOR or (REASONING_MODELS[0] if REASONING_MODELS else None)
+    if not model:
+        return listing
+    raw = ask(model, [{"role": "user", "content": prompt}], 0.2,
+              num_predict=model_cfg(model, "num_predict", 16384), label="u-compose")
+    if not raw or raw.startswith("__ERROR__"):
+        return listing
+    return strip_think(raw)
+
+
+def verify(question, answer, ctx=None):
+    """全経路共通の検証(§3.6)。実行検証(コードがあれば)→Critic→別系譜の順。(ok, issue)。"""
+    err = code_check(answer)
+    if err:
+        return False, f"code_check: {err}"
+    ok, issue = critique(question, answer)
+    if not ok:
+        return False, issue or "critic NG"
+    ok2, issue2 = second_opinion(question, answer)
+    if not ok2:
+        return False, issue2 or "second opinion NG"
+    return True, ""
+
+
+def _step_conclusion(result):
+    """ctx へ入れる 1 段の結論表現。ハード確定はキー、ソフトは本文末尾を要約的に使う。"""
+    if result.kind == "hard" and result.key is not None:
+        return str(result.key)
+    return (result.answer or "").strip()[-400:]
+
+
+def fugu_solve(question, history=None, plan=None):
+    """統合 MoA の入口(§3.7)。task_type 分岐なし: 分解→段ごとに sample→pool(遅延束縛)、
+    割れた段のみ追加サンプリング/再分解、compose→verify→NG なら再統合(MAX_ROUNDS まで)。
+    戻り値: {"answer": 最終キー or None, "text": 最終本文, "n_samples": 総サンプル数,
+             "n_steps": 段数, "pool_kinds": 各段の kind}"""
+    steps = decompose(question) if FUGU_DECOMPOSE else [{"goal": question}]
+    if len(steps) > 1:
+        print(f"   [U] {len(steps)} 段に分解:")
+        for i, s in enumerate(steps):
+            print(f"      段{i + 1}: {s['goal'][:80]}")
+    ctx = []
+    total = 0
+    kinds = []
+    last_result = None
+    for si, step in enumerate(steps):
+        cands = sample_step(step, question, ctx, STEP_VOTES_INIT)
+        total += len(cands)
+        result = pool(question, cands)
+        early = (FUGU_EARLY_UNANIMOUS and result.kind == "hard"
+                 and result.confirmed and result.agreement == 1.0)
+        while (not early and not result.confirmed
+               and len(cands) < STEP_VOTES_MAX):
+            more = sample_step(step, question, ctx, STEP_VOTES_STEP)
+            cands += more
+            total += len(more)
+            result = pool(question, cands)
+        if (not result.confirmed and FUGU_HIERARCHICAL):
+            subs = decompose(step["goal"], parent=question, depth=1)
+            if len(subs) > 1:
+                print(f"   [U] 段{si + 1} が割れたため再分解 ({len(subs)} 副段)")
+                sctx = list(ctx)
+                for sub in subs:
+                    scands = sample_step(sub, question, sctx, STEP_VOTES_INIT)
+                    total += len(scands)
+                    sres = pool(question, scands)
+                    sctx.append(f"[{sub['goal'][:100]}] -> {_step_conclusion(sres)[:200]}")
+                cands2 = sample_step(step, question, sctx, STEP_VOTES_INIT)
+                total += len(cands2)
+                result = pool(question, cands + cands2)
+        kinds.append(result.kind)
+        agree = f"{result.agreement:.2f}" if result.agreement is not None else "-"
+        print(f"   [U] 段{si + 1}/{len(steps)} 確定={result.confirmed} "
+              f"kind={result.kind} agree={agree} ({result.n_valid}/{result.n_total})")
+        ctx.append(f"[stage {si + 1}: {step['goal'][:100]}] "
+                   f"CONCLUSION: {_step_conclusion(result)[:300]}")
+        last_result = result
+    if len(steps) == 1 and last_result is not None:
+        final_text = last_result.answer
+        final_key = last_result.key
+    else:
+        final_text = compose(question, steps, ctx)
+        fk = extract_key(final_text, question)
+        final_key = fk[1] if fk else None
+    r = 1
+    while r < MAX_ROUNDS:
+        ok, issue = verify(question, final_text)
+        if ok:
+            break
+        print(f"   [U] verify NG (round {r}): {str(issue)[:80]} → 再統合")
+        final_text = compose(question, steps,
+                             ctx + [f"[Reviewer found this issue -- fix it] {issue}"])
+        fk = extract_key(final_text, question)
+        if fk:
+            final_key = fk[1]
+        r += 1
+    return {"answer": final_key, "text": final_text, "n_samples": total,
+            "n_steps": len(steps), "pool_kinds": kinds}
 
 
 if __name__ == "__main__":

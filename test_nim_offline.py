@@ -899,6 +899,71 @@ try:
     check("machine: SC_MACHINE=Falseは機械呼び出しゼロで従来どおり",
           res is not None and res["answer"] == "384" and mcalls["machine"] == 0)
 
+    # --- 機械裁定 v2 (sc11): 生成失敗の補充 + コード審査で決着 (2026-08-06) ---
+    f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_AUDIT, f.SC_CHALLENGER = True, False, False, False
+    f.SC_MACHINE, f.SC_MACHINE_ARBITRATE = True, True
+    _saved_mn = (f.SC_MACHINE_N, f.SC_MACHINE_MAX_TRIES)
+    f.SC_MACHINE_N, f.SC_MACHINE_MAX_TRIES = 3, 6
+    def _mk_m2_ask(verdicts, gens, reviews):
+        calls = {"court": 0, "machine": 0, "review": 0}
+        def fake_ask(model, messages, temp=0.5, **kw):
+            lbl = kw.get("label")
+            if lbl == "court":
+                v = verdicts[calls["court"] % len(verdicts)]; calls["court"] += 1
+                return f"...\nVERDICT: {v}"
+            if lbl == "machine":
+                g = gens[calls["machine"]] if calls["machine"] < len(gens) else "__ERROR__: x"
+                calls["machine"] += 1
+                return g if g.startswith("__ERROR__") else f"```python\n{g}\n```"
+            if lbl == "machine-review":
+                r = reviews[calls["review"] % len(reviews)]; calls["review"] += 1
+                return f"...\nPROGRAM: {r}"
+            return "\\boxed{NONE}"
+        return fake_ask, calls
+    # I-12 完全再現: 言語側24が確定 → プログラムは 1 / 385 で割れる → コード審査で385
+    fake, st = _mk_sampler(["24", "24", "24", "16", "16", "8", None, None])
+    f._sc_sample = fake
+    # 実行に成功するのは 2 本(出力 1 と 385)なので、審査のラベルは A=1 / B=385
+    f.ask, m2 = _mk_m2_ask(["A", "A", "A"],
+                           ["print(1)", "__ERROR__: empty", "print(385)", "__ERROR__: empty"],
+                           ["B", "B", "A"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        res = f.solve_verifiable("dummy", "math")
+    _log = buf.getvalue()
+    check("machine-v2: 生成失敗を補充して実行成功本を集める", "補充へ" in _log)
+    check("machine-v2: 割れた出力をコード審査で決着させ385を採用",
+          res is not None and res["answer"] == "385")
+    check("machine-v2: コード審査の決着がログに出る", "コード審査で決着" in _log)
+    # 2本一致するなら従来どおりコード審査は不要
+    fake, st = _mk_sampler(["24", "24", "24", "16", "16", "8", None, None])
+    f._sc_sample = fake
+    f.ask, m2 = _mk_m2_ask(["A", "A", "A"], ["print(385)", "print(385)"], ["A"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("machine-v2: 2本一致なら従来経路で採用(コード審査は呼ばない)",
+          res is not None and res["answer"] == "385" and m2["review"] == 0)
+    # 審査が過半数に達しなければ棄権して言語側を維持
+    fake, st = _mk_sampler(["24", "24", "24", "16", "16", "8", None, None])
+    f._sc_sample = fake
+    f.ask, m2 = _mk_m2_ask(["A", "A", "A"], ["print(1)", "print(385)", "print(7)"],
+                           ["A", "B", "C"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("machine-v2: 審査が割れたら棄権して言語側24を維持",
+          res is not None and res["answer"] == "24")
+    # ARBITRATE=False は sc10 の挙動のまま(棄権)
+    f.SC_MACHINE_ARBITRATE = False
+    fake, st = _mk_sampler(["24", "24", "24", "16", "16", "8", None, None])
+    f._sc_sample = fake
+    f.ask, m2 = _mk_m2_ask(["A", "A", "A"], ["print(1)", "print(385)"], ["B"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = f.solve_verifiable("dummy", "math")
+    check("machine-v2: ARBITRATE=False は sc10 と同じく棄権(24のまま)",
+          res is not None and res["answer"] == "24" and m2["review"] == 0)
+    f.SC_MACHINE, f.SC_MACHINE_ARBITRATE = False, False
+    f.SC_MACHINE_N, f.SC_MACHINE_MAX_TRIES = _saved_mn
+
     # --- rescue 統合: 抽出失敗2票を回収して全会一致で確定 ---
     f.SC_COURT, f.SC_RESCUE_VOTES = False, True
     _t248 = ("reasoning " * 40) + " so the answer is 248 clearly but"
@@ -925,6 +990,195 @@ finally:
     f.installed_models = _orig_installed
     for k, v in _saved_court.items():
         setattr(f, k, v)
+
+# ---------- 12d. 統合 MoA (UNIFIED_MOA_SPEC §7, 2026-08-05) ----------
+_saved_u = {k: getattr(f, k) for k in
+            ("FUGU_UNIFIED", "FUGU_DECOMPOSE", "FUGU_HIERARCHICAL", "FUGU_RESIDUAL",
+             "FUGU_EXEC_KEY", "FUGU_EARLY_UNANIMOUS", "POOL_MIN_KEYS",
+             "DECOMP_VOTES", "DECOMP_MAX_DEPTH", "ARBITER_MODEL",
+             "REASONING_MODELS", "PROPOSERS", "SC_PARALLEL", "SC_WORKERS",
+             "SC_STRATIFY", "SC_MIN_VOTES")}
+_orig_ask_u = f.ask
+_orig_agg_u = f.aggregate
+_orig_installed_u = f.installed_models
+try:
+    # (13) 最重要: 既定でマスタスイッチ OFF(既存経路ビット同一の前提)
+    check("unified: FUGU_UNIFIED は既定 False", _saved_u["FUGU_UNIFIED"] is False)
+
+    # (1)(2) extract_key の優先順位と None
+    check("unified: math キー発火", f.extract_key("thus \\boxed{42}") == ("math", "42"))
+    _mcq = f.extract_key("After comparing all options, the correct choice is \\boxed{C}")
+    check("unified: mcq キー発火", _mcq is not None and _mcq[0] == "mcq" and _mcq[1].upper() == "C")
+    check("unified: キー無しは None", f.extract_key("no conclusion drawn here at all") is None)
+
+    # (12) exec キー: 実装の異なる2コードが同出力なら同一キー
+    _q_exec = "Implement add(a, b).\n>>> add(2, 3)\n>>> add(10, -4)"
+    _c1 = "answer:\n```python\ndef add(a, b):\n    return a + b\n```"
+    _c2 = "another:\n```python\ndef add(x, y):\n    s = x\n    s += y\n    return s\n```"
+    _c3 = "wrong:\n```python\ndef add(a, b):\n    return a - b\n```"
+    f.FUGU_EXEC_KEY = True
+    _k1 = f.extract_key(_c1, _q_exec)
+    _k2 = f.extract_key(_c2, _q_exec)
+    _k3 = f.extract_key(_c3, _q_exec)
+    check("unified: exec キー発火(kind=exec)", _k1 is not None and _k1[0] == "exec")
+    check("unified: 実装違い同出力→同一キー", _k1 == _k2)
+    check("unified: 挙動が違えば別キー", _k3 is not None and _k3[1] != _k1[1])
+
+    # (3)(4) pool: ハード/ソフトの落ち方と確定条件(既存SCと同一)
+    f.aggregate = lambda q, props: "SOFT-MERGED"
+    f.POOL_MIN_KEYS, f.SC_MIN_VOTES = 3, 3
+    _r = f.pool("q", ["\\boxed{7}", "\\boxed{7}", "\\boxed{7}"])
+    check("unified: 有効キー3でハード・全会一致n>=3で確定",
+          _r.kind == "hard" and _r.confirmed and _r.key == "7")
+    _r = f.pool("q", ["\\boxed{7}", "\\boxed{7}", "no key here at all"])
+    check("unified: 有効キー2はソフトへ(aggregate統合・confirmed)",
+          _r.kind == "soft" and _r.confirmed and _r.answer == "SOFT-MERGED")
+    _r = f.pool("q", ["\\boxed{7}", "\\boxed{7}", "\\boxed{7}", "\\boxed{9}"])
+    check("unified: n>=4かつ過半数(3/4)で確定", _r.kind == "hard" and _r.confirmed)
+    _r = f.pool("q", ["\\boxed{7}", "\\boxed{7}", "\\boxed{9}", "\\boxed{9}"])
+    check("unified: 2-2同数は未確定", _r.kind == "hard" and not _r.confirmed)
+
+    # (5) kind 混在: 多数派 kind のみ有効票
+    _mix = ["\\boxed{7}", "\\boxed{7}", "\\boxed{7}", _c1, _c2]
+    _r = f.pool(_q_exec, _mix)
+    check("unified: kind混在は多数派(math)のみ有効票",
+          _r.kind == "hard" and _r.n_valid == 3 and _r.key == "7")
+
+    # (6)(7)(8) decompose: 縮退・深さ上限・分解投票
+    f.installed_models = lambda: []
+    f.ARBITER_MODEL = None
+    f.REASONING_MODELS = ["m/a", "m/b", "m/c"]
+    f.PROPOSERS = ["m/a", "m/b", "m/c"]
+    f.DECOMP_VOTES, f.DECOMP_MAX_DEPTH = 3, 2
+    _dec_calls = [0]
+    def fake_decomp_ask(model, messages, temp=0.5, **kw):
+        if kw.get("label") == "decomp":
+            _dec_calls[0] += 1
+            plans = ['{"steps": [{"goal": "A"}, {"goal": "B"}, {"goal": "C"}]}',
+                     '{"steps": [{"goal": "X"}, {"goal": "Y"}]}',
+                     '{"steps": [{"goal": "P"}, {"goal": "Q"}, {"goal": "R"}]}']
+            return plans[(_dec_calls[0] - 1) % 3]
+        return "\\boxed{5}"
+    f.ask = fake_decomp_ask
+    _steps = f.decompose("problem")
+    check("unified: 分解投票で段数最頻(3段)を採用",
+          len(_steps) == 3 and _steps[0]["goal"] == "A")
+    check("unified: 深さ上限で分解しない",
+          f.decompose("problem", depth=2) == [{"goal": "problem"}])
+    f.ask = lambda *a, **kw: '{"steps": [{"goal": "only-one"}]}'
+    check("unified: 2段未満は縮退", f.decompose("problem") == [{"goal": "problem"}])
+    f.ask = lambda *a, **kw: "__ERROR__: down"
+    check("unified: 分解失敗も縮退", f.decompose("problem") == [{"goal": "problem"}])
+
+    # (9)(10) sample_step: 残差結合と因果性
+    _seen_u = []
+    def fake_step_ask(model, messages, temp=0.5, **kw):
+        _seen_u.append(messages[-1]["content"])
+        return "work...\nCONCLUSION: done \\boxed{1}"
+    f.ask = fake_step_ask
+    f.SC_PARALLEL, f.SC_STRATIFY = False, False
+    f.FUGU_RESIDUAL = True
+    f.sample_step({"goal": "goal-K"}, "ORIGINAL-Q", ["c1-done", "c2-done"], 1)
+    check("unified: 残差結合で原問題がプロンプトに入る", "ORIGINAL-Q" in _seen_u[-1])
+    check("unified: 因果文脈(段1..k-1)が入り、段kのゴール以外の未来情報が無い",
+          "c1-done" in _seen_u[-1] and "c2-done" in _seen_u[-1]
+          and "goal-K" in _seen_u[-1])
+    f.FUGU_RESIDUAL = False
+    f.sample_step({"goal": "goal-K"}, "ORIGINAL-Q", [], 1)
+    check("unified: FUGU_RESIDUAL=False では原問題を含めない",
+          "ORIGINAL-Q" not in _seen_u[-1])
+    f.FUGU_RESIDUAL = True
+
+    # (11) 並列時の回収が投入順で決定的
+    import time as _t_u
+    _delays = {0: 0.05, 1: 0.03, 2: 0.01}
+    _ncall = [0]
+    def fake_par_ask(model, messages, temp=0.5, **kw):
+        i = _ncall[0]; _ncall[0] += 1
+        _t_u.sleep(_delays.get(i % 3, 0))
+        return f"CONCLUSION: \\boxed{{{i}}}"
+    f.ask = fake_par_ask
+    f.SC_PARALLEL, f.SC_WORKERS = True, 4
+    _outs = f.sample_step({"goal": "g"}, "q", [], 3)
+    check("unified: 並列でも回収は投入順",
+          [f.extract_key(o)[1] for o in _outs] == ["0", "1", "2"])
+finally:
+    f.ask = _orig_ask_u
+    f.aggregate = _orig_agg_u
+    f.installed_models = _orig_installed_u
+    for k, v in _saved_u.items():
+        setattr(f, k, v)
+
+# ---------- 12e. 思考テキストからの答え回収 (2026-08-06, rank1) ----------
+# 抽出ラダー単体
+check("salvage: \\boxed{} を回収",
+      f._salvage_from_thinking("考えている" * 20 + " so \\boxed{385} done")[0] == "385")
+check("salvage: マーカー付きの値を回収",
+      f._salvage_from_thinking("計算" * 30 + " Final Answer: 248 で確定")[0] == "248")
+check("salvage: 日本語マーカーも拾う",
+      f._salvage_from_thinking("検討" * 30 + " よって答えは 60 である")[0] == "60")
+check("salvage: 裸の最終数値は拾わない(中間値の誤採用を防ぐ)",
+      f._salvage_from_thinking("途中式 12 + 34 = 46 なので次に 99 を計算" * 5)[0] is None)
+check("salvage: 短すぎる思考は対象外",
+      f._salvage_from_thinking("短い")[0] is None)
+check("salvage: 複数マーカーは後ろを採用(結論はより後ろ)",
+      f._salvage_from_thinking("x" * 60 + " answer: 11 ... 訂正して final answer: 22")[0] == "22")
+check("salvage: mcq で数値が来たら棄却",
+      f._salvage_from_thinking("y" * 60 + " the answer is 42", "mcq")[0] is None)
+
+# _send 統合: reasoning_content のみで content 空 → 回収して \boxed{} で返す
+def sse_reasoning_only(think, finish="length"):
+    lines = [("data: " + json.dumps(
+        {"choices": [{"delta": {"reasoning_content": think}}]}) + "\n").encode(),
+        ("data: " + json.dumps(
+            {"choices": [{"delta": {}, "finish_reason": finish}]}) + "\n").encode(),
+        b"data: [DONE]\n"]
+    return FakeResponse(sse_lines=lines)
+
+_saved_sv = (f.NIM_SALVAGE_THINKING, f.NIM_SALVAGE_LOG, dict(f.NIM_FAIL_COUNTS))
+try:
+    f.NIM_SALVAGE_LOG = False
+    _think = "長い思考" * 40 + " Final Answer: 385"
+    f.NIM_SALVAGE_THINKING = False
+    out, _s, _ = run_mocked([sse_reasoning_only(_think)],
+                            lambda: f.ask("test/model", MSGS, 0.5, num_predict=100))
+    check("salvage: 既定(False)では従来どおり __ERROR__: truncated",
+          out.startswith("__ERROR__: truncated"))
+    f.NIM_SALVAGE_THINKING = True
+    for k in f.NIM_FAIL_COUNTS:
+        f.NIM_FAIL_COUNTS[k] = 0
+    out, _s, _ = run_mocked([sse_reasoning_only(_think)],
+                            lambda: f.ask("test/model", MSGS, 0.5, num_predict=100))
+    check("salvage: 有効時は回収して boxed で返す", out == "\\boxed{385}")
+    check("salvage: 呼び出し側の抽出器が拾える",
+          f.extract_final_answer(out, "math") == "385")
+    check("salvage: 型Aとして計上される",
+          f.NIM_FAIL_COUNTS["A_think_only"] >= 1 and f.NIM_FAIL_COUNTS["A_salvaged"] >= 1)
+    for k in f.NIM_FAIL_COUNTS:
+        f.NIM_FAIL_COUNTS[k] = 0
+    out, _s, _ = run_mocked([FakeResponse(sse_lines=[
+        ("data: " + json.dumps({"choices": [{"delta": {},
+         "finish_reason": "length"}]}) + "\n").encode(), b"data: [DONE]\n"])],
+        lambda: f.ask("test/model", MSGS, 0.5, num_predict=100))
+    # truncated は max_tokens 倍増リトライを起こすので送信は2回。カウントも2になる
+    check("salvage: 思考も本文も空は型Bとして計上",
+          f.NIM_FAIL_COUNTS["B_both_empty"] >= 1
+          and f.NIM_FAIL_COUNTS["A_think_only"] == 0
+          and out.startswith("__ERROR__"))
+    for k in f.NIM_FAIL_COUNTS:
+        f.NIM_FAIL_COUNTS[k] = 0
+    out, _s, _ = run_mocked([sse_reasoning_only("中間値 7 と 13 を計算" * 20)],
+                            lambda: f.ask("test/model", MSGS, 0.5, num_predict=100))
+    check("salvage: マーカー無しは回収せず従来どおり無効票",
+          out.startswith("__ERROR__") and f.NIM_FAIL_COUNTS["A_salvage_failed"] >= 1
+          and f.NIM_FAIL_COUNTS["A_salvaged"] == 0)
+    # 本文がある通常応答には一切影響しない
+    out, _s, _ = run_mocked([ok_body("normal")],
+                            lambda: f.ask("test/model", MSGS, 0.5))
+    check("salvage: 本文がある応答は不変", out == "normal")
+finally:
+    f.NIM_SALVAGE_THINKING, f.NIM_SALVAGE_LOG, _c = _saved_sv
+    f.NIM_FAIL_COUNTS.update(_c)
 
 # ---------- 13. 採点正規化の表記ゆれ吸収 (2026-08-04, math500実測NGの回帰) ----------
 check("norm: 度数 30^\\circ == 30", f.answers_equivalent("30", "30^\\circ"))
