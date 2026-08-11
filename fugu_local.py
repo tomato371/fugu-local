@@ -106,6 +106,54 @@ NIM_REQUEST_COUNT = 0         # 本プロセスの HTTP 送信数（リトライ
 _NIM_SEMAPHORE = threading.Semaphore(NIM_MAX_CONCURRENCY)
 _NIM_COUNT_LOCK = threading.Lock()
 
+# --- 起動時のモデル選抜 (2026-08-08) ---------------------------------------
+# 固定 ID の直置きは腐る。実測: mistral-medium-3.5-128b は 2026-08-07 09:00 UTC に
+# 提供終了して 410 Gone、deepseek-v4-pro はカタログから消滅、kime-k2.6 は掲載のまま
+# 推論 404。4 体編成のうち 2 枠が死んだまま毎ラウンド 1 回を 410 に溶かしていた。
+# そこで /v1/models と突き合わせ、規模順に生存プローブして上位 N 体を採用する。
+NIM_AUTO_SELECT = os.environ.get("FUGU_NIM_PIN", "") == ""   # FUGU_NIM_PIN=1 で旧固定布陣
+NIM_PICK_COUNT = int(os.environ.get("FUGU_NIM_PICKS", "5") or "5")
+NIM_PROBE_MAX = 16            # プローブ回数の上限(1体1リクエスト)。40RPM を踏まない範囲
+NIM_PROBE_WORKERS = 4
+NIM_PROBE_TIMEOUT = 20        # 1回目の生存プローブ
+NIM_PROBE_TIMEOUT_SLOW = 75   # コールドスタート組の再確認（glm-5.2 が該当）
+# ID に規模が書かれていないフラッグシップの公称規模(概算)。順位付けにのみ使い、
+# 表に無いものは規模不明として既知大型の後ろへ回す(除外はしない)。
+NIM_NOMINAL_B = {
+    "moonshotai/kimi-k2.6": 1000,
+    "minimaxai/minimax-m3": 456,
+    "ai21labs/jamba-1.5-large-instruct": 398,
+    "z-ai/glm-5.2": 355,
+    "deepseek-ai/deepseek-v4-flash-0731": 200,
+    "databricks/dbrx-instruct": 132,
+    "mistralai/mistral-large-2-instruct": 123,
+    "mistralai/mistral-large": 123,
+    "mistralai/mistral-nemotron": 120,
+    "01-ai/yi-large": 100,
+    "stepfun-ai/step-3.7-flash": 100,
+    "thinkingmachines/inkling": 100,
+    "microsoft/phi-3.5-moe-instruct": 42,
+}
+# 汎用推論に使えないもの: 埋め込み/再ランク/安全/音声/画像/生物 と、
+# 用途特化(医療・金融・創作)・コード専用・旧世代・小型を落とす。
+NIM_EXCLUDE_RE = re.compile(
+    r"embed|rerank|guard|safety|ocr|parse|asr|tts|speech|riva|vision|-vl-|clip|"
+    r"retrieval|nemoguard|reward|diffusion|flux|stable|sana|maisi|molmo|protein|"
+    r"esm|genmol|diffdock|synthetic|deplot|kosmos|vila|neva|fuyu|"
+    r"palmyra-(?:med|fin|creative)|chatqa|cosmos|ising|sea-lion|"
+    r"code|starcoder|codestral|codegemma|codellama|"
+    r"llama2-|recurrentgemma|minitron|nemotron-mini|zamba", re.I)
+# Conductor は毎問通る司令塔。要件は「速い・JSON が崩れない」だけなので大型は選ばない。
+NIM_CONDUCTOR_CANDIDATES = [
+    "meta/llama-3.1-8b-instruct",
+    "nvidia/llama-3.1-nemotron-nano-8b-v1",
+    "ibm/granite-3.0-8b-instruct",
+    "google/gemma-3-12b-it",
+    "meta/llama-3.3-70b-instruct",
+]
+_NIM_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", re.I)
+_NIM_MOE_RE = re.compile(r"(\d+(?:\.\d+)?)b-a(\d+(?:\.\d+)?)b", re.I)
+
 # --- モデルの役割 ---
 # Conductor + Critic: qwen3:4b（軽量・高速・JSON安定。ルーティング専用、VRAM常駐最小化）
 # Proposers: qwen3-coder:30b(コード特化MoE) / phi4(数学・PINN・物理) / gpt-oss:20b(汎用推論MoE)
@@ -251,25 +299,146 @@ def apply_high_vram_profile():
 # global 一括上書き。setup() が FUGU_BACKEND=="nim" を判定して呼ぶ。
 # モデル ID は 2026-08 時点の build.nvidia.com カタログ準拠。実在照合は本関数内で
 # /v1/models と突合して警告する（ネットワーク不通なら黙ってスキップ＝致命でない）。
-def _nim_model_available(model):
+def _nim_probe(model, timeout=None):
     """モデル可用性の軽量プローブ（1リクエスト・非ストリーム・max_tokens=4）。
-    2026-08-03 実測: NIM はモデル単位で混雑 429 / カタログ掲載のまま 404 を返すことが
-    あり、時間帯で回復する。プロファイル適用時（=ジョブごとの新プロセス起動時）に
-    プローブし、その時点で使える最強布陣を組む。"""
+
+    'ok' / 'gone'（恒久的に使えない）/ 'slow'（冷え・混雑。再試行の価値あり）を返す。
+    2026-08-08 実測: カタログ掲載でもアカウントに付与されていないものは
+    404 "Not found for account" を即返す一方、z-ai/glm-5.2 や deepseek-v4-flash は
+    初回だけ 20 秒では応答しない（コールドスタート）。この 2 つを同じ「NG」に潰すと
+    使えるモデルを取りこぼすため、恒久失敗と一時失敗を区別する。"""
+    payload = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 4, "stream": False}
+    req = urllib.request.Request(
+        f"{NIM_URL}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {NIM_API_KEY}"},
+        method="POST")
+    _nim_count_request()
     try:
-        payload = {"model": model, "messages": [{"role": "user", "content": "hi"}],
-                   "max_tokens": 4, "stream": False}
-        req = urllib.request.Request(
-            f"{NIM_URL}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {NIM_API_KEY}"},
-            method="POST")
-        _nim_count_request()
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.status == 200
+        with urllib.request.urlopen(req, timeout=timeout or NIM_PROBE_TIMEOUT) as r:
+            return "ok" if r.status == 200 else "slow"
+    except urllib.error.HTTPError as e:
+        return "gone" if e.code in (401, 403, 404, 410) else "slow"
     except Exception:
-        return False
+        return "slow"
+
+
+def _nim_model_available(model):
+    """旧シグネチャ（bool）。固定布陣の分岐と外部呼び出し互換のために残す。"""
+    return _nim_probe(model) == "ok"
+
+
+def _nim_catalog():
+    """/v1/models の ID 集合。不通なら空集合（呼び出し側が固定布陣へ退避）。"""
+    try:
+        req = urllib.request.Request(
+            f"{NIM_URL}/models", headers={"Authorization": f"Bearer {NIM_API_KEY}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode()).get("data", [])
+        return {m.get("id") for m in data if isinstance(m, dict) and m.get("id")}
+    except Exception:
+        return set()
+
+
+def _nim_scale_of(mid):
+    """順位付け用の (総パラメータB, 活性B)。ID から読めなければ公称表、無ければ (0,0)。"""
+    m = _NIM_MOE_RE.search(mid)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    nums = [float(x) for x in _NIM_SIZE_RE.findall(mid)]
+    if nums:
+        top = max(nums)
+        return top, top
+    nominal = NIM_NOMINAL_B.get(mid)
+    if nominal:
+        return float(nominal), float(nominal)
+    return 0.0, 0.0
+
+
+def _nim_rank_candidates(catalog):
+    """汎用推論に使えそうなものを規模の大きい順に並べる。規模不明は既知大型の後ろ。"""
+    rows = []
+    for mid in catalog:
+        if NIM_EXCLUDE_RE.search(mid):
+            continue
+        total, active = _nim_scale_of(mid)
+        # 規模不明(0)は最後尾へ回すが候補からは落とさない
+        rows.append((0 if total else 1, -total, -active, mid))
+    rows.sort()
+    return [r[3] for r in rows]
+
+
+def _nim_pick_live(ranked, need):
+    """規模順に生存プローブし、生きているものを need 体そろえる。
+
+    上位から NIM_PROBE_WORKERS 体ずつ試し、そろった時点で打ち切る。全部生きていれば
+    プローブは need 回前後で済み、無駄なリクエストを撒かない。
+    足りなければ、恒久失敗(404 等)を除く「冷えていただけ」の候補を長めの待ちで
+    もう一度だけ叩く。glm-5.2 のようなコールドスタート組を取りこぼさないため。
+    """
+    alive, slow, checked = [], [], 0
+    for i in range(0, min(len(ranked), NIM_PROBE_MAX), NIM_PROBE_WORKERS):
+        batch = ranked[i:i + NIM_PROBE_WORKERS]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as ex:
+            results = list(ex.map(_nim_probe, batch))
+        checked += len(batch)
+        for mid, status in zip(batch, results):
+            if status == "ok":
+                alive.append(mid)
+            else:
+                if status == "slow":
+                    slow.append(mid)
+                print(f"[setup] nim probe: {mid} = "
+                      f"{'NG（未付与/廃止）' if status == 'gone' else '応答なし（後で再試行）'}")
+        if len(alive) >= need:
+            return alive[:need], checked
+
+    for i in range(0, len(slow), NIM_PROBE_WORKERS):
+        batch = slow[i:i + NIM_PROBE_WORKERS]
+        print(f"[setup] nim: 生存 {len(alive)} 体。冷えていた {len(batch)} 体を"
+              f"{NIM_PROBE_TIMEOUT_SLOW}秒待ちで再確認します")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as ex:
+            results = list(ex.map(lambda m: _nim_probe(m, NIM_PROBE_TIMEOUT_SLOW), batch))
+        checked += len(batch)
+        for mid, status in zip(batch, results):
+            if status == "ok":
+                print(f"[setup] nim probe: {mid} = OK（再試行で応答）")
+                alive.append(mid)
+        if len(alive) >= need:
+            break
+    return alive[:need], checked
+
+
+def _nim_tuning_for(mid):
+    """モデル系統から思考の効かせ方を決める。ID 直置きをやめた以上、設定も系統で引く。"""
+    cfg = {"num_predict": 16384}
+    if "gpt-oss" in mid or "mistral-medium" in mid or "magistral" in mid:
+        cfg["think"] = "high"                      # reasoning_effort が効く系統
+    elif re.search(r"nemotron-3|nemotron-4", mid):
+        # build.nvidia.com のサンプル準拠。chat_template_kwargs で思考を開ける
+        cfg["nim_extra"] = {"chat_template_kwargs": {"enable_thinking": True},
+                            "reasoning_budget": 16384}
+    return cfg
+
+
+def _nim_diverse_three(picked):
+    """SC の 3 系統は系譜を散らす。同一ベンダーで揃えると票の独立性が落ちる。"""
+    chosen, seen = [], set()
+    for mid in picked:
+        vendor = mid.split("/", 1)[0]
+        if vendor not in seen:
+            chosen.append(mid)
+            seen.add(vendor)
+        if len(chosen) == 3:
+            return chosen
+    for mid in picked:                              # ベンダーが足りなければ順位で埋める
+        if mid not in chosen:
+            chosen.append(mid)
+        if len(chosen) == 3:
+            break
+    return chosen
 
 
 def apply_nim_profile():
@@ -285,29 +454,59 @@ def apply_nim_profile():
         return False
     print("[setup] FUGU_BACKEND=nim → NIM クラウドプロファイルを適用します")
 
-    # ID は 2026-08-02 に /v1/models で実在確認済み（計画時の r1/v3.1/405b/qwen3-235b/
-    # kimi-k2-instruct は現行カタログから消えており、後継へ差し替えた）。
-    cond = "meta/llama-3.1-8b-instruct"                    # Conductor/Critic: JSON 安定・軽量
-    prop_a = "openai/gpt-oss-120b"                         # 汎用推論 (reasoning_effort=high)
-    # 可用性プローブ (2026-08-03): kimi-k2.6 はカタログ掲載のまま 404、deepseek-v4-pro は
-    # 時間帯混雑 429 を実測。どちらも回復し次第この分岐が自動で強い方を選ぶ。
-    kimi = "moonshotai/kimi-k2.6"
-    kimi_ok = _nim_model_available(kimi)
-    prop_b = kimi if kimi_ok else "mistralai/mistral-medium-3.5-128b"
-    print(f"[setup] nim probe: kimi-k2.6={'OK' if kimi_ok else 'NG'} -> Proposer B = {prop_b}")
-    prop_c = "nvidia/nemotron-3-ultra-550b-a55b"           # 集約・大規模 (550B A55B MoE 思考型。
-                                                           # 思考は nim_extra の
-                                                           # chat_template_kwargs で有効化)
-    prop_d = "deepseek-ai/deepseek-v4-pro"                 # 理数・思考 (deepseek-r1 系後継。
-                                                           # 思考は既定 ON なのでパラメータ不要)
-    agg = "z-ai/glm-5.2"                                   # 統合 (v3.1 廃止 → GLM フラッグシップ)
-    jp_agg = "z-ai/glm-5.2"        # 日本語統合。qwen 系がカタログから消滅したため GLM で代替。
-                                   # 「JP は qwen3 で統合」のローカル教訓 (deepseek-r1 蒸留の
-                                   # 中国語混入) とは別物のフラッグシップだが、jmmlu ベンチと
-                                   # 対話 JP 1 問で実地検証すること。不良なら gemma-4-31b-it へ。
-    second = "mistralai/mistral-medium-3.5-128b"   # conductor(llama系)と別系統の独立チェック
-                                                   # (思考型。reasoning_effort が効く実サンプル確認済)
-    sc_third = "minimaxai/minimax-m3"              # SC 第3系統 (思考型・独立系譜)
+    # --- 起動時選抜 --------------------------------------------------------
+    # 固定 ID は腐る（2026-08-08 実測: 4 体中 2 体が提供終了/カタログ消滅）。
+    # /v1/models と突き合わせ、規模の大きい順に生存プローブして上位を採用する。
+    picked = []
+    if NIM_AUTO_SELECT:
+        catalog = _nim_catalog()
+        if catalog:
+            ranked = _nim_rank_candidates(catalog)
+            picked, probed = _nim_pick_live(ranked, NIM_PICK_COUNT)
+            print(f"[setup] nim 選抜: カタログ {len(catalog)} 件 → 候補 {len(ranked)} 件 → "
+                  f"{probed} 体プローブ → 採用 {len(picked)} 体")
+            for n, mid in enumerate(picked, 1):
+                tot, act = _nim_scale_of(mid)
+                if not tot:
+                    label = "規模不明"
+                elif act and act != tot:
+                    label = f"{tot:.0f}B/a{act:.0f}B"
+                else:
+                    label = f"{tot:.0f}B"
+                print(f"           {n}. {mid}  ({label})")
+        else:
+            print("⚠ [nim] /v1/models に到達できません。固定布陣へ退避します")
+
+    if len(picked) >= 4:
+        prop_a, prop_b, prop_c, prop_d = picked[0], picked[1], picked[2], picked[3]
+        agg = picked[4] if len(picked) >= 5 else picked[1]
+        second = picked[1]          # conductor と別系統の独立チェック
+        sc_third = _nim_diverse_three(picked)[2]
+    else:
+        # 退避: 2026-08-02 に実在確認した固定布陣。FUGU_NIM_PIN=1 でもここへ来る。
+        if NIM_AUTO_SELECT:
+            print("⚠ [nim] 生存モデルが 4 体に満たないため固定布陣へ退避します")
+        prop_a = "openai/gpt-oss-120b"
+        kimi = "moonshotai/kimi-k2.6"
+        prop_b = kimi if _nim_model_available(kimi) else "mistralai/mistral-medium-3.5-128b"
+        prop_c = "nvidia/nemotron-3-ultra-550b-a55b"
+        prop_d = "deepseek-ai/deepseek-v4-pro"
+        agg = "z-ai/glm-5.2"
+        second = "mistralai/mistral-medium-3.5-128b"
+        sc_third = "minimaxai/minimax-m3"
+        picked = [prop_a, prop_b, prop_c, prop_d, agg]
+
+    # Conductor は「速くて JSON が崩れない」ことだけが要件なので大型は選ばない。
+    cond = ""
+    for cand in NIM_CONDUCTOR_CANDIDATES:
+        if _nim_model_available(cand):
+            cond = cand
+            break
+    if not cond:
+        cond = NIM_CONDUCTOR_CANDIDATES[0]
+        print(f"⚠ [nim] Conductor 候補が全滅。{cond} をそのまま使います")
+    print(f"[setup] nim: conductor = {cond}")
+    jp_agg = agg                   # 日本語統合。qwen 系が消滅したため統合役を兼ねる
 
     DESIRED_PROPOSERS = [prop_a, prop_b, prop_c, prop_d]
     DESIRED_AGGREGATOR = agg
@@ -325,60 +524,50 @@ def apply_nim_profile():
         prop_c: "あなたは『Geminiの存在』。RAG(Office文書)のコンテキスト分析、大量ドキュメントとWeb検索結果の集約を担当する。",
         prop_d: "あなたは理数・物理・PINN(物理情報ニューラルネット)・偏微分方程式の専門家。厳密に段階を追って考える。",
     }
-    # 混雑・可用性メモ (2026-08-03 朝): deepseek-v4-pro は時間帯によりモデル単体で 429 が
-    # 続く（アカウント上限とは別のキャパシティ throttle）。MoA の Proposer D としては残す
-    # （落ちても MoA は縮退で耐える）が、精度の生命線である SC 投票系統と裁定からは外し、
-    # 可用性実測済みの nemotron-3-ultra 550B (prop_c, 思考型) を昇格させる。
     # ロード時導出 (:82 相当) は旧ローカル ID で陳腐化するため必ず再導出する
     MODEL_TO_PERSONA = {v: k for k, v in PERSONA_MODELS.items()}
-    PROPOSER_PROFILES = {
-        prop_a: "ChatGPT(GPT)の存在。バランス・一般的な対話・文章の骨組み (OpenAI OSS MoE 120B・思考high対応)",
-        prop_b: "Claudeの存在。高度なプログラミング・厳密な論理チェック・自己修復 (Mistral Medium 3.5 128B 思考型)",
-        prop_c: "Geminiの存在。RAG(Office文書)分析・大量ドキュメント・Web検索結果の集約 (Nemotron-3 Ultra 550B 思考型)",
-        prop_d: "理数・物理・PINN・偏微分方程式・アルゴリズム証明に強い思考型 (DeepSeek V4 Pro)",
-    }
+    # 役割の説明はスロットに固定し、モデル名と規模だけを実物から差し込む。
+    # ID を直書きしていた頃はモデルを差し替えるたびにここが嘘になっていた。
+    _slot_roles = [
+        "バランス・一般的な対話・文章の骨組み",
+        "高度なプログラミング・厳密な論理チェック・自己修復",
+        "長文脈の分析・大量ドキュメントと検索結果の集約",
+        "理数・物理・偏微分方程式・アルゴリズム証明",
+    ]
+    PROPOSER_PROFILES = {}
+    for _mid, _role in zip((prop_a, prop_b, prop_c, prop_d), _slot_roles):
+        _tot, _act = _nim_scale_of(_mid)
+        _size = (f"{_tot:.0f}B/a{_act:.0f}B" if _tot and _act and _act != _tot
+                 else (f"{_tot:.0f}B" if _tot else "規模不明"))
+        PROPOSER_PROFILES[_mid] = f"{_role} ({_mid} · {_size})"
     JP_AGGREGATOR = jp_agg
     JP_AGGREGATOR_STRONG = jp_agg
     AGGREGATOR_REASONING = prop_a
     SECOND_OPINION_MODEL = second
-    # SC 主力 3 系統: 理数最強の deepseek が使える時間帯はそれを第1系統+裁定に、
-    # 混雑中は nemotron-550b で代替（可用性プローブで自動選択）
-    deepseek_ok = _nim_model_available(prop_d)
-    sc_lead = prop_d if deepseek_ok else prop_c
-    print(f"[setup] nim probe: deepseek-v4-pro={'OK' if deepseek_ok else 'NG'} "
-          f"-> SC第1系統/裁定 = {sc_lead}")
-    REASONING_MODELS = [sc_lead, prop_a, sc_third]
+    # SC 主力 3 系統は系譜を散らす。裁定と第1系統は選抜1位（=最大規模の生存モデル）。
+    # 旧実装はここで deepseek をもう一度プローブしていたが、選抜が済んでいるので不要。
+    REASONING_MODELS = _nim_diverse_three(picked)
+    sc_lead = REASONING_MODELS[0]
     ARBITER_MODEL = sc_lead
+    print(f"[setup] nim: SC 3系統 = {', '.join(REASONING_MODELS)} / 裁定 = {sc_lead}")
     SC_CHEAP_VOTES = 0              # クラウドでは「安価票」の意味が消える
     PARALLEL_PROPOSERS = True
     SC_PARALLEL = True
     # num_ctx はクラウドでは送らない（_ask_nim が無視）。num_predict→max_tokens のみ意味を持つ。
     # 思考モデルは打ち切り(finish_reason=length・本文空)回避のため厚めに取る。
+    # 思考の効かせ方は ID 直指定ではなく系統から引く（選抜でモデルが入れ替わるため）
     for m in (cond, prop_a, prop_b, prop_c, prop_d, agg, second, sc_third):
-        MODEL_CONFIG[m] = {"num_predict": 16384}
-    MODEL_CONFIG[prop_a]["think"] = "high"     # reasoning_effort=high (gpt-oss)
-    MODEL_CONFIG[second]["think"] = "high"     # mistral-medium-3.5 も reasoning_effort 対応
-    # nemotron-3 系の思考は chat_template_kwargs で有効化（build.nvidia.com サンプル準拠）
-    MODEL_CONFIG[prop_c]["nim_extra"] = {
-        "chat_template_kwargs": {"enable_thinking": True},
-        "reasoning_budget": 16384,
-    }
+        MODEL_CONFIG[m] = _nim_tuning_for(m)
     NIM_MODEL_IDS = {cond, prop_a, prop_b, prop_c, prop_d, agg, jp_agg, second, sc_third}
     # response_format={"type":"json_object"} を受ける保守的な集合。外れても 400 drop 再送 +
     # スキーマ文字列注入 + 既存 _fallback 経路の三段防衛があるため致命でない。
     NIM_STRUCTURED_OK = {cond, agg, second}
-    # タイポ検出: /v1/models と一度だけ突合（不通・失敗は警告なしでスキップ）
-    try:
-        req = urllib.request.Request(
-            f"{NIM_URL}/models", headers={"Authorization": f"Bearer {NIM_API_KEY}"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            catalog = {m.get("id") for m in json.loads(r.read().decode()).get("data", [])
-                       if isinstance(m, dict)}
+    # タイポ検出は固定布陣のときだけ。選抜経路はカタログ由来なので突合済み。
+    if not NIM_AUTO_SELECT or len(picked) < 4:
+        catalog = _nim_catalog()
         missing = sorted(NIM_MODEL_IDS - catalog)
         if catalog and missing:
             print(f"⚠ [nim] /v1/models に存在しない ID（タイポ/廃止の可能性）: {missing}")
-    except Exception:
-        pass
     print(f"[setup] nim: proposers=4クラウド並列 SC_PARALLEL=ON workers={SC_WORKERS} "
           f"arbiter={ARBITER_MODEL} 予算={'無制限' if NIM_BUDGET == 0 else NIM_BUDGET}")
     return True

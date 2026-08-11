@@ -339,21 +339,33 @@ _g = ("DESIRED_PROPOSERS", "DESIRED_AGGREGATOR", "DESIRED_CONDUCTOR", "FALLBACK_
       "ARBITER_MODEL", "SC_CHEAP_VOTES", "SC_PARALLEL", "NIM_MODEL_IDS", "NIM_STRUCTURED_OK")
 _saved_profile = {k: copy.deepcopy(getattr(f, k)) for k in _g}
 try:
-    _catalog = FakeResponse({"data": [{"id": m} for m in
-                                      ("meta/llama-3.1-8b-instruct", "openai/gpt-oss-120b",
-                                       "moonshotai/kimi-k2.6",
-                                       "nvidia/nemotron-3-ultra-550b-a55b",
-                                       "deepseek-ai/deepseek-v4-pro", "z-ai/glm-5.2",
-                                       "mistralai/mistral-medium-3.5-128b",
-                                       "minimaxai/minimax-m3")]})
+    # 選抜はカタログ取得と生存プローブを並列で叩くため、HTTP モックだと送信順が不定になる。
+    # ここは選抜の判断そのものを見たいので、その 2 関数を差し替えて決定的に検査する。
+    _CAT = {
+        "meta/llama-3.1-8b-instruct",            # 8B  (Conductor 候補)
+        "meta/llama-3.3-70b-instruct",           # 70B
+        "openai/gpt-oss-120b",                   # 120B
+        "mistralai/mistral-medium-3.5-128b",     # 128B
+        "z-ai/glm-5.2",                          # 公称 355B
+        "minimaxai/minimax-m3",                  # 公称 456B
+        "nvidia/nemotron-3-ultra-550b-a55b",     # 550B/a55B
+        "moonshotai/kimi-k2.6",                  # 公称 1000B
+        "baai/bge-m3",                           # 埋め込み → 除外されること
+        "meta/codellama-70b",                    # コード専用 → 除外されること
+    }
+    _orig_cat, _orig_avail = f._nim_catalog, f._nim_probe
+
+    def _profile_with(dead=(), catalog=None):
+        """dead に挙げた ID だけ落ちている状態で apply_nim_profile を回す。"""
+        f._nim_catalog = lambda: (set(_CAT) if catalog is None else set(catalog))
+        f._nim_probe = lambda m, timeout=None: ("gone" if m in dead else "ok")
+        _b = io.StringIO()
+        with contextlib.redirect_stdout(_b):
+            return f.apply_nim_profile(), _b.getvalue()
+
+    applied, _log = _profile_with()
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        # 送信順: kimi プローブ → deepseek プローブ → /v1/models 照合（全部可用の想定）
-        def _profile():
-            return f.apply_nim_profile()
-        applied, _, _ = run_mocked(
-            [FakeResponse({"ok": True}), FakeResponse({"ok": True}), _catalog],
-            _profile)
+    buf.write(_log)
     check("profile: 適用成功 (True)", applied is True)
     check("profile: タイポ警告なし（採用 ID は全て実在扱い）", "⚠" not in buf.getvalue())
     check("profile: MODEL_TO_PERSONA が再導出される",
@@ -375,19 +387,43 @@ try:
           all("num_ctx" not in f.MODEL_CONFIG[m] for m in f.NIM_MODEL_IDS))
     check("profile: SC_CHEAP_VOTES=0 / 並列 ON",
           f.SC_CHEAP_VOTES == 0 and f.PARALLEL_PROPOSERS and f.SC_PARALLEL)
-    check("profile: 可用プローブOKなら kimi が Proposer B・deepseek がSC第1系統/裁定",
-          f.PERSONA_MODELS["Proposer B"] == "moonshotai/kimi-k2.6"
-          and f.REASONING_MODELS[0] == "deepseek-ai/deepseek-v4-pro"
-          and f.ARBITER_MODEL == "deepseek-ai/deepseek-v4-pro")
-    # 混雑/404 時の縮退: kimi 404 → mistral、deepseek 429 → nemotron が代替
-    with contextlib.redirect_stdout(io.StringIO()):
-        applied2, _, _ = run_mocked(
-            [http_error(404), http_error(429), _catalog], _profile)
-    check("profile: プローブNGなら mistral / nemotron へ自動縮退",
+    # --- 起動時選抜 (2026-08-08) ---
+    check("選抜: 規模の大きい順に 5 体を採用する",
+          list(f.DESIRED_PROPOSERS) == ["moonshotai/kimi-k2.6",
+                                        "nvidia/nemotron-3-ultra-550b-a55b",
+                                        "minimaxai/minimax-m3",
+                                        "z-ai/glm-5.2"]
+          and f.DESIRED_AGGREGATOR == "mistralai/mistral-medium-3.5-128b")
+    check("選抜: 裁定は最大規模の生存モデル",
+          f.ARBITER_MODEL == "moonshotai/kimi-k2.6")
+    check("選抜: 埋め込み/コード専用はそもそも候補に入らない",
+          "baai/bge-m3" not in f.NIM_MODEL_IDS
+          and "meta/codellama-70b" not in f.NIM_MODEL_IDS)
+    check("選抜: Conductor は大型ではなく軽量機を選ぶ",
+          f.DESIRED_CONDUCTOR == "meta/llama-3.1-8b-instruct")
+    check("選抜: SC 3 系統はベンダーが重複しない",
+          len({m.split("/")[0] for m in f.REASONING_MODELS}) == 3)
+    check("選抜: 思考の効かせ方は系統から引く（gpt-oss は effort / nemotron は template）",
+          f.MODEL_CONFIG["nvidia/nemotron-3-ultra-550b-a55b"]["nim_extra"]
+          ["chat_template_kwargs"]["enable_thinking"] is True)
+
+    # 死んでいる ID は飛ばして次点を採る（固定 ID の腐りへの対処そのもの）
+    applied2, _log2 = _profile_with(dead={"moonshotai/kimi-k2.6", "minimaxai/minimax-m3"})
+    check("選抜: 死んでいるモデルは採らず次点へ送る",
           applied2 is True
-          and f.PERSONA_MODELS["Proposer B"] == "mistralai/mistral-medium-3.5-128b"
-          and f.REASONING_MODELS[0] == "nvidia/nemotron-3-ultra-550b-a55b"
+          and "moonshotai/kimi-k2.6" not in f.NIM_MODEL_IDS
+          and "minimaxai/minimax-m3" not in f.NIM_MODEL_IDS
           and f.ARBITER_MODEL == "nvidia/nemotron-3-ultra-550b-a55b")
+    check("選抜: 落としたモデルはログに残す", "NG（未付与/廃止）" in _log2)
+
+    # カタログ不通なら旧固定布陣へ退避する（選抜が使えないだけで停止はしない）
+    applied3, _log3 = _profile_with(catalog=set())
+    check("選抜: カタログ不通なら固定布陣へ退避",
+          applied3 is True
+          and "nvidia/nemotron-3-ultra-550b-a55b" in f.DESIRED_PROPOSERS
+          and "⚠" in _log3)
+
+    f._nim_catalog, f._nim_probe = _orig_cat, _orig_avail
     # キー未設定なら False
     f.NIM_API_KEY = ""
     with contextlib.redirect_stdout(io.StringIO()):
