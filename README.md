@@ -50,6 +50,20 @@ On 8 GB VRAM, large models run with automatic RAM offload (absorbed by 48 GB RAM
 - Console output is reconfigured with `errors="replace"` so Windows `cp932` pipes don't crash
   on symbols like `✓ ⚠ ❌`.
 
+## Benchmark: NIM cloud backend experiment (opt-in, not the local default)
+
+Separately from the local-only design above, the `feature/nim-backend` branch (merged into
+`main`) swaps Ollama for hosted [NVIDIA NIM](https://build.nvidia.com/) models to test how the
+same dynamic-MoA design performs once the 8 GB VRAM ceiling is removed. Measured result against
+Fable 5 on 210 questions (AIME 2024/2025/2026, MATH-500, HumanEval, JMMLU), 36/36
+regression-tested:
+
+**200/210 vs. Fable 5's 199/210 (+1) — but the win is thin and isn't math.** fugu loses on AIME
+2024/2025 and ties on the contamination-free AIME 2026 set; the entire margin comes from JMMLU
+and HumanEval. Re-graded with strict exact-match instead of the current lenient equivalence
+checker, the result flips to 189/199 (**-10**). Full breakdown and caveats:
+[`docs/nim-benchmark-results.md`](docs/nim-benchmark-results.md).
+
 ## Features
 
 - 🧠 **Dynamic MoA** — Conductor-planned single/council routing with critic escalation and bounded recursive rounds
