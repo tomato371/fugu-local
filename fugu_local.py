@@ -265,7 +265,7 @@ def model_cfg(model, key, default=None):
 # 大 VRAM プロファイル（将来の 96GB 等の環境向け・一発切り替え）
 # ==================================================
 # 8GB ラップトップは「大型モデルを RAM/NVMe にオフロードして逐次で回す」制約下にあるが、
-# nk108 は本手法が有効なら VRAM 96GB 級の環境で実験予定。そこでは全モデルが VRAM 常駐でき、
+# 本手法が有効なら VRAM 96GB 級の環境での実験を想定。そこでは全モデルが VRAM 常駐でき、
 # 制約が一変する（並列プロポーザー可・context 大幅拡大・SC のサンプル数を大量に増やせる・
 # 120b arbiter も高速）。環境変数 FUGU_HIGH_VRAM=1 で下記を一括適用する（コード改変不要）。
 #   PowerShell: $env:FUGU_HIGH_VRAM=1 ; python fugu_local.py ...
@@ -608,7 +608,7 @@ ALLOW_RECURSION = True      # 合議後、批評 → 必要なら追加ラウン
 # 回答中の ```python ブロックを実際に subprocess で実行し、失敗したら traceback を
 # 次ラウンドの修正ヒントとして渡す。LLM の自己審査と違い実行結果は決定的なので、
 # コードに関しては最強の Critic になる。エラーが残る限り MAX_ROUNDS_CODE まで
-# 修正ラウンドを繰り返す（nk108 の方針: 時間をかけてでも精度優先）。
+# 修正ラウンドを繰り返す（運用方針: 時間をかけてでも精度優先）。
 # 注意: 生成コードをこのマシンで直接実行する。信頼できる自分の質問にだけ使うこと。
 CODE_EXECUTION = True
 CODE_EXEC_TIMEOUT = 15      # 秒。input() 待ちや無限ループはタイムアウトで失敗扱い
@@ -4434,7 +4434,7 @@ def aggregate(question, proposals):
 # さらに math では「Python を書かせて実行し、その出力を 1 票にする」PoT 票を混ぜ、
 # 計算ミス系の誤答を機械的に排除する。時間無制限・精度最優先の方針の中核機能（2026-07-11）。
 
-# nk108 方針: 時間は無制限・精度最優先。SC は「サンプルを増やすほど当たる」ので上限を高めに取る。
+# 運用方針: 時間は無制限・精度最優先。SC は「サンプルを増やすほど当たる」ので上限を高めに取る。
 SC_ENABLED = True
 SC_INITIAL = 6          # 第1バッチの CoT サンプル数（精度優先で厚め）
 SC_STEP = 4             # 過半数が取れないときの追加サンプル数
@@ -4803,7 +4803,7 @@ SC_CHEAP_MODEL = "NitrAI/VibeThinker-3B"  # VRAM 常駐の量産サンプラー�
 SC_CHEAP_VOTES = 0      # 安価票の数。VibeThinker の AIME ミニ実測で合格したら 6〜12 へ引き上げる
 # 票が拮抗したときの最終審判。8GB 環境では gpt-oss:120b(65GB) が RAM48+VRAM8=56GB を超え
 # NVMe ページングで1裁定に数十分〜数時間かかり得るため、qwen3.6:35b（思考型・理数最強格）で裁く
-# （2026-07-12 nk108 決定）。120b は FUGU_HIGH_VRAM=1（96GB 環境）で解禁される。
+# （2026-07-12 決定）。120b は FUGU_HIGH_VRAM=1（96GB 環境）で解禁される。
 # 失敗/空/未導入なら _arbitrate が REASONING_MODELS へ自動フォールバックする。
 ARBITER_MODEL = "qwen3.6:35b"
 

@@ -89,7 +89,7 @@ checker, the result flips to 189/199 (**-10**). Full breakdown and caveats:
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+ (CI runs 3.9-3.12)
 - [Ollama](https://ollama.com) running locally (`http://localhost:11434`)
 - Pull the models you want to use, e.g.:
   ```bash
@@ -193,7 +193,8 @@ python -m fugu_evolve --prompts PRESENTATION_STYLE
 
 Safety: edits, commits, and every destructive git operation are structurally
 restricted to `auto-evolve/*` branches; verification requires 100% tests passing
-and bench non-regression; adopted merges are logged to `docs/evolution_history.md`.
+and bench non-regression; adopted merges are logged to `docs/evolution_history.md`
+(created at runtime on the first adopted merge).
 
 ## Run with Docker
 
@@ -258,7 +259,7 @@ stdio server (stdlib only — no SDK dependency), so Claude Code can call the lo
 pipeline as a tool:
 
 ```bash
-claude mcp add --scope user fugu -- python D:/repos/fugu-local-integ/fugu_mcp.py
+claude mcp add --scope user fugu -- python /path/to/fugu-local/fugu_mcp.py
 ```
 
 | Tool | Purpose |
@@ -292,12 +293,15 @@ completion as usual, so a long `fugu_ask_start` job can ping you when it's done.
 | `fugu_evolve/` | Self-improvement loop: profiler / planner / workspace / evaluator / diff patcher / CLI / prompt evolver |
 | `fugu_prompts/` | Prompt-override layer written by the prompt evolver |
 | `fugu_tools.py` | Runtime tool registry + schema-constrained tool selection |
+| `fugu_rag_retriever.py` | Bridge to the [fugu-rag](https://github.com/tomato371/fugu-rag) hybrid retriever |
 | `fugu_approval.py` | Blocking human-approval gate resolved via the REST API |
 | `bench_fugu.py` | Benchmark runner (accuracy) |
 | `bench_queue.py` | Batch/queue benchmarking |
 | `eval_fugu.py` | Evaluation utilities |
 | `test_fugu_offline.py` | Offline characterization checks (no model required) |
 | `tests/` | Offline pytest suite for every module above |
+| `bench_search.py`, `docs/search-benchmark.md` | AB-MCTS search benchmark + interim report |
+| `docs/site/` | Japanese project site for the NIM-backend experiment (open `docs/site/index.html`) |
 | `Dockerfile` | Container image for the app (web UI by default) |
 | `docker-compose.yml` | One-command stack: Ollama + fugu web UI |
 | `requirements.txt` | Optional deps (web UI + file I/O); core needs none |
