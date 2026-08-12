@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fugu-nim 次期設計 — 引き算と回収</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; }
+  img, svg { max-width: 100%; }
+  h1, h2, h3, h4, p, ul, ol, dl, dd, figure, pre { margin: 0; }
+  ul, ol { padding: 0; }
+  table { border-collapse: collapse; }
+</style>
+</head>
+<body>
+<style>
+  :root {
+    color-scheme: light;
+    --ground:  #f1f3f1;
+    --panel:   #fbfcfb;
+    --panel-2: #eaeeeb;
+    --ink:     #131a20;
+    --ink-2:   #4a565f;
+    --ink-3:   #7c8790;
+    --rule:    #d9dfdb;
+    --ai:      #1f3a66;   /* 藍 — 構造色 */
+    --ai-soft: #e3eaf4;
+    --shu:     #a83f2a;   /* 朱 — 限界・注意 */
+    --shu-soft:#f6e7e2;
+    --moss:    #3a6a51;   /* 実測済み */
+    --moss-soft:#e2eee8;
+    --on-ai:   #eef2f8;
+    --ring:    rgba(19,26,32,.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --ground:  #0e1216;
+      --panel:   #171c21;
+      --panel-2: #1f262c;
+      --ink:     #e5eaee;
+      --ink-2:   #a3b0b9;
+      --ink-3:   #79868f;
+      --rule:    #262e35;
+      --ai:      #8aaddf;
+      --ai-soft: #1a2739;
+      --shu:     #e08163;
+      --shu-soft:#33211c;
+      --moss:    #74ab8d;
+      --moss-soft:#1b2b23;
+      --on-ai:   #0e1216;
+      --ring:    rgba(229,234,238,.12);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:  #0e1216; --panel: #171c21; --panel-2: #1f262c;
+    --ink: #e5eaee; --ink-2: #a3b0b9; --ink-3: #79868f; --rule: #262e35;
+    --ai: #8aaddf; --ai-soft: #1a2739; --shu: #e08163; --shu-soft: #33211c;
+    --moss: #74ab8d; --moss-soft: #1b2b23; --on-ai: #0e1216;
+    --ring: rgba(229,234,238,.12);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --ground: #f1f3f1; --panel: #fbfcfb; --panel-2: #eaeeeb;
+    --ink: #131a20; --ink-2: #4a565f; --ink-3: #7c8790; --rule: #d9dfdb;
+    --ai: #1f3a66; --ai-soft: #e3eaf4; --shu: #a83f2a; --shu-soft: #f6e7e2;
+    --moss: #3a6a51; --moss-soft: #e2eee8; --on-ai: #eef2f8;
+    --ring: rgba(19,26,32,.10);
+  }
+  :root {
+    --sans: system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", "Hiragino Sans", Meiryo, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  }
+
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--sans); font-size: 16.5px; line-height: 1.78;
+    -webkit-font-smoothing: antialiased;
+  }
+  .col { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
+  .prose { max-width: 70ch; }
+
+  /* ===== masthead ===== */
+  .mast { background: var(--ai); color: var(--on-ai); padding: 0 0 46px; }
+  .mast .col { padding-top: 44px; }
+  .brandline {
+    display: flex; align-items: center; gap: 12px; margin: 0 0 40px;
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: .12em; opacity: .78;
+  }
+  .brandline .tag {
+    border: 1px solid currentColor; padding: 2px 8px; letter-spacing: .1em;
+    font-size: 11px;
+  }
+  .mast h1 {
+    font-size: clamp(40px, 8vw, 82px); line-height: .98; letter-spacing: -.035em;
+    font-weight: 800; margin: 0 0 6px;
+  }
+  .mast h1 .thin { font-weight: 300; opacity: .62; }
+  .mast .sub {
+    font-family: var(--mono); font-size: clamp(13px, 2.1vw, 15px);
+    letter-spacing: .04em; opacity: .82; margin: 0 0 26px;
+  }
+  .mast .lead {
+    font-size: clamp(17px, 2.4vw, 21px); line-height: 1.62; max-width: 40ch;
+    margin: 0; font-weight: 400;
+  }
+  .mast .lead b { font-weight: 700; }
+  .factbar {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 26px 34px; margin: 40px 0 0; padding: 26px 0 0;
+    border-top: 1px solid rgba(255,255,255,.22);
+  }
+  :root[data-theme="dark"] .factbar, :root:where(:not([data-theme="light"])) .factbar {
+    border-top-color: rgba(0,0,0,.28);
+  }
+  @media (prefers-color-scheme: light) { .factbar { border-top-color: rgba(255,255,255,.22); } }
+  .fact .k {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; opacity: .68; margin: 0 0 4px;
+  }
+  .fact .v { font-size: 27px; font-weight: 700; letter-spacing: -.02em; margin: 0; line-height: 1.15; }
+  .fact .n { font-size: 12.5px; opacity: .72; margin: 3px 0 0; line-height: 1.5; font-family: var(--mono); }
+
+  /* ===== sections ===== */
+  section { padding: 62px 0 0; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ai); margin: 0 0 10px; font-weight: 700;
+  }
+  h2 {
+    font-size: clamp(24px, 3.4vw, 32px); line-height: 1.25; letter-spacing: -.022em;
+    font-weight: 700; margin: 0 0 14px; text-wrap: balance;
+  }
+  h3 { font-size: 17.5px; font-weight: 700; margin: 32px 0 6px; letter-spacing: -.008em; }
+  p { margin: 14px 0; }
+  a { color: var(--ai); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  a:focus-visible { outline: 2px solid var(--ai); outline-offset: 3px; border-radius: 2px; }
+  code {
+    font-family: var(--mono); font-size: .86em; background: var(--panel-2);
+    padding: .13em .4em; border-radius: 3px;
+  }
+  strong { font-weight: 700; }
+
+  .rule { height: 1px; background: var(--rule); margin: 62px 0 0; }
+
+  /* ===== cards / boxes ===== */
+  .box {
+    background: var(--panel); border: 1px solid var(--rule);
+    padding: 24px 26px; margin: 24px 0 0;
+  }
+  .box.accent { border-left: 3px solid var(--ai); }
+  .box.caution { border-left: 3px solid var(--shu); }
+  .box.verified { border-left: 3px solid var(--moss); }
+  .box h3:first-child, .box p:first-child { margin-top: 0; }
+  .box p:last-child { margin-bottom: 0; }
+
+  .principles { display: grid; gap: 18px; margin: 26px 0 0; }
+  @media (min-width: 760px) { .principles { grid-template-columns: repeat(3, 1fr); } }
+  .pr { background: var(--panel); border: 1px solid var(--rule); padding: 22px 22px 20px; }
+  .pr .no {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--ai);
+    margin: 0 0 10px; font-weight: 700;
+  }
+  .pr h3 { margin: 0 0 8px; font-size: 16.5px; }
+  .pr p { margin: 0; font-size: 14.5px; line-height: 1.68; color: var(--ink-2); }
+
+  /* ===== two-column verdict ===== */
+  .fits { display: grid; gap: 20px; margin: 26px 0 0; }
+  @media (min-width: 720px) { .fits { grid-template-columns: 1fr 1fr; } }
+  .fit { border: 1px solid var(--rule); background: var(--panel); padding: 22px 24px 18px; }
+  .fit .hd {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .1em; font-weight: 700;
+    margin: 0 0 14px; padding: 0 0 10px; border-bottom: 1px solid var(--rule);
+  }
+  .fit.yes .hd { color: var(--moss); }
+  .fit.no .hd { color: var(--shu); }
+  .fit ul { margin: 0; padding: 0; list-style: none; }
+  .fit li {
+    display: flex; gap: 11px; align-items: flex-start;
+    padding: 8px 0; font-size: 15px; line-height: 1.62; border-bottom: 1px dashed var(--rule);
+  }
+  .fit li:last-child { border-bottom: none; }
+  .fit li .mk { font-family: var(--mono); flex: none; font-weight: 700; line-height: 1.62; }
+  .fit.yes li .mk { color: var(--moss); }
+  .fit.no li .mk { color: var(--shu); }
+
+  /* ===== table ===== */
+  .tw { overflow-x: auto; margin: 24px 0 0; }
+  table { border-collapse: collapse; width: 100%; min-width: 580px; font-size: 14.5px; }
+  th, td { padding: 10px 13px; text-align: right; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    font-size: 12px; color: var(--ink-2); font-weight: 700; white-space: nowrap;
+    border-bottom: 1.5px solid var(--ink-3);
+  }
+  tbody td { font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 13.5px; }
+  tbody td:first-child { font-family: var(--sans); font-size: 14.5px; }
+  tbody tr:hover { background: var(--panel-2); }
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700;
+    padding: 2px 8px; border-radius: 2px; letter-spacing: .04em;
+  }
+  .pill.w { background: var(--moss-soft); color: var(--moss); }
+  .pill.e { background: var(--panel-2); color: var(--ink-2); }
+  .pill.l { background: var(--shu-soft); color: var(--shu); }
+  caption {
+    caption-side: top; text-align: left; font-family: var(--mono); font-size: 11.5px;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); padding: 0 0 10px;
+  }
+
+  /* ===== figure ===== */
+  figure { margin: 30px 0 0; }
+  figure svg { display: block; width: 100%; height: auto; max-width: 100%; }
+  .figwrap { background: var(--panel); border: 1px solid var(--rule); padding: 26px 20px 18px; overflow-x: auto; }
+  .figwrap > svg { min-width: 560px; }
+  figcaption {
+    font-size: 13.5px; color: var(--ink-2); margin: 12px 0 0; line-height: 1.66;
+    max-width: 72ch;
+  }
+
+  /* ===== code block ===== */
+  pre {
+    font-family: var(--mono); font-size: 13px; line-height: 1.75; background: var(--panel);
+    border: 1px solid var(--rule); border-left: 3px solid var(--ink-3);
+    padding: 18px 20px; overflow-x: auto; margin: 20px 0 0;
+  }
+  pre .c { color: var(--ink-3); }
+  pre .k { color: var(--ai); font-weight: 700; }
+
+  /* ===== cta ===== */
+  .cta {
+    display: flex; flex-wrap: wrap; gap: 14px; margin: 30px 0 0;
+  }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px; text-decoration: none;
+    font-family: var(--mono); font-size: 13.5px; font-weight: 700; letter-spacing: .03em;
+    padding: 13px 20px; border: 1.5px solid var(--ai); color: var(--ai);
+    background: transparent; transition: background .15s, color .15s;
+  }
+  .btn:hover { background: var(--ai); color: var(--on-ai); }
+  .btn.solid { background: var(--ai); color: var(--on-ai); }
+  .btn.solid:hover { opacity: .86; }
+
+  footer {
+    margin: 74px 0 0; background: var(--panel); border-top: 1px solid var(--rule);
+    padding: 34px 0 54px;
+  }
+  footer .col { font-family: var(--mono); font-size: 12.5px; color: var(--ink-3); line-height: 1.9; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<header class="mast">
+  <div class="col">
+    <p class="brandline"><span>FUGU-NIM</span><span class="tag">DESIGN · 2026-08-06</span><span>rev.2</span></p>
+    <h1>足すのをやめて、<span class="thin">捨てているものを</span><br>拾い直す</h1>
+    <p class="sub">Next architecture — subtraction, salvage, and honest numbers</p>
+    <p class="lead">
+      4 日間で足した機構はほとんど効かなかった。同じ期間に、
+      <b>既に生成させて捨てているデータ</b>と、<b>報告していた数字の誤り</b>が見つかった。
+      次期設計は新機構をほぼ足さない。
+    </p>
+
+    <div class="factbar">
+      <div class="fact">
+        <p class="k">訂正後スコア</p>
+        <p class="v">187 / 210</p>
+        <p class="n">単一構成。199 は構成群の和集合だった</p>
+      </div>
+      <div class="fact">
+        <p class="k">捨てている票</p>
+        <p class="v">78% / 67%</p>
+        <p class="n">2系統が難問で無効。回収が最優先</p>
+      </div>
+      <div class="fact">
+        <p class="k">新機構</p>
+        <p class="v">0 個</p>
+        <p class="n">上位4施策はすべて引き算か回収</p>
+      </div>
+      <div class="fact">
+        <p class="k">検証</p>
+        <p class="v">17 + 9</p>
+        <p class="n">独立設計・敵対的反証・技術調査の総数</p>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="col">
+
+  <!-- ========== 訂正 ========== -->
+  <section>
+    <p class="eyebrow">Correction · read this first</p>
+    <h2>訂正 — 199/210 は単一システムの成績ではなかった</h2>
+
+    <div class="box caution">
+      <h3>何が間違っていたか</h3>
+      <p>
+        本サイトはこれまで <strong>199/210</strong> を「fugu-nim の成績」として掲げ、
+        基準モデルの 199.5/210 と<strong>同点</strong>だと述べてきました。これは誤りです。
+      </p>
+      <p>
+        199/210 は <strong>20 以上の構成の和集合</strong>——「どれか 1 つの構成で解けたら正解」
+        として数えた値でした。一方、比較対象の 199.5/210 は<strong>単一モデル</strong>の成績です。
+        性質の違うものを並べていました。
+      </p>
+      <p>
+        <strong>単一構成の最良合計は 187/210 です。</strong>
+        したがって公平な比較は <strong>187 対 199.5 で、12.5 問の差</strong>があります。
+      </p>
+    </div>
+
+    <div class="tw">
+      <table>
+        <caption>和集合と単一構成の差（再集計・両側に同じ正規化採点を適用）</caption>
+        <thead>
+          <tr><th>ベンチ</th><th class="num">和集合</th><th class="num">最良単一構成</th><th class="num">差</th><th>差の出どころ</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>AIME 2024</td><td class="num">28/30</td><td class="num">27/30 (sc@nim)</td><td class="num">+1</td><td>別構成での再挑戦</td></tr>
+          <tr><td>AIME 2025</td><td class="num">29/30</td><td class="num">23/30 (sc@nim)</td><td class="num">+6</td><td>429 嵐の再測定＋別構成</td></tr>
+          <tr><td>AIME 2026</td><td class="num">30/30</td><td class="num">25/30 (sc@nim)</td><td class="num">+5</td><td>429 嵐の再測定＋戦略層化</td></tr>
+          <tr><td>MATH-500</td><td class="num">49/50</td><td class="num">49/50 (sc@nim)</td><td class="num">0</td><td>—</td></tr>
+          <tr><td>HumanEval</td><td class="num">28/30</td><td class="num">28/30 (coder@nim)</td><td class="num">0</td><td>—</td></tr>
+          <tr><td>JMMLU</td><td class="num">35/40</td><td class="num">35/40 (fugu@nim)</td><td class="num">0</td><td>—</td></tr>
+        </tbody>
+        <tfoot>
+          <tr><td>合計</td><td class="num">199/210</td><td class="num">187/210</td><td class="num">+12</td><td>すべて AIME 系</td></tr>
+        </tfoot>
+      </table>
+    </div>
+
+    <div class="box caution">
+      <h3>なぜこれが「オラクル」なのか</h3>
+      <p>
+        差の 12 問は「sc@nim で落ちた問題に別構成を当て、当たったら正解と数えた」結果です。
+        <strong>どの構成を使うかを、正解を見てから選んでいます。</strong>
+        実行時にはその選択ができないので、199 は<strong>到達可能な成績ではなく上限</strong>です。
+      </p>
+      <p>
+        さらに <strong>128 問は 1 つの構成でしか解けていません</strong>。
+        構成選択が成績を支配しており、それを正解なしに当てる機構は実装されていません。
+      </p>
+      <p>
+        なお AIME25/26 の差の一部は「429 エラーの嵐で票が枯渇した問題の再測定」で、
+        最初の測定が無効だった分です。ただし<strong>修正後に全問を測り直したわけではなく
+        失敗した問題だけを再走させている</strong>ので、これも汚染されています。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>「40% → 97%」も同じ問題を抱えている</h3>
+      <p>
+        分母の 40% は <code>think@nim</code> の <strong>2/5（n=5）</strong>、
+        分子の 97% は和集合です。正直な数字は
+        <strong>単発 2/5 に対し sc@nim 単一構成で 25/30（83%）</strong>。
+        方向は明確ですが、<strong>+57 ポイントという値は過大</strong>で、実際は +43 程度、
+        しかも分母の標本が 5 問しかありません。
+      </p>
+      <p>
+        さらに、この差には「異種モデルを混ぜた効果」と「単に生成回数を増やした効果」が
+        分離されずに含まれています。<strong>多様性の寄与は未測定です。</strong>
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 撤退 ========== -->
+  <section>
+    <p class="eyebrow">Line closed</p>
+    <h2>検証機構への投資を止める — 2 回の失敗で条件が満たされた</h2>
+    <div class="prose">
+      <p>
+        機械検証官（独立生成したプログラムの実行結果を最終裁定にする機構）は、
+        2 回の実測で結論が出ました。
+      </p>
+      <p>
+        <strong>1 回目（sc10b）</strong>：プログラムが正解 385 を計算して印字したのに、
+        「2 本以上の一致」規則が棄権を選び、言語側の誤答 24 が確定しました。
+        <strong>規則が正解を捨てた</strong>——そう解釈して規則を修正しました。
+      </p>
+      <p>
+        <strong>2 回目（sc11・修正版）</strong>：生成失敗の補充とコード審査を実装して再挑戦。
+        機構は設計どおり動作しました（審査は 3 名とも発火）。
+        しかし<strong>今回はどのプログラムも 385 を出しませんでした</strong>——
+        出力は 1 / 99 / 168 で、審査も割れ、最終回答は 16（正解 385）。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>この 2 回が意味すること</h3>
+      <p>
+        <strong>385 の出現は n=1 の観測であり、再現しませんでした。</strong>
+        したがって「集約規則が正解を捨てていた」という診断は、正しくはあっても
+        <strong>主因ではありません</strong>。規則を直しても、材料のほうが安定して出てこない。
+      </p>
+      <p>
+        この問題（aime24-I-12）は 5 回の独立試行すべてが 384 に到達する
+        <strong>共有されたオフバイワン</strong>であり、裁判官にも監査人にも、
+        そして機械検証にも安定しては見えませんでした。
+        <strong>これは検証機構の問題ではなく、生成側の問題です。</strong>
+      </p>
+      <p>
+        撤退条件は事前に「385 を出力したプログラムが存在しなければ投資を止める」と
+        決めてありました。<strong>その条件が満たされたので止めます。</strong>
+        sc10 / sc11 の構成はコードから削除せず、この結果とともに残します。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 施策 ========== -->
+  <section>
+    <p class="eyebrow">Ranked actions</p>
+    <h2>次にやること — 上位 4 つは新機構をひとつも足さない</h2>
+    <div class="prose">
+      <p>
+        以下は 8 領域の技術調査（Web 調査を含む）と、4 つの独立設計への
+        敵対的反証から導いた優先順位です。各項目には<strong>捨てる条件</strong>を先に固定してあります。
+      </p>
+      <p>
+        <strong>順序の原理は「引き算と回収が先、追加は後」</strong>です。
+        rank 1〜4 は一つも機構を足していません。
+        これが sc10 / sc11 のような「もう一段の裁定機構を積む」変更との違いです。
+      </p>
+    </div>
+
+    <div class="box verified">
+      <h3>rank 1 — 捨てている思考テキストから答えを回収する<span class="pill w">最優先</span></h3>
+      <p>
+        現在の実装は SSE ストリームで <code>delta.reasoning_content</code> を
+        <strong>明示的に捨て</strong>、<code>delta.content</code> だけを集めています。
+        思考が <code>max_tokens</code> を食い尽くして本文がゼロになると、
+        <strong>すでに課金（リクエスト）を払って生成させた思考テキストを丸ごと破棄</strong>して
+        無効票にしています。
+      </p>
+      <p>
+        直し方は、思考テキストも別バッファに貯め、本文が空のときだけ
+        決定論的な抽出ラダー（<code>\boxed{}</code> の最後の出現 → 「答えは/Final Answer」マーカー →
+        末尾行の数式 → 最後の数値、＋単位・カンマ・全角の正規化）を掛けることです。
+        <strong>追加リクエストはゼロ、差分は 60 行以内、追加依存もゼロ。</strong>
+      </p>
+      <p>
+        <strong>期待効果</strong>：gpt-oss の有効票 93 → 200 前後（抽出失敗 78% → 50% 前後）。
+        票を 32 に増やす方向（1 問あたり 1,149 リクエスト）より<strong>2 桁安い</strong>。
+      </p>
+      <p style="font-size:14.5px;color:var(--ink-2)">
+        <strong>捨てる条件</strong>：dry-run で救出成功率が 20% 未満なら放棄。
+        救出票を採用した結果、MATH-500 42 問で正解→不正解の反転が 2 問以上出たら即ロールバック
+        （思考途中の暫定値を拾っている証拠）。
+      </p>
+    </div>
+
+    <div class="box verified">
+      <h3>rank 2 — 思考予算と本文予算を分離し、max_tokens 倍増リトライを廃止する</h3>
+      <p>
+        現在は本文がゼロだと <code>max_tokens</code> を倍にして<strong>丸ごと再生成</strong>しています。
+        これは「思考をもう一度最初から全部やり直す」ので、レイテンシを確実に悪化させます。
+      </p>
+      <p>
+        代わりに、<code>max_tokens</code> の 70% を思考上限、残り 30% を本文専用として確保する
+        不変条件を入れ、倍増リトライは rank 1 の救出が失敗したときだけ・1 回のみに限定します。
+        併せて gpt-oss の <code>reasoning_effort</code> を high → medium に落とします。
+      </p>
+      <p>
+        <strong>賭けの内容を明示します</strong>：思考量を減らすと単体精度は下がる方向に働きます。
+        しかし現状は<strong>「賢いが票が存在しない」</strong>状態なので、
+        やや弱くても存在する票のほうが合議には価値がある、という判断です。
+      </p>
+      <p style="font-size:14.5px;color:var(--ink-2)">
+        <strong>捨てる条件</strong>：有効票が 1.5 倍未満、かつ有効票の単体正答率が 10pt 以上低下したら high に戻す。
+        有効票が 2 倍以上なら単体正答率が 5pt 落ちても採用してよい。
+      </p>
+    </div>
+
+    <div class="box verified">
+      <h3>rank 3 — PoT（Python 実行票）を全廃または math 限定に縮小する</h3>
+      <p>
+        自分たちの Phase 0 分析が既に結論を出しています——
+        <strong>「群 A の全構成で PoT 票が正解に一致した例は 0。deepseek の PoT は大半が実行失敗」</strong>。
+        機構を足すのではなく<strong>引く</strong>施策であり、期待値が最も確かな種類の変更です。
+      </p>
+      <p>
+        判断は既存ログのオフライン集計だけで確定します（API 追加ゼロ）。
+        Phase 0 は未解決 3 問しか見ていないので、<strong>全 210 問で同じ集計を取り直す</strong>のが第一歩です。
+      </p>
+      <p style="font-size:14.5px;color:var(--ink-2)">
+        <strong>捨てる条件</strong>：PoT が単独で決着させた問題が 210 問中 3 問以上あれば全廃を中止し、
+        math 限定＋タイムアウト 30 秒＋deepseek への割当停止に留める。0〜2 問なら全廃。
+      </p>
+    </div>
+
+    <div class="box verified">
+      <h3>rank 4 — 待機時間に上限を入れ、待たずに別系統へ倒す</h3>
+      <p>
+        現在は 1 リクエストあたり最悪 20 分の 429 待機に、さらに 600 秒のタイムアウトが乗ります。
+        実測には単問 8,217 秒 / 12,886 秒 / <strong>28,815 秒</strong>という記録があります。
+        1 リクエストあたりの累積待機に上限（例 180 秒）を入れ、超えたらそのモデルを
+        当該問題でスキップして票を他系統で埋めます。
+      </p>
+      <p>
+        <strong>これも測定が先です。</strong>「この呼び出しで待機に費やした秒」と
+        「最初の本文チャンクまでの秒」を記録し、<strong>8,217 秒の内訳が待機何 %・生成何 %</strong>かを出す。
+        待機が 30% 未満ならこの施策自体を捨てます。
+      </p>
+      <p style="font-size:14.5px;color:var(--ink-2)">
+        落とし穴：LLM サーバは生成開始前にヘッダを返すため、ヘッダ受信時刻でタイムアウト判定してはいけません。
+        必ず<strong>最初の content チャンクの到着時刻</strong>で測ります。
+      </p>
+    </div>
+
+    <div class="box accent">
+      <h3>rank 5〜8（rank 1〜4 の完了後にのみ着手）</h3>
+      <p>
+        <strong>rank 5 — 自己一貫性投票に早期停止を入れる。</strong>
+        固定 20 票をやめ、窓（3〜5 票）内が全会一致なら打ち切る。
+        しきい値は手書きせず、既存 210 問を較正集合とした分位点で機械的に決めます。
+        自分のデータ側の根拠が強い施策です——誤答「15」が
+        <strong>2→5→8→10 票とサンプルを増やすほど強化された</strong>記録があり、
+        <strong>追加サンプリングは勝者を変えていません</strong>。失うものが構造的にほぼない。
+      </p>
+      <p>
+        <strong>rank 6 — 日常対話用のローカル高速パスを分離する。</strong>
+        小型モデルを Ollama に置き、対話は既定でそこへ流す。
+        <strong>精度スタックに一切触れないので 210 問のスコアに影響しません。</strong>
+        これが重要で、脆い合議機構に手を入れずに「日常使い」を満たせます。
+      </p>
+      <p>
+        <strong>rank 7 — 思考オフのドラフト一致ゲートを入口に置く。</strong>
+        まず思考オフ・低予算のドラフトを 2 本引き、一致したら即返す。
+        不一致のときだけ重い経路へ。副産物として
+        <strong>「2 本一致した部分集合の正解率」という品質推定器</strong>が手に入り、
+        以降のあらゆるルーティング判断の土台になります。
+      </p>
+      <p>
+        <strong>rank 8 — 検証機構は撤退（上記のとおり条件成立済み）。</strong>
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== やらない ========== -->
+  <section>
+    <p class="eyebrow">Explicitly rejected</p>
+    <h2>やらないことと、その根拠</h2>
+    <div class="prose">
+      <p>
+        流行している技術ほど、この系には効かないという結果になりました。
+        <strong>採用しない判断にも根拠を残します</strong>——これは効かなかった構成を
+        削除せず注記つきで残すのと同じ作法です。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>1. 構造化出力の強制（JSON mode / guided_json）を推論に適用すること</h3>
+      <p>
+        これは私が当初「抽出失敗 78%/67% の解決策」と考えていたものですが、
+        <strong>逆効果である証拠が出ました。</strong>
+      </p>
+      <p>
+        推論タスクで JSON モードを強制すると、報告されている劣化は
+        <strong>GSM8K で 76.6% → 49.3%（GPT-3.5-Turbo）、86.5% → 23.4%（Claude-3-Haiku）</strong>。
+        形式の妥当性 100% と引き換えに正答率が最大 8.7pt 落ちるという追試もあります。
+      </p>
+      <p>
+        さらにこの系にとって致命的なのは<strong>多様性の崩壊</strong>です。
+        JSON で返せと指示するだけで最頻回答のシェアが <strong>41% → 64%</strong>、
+        異なり回答数が <strong>52 → 36</strong> に減るという報告があります。
+        <strong>自己一貫性投票は多様性を前提にした機構なので、これは土台を壊します。</strong>
+      </p>
+      <p>
+        正しい適用範囲は<strong>入口判定器やルーティングのような分類的呼び出しに限る</strong>ことです。
+        推論本体には掛けない。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>2. クライアント側の制約デコーディング（Outlines / llguidance / XGrammar 等）</h3>
+      <p>
+        この領域で最も実装が充実していますが、<strong>すべて logits へのアクセスが前提</strong>です。
+        クラウド 4 系統は API 経由のみで、logprobs は取れても<strong>マスクはできません</strong>。
+        構造的に届きません。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>3. 進化的モデルマージ（および TIES / DARE / model soups）</h3>
+      <p>
+        <strong>棄却の理由は「重みが手に入らないから」ではありません。</strong>
+        gpt-oss は Apache-2.0、DeepSeek V4 は MIT で重み自体は入手できます。
+        不可能なのは次の 3 つです。
+      </p>
+      <p>
+        <strong>①</strong> 4 系統が共通の事前学習ベースを持たないため、
+        マージの前提であるタスクベクトルが定義できない。
+        <strong>②</strong> V4-Pro は 1.6T 総パラメータで、空きディスク 750GB に収まらない。
+        <strong>③</strong> 仮にマージできても 8GB 1 枚では走らない。
+      </p>
+      <p style="font-size:14.5px;color:var(--ink-2)">
+        以前このサイトおよび対話で「重みが入手不可だからマージできない」と述べましたが、
+        <strong>理由が不正確でした</strong>。正しくは上記 3 点です。結論（適用不可）は変わりません。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>4. 合議結果を教師にした自己蒸留・自己学習</h3>
+      <p>
+        この系では<strong>特に有害</strong>です。誤答「15」がサンプルを増やすほど
+        2→5→8→10 票と強化された実測が、まさに合意の罠の実例です。
+        <strong>多数決を教師にすれば、共有された誤りが恒久化します。</strong>
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>5. RAG の高度化（GraphRAG / 再ランク / Agentic RAG など）</h3>
+      <p>
+        自作の RAG は既に <strong>recall@3 = 1.0</strong> です。
+        挙げられる技術はすべて recall を上げるもので、<strong>定義上、効果が観測できません</strong>。
+        Agentic RAG 系はレイテンシが 15〜22 倍で、中央値 5.3 分の系に掛けたら破滅します。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>6. 審理・監査レイヤの増設、LLM 審査員の追加</h3>
+      <p>
+        <strong>最も流行していて、この系で最も効かない方向</strong>です。
+        aime24-I-12 の 384 は多数決でも審理でも監査でも検出できませんでした。
+        文献側も、9 名の審査員パネルの実効票数が約 2.2 にしかならず、
+        パネル精度が独立投票の予測より 8〜22pt 低いと報告しています。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>7. 学習型ルーターの新規構築（RouteLLM 等）</h3>
+      <p>
+        統一評価では上位手法でも<strong>最良単一構成に対して +4%・コスト −31.7% が天井</strong>で、
+        複数の手法と商用ルータは最良単一構成に負けています。
+        学習データも 8 万件の人間選好が前提で、<strong>210 問とは 3 桁違います</strong>。
+      </p>
+      <p>
+        なお「16,506 リクエスト」は<strong>ラベル付き事例数ではありません</strong>。
+        正負のラベルが付くのは問題×構成の単位で、問題は 210・未解決は 8 しかない。
+        ここを取り違えると学習の設計を誤ります。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 衛生 ========== -->
+  <section>
+    <p class="eyebrow">Measurement hygiene</p>
+    <h2>測定の衛生 — これがないと、どの施策も効果を帰属できない</h2>
+
+    <div class="box accent">
+      <h3>失敗を 1 つに潰さない</h3>
+      <p>
+        現在の実装は失敗をすべて <code>__ERROR__: truncated</code> という 1 つの状態に潰しています。
+        しかし中身は 4 種類あり、<strong>効く対策がそれぞれ違います</strong>。
+      </p>
+      <div class="tw">
+        <table>
+          <caption>抽出失敗の 4 分類（rank 1 と同じコミットで必ず入れる）</caption>
+          <thead><tr><th class="num">型</th><th>状態</th><th>効く対策</th></tr></thead>
+          <tbody>
+            <tr><td class="num">A</td><td>思考テキストはある・本文が空（思考が予算を食い尽くした）</td><td>rank 1（回収）＋ rank 2（予算分離）</td></tr>
+            <tr><td class="num">B</td><td>思考も本文も空（混雑・空応答）</td><td>rank 4（待機上限・別系統へ）</td></tr>
+            <tr><td class="num">C</td><td>本文はあるがパーサが取り出せない</td><td>rank 1 の抽出ラダー</td></tr>
+            <tr><td class="num">D</td><td>PoT のコード実行が失敗</td><td>rank 3（縮小・全廃）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>78% という数字が A なのか C なのかで、打つべき手がまったく変わります。</strong>
+        参考として、ある評価ハーネスでは抽出処理を直しただけで
+        <strong>特定モデルのスコアがほぼ 3 倍</strong>になった例があります。
+        つまり「モデルが答えていない」のではなく「取り出せていない」場合が現実にあります。
+      </p>
+    </div>
+
+    <div class="box accent">
+      <h3>各施策の後に必ず測る 4 つ</h3>
+      <p>
+        (a) 210 問の正解数、(b) <strong>モデル別の有効票数と抽出失敗率</strong>、
+        (c) 1 問あたりリクエスト数、(d) 秒数の中央値と最大値。
+      </p>
+      <p>
+        とくに <strong>(b) が動かない改修は、この系では何も直していません</strong>。
+        4 系統が実質 2 系統に溶けている状態が続く限り、その上に載せた集約の実測は
+        すべて汚染されたデータです。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>評価対象から分離すべき 1 問</h3>
+      <p>
+        aime24-II-15 は問題文が参照する図がデータセットに欠落しており、
+        全構成が同じ誤読をしています。これは技術ではなく<strong>ベンチデータの欠陥</strong>です。
+        直さないまま「あと 3 問」を数えると、<strong>以降のすべての A/B の分母が汚染されます</strong>。
+        注記つきで分離するか、図のテキスト記述を補うべきです。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 依存 ========== -->
+  <section>
+    <p class="eyebrow">Dependencies</p>
+    <h2>なぜこの順序なのか</h2>
+    <div class="prose">
+      <p>
+        依存関係は 3 本あります。順序を守らないと、測定そのものが無効になります。
+      </p>
+      <p>
+        <strong>第一に、rank 1・2 が終わるまで他のあらゆる A/B は測定できません。</strong>
+        78%・67% が抽出失敗している状態では、どんな改修も
+        「有効票がそもそも存在しない」というノイズに埋もれます。
+        Phase 0 レポートが自分で出した優先順位の第 1 項がまさにこれで、
+        その後 sc10 / sc11 という別方向に 2 日投じたのが直近の経緯です。
+        <strong>ここに戻るのが最短路です。</strong>
+      </p>
+      <p>
+        <strong>第二に、早期停止（rank 5）は rank 1〜4 の後でなければ危険です。</strong>
+        停止則は「有効票の一致」を数えるので、抽出が壊れたまま導入すると
+        抽出失敗が偶然そろった時点で停止してしまいます。
+      </p>
+      <p>
+        <strong>第三に、ドラフトゲート（rank 7）は rank 1・2・5 すべてに依存します。</strong>
+        ドラフトの一致率を測るには抽出が信頼できることが前提で、
+        かつゲートが弾いた問題を落とす先が軽くなっていないと、
+        中央値は改善しても最悪ケースが変わりません。
+      </p>
+      <p>
+        rank 4 と rank 6 だけは完全に独立で、他のどれとも並行に着手できます。
+        <strong>rank 4 は測定そのものを速くするので、むしろ最初に入れると実験サイクルが縮みます。</strong>
+        rank 6 は精度スタックに一切触れないので、日常使いを先に満たしたいなら単独で片付けてよい。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 検証方法 ========== -->
+  <section>
+    <p class="eyebrow">How this was derived</p>
+    <h2>この設計はどう検証されたか</h2>
+    <div class="prose">
+      <p>
+        単一の視点で書いた設計は、その視点の盲点をそのまま持ちます。
+        そこで<strong>4 つの独立した設計を、意図的に異なる前提から</strong>起こしました——
+        コストを唯一の軸とする案、検証可能性を唯一の軸とする案、
+        手書き定数の排除を軸とする案、そして<strong>引き算しか信じない案</strong>。
+      </p>
+      <p>
+        次に各案へ<strong>3 方向の敵対的反証</strong>をぶつけました——
+        実測データとの矛盾、実行可能性、そして「6 か月後に最も後悔しているとしたら何が原因か」。
+        反証側には「根拠のない難癖は書くな、必ず実測に紐づけろ」と条件を課しています。
+      </p>
+    </div>
+
+    <div class="box verified">
+      <h3>反証が実際に見つけたもの</h3>
+      <p>
+        <strong>この訂正（199 は和集合）を見つけたのは反証エージェントです。</strong>
+        「引き算案」の前提を検査する過程で、集計スクリプトが和集合を取っていることが指摘され、
+        独立に再集計して確認しました。
+      </p>
+      <p>
+        ほかにも、レイテンシの主因を「無料枠の奪い合い」とした案に対して
+        <strong>「実測は 16,506 req ÷ 4 日 = 約 2.9 req/分で、40 req/分枠の 7% しか使っていない」</strong>
+        という反証が出て、その案の中核が崩れました。
+        4 案のうち<strong>3 名の反証すべてに耐えたものは 1 つもありません</strong>。
+      </p>
+      <p>
+        ここに書いた rank 1〜8 は、どれか 1 つの案ではなく
+        <strong>4 案から反証を生き延びた要素だけを取り出したもの</strong>です。
+      </p>
+    </div>
+
+    <div class="cta">
+      <a class="btn solid" href="index.html">実測結果と限界 →</a>
+      <a class="btn" href="roadmap.html">ロードマップ →</a>
+      <a class="btn" href="usage.html">使ってみる →</a>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <div class="col">
+    fugu-nim — 次期設計（2026-08-06 rev.2）<br>
+    導出: 独立設計 4 案 × 敵対的反証 3 方向（17 エージェント）＋ 技術調査 8 領域（9 エージェント）<br>
+    本ページの数値はすべて fugu_bench/results/*.jsonl と logs/ の実測から再集計しています<br>
+    施策の「捨てる条件」は着手前に固定し、後から動かさない方針です
+  </div>
+</footer>
+
+</body>
+</html>

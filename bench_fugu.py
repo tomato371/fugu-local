@@ -337,6 +337,291 @@ def run_sc(item, pot, cheap=0):
         f.SC_POT, f.SC_CHEAP_VOTES = saved_pot, saved_cheap
 
 
+def run_sc3(item):
+    """強化 SC (2026-08-04): 実力負け問題の再攻略用。4系統(deepseek/nemotron/gpt-oss/minimax)・
+    初回8票・上限32票・思考32kトークン開始。通常 sc@nim(3系統・6/20票・16k開始)で
+    票が散った問題に test-time compute を積み増して挑む。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 8, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+
+
+def run_sc4(item):
+    """DeepConf 構成 (2026-08-04): sc3(4系統・32票・思考32k) + logprobs 収集 +
+    自信度加重集約(低自信トレース除外つき)。Meta AI 'Deep Think with Confidence' の
+    オフライン版。gpt-oss-120b で AIME25 97.0->99.9% を実証した手法を fugu の SC に接続。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_conf = (f.NIM_CAPTURE_LOGPROBS, f.SC_CONF_VOTE)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.NIM_CAPTURE_LOGPROBS = True
+        f.SC_CONF_VOTE = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        f.NIM_CAPTURE_LOGPROBS, f.SC_CONF_VOTE = saved_conf
+
+
+def run_sc6(item):
+    """SC-Court 構成 (2026-08-05, fugu独自設計): sc3系サンプリング(4系統・初回12票・
+    上限32票・思考32k・生多数決) + 抽出失敗票の救済(SC_RESCUE_VOTES) + 対審集約
+    (SC_COURT: 異種裁判官団が候補トレースを審理し判決、全候補FLAWEDなら悪魔の代弁人)。
+    DeepConf実測(sc4, 0/5で有害)で判明した3失敗モード — 票の散逸・サンプル浪費・
+    合意型誤答 — への fugu 独自の応答。生成側の自信度ではなく検証側の信号を使う。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        f.SC_COURT, f.SC_RESCUE_VOTES = saved_court
+
+
+def run_sc7(item):
+    """S3C + SC-Court v2 構成 (2026-08-05, fugu独自設計): sc6 に加えて
+    - SC_STRATIFY: 戦略層化サンプリング。強モデルが「本質的に異なる攻め方」を列挙し
+      各CoTサンプルへ強制割当。温度多様性が探索できない「別の解法流域」を被覆する
+      (sc6実測の核心: 全38サンプル中に正解が一度も生成されない問題は集約では救えない)
+    - Court v2: 裁判官棄権時の補充 / 審理スキップ条件に真過半数を要求 / 評決不成立でも
+      悪魔の代弁人発動 (aime26-15 のマージン自己封殺・aime24-I-12 の棄権機会損失の修正)"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        f.SC_STRATIFY = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY = saved_court
+
+
+def run_sc8(item):
+    """境界監査つき構成 (2026-08-05, fugu独自設計): sc7(S3C+Court v2) + SC_AUDIT。
+    sc7実測 aime24-I-12 で悪魔の代弁人2名が独立に384へ収束(正解385) — 独立一致後の
+    残リスクは共有オフバイワンに絞られるため、採用直前に「境界処理のみ」の専任監査を
+    通す。全監査人が同一修正値に一致した場合のみ置換(正解を壊さない保守則)。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        f.SC_STRATIFY = True
+        f.SC_AUDIT = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT = saved_court
+
+
+def run_sc9(item):
+    """挑戦者制度つき構成 (2026-08-05, fugu独自設計): sc8 + SC_CHALLENGER + 候補枠5 +
+    戦略6本。sc8実測で審理が誤答多数派を追認して悪魔ルートが封じられた(aime24-I-12)、
+    1票同士の候補選抜が出現順で正解60が候補枠から漏れうる(aime25-13)への応答。
+    現職には常に挑戦者(悪魔合意)をぶつけ、決選審理で数学だけを見て決める。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+                   f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        f.SC_STRATIFY = True
+        f.SC_AUDIT = True
+        f.SC_CHALLENGER = True
+        f.SC_COURT_TOPK = 5
+        f.SC_STRATEGY_N = 6
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+         f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N) = saved_court
+
+
+def run_sc10(item):
+    """機械検証官つき構成 (2026-08-05, fugu独自設計, 理論#5): sc9 + SC_MACHINE。
+    理論#1-4(言語による検証)では 384→385 の共有オフバイワンが裁判官にも監査人にも
+    不可視だった実測を受け、複数モデルが独立に書いた全数列挙プログラムの実行結果一致
+    (実行可能な合意)を最終裁定として全てに優先させる。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved_court = (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+                   f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N, f.SC_MACHINE)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        f.SC_STRATIFY = True
+        f.SC_AUDIT = True
+        f.SC_CHALLENGER = True
+        f.SC_COURT_TOPK = 5
+        f.SC_STRATEGY_N = 6
+        f.SC_MACHINE = True
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+         f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N,
+         f.SC_MACHINE) = saved_court
+
+
+def run_sc11(item):
+    """機械裁定 v2 構成 (2026-08-06, sc10 実測の教訓): sc10 + SC_MACHINE_ARBITRATE。
+    sc10 では検証プログラムが正解 385 を出力していたのに「2本一致」不成立で棄権し、
+    言語側の誤答 24 が確定した。生成失敗を補充で埋め、なお割れたらコード審査
+    (どのプログラムが問題文を忠実に実装しているか)で決着させる。"""
+    lineup = ["deepseek-ai/deepseek-v4-pro", "nvidia/nemotron-3-ultra-550b-a55b",
+              "openai/gpt-oss-120b", "minimaxai/minimax-m3"]
+    saved_rm = f.REASONING_MODELS
+    saved_sc = (f.SC_INITIAL, f.SC_STEP, f.SC_MAX)
+    saved_mc = {k: dict(v) for k, v in f.MODEL_CONFIG.items()}
+    saved = (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+             f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N, f.SC_MACHINE,
+             f.SC_MACHINE_ARBITRATE, f.SC_MACHINE_N)
+    try:
+        f.REASONING_MODELS = [m for m in lineup if f._is_nim(m)]
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = 12, 4, 32
+        for m in lineup:
+            if m in f.MODEL_CONFIG:
+                f.MODEL_CONFIG[m]["num_predict"] = 32768
+        f.SC_COURT = True
+        f.SC_RESCUE_VOTES = True
+        f.SC_STRATIFY = True
+        f.SC_AUDIT = True
+        f.SC_CHALLENGER = True
+        f.SC_COURT_TOPK = 5
+        f.SC_STRATEGY_N = 6
+        f.SC_MACHINE = True
+        f.SC_MACHINE_ARBITRATE = True
+        f.SC_MACHINE_N = 4
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved_rm
+        f.SC_INITIAL, f.SC_STEP, f.SC_MAX = saved_sc
+        f.MODEL_CONFIG = saved_mc
+        (f.SC_COURT, f.SC_RESCUE_VOTES, f.SC_STRATIFY, f.SC_AUDIT,
+         f.SC_CHALLENGER, f.SC_COURT_TOPK, f.SC_STRATEGY_N, f.SC_MACHINE,
+         f.SC_MACHINE_ARBITRATE, f.SC_MACHINE_N) = saved
+
+
+def _run_unified(item, **flag_overrides):
+    """統合 MoA (docs/UNIFIED_MOA_SPEC.md) の共通ランナー。
+    フラグを保存→設定→finally で復元(既存 runner と同じ作法)。task_type は渡さない。"""
+    keys = ("FUGU_UNIFIED", "FUGU_DECOMPOSE", "FUGU_HIERARCHICAL", "FUGU_RESIDUAL",
+            "FUGU_EXEC_KEY", "FUGU_EARLY_UNANIMOUS")
+    saved = {k: getattr(f, k) for k in keys}
+    try:
+        f.FUGU_UNIFIED = True
+        for k, v in flag_overrides.items():
+            setattr(f, k, v)
+        res = f.fugu_solve(item["question"])
+        return res["text"], res["answer"], res["n_samples"]
+    finally:
+        for k, v in saved.items():
+            setattr(f, k, v)
+
+
+def run_u(item):
+    return _run_unified(item)
+
+
+def run_u_nodecomp(item):
+    return _run_unified(item, FUGU_DECOMPOSE=False)
+
+
+def run_u_nohier(item):
+    return _run_unified(item, FUGU_HIERARCHICAL=False)
+
+
+def run_u_nores(item):
+    return _run_unified(item, FUGU_RESIDUAL=False)
+
+
+def run_u_noexec(item):
+    return _run_unified(item, FUGU_EXEC_KEY=False)
+
+
+def run_u_noearly(item):
+    return _run_unified(item, FUGU_EARLY_UNANIMOUS=False)
+
+
 def run_vibe(item):
     """VibeThinker-3B 単発（汚染検証）。AIME26(カットオフ後)も高得点なら実力、
     24/25 だけ高得点なら学習データ汚染 → SC_CHEAP_VOTES は封印のまま。"""
@@ -366,6 +651,177 @@ def run_coder(item, single=False):
     return text, None, 0
 
 
+def run_coder2(item):
+    """実行検証つきコーダ (2026-08-07)。coder@nim の 2 敗はどちらも問題文に
+    実行可能な例が書かれており、実行すれば API 0 円で偽と分かった
+    (132 は矢印形 6 例、145 は比較形 2 例)。候補を実行例に当てて通過数で
+    選抜し、落ちた分だけ実測トレースを添えて直させる。"""
+    coder = f.AGGREGATOR if f.AGGREGATOR else _best_model()
+    lineup, seen = [], set()
+    for m in [coder] + list(f.PROPOSERS):
+        if m and m not in seen:
+            seen.add(m)
+            lineup.append(m)
+    text, stat = f.solve_code_verified(item["question"],
+                                       models=lineup[:f.CODE_CANDIDATES])
+    if not text:
+        # 実行例が取れない/候補が全滅 → 従来の MoA 合議へ退避する。
+        # 検証できない問題で「単一モデルの出力」に落とすと coder@nim より弱くなる。
+        print(f"   [C2] 検証不能({'実行例なし' if stat.get('no_examples') else '候補なし'}) "
+              f"→ 従来の MoA 合議へ")
+        return run_coder(item, single=False)
+    p, n = stat["best"]
+    print(f"   [C2] 確定: 実行例 {p}/{n} 通過, 修復 {stat['repairs']} 回, "
+          f"検証済={stat['verified']}")
+    return text, None, stat["repairs"]
+
+
+SC_BIG_PREDICT = 49152      # 既定 16384 の 3 倍
+SC_BIG_CAP = 98304          # 自動増額の上限も上げる(既定 32768 のまま だと増額が起きない)
+SC_ADAPT_MAX = 40           # 難問判定後の票数上限(既定 SC_MAX=20 の 2 倍)
+
+
+def run_sc_budget(item):
+    """予算切れへの直接対処 (2026-08-07)。sc@nim の数学の失敗16件のうち13件は
+    無回答で、その正体は「思考が結論に到達する前に max_tokens で切られた」。
+    継投(relay)は途中経過を別モデルに継がせる手だが、そもそも予算を増やせば
+    自力で結論に届く可能性がある。単純な方を先に測る。
+
+    測定上の注意: 自然に stop で終わった応答には上限の引き上げは何の影響も
+    与えない(既にモデル自身が止まっている)。影響を受けるのは打ち切られた
+    応答だけで、それらは今ゼロ票なので、原理的にはほぼ単調。ただし「本文は
+    出たが途中で切れた」サンプルは票が変わりうるので、無回答問題で効果を
+    確かめた後に全問走で回帰が無いことを確認してからスコアに算入する。"""
+    saved = ({m: dict(v) for m, v in f.MODEL_CONFIG.items()}, f.NIM_MAX_TOKENS_CAP)
+    try:
+        for m in f.REASONING_MODELS:
+            f.MODEL_CONFIG.setdefault(m, {})["num_predict"] = SC_BIG_PREDICT
+        # 上限を上げないと `max_tokens < NIM_MAX_TOKENS_CAP` が偽になり増額が起きない
+        f.NIM_MAX_TOKENS_CAP = SC_BIG_CAP
+        print(f"   [BIG] num_predict={SC_BIG_PREDICT} cap={SC_BIG_CAP} "
+              f"for {f.REASONING_MODELS}")
+        return run_sc(item, pot=True)
+    finally:
+        f.MODEL_CONFIG, f.NIM_MAX_TOKENS_CAP = saved
+
+
+def run_sc_big_relay(item):
+    """予算増 + 思考継投。予算を増やしても結論に届かなかった分だけ継投が拾う。
+    継投は有効票ゼロのときしか発動しないので、両者は干渉しない。"""
+    saved = f.NIM_RELAY
+    f.NIM_RELAY = True
+    try:
+        return run_sc_budget(item)
+    finally:
+        f.NIM_RELAY = saved
+
+
+def run_adapt(item):
+    """今日の3つの修理を組み合わせた候補構成 (2026-08-07)。
+
+      ・票数の均等化      … 呼び出し回数でなく票数を揃える
+      ・思考予算の段階的引き上げ … 票が割れた時点で num_predict を積む
+      ・検証選抜          … 票が床に届かず無回答で終わる分岐だけで発動
+
+    3つとも「初回バッチには一切触れない」ように作ってある。したがって
+    初回で確定する易問の結果は原理的に変わらず、影響範囲は第2バッチ以降に
+    入った問題(AIME 90問中31問)に限定される。この性質があるから、その31問
+    だけを測り直しても和集合の罠(pass@k を単一構成スコアと誤認する)を踏まない。
+
+    どれも正解を見て調整した箇所は無い。均等化が見るのは「票になったか」だけで
+    「合っていたか」は見ない。予算引き上げは機械的な打ち切りの修理である。
+    """
+    saved = ({m: dict(v) for m, v in f.MODEL_CONFIG.items()}, f.NIM_MAX_TOKENS_CAP,
+             f.SC_EQUALIZE_VOTES, f.SC_VERIFY_SELECT, f.SC_DATASET_HINT,
+             f.SC_ESCALATE_PREDICT, f.SC_ESCALATE_CAP, f.SC_ESCALATE_MAX)
+    f.SC_EQUALIZE_VOTES = True
+    f.SC_VERIFY_SELECT = True
+    f.SC_DATASET_HINT = str(item.get("id") or "")
+    f.SC_ESCALATE_PREDICT = SC_BIG_PREDICT
+    f.SC_ESCALATE_CAP = SC_BIG_CAP
+    f.SC_ESCALATE_MAX = SC_ADAPT_MAX
+    try:
+        return run_sc(item, pot=True)
+    finally:
+        (f.MODEL_CONFIG, f.NIM_MAX_TOKENS_CAP, f.SC_EQUALIZE_VOTES,
+         f.SC_VERIFY_SELECT, f.SC_DATASET_HINT,
+         f.SC_ESCALATE_PREDICT, f.SC_ESCALATE_CAP, f.SC_ESCALATE_MAX) = saved
+
+
+def run_eq(item):
+    """sc@nim + 票数の均等化 (2026-08-07)。既存の配分は「呼び出し回数」を揃えて
+    いるが、死票率がモデル間で大きく違う(gpt-oss-120b 65% / minimax-m3 0%)ため
+    票数が揃わない。この問題での実測死票率から期待票数が揃うよう配り直す。
+    精度は参照しない(参照するとテストデータへの当てはめになる)。
+    初回バッチは実測が無いので従来どおり均等 = 早期確定する易問の挙動は不変。"""
+    saved = f.SC_EQUALIZE_VOTES
+    f.SC_EQUALIZE_VOTES = True
+    try:
+        return run_sc(item, pot=True)
+    finally:
+        f.SC_EQUALIZE_VOTES = saved
+
+
+def run_full(item):
+    """今日の改良を全部入れた候補構成 (2026-08-07)。
+      ・票数の均等化  … 黙りがちなモデルの声が体系的に小さくなるのを直す
+      ・予算増と上限引き上げ … 増額が 32768 で頭打ちになり 53 票が死んでいた
+      ・検証選抜      … 票が床に届かず無回答で終わる分岐だけで発動
+    いずれも「機械的な取りこぼしの修理」であって、正解を見て調整した箇所はない。"""
+    saved = (f.SC_EQUALIZE_VOTES, f.SC_VERIFY_SELECT, f.SC_DATASET_HINT)
+    f.SC_EQUALIZE_VOTES = True
+    f.SC_VERIFY_SELECT = True
+    f.SC_DATASET_HINT = str(item.get("id") or "")
+    try:
+        return run_sc_budget(item)
+    finally:
+        (f.SC_EQUALIZE_VOTES, f.SC_VERIFY_SELECT, f.SC_DATASET_HINT) = saved
+
+
+def run_select(item):
+    """sc@nim + 検証選抜 (2026-08-07)。票が床(SC_MIN_VOTES)に届かず無回答で
+    終わる問題でだけ、候補集合を審査員に検証させて 1 つ選ぶ。
+    aime25-13(正解60)と aime25-27(正解248)は 27 サンプル中に正解を 1 票だけ
+    生成しており、多数決には信号が無かった。この分岐の返り値は run_sc では
+    確定的に無回答なので、選抜を足しても原理的に退行しない。"""
+    saved = (f.SC_VERIFY_SELECT, f.SC_DATASET_HINT)
+    f.SC_VERIFY_SELECT = True
+    f.SC_DATASET_HINT = str(item.get("id") or "")
+    try:
+        return run_sc(item, pot=True)
+    finally:
+        f.SC_VERIFY_SELECT, f.SC_DATASET_HINT = saved
+
+
+def run_sc_glm(item):
+    """SC 投票系統に glm-5.2 を加えた 4 系統 (2026-08-07)。
+    glm-5.2 は Z.ai のフラッグシップで AIME2026 95% 台と報告されるが、fugu では
+    統合役にしか使っておらず投票に参加していなかった。既存3系統
+    (deepseek-v4-pro / gpt-oss-120b / minimax-m3) とは系譜も異なる。
+    kimi-k2.6 (96.4% 報告) はカタログに在るが推論が 404 のため使えない
+    (2026-08-07 実測。8/3 に記録したカタログ churn と同じ)。"""
+    saved = f.REASONING_MODELS
+    try:
+        glm = "z-ai/glm-5.2"
+        f.REASONING_MODELS = list(saved) + ([glm] if glm not in saved else [])
+        print(f"   [SCG] SC投票系統 = {f.REASONING_MODELS}")
+        return run_sc(item, pot=True)
+    finally:
+        f.REASONING_MODELS = saved
+
+
+def run_relay(item):
+    """sc@nim + 思考継投 (2026-08-07)。構成は sc@nim と完全に同一で、有効票が
+    ゼロになった問題でだけ、予算切れで捨てていた思考トレースを別呼び出しに
+    継がせる。票が 1 つでもあれば発動しないので既存の多数決は動かない。"""
+    saved = f.NIM_RELAY
+    f.NIM_RELAY = True
+    try:
+        return run_sc(item, pot=True)
+    finally:
+        f.NIM_RELAY = saved
+
+
 CONFIGS = {
     "moa-old": run_moa_old,
     "fugu": run_fugu,
@@ -377,6 +833,70 @@ CONFIGS = {
     "coder1": lambda it: run_coder(it, single=True),
     "vibe": run_vibe,
 }
+
+# NIM クラウド構成 (2026-08-02): runner は既存を完全再利用し、run_bench が構成名の
+# @nim サフィックスで FUGU_BACKEND=nim を setup() 前に適用する。別名にするのは結果
+# ファイル <dataset>__<config>.jsonl をローカル結果と分離するため（report でも別行になる）。
+# sc@nim は PoT 込み（PoT のコード実行は backend に関係なくローカル subprocess であり、
+# 機械検証票はクラウドでも純増の強み）。
+CONFIGS.update({
+    "fugu@nim": run_fugu,
+    "think@nim": run_think,
+    "sc@nim": lambda it: run_sc(it, pot=True),
+    "coder@nim": lambda it: run_coder(it, single=False),
+    # sc2@nim (2026-08-03): runner は sc@nim と同一。429ストーム修正(指数バックオフ+
+    # グローバルクールダウン)と第3系統復活(minimax-m3)後の再測定を、修正前の sc@nim
+    # 結果と別ファイルで比較するための名前。主用途は嵐で無投票敗退した問題の --ids 再挑戦。
+    "sc2@nim": lambda it: run_sc(it, pot=True),
+    # sc3@nim (2026-08-04): 4系統・32票・思考32k の強化構成。実力負け問題の再攻略用。
+    "sc3@nim": run_sc3,
+    # sc4@nim (2026-08-04): sc3 + DeepConf(logprobs自信度の加重集約・低自信トレース除外)。
+    # 【実測 2026-08-05: 0/5 で有害と結論。記録用に構成は残す】
+    "sc4@nim": run_sc4,
+    # sc6@nim (2026-08-05): SC-Court 対審集約 + 抽出失敗票救済 (fugu独自設計)。
+    "sc6@nim": run_sc6,
+    # sc7@nim (2026-08-05): S3C 戦略層化サンプリング + SC-Court v2 (fugu独自設計)。
+    "sc7@nim": run_sc7,
+    # sc8@nim (2026-08-05): sc7 + 境界監査 (独立一致した答えのオフバイワン監査, fugu独自設計)。
+    "sc8@nim": run_sc8,
+    # sc9@nim (2026-08-05): sc8 + 挑戦者制度 (現職への悪魔挑戦+決選審理) + 候補5枠 + 戦略6本。
+    "sc9@nim": run_sc9,
+    # sc10@nim (2026-08-05): sc9 + 機械検証官 (独立生成プログラムの実行一致を最終裁定に)。
+    "sc10@nim": run_sc10,
+    # sc11@nim (2026-08-06): sc10 + 機械裁定v2 (生成失敗の補充 + 割れたらコード審査)。
+    "sc11@nim": run_sc11,
+    # 統合 MoA (docs/UNIFIED_MOA_SPEC.md, 2026-08-05): task_type分岐なしの単一経路 +
+    # 段分解 + 遅延束縛プーリング。u-* はアブレーション(各機能の寄与切り分け)。
+    "u@nim": run_u,
+    "u-nodecomp@nim": run_u_nodecomp,
+    "u-nohier@nim": run_u_nohier,
+    "u-nores@nim": run_u_nores,
+    "u-noexec@nim": run_u_noexec,
+    "u-noearly@nim": run_u_noearly,
+    # 2026-08-07 の失敗解剖から出た 2 構成。どちらも「その問題で捨てていた
+    # 無料の信号」を拾うだけで、新しい理論は入れていない。
+    # coder2@nim の結果ファイルは v1(公開例を通った最初の候補で早期確定)の測定。
+    # HumanEval_145 が公開例 2/2 を通しながら隠れテストで落ちたため、v2 では
+    # 早期確定をやめ、生成入力による振る舞い多数決を挟む。測定を混ぜないよう別名にする。
+    "coder2@nim": run_coder2,
+    "coder3@nim": run_coder2,
+    # coder4: coder3 で出た回帰の修正版。実行例が 0 件の問題(HumanEval_130 の
+    # 'tri(2) = 1 + (2 / 2) = 2' 形式)で候補 1 本目を返しており、従来の MoA 合議
+    # より弱くなっていた。検証不能な問題は従来経路へ退避するようにした。
+    "coder4@nim": run_coder2,
+    # coder5: 候補を 3 本から 5 本へ。誤りは互いに異なる振る舞いになるが正答は
+    # 必ず同一の振る舞いになるので、候補が増えるほど正解クラスが多数派になりやすい。
+    "coder5@nim": run_coder2,
+    "scmcq@nim": lambda it: run_sc(it, pot=False),
+    "relay@nim": run_relay,
+    "scg@nim": run_sc_glm,
+    "big@nim": run_sc_budget,
+    "bigrelay@nim": run_sc_big_relay,
+    "sel@nim": run_select,
+    "eq@nim": run_eq,
+    "full@nim": run_full,
+    "adapt@nim": run_adapt,
+})
 
 # ==================================================
 # ランナー（1問ずつ JSONL 追記・再開可能）
@@ -409,6 +929,17 @@ def run_bench(dataset, config, limit=None, ids=None, offset=0, notify=False,
               shuffle_seed=42):
     if config not in CONFIGS:
         raise SystemExit(f"未知の構成: {config} (choices: {list(CONFIGS)})")
+    nim_cfg = config.endswith("@nim")
+    if nim_cfg:
+        # setup() より前にバックエンドを切替（apply_nim_profile が setup 内で適用される）
+        if not f.NIM_API_KEY:
+            raise SystemExit("@nim 構成には NVIDIA_API_KEY が必要です（build.nvidia.com で生成）")
+        f.FUGU_BACKEND = "nim"
+    elif f.FUGU_BACKEND == "nim":
+        # 逆方向の事故: NIM バックエンドのまま非 @nim 構成を走らせるとローカル結果
+        # ファイルがクラウド実測で汚染される。黙って続行せず明示的に止める。
+        raise SystemExit(f"FUGU_BACKEND=nim ですが構成 {config} は @nim ではありません"
+                         "（ローカル結果の汚染防止のため中止。env を外すか @nim 構成を指定）")
     items = load_items(dataset)
     if ids:
         want = set(ids)
@@ -431,6 +962,7 @@ def run_bench(dataset, config, limit=None, ids=None, offset=0, notify=False,
     for k, it in enumerate(todo, 1):
         print(f"\n=== [{k}/{len(todo)}] {it['id']} ({dataset}/{config}) ===")
         t0 = time.time()
+        nim_req0 = f.NIM_REQUEST_COUNT
         rec = {"id": it["id"], "dataset": dataset, "config": config,
                "expected": it["answer"], "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
         try:
@@ -447,10 +979,14 @@ def run_bench(dataset, config, limit=None, ids=None, offset=0, notify=False,
                         "error": f"{type(e).__name__}: {e}"})
             err_count += 1
         rec["seconds"] = round(time.time() - t0, 1)
+        if nim_cfg:
+            rec["nim_requests"] = f.NIM_REQUEST_COUNT - nim_req0
         append_result(dataset, config, rec)
         ok_count += int(rec.get("correct", False))
+        nim_note = (f"  nim_req={rec['nim_requests']} (累計 {f.NIM_REQUEST_COUNT})"
+                    if nim_cfg else "")
         print(f"    -> {'OK' if rec.get('correct') else 'NG'} "
-              f"got={rec.get('got')} expected={it['answer']} ({rec['seconds']}s)")
+              f"got={rec.get('got')} expected={it['answer']} ({rec['seconds']}s){nim_note}")
         if notify and (k % NOTIFY_EVERY == 0 or k == len(todo)):
             f.notify_slack(f"bench {dataset}/{config}",
                            f"{k}/{len(todo)} 完了  acc={ok_count}/{k}  err={err_count}",
@@ -524,11 +1060,13 @@ def report():
         n = len(recs)
         ok = sum(1 for r in recs if r.get("correct"))
         secs = [r.get("seconds", 0) for r in recs if r.get("seconds")]
-        rows[key] = (n, ok, (sum(secs) / len(secs)) if secs else 0)
-    print(f"{'dataset':12} {'config':10} {'acc':>14} {'avg_sec':>9}")
-    print("-" * 50)
-    for (ds, cfg), (n, ok, avg) in sorted(rows.items()):
-        print(f"{ds:12} {cfg:10} {ok:>4}/{n:<4} ({ok / n * 100:5.1f}%) {avg:>8.1f}")
+        nim_total = sum(r.get("nim_requests", 0) for r in recs)
+        rows[key] = (n, ok, (sum(secs) / len(secs)) if secs else 0, nim_total)
+    print(f"{'dataset':12} {'config':10} {'acc':>14} {'avg_sec':>9} {'nim_req':>8}")
+    print("-" * 60)
+    for (ds, cfg), (n, ok, avg, nim_total) in sorted(rows.items()):
+        nim_col = str(nim_total) if nim_total else "-"
+        print(f"{ds:12} {cfg:10} {ok:>4}/{n:<4} ({ok / n * 100:5.1f}%) {avg:>8.1f} {nim_col:>8}")
 
 
 # ==================================================

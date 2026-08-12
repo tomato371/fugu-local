@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fugu-nim の使い方 — 5 分で動かす</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; }
+  img, svg { max-width: 100%; }
+  h1, h2, h3, h4, p, ul, ol, dl, dd, figure, pre { margin: 0; }
+  ul, ol { padding: 0; }
+  table { border-collapse: collapse; }
+</style>
+</head>
+<body>
+<style>
+  :root {
+    color-scheme: light;
+    --ground:  #f1f3f1;
+    --panel:   #fbfcfb;
+    --panel-2: #eaeeeb;
+    --ink:     #131a20;
+    --ink-2:   #4a565f;
+    --ink-3:   #7c8790;
+    --rule:    #d9dfdb;
+    --ai:      #1f3a66;   /* 藍 — 構造色 */
+    --ai-soft: #e3eaf4;
+    --shu:     #a83f2a;   /* 朱 — 限界・注意 */
+    --shu-soft:#f6e7e2;
+    --moss:    #3a6a51;   /* 実測済み */
+    --moss-soft:#e2eee8;
+    --on-ai:   #eef2f8;
+    --ring:    rgba(19,26,32,.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --ground:  #0e1216;
+      --panel:   #171c21;
+      --panel-2: #1f262c;
+      --ink:     #e5eaee;
+      --ink-2:   #a3b0b9;
+      --ink-3:   #79868f;
+      --rule:    #262e35;
+      --ai:      #8aaddf;
+      --ai-soft: #1a2739;
+      --shu:     #e08163;
+      --shu-soft:#33211c;
+      --moss:    #74ab8d;
+      --moss-soft:#1b2b23;
+      --on-ai:   #0e1216;
+      --ring:    rgba(229,234,238,.12);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:  #0e1216; --panel: #171c21; --panel-2: #1f262c;
+    --ink: #e5eaee; --ink-2: #a3b0b9; --ink-3: #79868f; --rule: #262e35;
+    --ai: #8aaddf; --ai-soft: #1a2739; --shu: #e08163; --shu-soft: #33211c;
+    --moss: #74ab8d; --moss-soft: #1b2b23; --on-ai: #0e1216;
+    --ring: rgba(229,234,238,.12);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --ground: #f1f3f1; --panel: #fbfcfb; --panel-2: #eaeeeb;
+    --ink: #131a20; --ink-2: #4a565f; --ink-3: #7c8790; --rule: #d9dfdb;
+    --ai: #1f3a66; --ai-soft: #e3eaf4; --shu: #a83f2a; --shu-soft: #f6e7e2;
+    --moss: #3a6a51; --moss-soft: #e2eee8; --on-ai: #eef2f8;
+    --ring: rgba(19,26,32,.10);
+  }
+  :root {
+    --sans: system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", "Hiragino Sans", Meiryo, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  }
+
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--sans); font-size: 16.5px; line-height: 1.78;
+    -webkit-font-smoothing: antialiased;
+  }
+  .col { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
+  .prose { max-width: 70ch; }
+
+  /* ===== masthead ===== */
+  .mast { background: var(--ai); color: var(--on-ai); padding: 0 0 46px; }
+  .mast .col { padding-top: 44px; }
+  .brandline {
+    display: flex; align-items: center; gap: 12px; margin: 0 0 40px;
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: .12em; opacity: .78;
+  }
+  .brandline .tag {
+    border: 1px solid currentColor; padding: 2px 8px; letter-spacing: .1em;
+    font-size: 11px;
+  }
+  .mast h1 {
+    font-size: clamp(40px, 8vw, 82px); line-height: .98; letter-spacing: -.035em;
+    font-weight: 800; margin: 0 0 6px;
+  }
+  .mast h1 .thin { font-weight: 300; opacity: .62; }
+  .mast .sub {
+    font-family: var(--mono); font-size: clamp(13px, 2.1vw, 15px);
+    letter-spacing: .04em; opacity: .82; margin: 0 0 26px;
+  }
+  .mast .lead {
+    font-size: clamp(17px, 2.4vw, 21px); line-height: 1.62; max-width: 40ch;
+    margin: 0; font-weight: 400;
+  }
+  .mast .lead b { font-weight: 700; }
+  .factbar {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 26px 34px; margin: 40px 0 0; padding: 26px 0 0;
+    border-top: 1px solid rgba(255,255,255,.22);
+  }
+  :root[data-theme="dark"] .factbar, :root:where(:not([data-theme="light"])) .factbar {
+    border-top-color: rgba(0,0,0,.28);
+  }
+  @media (prefers-color-scheme: light) { .factbar { border-top-color: rgba(255,255,255,.22); } }
+  .fact .k {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; opacity: .68; margin: 0 0 4px;
+  }
+  .fact .v { font-size: 27px; font-weight: 700; letter-spacing: -.02em; margin: 0; line-height: 1.15; }
+  .fact .n { font-size: 12.5px; opacity: .72; margin: 3px 0 0; line-height: 1.5; font-family: var(--mono); }
+
+  /* ===== sections ===== */
+  section { padding: 62px 0 0; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ai); margin: 0 0 10px; font-weight: 700;
+  }
+  h2 {
+    font-size: clamp(24px, 3.4vw, 32px); line-height: 1.25; letter-spacing: -.022em;
+    font-weight: 700; margin: 0 0 14px; text-wrap: balance;
+  }
+  h3 { font-size: 17.5px; font-weight: 700; margin: 32px 0 6px; letter-spacing: -.008em; }
+  p { margin: 14px 0; }
+  a { color: var(--ai); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  a:focus-visible { outline: 2px solid var(--ai); outline-offset: 3px; border-radius: 2px; }
+  code {
+    font-family: var(--mono); font-size: .86em; background: var(--panel-2);
+    padding: .13em .4em; border-radius: 3px;
+  }
+  strong { font-weight: 700; }
+
+  .rule { height: 1px; background: var(--rule); margin: 62px 0 0; }
+
+  /* ===== cards / boxes ===== */
+  .box {
+    background: var(--panel); border: 1px solid var(--rule);
+    padding: 24px 26px; margin: 24px 0 0;
+  }
+  .box.accent { border-left: 3px solid var(--ai); }
+  .box.caution { border-left: 3px solid var(--shu); }
+  .box.verified { border-left: 3px solid var(--moss); }
+  .box h3:first-child, .box p:first-child { margin-top: 0; }
+  .box p:last-child { margin-bottom: 0; }
+
+  .principles { display: grid; gap: 18px; margin: 26px 0 0; }
+  @media (min-width: 760px) { .principles { grid-template-columns: repeat(3, 1fr); } }
+  .pr { background: var(--panel); border: 1px solid var(--rule); padding: 22px 22px 20px; }
+  .pr .no {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em; color: var(--ai);
+    margin: 0 0 10px; font-weight: 700;
+  }
+  .pr h3 { margin: 0 0 8px; font-size: 16.5px; }
+  .pr p { margin: 0; font-size: 14.5px; line-height: 1.68; color: var(--ink-2); }
+
+  /* ===== two-column verdict ===== */
+  .fits { display: grid; gap: 20px; margin: 26px 0 0; }
+  @media (min-width: 720px) { .fits { grid-template-columns: 1fr 1fr; } }
+  .fit { border: 1px solid var(--rule); background: var(--panel); padding: 22px 24px 18px; }
+  .fit .hd {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .1em; font-weight: 700;
+    margin: 0 0 14px; padding: 0 0 10px; border-bottom: 1px solid var(--rule);
+  }
+  .fit.yes .hd { color: var(--moss); }
+  .fit.no .hd { color: var(--shu); }
+  .fit ul { margin: 0; padding: 0; list-style: none; }
+  .fit li {
+    display: flex; gap: 11px; align-items: flex-start;
+    padding: 8px 0; font-size: 15px; line-height: 1.62; border-bottom: 1px dashed var(--rule);
+  }
+  .fit li:last-child { border-bottom: none; }
+  .fit li .mk { font-family: var(--mono); flex: none; font-weight: 700; line-height: 1.62; }
+  .fit.yes li .mk { color: var(--moss); }
+  .fit.no li .mk { color: var(--shu); }
+
+  /* ===== table ===== */
+  .tw { overflow-x: auto; margin: 24px 0 0; }
+  table { border-collapse: collapse; width: 100%; min-width: 580px; font-size: 14.5px; }
+  th, td { padding: 10px 13px; text-align: right; border-bottom: 1px solid var(--rule); }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    font-size: 12px; color: var(--ink-2); font-weight: 700; white-space: nowrap;
+    border-bottom: 1.5px solid var(--ink-3);
+  }
+  tbody td { font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 13.5px; }
+  tbody td:first-child { font-family: var(--sans); font-size: 14.5px; }
+  tbody tr:hover { background: var(--panel-2); }
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700;
+    padding: 2px 8px; border-radius: 2px; letter-spacing: .04em;
+  }
+  .pill.w { background: var(--moss-soft); color: var(--moss); }
+  .pill.e { background: var(--panel-2); color: var(--ink-2); }
+  .pill.l { background: var(--shu-soft); color: var(--shu); }
+  caption {
+    caption-side: top; text-align: left; font-family: var(--mono); font-size: 11.5px;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); padding: 0 0 10px;
+  }
+
+  /* ===== figure ===== */
+  figure { margin: 30px 0 0; }
+  figure svg { display: block; width: 100%; height: auto; max-width: 100%; }
+  .figwrap { background: var(--panel); border: 1px solid var(--rule); padding: 26px 20px 18px; overflow-x: auto; }
+  .figwrap > svg { min-width: 560px; }
+  figcaption {
+    font-size: 13.5px; color: var(--ink-2); margin: 12px 0 0; line-height: 1.66;
+    max-width: 72ch;
+  }
+
+  /* ===== code block ===== */
+  pre {
+    font-family: var(--mono); font-size: 13px; line-height: 1.75; background: var(--panel);
+    border: 1px solid var(--rule); border-left: 3px solid var(--ink-3);
+    padding: 18px 20px; overflow-x: auto; margin: 20px 0 0;
+  }
+  pre .c { color: var(--ink-3); }
+  pre .k { color: var(--ai); font-weight: 700; }
+
+  /* ===== cta ===== */
+  .cta {
+    display: flex; flex-wrap: wrap; gap: 14px; margin: 30px 0 0;
+  }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px; text-decoration: none;
+    font-family: var(--mono); font-size: 13.5px; font-weight: 700; letter-spacing: .03em;
+    padding: 13px 20px; border: 1.5px solid var(--ai); color: var(--ai);
+    background: transparent; transition: background .15s, color .15s;
+  }
+  .btn:hover { background: var(--ai); color: var(--on-ai); }
+  .btn.solid { background: var(--ai); color: var(--on-ai); }
+  .btn.solid:hover { opacity: .86; }
+
+  footer {
+    margin: 74px 0 0; background: var(--panel); border-top: 1px solid var(--rule);
+    padding: 34px 0 54px;
+  }
+  footer .col { font-family: var(--mono); font-size: 12.5px; color: var(--ink-3); line-height: 1.9; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<header class="mast">
+  <div class="col">
+    <p class="brandline"><span>FUGU-NIM</span><span class="tag">GETTING STARTED</span><span>v. 2026-08-06</span></p>
+    <h1>動かしてみる<span class="thin">まで</span><br>5 分</h1>
+    <p class="sub">Setup, interfaces, and what to expect</p>
+    <p class="lead">
+      本体は <b>Python 標準ライブラリのみ</b>で動きます。
+      クラウド構成なら GPU もローカルモデルも不要で、<b>無料の API キー 1 本</b>から始められます。
+    </p>
+
+    <div class="factbar">
+      <div class="fact">
+        <p class="k">最短</p>
+        <p class="v">3 コマンド</p>
+        <p class="n">キー取得 → 環境変数 → 実行</p>
+      </div>
+      <div class="fact">
+        <p class="k">費用</p>
+        <p class="v">¥0</p>
+        <p class="n">NIM 無料枠 / ローカルは電気代</p>
+      </div>
+      <div class="fact">
+        <p class="k">入口</p>
+        <p class="v">4 種</p>
+        <p class="n">CLI / TUI / Web / REST</p>
+      </div>
+      <div class="fact">
+        <p class="k">1 問の所要</p>
+        <p class="v">1〜10 分</p>
+        <p class="n">対話用途には向きません</p>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="col">
+
+  <!-- ========== 選ぶ ========== -->
+  <section>
+    <p class="eyebrow">Choose a backend</p>
+    <h2>まず、2 つのうちどちらで動かすか決める</h2>
+    <div class="prose">
+      <p>
+        fugu は<strong>同じオーケストレーション設計のまま、モデルの供給元だけを差し替えられる</strong>
+        構造になっています。切り替えは環境変数 1 つです。
+      </p>
+    </div>
+
+    <div class="fits">
+      <div class="fit yes">
+        <p class="hd">クラウド（NIM）— まずはこちら</p>
+        <ul>
+          <li><span class="mk">+</span><span>GPU 不要。ノート PC でも動く</span></li>
+          <li><span class="mk">+</span><span>100B〜550B 級のモデルを無料枠で使える</span></li>
+          <li><span class="mk">+</span><span>本サイトの実測値はすべてこの構成</span></li>
+          <li><span class="mk">−</span><span>約 40 リクエスト/分の制限。混雑時は待つ</span></li>
+          <li><span class="mk">−</span><span>問題文が外部 API へ送信される</span></li>
+        </ul>
+      </div>
+      <div class="fit no">
+        <p class="hd">ローカル（Ollama）</p>
+        <ul>
+          <li><span class="mk">+</span><span>データが外に出ない。レート制限もない</span></li>
+          <li><span class="mk">+</span><span>8GB VRAM から動く設計（モデルは逐次ロード）</span></li>
+          <li><span class="mk">−</span><span>Ollama と 20B〜35B 級モデルの用意が必要</span></li>
+          <li><span class="mk">−</span><span>8GB 環境ではモデル再ロードで大幅に遅くなる</span></li>
+          <li><span class="mk">−</span><span>精度はクラウド構成より下がる</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 最短手順 ========== -->
+  <section>
+    <p class="eyebrow">Quick start · cloud</p>
+    <h2>クラウド構成 — 3 コマンドで動く</h2>
+    <div class="prose">
+      <p>
+        <strong>1. 無料の API キーを取る。</strong>
+        <a href="https://build.nvidia.com/">build.nvidia.com</a> でアカウントを作り、
+        電話番号認証をすると <code>nvapi-</code> で始まるキーが発行されます。クレジットカードは不要です。
+      </p>
+      <p>
+        <strong>2. 環境変数を 2 つ設定して、実行する。</strong>（PowerShell の例）
+      </p>
+    </div>
+
+<pre><span class="c"># キーとバックエンドを指定（このウィンドウ内だけ有効）</span>
+<span class="k">$env:</span>NVIDIA_API_KEY = <span class="k">"nvapi-..."</span>
+<span class="k">$env:</span>FUGU_BACKEND  = <span class="k">"nim"</span>
+
+<span class="c"># 質問を 1 つ投げる</span>
+python fugu_local.py <span class="k">"3^100 の下 3 桁を求めて"</span></pre>
+
+    <div class="prose">
+      <p>
+        起動時に<strong>利用可能なモデルを自動でプローブして布陣を組みます</strong>。
+        混雑しているモデルがあれば、その場で代替に差し替わります。
+        画面に出る <code>[setup] nim probe:</code> の行が、その日の実際の構成です。
+      </p>
+      <p>
+        キーを毎回打ちたくない場合は、<code>setx NVIDIA_API_KEY "nvapi-..."</code> で
+        ユーザー環境変数に保存できます（新しいウィンドウから有効）。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>最初の 1 問は、待つつもりで投げてください</h3>
+      <p>
+        この系は<strong>「精度優先・時間は無制限」</strong>という設計で作られています。
+        平易な質問なら数十秒ですが、難問では複数モデルが並列に解いて投票し、
+        票が割れれば追加でサンプリングします。
+        <strong>HumanEval 30 問の実測では中央値 5.3 分・最長 35 分</strong>でした。
+        エディタ補完やチャットの代わりにはなりません。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== ローカル ========== -->
+  <section>
+    <p class="eyebrow">Quick start · local</p>
+    <h2>ローカル構成 — Ollama を使う</h2>
+    <div class="prose">
+      <p>
+        <code>FUGU_BACKEND</code> を設定しなければ、既定でローカル（Ollama）動作になります。
+        <a href="https://ollama.com/">Ollama</a> を入れて、使いたいモデルを引いておきます。
+      </p>
+    </div>
+
+<pre><span class="c"># 役割ごとに 1 体ずつ。全部揃わなくても、入っているものだけで動く</span>
+ollama pull gpt-oss:20b
+ollama pull qwen3.6:35b
+
+<span class="c"># そのまま起動（FUGU_BACKEND は未設定でよい）</span>
+python fugu_local.py <span class="k">"フェルマーの小定理を使って説明して"</span></pre>
+
+    <div class="prose">
+      <p>
+        導入済みモデルは起動時に自動検出され、<strong>足りない役割は入っているモデルで代替されます</strong>。
+        4 体すべてを揃える必要はありません。まず 1〜2 体から試せます。
+      </p>
+      <p>
+        8GB VRAM 環境では、モデルを 1 体ずつ入れ替えながら動きます（同時常駐しません）。
+        そのぶん再ロードで遅くなるため、<code>OLLAMA_MAX_LOADED_MODELS</code> を上げられる
+        メモリがあるなら上げたほうが快適です。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 入口 ========== -->
+  <section>
+    <p class="eyebrow">Interfaces</p>
+    <h2>4 つの入口 — 用途で選ぶ</h2>
+    <div class="prose">
+      <p>
+        コアは <code>fugu_local.py</code> ひとつで、残りはその薄いラッパです。
+        <strong>どれを使っても中身のオーケストレーションは同一</strong>です。
+      </p>
+    </div>
+
+    <div class="tw">
+      <table>
+        <caption>起動方法と追加依存</caption>
+        <thead>
+          <tr><th>入口</th><th class="num">起動</th><th>追加依存</th><th>向く場面</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>CLI</strong></td>
+            <td class="num">python fugu_local.py</td>
+            <td>なし（標準ライブラリのみ）</td>
+            <td>まず試す。バッチ処理。引数なしで対話モード</td>
+          </tr>
+          <tr>
+            <td><strong>TUI</strong></td>
+            <td class="num">python fugu_tui.py</td>
+            <td><code>pip install rich prompt_toolkit</code></td>
+            <td>ターミナルで対話。思考過程が整形されて見える</td>
+          </tr>
+          <tr>
+            <td><strong>Web UI</strong></td>
+            <td class="num">python fugu_web.py</td>
+            <td><code>pip install gradio</code></td>
+            <td>ブラウザで使う。<code>localhost:7860</code> が自動で開く</td>
+          </tr>
+          <tr>
+            <td><strong>REST API</strong></td>
+            <td class="num">uvicorn fugu_api:app</td>
+            <td><code>pip install fastapi uvicorn</code></td>
+            <td>他のプログラムから叩く。<code>/docs</code> に対話ドキュメント</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box accent">
+      <h3>おすすめの最初の一歩</h3>
+      <p>
+        <strong>まず CLI で 1 問投げて、動くことと遅さを体感してください。</strong>
+        気に入ったら <code>fugu_web.py</code> に移ると、履歴つきのチャットとして使えます。
+        Web UI はセッションを分けて保存できるので、テーマごとに文脈を分離できます。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 実用 ========== -->
+  <section>
+    <p class="eyebrow">Recipes</p>
+    <h2>実際に役に立つ使い方</h2>
+
+    <div class="prose">
+      <p>
+        単発の質問より、<strong>ファイルを渡して結果をファイルで受け取る</strong>使い方のほうが
+        この系の性格に合っています。拡張子から出力形式が自動で決まります。
+      </p>
+    </div>
+
+<pre><span class="c"># 仕様書（PDF/Word）を読ませて、実装を .py で受け取る</span>
+python fugu_local.py --file spec.pdf --out impl.py
+
+<span class="c"># 手元のコードを直させる（元ファイルは上書きしない）</span>
+python fugu_local.py --file buggy.py --out fixed.py
+
+<span class="c"># 手元のドキュメント群を根拠にして答えさせる（RAG）</span>
+python fugu_local.py --rag ./docs <span class="k">"この設計の弱点は？"</span>
+
+<span class="c"># Web 検索を足す（最新情報が要るとき）</span>
+python fugu_local.py --search <span class="k">"NIM の無料枠の現在の制限は？"</span>
+
+<span class="c"># プロジェクトごとに会話履歴を分ける</span>
+python fugu_local.py --session ./project-a.json <span class="k">"前回の続きから"</span>
+
+<span class="c"># 履歴を一切使わない（単発の実験向け）</span>
+python fugu_local.py --no-history <span class="k">"..."</span></pre>
+
+    <div class="prose">
+      <p>
+        PDF の読み込みには <code>pdfplumber</code>、PDF での書き出しには <code>fpdf2</code>、
+        Word/Excel/PowerPoint にはそれぞれ <code>python-docx</code> /
+        <code>openpyxl</code> / <code>python-pptx</code> が必要です。
+        <strong>入れなくても本体は動きます</strong>——テキストと Markdown だけなら追加依存はゼロです。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== ベンチ ========== -->
+  <section>
+    <p class="eyebrow">Reproduce</p>
+    <h2>本サイトの数字を、自分で測り直す</h2>
+    <div class="prose">
+      <p>
+        主張を信じる必要はありません。同じハーネスが同梱されています。
+        まずは 5 問だけ回して、所要時間とリクエスト消費の感覚を掴むのがおすすめです。
+      </p>
+    </div>
+
+<pre><span class="c"># 5 問だけ試す（データセットは自動ダウンロード）</span>
+python bench_fugu.py run --dataset aime26 --config sc@nim --limit 5
+
+<span class="c"># 構成を変えて比べる（同じ問題に別の集約を当てる）</span>
+python bench_fugu.py run --dataset aime26 --config sc6@nim --limit 5
+
+<span class="c"># 結果を集計して表示</span>
+python bench_fugu.py report
+
+<span class="c"># 消費が心配なら上限を決めておく（到達で安全停止）</span>
+<span class="k">$env:</span>FUGU_NIM_BUDGET = <span class="k">"300"</span></pre>
+
+    <div class="prose">
+      <p>
+        結果は <code>~/fugu_bench/results/&lt;dataset&gt;__&lt;config&gt;.jsonl</code> に
+        1 問 1 行で残ります。途中で止めても、次に同じコマンドを打てば<strong>済んだ問題は
+        飛ばして続きから再開</strong>します。
+      </p>
+    </div>
+
+    <div class="tw">
+      <table>
+        <caption>主な構成 — どれを使うか</caption>
+        <thead>
+          <tr><th class="num">構成</th><th>中身</th><th>使いどころ</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">fugu@nim</td><td>Conductor が経路を判断する標準構成</td><td>汎用。日本語・知識問題を含む場合</td></tr>
+          <tr><td class="num">sc@nim</td><td>自己一貫性投票（3 系統・6〜20 票）</td><td><strong>数学の既定。最も費用対効果が良い</strong></td></tr>
+          <tr><td class="num">coder@nim</td><td>コード生成＋実行検証</td><td>プログラミング課題</td></tr>
+          <tr><td class="num">sc6〜sc10@nim</td><td>対審集約・戦略層化・境界監査・機械検証</td><td>sc で解けなかった難問への追撃</td></tr>
+          <tr><td class="num">u@nim</td><td>段分解つき統合経路（実験中）</td><td>研究目的。<strong>常用は非推奨</strong>（コスト約 7 倍）</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== つまづき ========== -->
+  <section>
+    <p class="eyebrow">Troubleshooting</p>
+    <h2>つまずきやすいところ</h2>
+
+    <div class="box caution">
+      <h3>応答が返らない／やたらに遅い</h3>
+      <p>
+        まず<strong>異常ではない</strong>可能性を疑ってください。難問では 1 問に数十分かかります。
+        画面に <code>[SC n]</code> の行が増えていれば進行中です。
+        本当に固まる場合は、ストリームが無音になってから 10 分、または全体 40 分で
+        自動的に打ち切って次へ進む安全装置が入っています。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>429 が続く／モデルが見つからない</h3>
+      <p>
+        無料枠は<strong>モデル単位で混雑</strong>します。混雑を検知すると指数バックオフで待ち、
+        そのモデルだけを一時的に休ませて他の系統で続行します。
+        カタログに載っているのに 404 を返すモデルもあり、起動時プローブで自動的に迂回します。
+        <strong>時間帯を変えると通ることがよくあります</strong>（日中より深夜のほうが混みやすい日もあります）。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>ローカルで「モデルが見つからない」</h3>
+      <p>
+        Ollama が起動しているか（<code>ollama list</code>）を確認してください。
+        1 体も無いと起動を中断します。逆に <strong>1 体でもあれば、その 1 体で動きます</strong>。
+      </p>
+    </div>
+
+    <div class="box accent">
+      <h3>秘密のデータを扱うとき</h3>
+      <p>
+        クラウド構成では<strong>質問文と添付ファイルの本文が外部 API に送信されます</strong>。
+        機密を扱う場合はローカル構成（<code>FUGU_BACKEND</code> 未設定）を使ってください。
+        設計は同一なので、切り替えても使い方は変わりません。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ========== 期待値 ========== -->
+  <section>
+    <p class="eyebrow">Expectations</p>
+    <h2>何に効いて、何に効かないか</h2>
+    <div class="prose">
+      <p>
+        使い始める前に知っておくと失望が少ない点を、実測にもとづいて挙げます。
+        詳しい根拠は<a href="index.html">トップページの実測結果と限界</a>にあります。
+      </p>
+    </div>
+
+    <div class="fits">
+      <div class="fit yes">
+        <p class="hd">効く</p>
+        <ul>
+          <li><span class="mk">+</span><span>答えが 1 つに定まる問題（数学・アルゴリズム・選択式）。投票が使える</span></li>
+          <li><span class="mk">+</span><span>時間をかけてよい難問。単発 40% が合議で 97% に上がった実測がある</span></li>
+          <li><span class="mk">+</span><span>コード生成。実行して確かめる経路がある</span></li>
+          <li><span class="mk">+</span><span>夜間バッチ。待ち時間が問題にならない場面</span></li>
+        </ul>
+      </div>
+      <div class="fit no">
+        <p class="hd">効かない</p>
+        <ul>
+          <li><span class="mk">−</span><span>速さが要る用途。対話補完の代わりにはならない</span></li>
+          <li><span class="mk">−</span><span>答えが定まらない創作・相談。投票が効かず、統合役の能力に頭打ちする</span></li>
+          <li><span class="mk">−</span><span>平易な大量処理。1 問あたり数〜数十リクエストを使う</span></li>
+          <li><span class="mk">−</span><span>全モデルが同じ誤読をする問題。票を増やしても直らない</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="box verified">
+      <h3>この系の本質は「モデルを増幅する層」です</h3>
+      <p>
+        fugu 単体には性能がありません。<strong>同じモデル群を単発で呼ぶと約 40%、
+        同じモデル群をこのオーケストレーションに通すと 97%</strong>（AIME26 実測）。
+        差の 57 ポイントが設計の寄与です。
+        したがって<strong>手元のモデルが良くなれば、この層の出力もそのまま良くなります</strong>。
+      </p>
+    </div>
+
+    <div class="cta">
+      <a class="btn solid" href="index.html">実測結果と限界 →</a>
+      <a class="btn" href="design.html">次期設計と訂正 →</a>
+      <a class="btn" href="roadmap.html">ロードマップ →</a>
+      <a class="btn" href="architecture.html">アーキテクチャ →</a>
+      <a class="btn" href="scaling.html">計算量スケーリング →</a>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <div class="col">
+    fugu-nim — Dynamic Mixture-of-Agents orchestrator<br>
+    本ページの手順は <code>fugu_local.py</code> / <code>bench_fugu.py</code> の実装から起こしています<br>
+    所要時間・リクエスト数はすべて fugu_bench/results/*.jsonl の実測値です
+  </div>
+</footer>
+
+</body>
+</html>

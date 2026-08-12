@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fugu-nim 改修仕様 — 分岐の廃止と合成性の導入</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; }
+  img, svg { max-width: 100%; }
+  h1, h2, h3, h4, p, ul, ol, dl, dd, figure, pre { margin: 0; }
+  ul, ol { padding: 0; }
+  table { border-collapse: collapse; }
+</style>
+</head>
+<body>
+<style>
+  :root {
+    color-scheme: light;
+    --ground:#f1f3f1; --panel:#fbfcfb; --panel-2:#eaeeeb;
+    --ink:#131a20; --ink-2:#4a565f; --ink-3:#7c8790; --rule:#d9dfdb;
+    --ai:#1f3a66; --ai-soft:#e3eaf4; --shu:#a83f2a; --shu-soft:#f6e7e2;
+    --moss:#3a6a51; --moss-soft:#e2eee8; --on-ai:#eef2f8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --ground:#0e1216; --panel:#171c21; --panel-2:#1f262c;
+      --ink:#e5eaee; --ink-2:#a3b0b9; --ink-3:#79868f; --rule:#262e35;
+      --ai:#8aaddf; --ai-soft:#1a2739; --shu:#e08163; --shu-soft:#33211c;
+      --moss:#74ab8d; --moss-soft:#1b2b23; --on-ai:#0e1216;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:#0e1216; --panel:#171c21; --panel-2:#1f262c;
+    --ink:#e5eaee; --ink-2:#a3b0b9; --ink-3:#79868f; --rule:#262e35;
+    --ai:#8aaddf; --ai-soft:#1a2739; --shu:#e08163; --shu-soft:#33211c;
+    --moss:#74ab8d; --moss-soft:#1b2b23; --on-ai:#0e1216;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --ground:#f1f3f1; --panel:#fbfcfb; --panel-2:#eaeeeb;
+    --ink:#131a20; --ink-2:#4a565f; --ink-3:#7c8790; --rule:#d9dfdb;
+    --ai:#1f3a66; --ai-soft:#e3eaf4; --shu:#a83f2a; --shu-soft:#f6e7e2;
+    --moss:#3a6a51; --moss-soft:#e2eee8; --on-ai:#eef2f8;
+  }
+  :root {
+    --sans: system-ui, -apple-system, "Segoe UI", "Yu Gothic UI", "Hiragino Sans", Meiryo, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  }
+
+  body { margin:0; background:var(--ground); color:var(--ink);
+    font-family:var(--sans); font-size:16.5px; line-height:1.78; -webkit-font-smoothing:antialiased; }
+  .col { max-width:1040px; margin:0 auto; padding:0 24px; }
+  .prose { max-width:70ch; }
+
+  .top { background:var(--ai); color:var(--on-ai); padding:38px 0 34px; }
+  .crumb { font-family:var(--mono); font-size:12.5px; letter-spacing:.1em; opacity:.75; margin:0 0 22px; }
+  .crumb a { color:inherit; text-decoration:underline; text-underline-offset:3px; }
+  .top h1 { font-size:clamp(28px,5vw,46px); line-height:1.1; letter-spacing:-.03em;
+    font-weight:800; margin:0 0 12px; text-wrap:balance; }
+  .top p { margin:0; max-width:58ch; opacity:.88; font-size:16px; }
+  .top .badge { display:inline-block; font-family:var(--mono); font-size:11px; letter-spacing:.1em;
+    border:1px solid currentColor; padding:3px 9px; margin:16px 0 0; opacity:.8; }
+
+  section { padding:56px 0 0; }
+  .eyebrow { font-family:var(--mono); font-size:11.5px; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--ai); font-weight:700; margin:0 0 10px; }
+  h2 { font-size:clamp(22px,3.2vw,29px); line-height:1.28; letter-spacing:-.022em; font-weight:700; margin:0 0 14px; }
+  h3 { font-size:16.5px; font-weight:700; margin:28px 0 6px; }
+  p { margin:14px 0; }
+  a { color:var(--ai); text-underline-offset:3px; }
+  code { font-family:var(--mono); font-size:.86em; background:var(--panel-2); padding:.13em .4em; border-radius:3px; }
+  .rule { height:1px; background:var(--rule); margin:56px 0 0; }
+  ol, ul { max-width:70ch; }
+
+  figure { margin:26px 0 0; }
+  .figwrap { background:var(--panel); border:1px solid var(--rule); padding:24px 18px 16px; overflow-x:auto; }
+  .figwrap > svg { display:block; width:100%; height:auto; min-width:660px; }
+  figcaption { font-size:13.5px; color:var(--ink-2); margin:12px 0 0; line-height:1.66; max-width:76ch; }
+
+  .box { background:var(--panel); border:1px solid var(--rule); padding:22px 24px; margin:22px 0 0; }
+  .box.accent { border-left:3px solid var(--ai); }
+  .box.caution { border-left:3px solid var(--shu); }
+  .box.verified { border-left:3px solid var(--moss); }
+  .box > :first-child { margin-top:0; }
+  .box > :last-child { margin-bottom:0; }
+
+  .tw { overflow-x:auto; margin:22px 0 0; }
+  table { border-collapse:collapse; width:100%; min-width:640px; font-size:14px; }
+  th,td { padding:11px 12px; text-align:left; border-bottom:1px solid var(--rule); vertical-align:top; }
+  thead th { font-size:12px; color:var(--ink-2); font-weight:700; white-space:nowrap; border-bottom:1.5px solid var(--ink-3); }
+  tbody tr:hover { background:var(--panel-2); }
+  td.m, th.m { font-family:var(--mono); font-size:12.5px; }
+  td.r { text-align:right; font-variant-numeric:tabular-nums; font-family:var(--mono); }
+  caption { caption-side:top; text-align:left; font-family:var(--mono); font-size:11.5px;
+    letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); padding:0 0 10px; }
+
+  pre { font-family:var(--mono); font-size:12.5px; line-height:1.72; background:var(--panel);
+    border:1px solid var(--rule); border-left:3px solid var(--ink-3);
+    padding:16px 18px; overflow-x:auto; margin:18px 0 0; }
+  pre .c { color:var(--ink-3); }
+  pre .k { color:var(--ai); font-weight:700; }
+  pre .s { color:var(--moss); }
+  pre .x { color:var(--shu); }
+
+  footer { margin:70px 0 0; background:var(--panel); border-top:1px solid var(--rule); padding:32px 0 52px; }
+  footer .col { font-family:var(--mono); font-size:12.5px; color:var(--ink-3); line-height:1.9; }
+  @media (prefers-reduced-motion:reduce){ *{transition:none!important;} }
+</style>
+
+<header class="top">
+  <div class="col">
+    <p class="crumb"><a href="index.html">← fugu-nim</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; SPEC</p>
+    <h1>分岐を捨てて、<br>合成性を入れる</h1>
+    <p>2 つの改修を 1 回で実装する。経路分岐の廃止と、推論の段ごとのプーリング。
+       段階には分けず、機能ごとのフラグで寄与を切り分ける。</p>
+    <p class="badge">SPEC — 実装完了 2026-08-05 / 測定済み 08-06</p>
+  </div>
+</header>
+
+<main>
+<div class="col">
+
+  <!-- ============ 実装状況 ============ -->
+  <section>
+    <p class="eyebrow">Status · 2026-08-06</p>
+    <h2>この仕様は実装され、測定されました</h2>
+    <div class="box caution">
+      <h3>結論を先に — 精度では既存構成を上回りませんでした</h3>
+      <p>
+        以下は<strong>実装前に書かれた設計文書</strong>です。記述は当時のまま残しています。
+        2026-08-05 に全機能を実装し（<code>u@nim</code> および 5 つのアブレーション構成、
+        オフラインテスト 20 件追加）、翌日に測定しました。
+      </p>
+      <p>
+        <strong>MATH-500（42 問・両側に同じ正規化採点）: 既存 42/42 に対し統合版 41/42。
+        リクエストは 1 問あたり 7.7 → 55.2 と約 7 倍。</strong>
+        AIME25（12 問）は 8/12 で同点ながら、3 問を救済し 3 問を新たに落とす入れ替わりでした。
+        回帰した 3 問はいずれも 14〜22 リクエストで早期に確定して誤答しています。
+        さらに AIME24 の 1 問目は 8 段へ分解された後に副段への再分解が連鎖し、
+        <strong>18 時間かけても 1 問が完了しません</strong>でした（階層再分解に予算上限が無い）。
+      </p>
+      <p>
+        本仕様は「スコア向上を完了条件に含めない。下回った場合はその事実と回帰リストを
+        報告することが完了条件」と定めていました。<strong>その条件のとおりに報告しています。</strong>
+        構成は削除せず残します。最新の数字は
+        <a href="index.html">トップページの「合成性の導入 — 実装して、測った」</a>を参照してください。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 変更1 ============ -->
+  <section>
+    <p class="eyebrow">Change 1</p>
+    <h2>分岐を廃止する</h2>
+    <div class="prose">
+      <p>
+        現行は Conductor が <code>task_type</code> を判定し、math / mcq は投票経路へ、
+        それ以外は合議経路へ振り分けています。この分岐には 2 つの問題があります。
+      </p>
+      <p>
+        <strong>ひとつ、判定が測られていない。</strong> Conductor は 6 つのベンチマークのうち
+        <code>fugu@nim</code> でしか動いていません。他の構成は
+        <code>solve_verifiable(question, item["task_type"])</code> のように
+        データセットのラベルを直接渡しており、判定器を通っていない。
+      </p>
+      <p>
+        <strong>ふたつ、誤ると投票エンジンごと失う。</strong> 数学問題を
+        <code>knowledge</code> と誤分類すれば、その問題は多数決を一切受けずに合議へ流れます。
+        最も高リスクな判定が、最も測られていない場所にある。
+      </p>
+      <p>
+        しかし、そもそも <strong>2 つの経路は集約方法が違うだけ</strong>です。
+        そして<strong>どちらを使うかは事前に予測する必要がありません</strong>——
+        提案を生成してから、比較可能な結論が抽出できたかを見ればよい。
+      </p>
+    </div>
+
+    <figure>
+      <div class="figwrap">
+        <svg viewBox="0 0 920 330" role="img" aria-label="分岐廃止の前後比較。現状はConductorのtask_type判定で2経路に分かれるが、統合後は単一ループになりpool関数が出力の性質を見て集約方式を決める。">
+          <defs>
+            <marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+            </marker>
+            <marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--shu)"/>
+            </marker>
+            <marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--moss)"/>
+            </marker>
+          </defs>
+
+          <!-- LEFT: current -->
+          <text x="210" y="26" text-anchor="middle" font-size="14" font-weight="700" fill="var(--shu)">現状 — 入力を分類して分岐</text>
+
+          <rect x="150" y="44" width="120" height="30" rx="3" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <text x="210" y="64" text-anchor="middle" font-size="12.5" fill="currentColor">質問</text>
+          <line x1="210" y1="74" x2="210" y2="92" stroke="currentColor" stroke-width="1.4" marker-end="url(#m1)"/>
+
+          <rect x="118" y="94" width="184" height="46" rx="3" fill="var(--shu-soft)" stroke="var(--shu)" stroke-width="1.8"/>
+          <text x="210" y="113" text-anchor="middle" font-size="12.5" fill="var(--shu)" font-weight="700">task_type を予測</text>
+          <text x="210" y="130" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--shu)">llama-8b · 精度は未測定</text>
+
+          <path d="M 210 140 L 210 156 L 120 156 L 120 176" fill="none" stroke="var(--shu)" stroke-width="1.4" marker-end="url(#m2)"/>
+          <path d="M 210 140 L 210 156 L 300 156 L 300 176" fill="none" stroke="var(--shu)" stroke-width="1.4" marker-end="url(#m2)"/>
+          <text x="120" y="152" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">math/mcq</text>
+          <text x="300" y="152" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">それ以外</text>
+
+          <rect x="52" y="178" width="136" height="56" rx="3" fill="var(--panel)" stroke="currentColor" stroke-width="1.4"/>
+          <text x="120" y="199" text-anchor="middle" font-size="12" fill="currentColor">SC 投票</text>
+          <text x="120" y="217" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">solve_verifiable()</text>
+
+          <rect x="232" y="178" width="136" height="56" rx="3" fill="var(--panel)" stroke="currentColor" stroke-width="1.4"/>
+          <text x="300" y="199" text-anchor="middle" font-size="12" fill="currentColor">MoA 合議</text>
+          <text x="300" y="217" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">fugu_answer()</text>
+
+          <text x="210" y="262" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--shu)">誤分類 → 投票エンジンを丸ごと失う</text>
+          <text x="210" y="282" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">2 つのコード経路・2 つの確定条件</text>
+
+          <line x1="460" y1="24" x2="460" y2="310" stroke="var(--rule)" stroke-width="1"/>
+
+          <!-- RIGHT: unified -->
+          <text x="690" y="26" text-anchor="middle" font-size="14" font-weight="700" fill="var(--moss)">統合後 — 出力の性質で決める</text>
+
+          <rect x="630" y="44" width="120" height="30" rx="3" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <text x="690" y="64" text-anchor="middle" font-size="12.5" fill="currentColor">質問</text>
+          <line x1="690" y1="74" x2="690" y2="92" stroke="var(--moss)" stroke-width="1.4" marker-end="url(#m3)"/>
+
+          <rect x="586" y="94" width="208" height="42" rx="3" fill="var(--panel)" stroke="var(--moss)" stroke-width="1.5"/>
+          <text x="690" y="113" text-anchor="middle" font-size="12.5" fill="currentColor">提案を n 本生成</text>
+          <text x="690" y="129" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">分岐なし・常に複数</text>
+          <line x1="690" y1="136" x2="690" y2="152" stroke="var(--moss)" stroke-width="1.4" marker-end="url(#m3)"/>
+
+          <rect x="562" y="154" width="256" height="82" rx="3" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1.8"/>
+          <text x="690" y="174" text-anchor="middle" font-size="12.5" fill="var(--moss)" font-weight="700">pool() — 遅延束縛</text>
+          <line x1="578" y1="182" x2="802" y2="182" stroke="var(--moss)" stroke-width="1" opacity=".45"/>
+          <text x="578" y="200" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-2)">比較可能なキーが k 本以上</text>
+          <text x="806" y="200" text-anchor="end" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--moss)" font-weight="700">→ 投票</text>
+          <text x="578" y="220" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-2)">それ未満</text>
+          <text x="806" y="220" text-anchor="end" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--moss)" font-weight="700">→ 統合</text>
+
+          <text x="690" y="262" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--moss)">誤分類という事故が構造的に起きない</text>
+          <text x="690" y="282" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">1 つのコード経路・1 つの確定条件</text>
+          <text x="690" y="304" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-3)">コード生成にも投票が使える（実行等価性）</text>
+        </svg>
+      </div>
+      <figcaption>
+        判定の位置が変わる。現状は<strong>生成の前</strong>に入力を分類し、外すと経路ごと誤る。
+        統合後は<strong>生成の後</strong>に出力の性質を見るため、予測が要らない。
+        分解が 1 段しか返さなければ従来の「丸ごと解く」に自然に縮退するので、
+        これも分岐ではなく縮退として実装する。
+      </figcaption>
+    </figure>
+
+    <div class="box verified">
+      <h3>副産物 — コード生成に投票が効くようになる</h3>
+      <p>
+        キー抽出に<strong>実行等価性</strong>を加えます。実装の異なる 2 つのコードが
+        同じ入力に同じ出力を返すなら等価である——これは投票に必要な同値関係そのものです。
+      </p>
+      <p>
+        機構はすでに揃っています（<code>extract_code</code> / <code>run_python</code> /
+        <code>code_check</code>）。現状これらは SC 経路にしか配線されておらず、
+        <strong>系で唯一の決定的な検証器が半分の経路でしか使われていません</strong>。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 変更2 ============ -->
+  <section>
+    <p class="eyebrow">Change 2</p>
+    <h2>合成性を入れる</h2>
+    <div class="prose">
+      <p>
+        現行はすべてのサンプルが問題を丸ごと解きます。5 段の推論なら、各段 0.8 の正答率でも
+        全体は 0.8⁵ ≈ 0.33——<strong>誤りが乗算で効きます</strong>。
+        全系統が同じ段で転べば票は揃って間違い、票を増やしても直りません。
+        実測でも <code>sc3</code>（幅 32）は 1 問救うのに 1,149 リクエストを要しました。
+      </p>
+      <p style="font-family:var(--mono);font-size:14px;border-left:3px solid var(--shu);padding-left:16px;color:var(--ink-2)">
+        全 38 サンプル中に正解が一度も生成されない問題は集約では救えない
+        <span style="font-size:12px;color:var(--ink-3)"><br>— run_sc7 の docstring より</span>
+      </p>
+    </div>
+
+    <figure>
+      <div class="figwrap">
+        <svg viewBox="0 0 920 380" role="img" aria-label="現状と提案の比較図。現状は32サンプルが問題を丸ごと解き全体で投票するため誤りが乗算で効く。提案は問題を段に分解し段ごとに投票するため誤りが各段で潰される。">
+          <defs>
+            <marker id="r2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--moss)"/>
+            </marker>
+          </defs>
+
+          <text x="220" y="26" text-anchor="middle" font-size="14" font-weight="700" fill="var(--shu)">現状 — 丸ごと解く</text>
+          <rect x="40" y="46" width="360" height="290" rx="4" fill="var(--shu-soft)" opacity=".35"/>
+          <circle cx="76" cy="190" r="14" fill="var(--ink-3)"/>
+          <text x="76" y="220" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-3)">問題</text>
+
+          <g font-family="ui-monospace, monospace" font-size="9">
+            <g>
+              <line x1="92" y1="182" x2="120" y2="96" stroke="currentColor" stroke-width="1" opacity=".5"/>
+              <rect x="122" y="86" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="158" y="86" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="194" y="86" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="230" y="86" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="266" y="86" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <text x="310" y="100" fill="var(--moss)" font-weight="700">正解</text>
+            </g>
+            <g>
+              <line x1="92" y1="186" x2="120" y2="136" stroke="currentColor" stroke-width="1" opacity=".5"/>
+              <rect x="122" y="126" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="158" y="126" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="194" y="126" width="30" height="20" rx="2" fill="var(--shu-soft)" stroke="var(--shu)" stroke-width="1.4"/>
+              <text x="209" y="140" text-anchor="middle" fill="var(--shu)" font-weight="700">✕</text>
+              <rect x="230" y="126" width="30" height="20" rx="2" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="2 2"/>
+              <rect x="266" y="126" width="30" height="20" rx="2" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="2 2"/>
+              <text x="310" y="140" fill="var(--shu)">誤答</text>
+            </g>
+            <g>
+              <line x1="92" y1="194" x2="120" y2="176" stroke="currentColor" stroke-width="1" opacity=".5"/>
+              <rect x="122" y="166" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="158" y="166" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="194" y="166" width="30" height="20" rx="2" fill="var(--shu-soft)" stroke="var(--shu)" stroke-width="1.4"/>
+              <text x="209" y="180" text-anchor="middle" fill="var(--shu)" font-weight="700">✕</text>
+              <rect x="230" y="166" width="30" height="20" rx="2" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="2 2"/>
+              <rect x="266" y="166" width="30" height="20" rx="2" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="2 2"/>
+              <text x="310" y="180" fill="var(--shu)">誤答</text>
+            </g>
+            <g>
+              <line x1="92" y1="200" x2="120" y2="216" stroke="currentColor" stroke-width="1" opacity=".5"/>
+              <rect x="122" y="206" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="158" y="206" width="30" height="20" rx="2" fill="var(--moss-soft)" stroke="var(--moss)" stroke-width="1"/>
+              <rect x="194" y="206" width="30" height="20" rx="2" fill="var(--shu-soft)" stroke="var(--shu)" stroke-width="1.4"/>
+              <text x="209" y="220" text-anchor="middle" fill="var(--shu)" font-weight="700">✕</text>
+              <rect x="230" y="206" width="30" height="20" rx="2" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="2 2"/>
+              <rect x="266" y="206" width="30" height="20" rx="2" fill="none" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="2 2"/>
+              <text x="310" y="220" fill="var(--shu)">誤答</text>
+            </g>
+            <text x="209" y="252" text-anchor="middle" font-size="10" fill="var(--ink-3)">⋮　サンプル 32 本まで</text>
+          </g>
+
+          <line x1="60" y1="272" x2="380" y2="272" stroke="var(--shu)" stroke-width="1" opacity=".4"/>
+          <text x="220" y="292" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--shu)">全体の答えで投票 → 3 対 1 で誤答が勝つ</text>
+          <text x="220" y="312" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-2)">段 3 の誤りが相関 ＝ 票を増やしても直らない</text>
+          <text x="220" y="330" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">全体正答率 ≈ 0.8⁵ = 0.33</text>
+
+          <line x1="460" y1="30" x2="460" y2="350" stroke="var(--rule)" stroke-width="1"/>
+
+          <text x="690" y="26" text-anchor="middle" font-size="14" font-weight="700" fill="var(--moss)">統合後 — 段に分けて解く</text>
+          <rect x="500" y="46" width="380" height="290" rx="4" fill="var(--moss-soft)" opacity=".3"/>
+          <circle cx="530" cy="190" r="14" fill="var(--ink-3)"/>
+          <text x="530" y="220" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-3)">問題</text>
+          <line x1="546" y1="190" x2="574" y2="190" stroke="var(--moss)" stroke-width="1.4" marker-end="url(#r2)"/>
+          <text x="560" y="180" text-anchor="middle" font-family="ui-monospace, monospace" font-size="9.5" fill="var(--moss)">分解</text>
+
+          <g font-family="ui-monospace, monospace" font-size="9.5">
+            <g>
+              <rect x="578" y="120" width="52" height="140" rx="3" fill="var(--panel)" stroke="var(--moss)" stroke-width="1.4"/>
+              <text x="604" y="112" text-anchor="middle" fill="var(--moss)" font-weight="700">段1</text>
+              <circle cx="592" cy="146" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="616" cy="146" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="592" cy="170" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="616" cy="170" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <line x1="586" y1="192" x2="622" y2="192" stroke="var(--moss)" stroke-width="1"/>
+              <text x="604" y="212" text-anchor="middle" fill="var(--moss)" font-weight="700">4/4</text>
+              <text x="604" y="232" text-anchor="middle" fill="var(--ink-3)">確定</text>
+            </g>
+            <line x1="630" y1="190" x2="646" y2="190" stroke="var(--moss)" stroke-width="1.3" marker-end="url(#r2)"/>
+            <g>
+              <rect x="650" y="120" width="52" height="140" rx="3" fill="var(--panel)" stroke="var(--moss)" stroke-width="1.4"/>
+              <text x="676" y="112" text-anchor="middle" fill="var(--moss)" font-weight="700">段2</text>
+              <circle cx="664" cy="146" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="688" cy="146" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="664" cy="170" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="688" cy="170" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <line x1="658" y1="192" x2="694" y2="192" stroke="var(--moss)" stroke-width="1"/>
+              <text x="676" y="212" text-anchor="middle" fill="var(--moss)" font-weight="700">4/4</text>
+              <text x="676" y="232" text-anchor="middle" fill="var(--ink-3)">確定</text>
+            </g>
+            <line x1="702" y1="190" x2="718" y2="190" stroke="var(--moss)" stroke-width="1.3" marker-end="url(#r2)"/>
+            <g>
+              <rect x="722" y="106" width="52" height="168" rx="3" fill="var(--shu-soft)" stroke="var(--shu)" stroke-width="1.8"/>
+              <text x="748" y="98" text-anchor="middle" fill="var(--shu)" font-weight="700">段3</text>
+              <circle cx="736" cy="130" r="6" fill="var(--shu-soft)" stroke="var(--shu)"/>
+              <circle cx="760" cy="130" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="736" cy="152" r="6" fill="var(--shu-soft)" stroke="var(--shu)"/>
+              <circle cx="760" cy="152" r="6" fill="var(--shu-soft)" stroke="var(--shu)"/>
+              <circle cx="736" cy="174" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="760" cy="174" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="748" cy="196" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <line x1="730" y1="214" x2="766" y2="214" stroke="var(--shu)" stroke-width="1"/>
+              <text x="748" y="232" text-anchor="middle" fill="var(--shu)" font-weight="700">割れた</text>
+              <text x="748" y="248" text-anchor="middle" fill="var(--shu)">→ 票を追加</text>
+              <text x="748" y="264" text-anchor="middle" fill="var(--ink-3)">ここだけ</text>
+            </g>
+            <line x1="774" y1="190" x2="790" y2="190" stroke="var(--moss)" stroke-width="1.3" marker-end="url(#r2)"/>
+            <g>
+              <rect x="794" y="120" width="52" height="140" rx="3" fill="var(--panel)" stroke="var(--moss)" stroke-width="1.4"/>
+              <text x="820" y="112" text-anchor="middle" fill="var(--moss)" font-weight="700">段4-5</text>
+              <circle cx="808" cy="146" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="832" cy="146" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="808" cy="170" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <circle cx="832" cy="170" r="6" fill="var(--moss-soft)" stroke="var(--moss)"/>
+              <line x1="802" y1="192" x2="838" y2="192" stroke="var(--moss)" stroke-width="1"/>
+              <text x="820" y="212" text-anchor="middle" fill="var(--moss)" font-weight="700">4/4</text>
+              <text x="820" y="232" text-anchor="middle" fill="var(--ink-3)">確定</text>
+            </g>
+          </g>
+
+          <line x1="520" y1="286" x2="860" y2="286" stroke="var(--moss)" stroke-width="1" opacity=".4"/>
+          <text x="690" y="306" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--moss)">段ごとに投票 → 誤りが段 3 で止まる</text>
+          <text x="690" y="324" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-2)">計算は「割れた段」にだけ集中する</text>
+        </svg>
+      </div>
+      <figcaption>
+        変えるのはサンプル数ではなく<strong>誤りが伝播する範囲</strong>である。
+        構造は TCN と同型——因果性（段 k は段 1..k−1 のみ参照）、重み共有（同一ソルバプールを全段に）、
+        階層分解（dilation 相当）、残差結合。軸が「時刻」から「推論の段」に変わっただけ。
+      </figcaption>
+    </figure>
+
+    <div class="tw">
+      <table>
+        <caption>CNN の要素と実装の対応</caption>
+        <thead>
+          <tr><th>CNN の要素</th><th>実装</th><th class="m">フラグ</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>局所受容野</strong></td><td>各サンプルが問題全体でなく 1 段だけを解く。受容野＝原問題＋確定済み文脈</td><td class="m">FUGU_DECOMPOSE</td></tr>
+          <tr><td><strong>重み共有</strong></td><td>同一ソルバプールを全段に使い回す。段ごとに別モデルを割り当てない</td><td class="m">（同上）</td></tr>
+          <tr><td><strong>階層的プーリング</strong></td><td>段ごとに <code>pool()</code> → 合成後に全体で再プーリング</td><td class="m">（同上）</td></tr>
+          <tr><td><strong>拡張（dilation）</strong></td><td>粗く分解し、割れた段だけを再分解。深さ上限 2</td><td class="m">FUGU_HIERARCHICAL</td></tr>
+          <tr><td><strong>残差結合</strong></td><td>原問題を段ソルバ・合成器・判事・監査人へ直結</td><td class="m">FUGU_RESIDUAL</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 実装 ============ -->
+  <section>
+    <p class="eyebrow">Implementation</p>
+    <h2>実装一式</h2>
+    <div class="prose">
+      <p>
+        段階に分けず、以下を 1 回で実装します。すべて <code>fugu_local.py</code> への
+        <strong>追記</strong>で、既存関数は変更しません。
+      </p>
+    </div>
+
+<pre><span class="c"># ---- 統合ループ ----</span>
+<span class="k">def</span> fugu_solve(question, history=<span class="k">None</span>, plan=<span class="k">None</span>):
+    steps = decompose(question)              <span class="c"># 1 段しか取れなければ従来動作へ縮退</span>
+    ctx = []
+    <span class="k">for</span> step <span class="k">in</span> steps:                       <span class="c"># 因果ループ</span>
+        cands  = sample_step(step, question, ctx, n=STEP_VOTES_INIT)
+        result = pool(question, cands)       <span class="s"># ★ 遅延束縛</span>
+        <span class="k">while</span> <span class="k">not</span> result.confirmed <span class="k">and</span> 予算内:
+            cands += sample_step(step, question, ctx, n=STEP_VOTES_STEP)
+            result = pool(question, cands)   <span class="c"># 割れた段にだけ追加</span>
+        <span class="k">if</span> <span class="k">not</span> result.confirmed <span class="k">and</span> FUGU_HIERARCHICAL:
+            result = 再分解して再帰            <span class="c"># dilation 相当・深さ上限 2</span>
+        ctx.append(result)
+    final = compose(question, steps, ctx)
+    <span class="k">return</span> verify_and_maybe_loop(final)    <span class="c"># 既存 MoA の再帰を維持</span>
+
+<span class="c"># ---- 分岐を消す本体 ----</span>
+<span class="k">def</span> extract_key(text, question=<span class="k">None</span>):
+    <span class="c"># 1) math  : extract_final_answer(text, "math")</span>
+    <span class="c"># 2) mcq   : extract_final_answer(text, "mcq")</span>
+    <span class="s"># 3) exec  : extract_code → run_python → 出力の振る舞い等価性ハッシュ</span>
+    <span class="c"># 4) 取れなければ None</span>
+
+<span class="k">def</span> pool(question, candidates):
+    keys  = [extract_key(c, question) <span class="k">for</span> c <span class="k">in</span> candidates]
+    valid = [k <span class="k">for</span> k <span class="k">in</span> keys <span class="k">if</span> k <span class="k">is</span> <span class="k">not</span> <span class="k">None</span>]
+    <span class="k">if</span> len(valid) &gt;= POOL_MIN_KEYS:
+        <span class="k">return</span> vote_answers(valid)         <span class="c"># ハード（既存を再利用）</span>
+    <span class="k">return</span> aggregate(question, candidates) <span class="c"># ソフト（既存を再利用）</span></pre>
+
+    <div class="tw">
+      <table>
+        <caption>フラグ（すべて既定 False / 既存挙動は 1 バイトも変えない）</caption>
+        <thead>
+          <tr><th class="m">フラグ</th><th>内容</th><th>アブレーション config</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="m">FUGU_UNIFIED</td><td>統合ループを使う（マスタスイッチ）</td><td class="m">u@nim</td></tr>
+          <tr><td class="m">FUGU_DECOMPOSE</td><td>段分解と段別プーリング</td><td class="m">u-nodecomp@nim</td></tr>
+          <tr><td class="m">FUGU_HIERARCHICAL</td><td>割れた段の再分解</td><td class="m">u-nohier@nim</td></tr>
+          <tr><td class="m">FUGU_RESIDUAL</td><td>原問題を全層へ直結</td><td class="m">u-nores@nim</td></tr>
+          <tr><td class="m">FUGU_EXEC_KEY</td><td>実行等価性によるキー抽出</td><td class="m">u-noexec@nim</td></tr>
+          <tr><td class="m">FUGU_EARLY_UNANIMOUS</td><td>全会一致での早期確定（<code>single</code> の置換）</td><td class="m">u-noearly@nim</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box accent">
+      <h3>段階を分けない代わりに、フラグで切り分ける</h3>
+      <p>
+        全部同時に入れると、回帰が出たときに原因を特定できません。
+        これは<strong>実装を分けなくても解けます</strong>——各機能を独立フラグにして、
+        実装後に leave-one-out のアブレーションを 1 回回せば、寄与は同じ精度で分離できます。
+      </p>
+      <p style="font-size:14.5px;color:var(--ink-2)">
+        切り分けの手段は実装順序ではなくフラグである、という設計にしています。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 計測 ============ -->
+  <section>
+    <p class="eyebrow">Measurement</p>
+    <h2>計測とアブレーション</h2>
+
+    <h3>本測定（フル）</h3>
+    <div class="prose">
+      <p>
+        <code>u@nim</code> を AIME 90 問 / MATH-500 50 問 / HumanEval 30 問 / JMMLU 40 問で回し、
+        既存の <code>sc@nim</code>・<code>coder@nim</code>・<code>fugu@nim</code> と比較します。
+      </p>
+    </div>
+
+    <h3>アブレーション（診断サブセット・28 問）</h3>
+    <div class="prose">
+      <p>全 90 問は回しません。対象を絞ります。</p>
+      <ul>
+        <li><code>sc@nim</code> で失敗した 15 問</li>
+        <li>未解決 3 問（<code>aime24-2024-I-12</code> / <code>aime24-2024-II-15</code> / <code>aime25-13</code>）</li>
+        <li><strong>回帰検出用</strong>に、40–60 req で正解した 10 問</li>
+      </ul>
+    </div>
+
+    <div class="tw">
+      <table>
+        <caption>推定コスト</caption>
+        <thead>
+          <tr><th>測定</th><th class="r">問題数</th><th class="r">構成数</th><th class="r">推定 req</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>本測定（u@nim・全ベンチ）</td><td class="r">210</td><td class="r">1</td><td class="r">約 5,000</td></tr>
+          <tr><td>アブレーション（leave-one-out）</td><td class="r">28</td><td class="r">5</td><td class="r">約 4,200</td></tr>
+          <tr><td><strong>合計</strong></td><td class="r"></td><td class="r"></td><td class="r"><strong>約 9,200</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box caution">
+      <p>
+        これまでの累計が 15,000+ req なので、<strong>この計測でおよそ倍になります</strong>。
+        無料枠の消費ペースを <code>nim_usage.json</code> で監視し、
+        必要なら <code>FUGU_NIM_BUDGET</code> で上限を設定してください
+        （到達時に <code>SystemExit(42)</code> で安全に停止します）。
+      </p>
+    </div>
+
+    <h3>報告に必ず含めるもの</h3>
+    <ul>
+      <li>スコアだけでなく <strong>req/問</strong> と <strong>req/救済1問</strong>（効率を併記）</li>
+      <li>アブレーション表 — 各機能を切ったときのスコア差と req 差</li>
+      <li><strong>回帰リスト</strong> — 既存構成で正解していたのに <code>u@nim</code> で落とした問題を全件</li>
+    </ul>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ リスク ============ -->
+  <section>
+    <p class="eyebrow">Risks</p>
+    <h2>リスクと緩和</h2>
+
+    <div class="box caution">
+      <h3>1. 分解の誤りが全段を巻き添えにする</h3>
+      <p>
+        最大のリスク。<strong>緩和：</strong>分解自体を 3 本引いて投票する（分解の SC）。
+        段数が最頻の分解を採用します。加えて回帰リストを必ず報告し、
+        回帰が出たら <code>FUGU_DECOMPOSE=False</code> のアブレーション結果と突き合わせて原因を特定します。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>2. 並進同変性は完全には成り立たない</h3>
+      <p>
+        数学の解法は一意に段分割できません。「どの位置も同じ手続きで処理できる」という
+        畳み込みの前提が、ここでは近似にとどまります。
+        <strong>緩和：</strong>分解が 2 段未満なら <code>[question]</code> を返して従来動作に縮退させる。
+        これを分岐ではなく<strong>縮退</strong>として実装するのが要点です。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>3. 早期確定の誤りが伝播する</h3>
+      <p>
+        因果構造ゆえ、段 1 を誤確定すると以降が崩れます。
+        <strong>緩和：</strong><code>STEP_BEAM=2</code> で、確定できない段は候補を 2 本保持して分岐（ビーム）。
+        保持は「確定条件を満たさなかった段のみ」に限定し、探索の爆発を防ぎます。
+      </p>
+    </div>
+
+    <div class="box caution">
+      <h3>4. 全タスクが常に複数提案になる</h3>
+      <p>
+        <code>single</code> モードを廃するため、「こんにちは」にも n 提案かかります。
+        <strong>緩和：</strong>第 1 バッチで全候補のキーが一致したら即確定
+        （<code>FUGU_EARLY_UNANIMOUS</code>）。これは<strong>入力の分類ではなく出力の性質</strong>なので、
+        分岐を持ち込まずに済みます。
+      </p>
+    </div>
+
+    <div class="box verified">
+      <h3>やらないこと</h3>
+      <p>
+        既存の <code>solve_verifiable</code> / <code>fugu_answer</code> は<strong>残します</strong>。
+        既存 config（<code>sc@nim</code> 〜 <code>sc9@nim</code> / <code>fugu@nim</code> / <code>coder@nim</code>）も
+        削除・リネームしません。比較可能性を壊さないためで、
+        DeepConf を「有害」と記録したまま構成ごと残したのと同じ方針です。
+      </p>
+    </div>
+  </section>
+
+  <div class="rule"></div>
+
+  <!-- ============ 完了条件 ============ -->
+  <section>
+    <p class="eyebrow">Definition of done</p>
+    <h2>完了条件</h2>
+    <ol>
+      <li><code>FUGU_UNIFIED=False</code> で既存の全 config が<strong>ビット同一の挙動</strong>を示す</li>
+      <li>オフラインテストが全て緑（既存 51 件 ＋ 新規 12 件）</li>
+      <li><code>u@nim</code> が全 4 ベンチで完走し、結果 JSONL が生成されている</li>
+      <li>アブレーション 5 構成が診断サブセット 28 問で完走している</li>
+      <li>報告に<strong>回帰リストが含まれている</strong></li>
+    </ol>
+
+    <div class="box accent">
+      <p>
+        <strong>スコアが既存を上回ることは完了条件に含めません。</strong>
+        下回った場合は、その事実と原因の分析を報告することが完了条件です。
+        効かなかった手法を消さずに記録するのは、この系の既定の作法です。
+      </p>
+    </div>
+
+    <div class="prose">
+      <p style="font-size:14.5px;color:var(--ink-2);margin-top:26px">
+        実装仕様の全文は <code>fugu_live_work/docs/UNIFIED_MOA_SPEC.md</code>。
+        既存の失敗トレースを分類する事前分析（API 呼び出しゼロ）が
+        <code>docs/PHASE0_failure_analysis.md</code> にあり、
+        実装をブロックせず並行して回せます。分解器のプロンプト設計に効きます。
+      </p>
+    </div>
+  </section>
+
+</div>
+</main>
+
+<footer>
+  <div class="col">
+    fugu-nim — 統合 MoA 実装仕様（SPEC・実装完了 2026-08-05 / 測定済み 08-06）<br>
+    前提となる実測: fugu_bench/results/*.jsonl（AIME 90問・9構成・累計 9,486 req）<br>
+    改修対象: fugu_local.py（追記のみ）, bench_fugu.py（CONFIGS 追加）<br>
+    <a href="index.html">← 概要</a> ·
+    <a href="architecture.html">アーキテクチャ</a> ·
+    <a href="neural.html">ニューラル観</a> ·
+    <a href="scaling.html">スケーリング実測</a>
+  </div>
+</footer>
+
+</body>
+</html>

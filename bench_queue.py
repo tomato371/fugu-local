@@ -47,6 +47,20 @@ QUEUE = [
     ("jmmlu", "fugu", 40),
 ]
 
+# NIM クラウドキュー (2026-08-02, --nim で選択)。段階実行: スモーク → 本命 AIME(Fable
+# 29/30 と直接比較) → 補完。math500 は 50 問刻み(resume で拡張、無制限の実挙動確認後に
+# None へ拡大可)。所要試算: ≈40 RPM・並列 4・SC 1 問 8-15 req → AIME 3 年分 3-9 時間。
+NIM_QUEUE = [
+    ("aime26",    "think@nim", 5),      # スモーク: 配線・429 リトライ・課金カウンタ確認
+    ("aime26",    "sc@nim",  None),     # 本命: Fable 基準 29/30 との直接比較
+    ("aime25",    "sc@nim",  None),
+    ("aime24",    "sc@nim",  None),
+    ("math500",   "sc@nim",  50),
+    ("humaneval", "coder@nim", 30),
+    ("jmmlu",     "fugu@nim", 40),      # 日本語 JP_AGGREGATOR(glm-5.2) 経路の実地検証
+    ("gpqa",      "sc@nim",  30),
+]
+
 
 def write_status(status):
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -69,6 +83,11 @@ def classify_exit_code(rc):
     """
     if rc == 0:
         return "ok"
+    if rc == 42:
+        # NIM リクエスト予算 (FUGU_NIM_BUDGET) 到達による意図的終了。fugu_local._ask_nim が
+        # 送信前に SystemExit(42) する契約。続行すると全ジョブが同じ即死を繰り返して
+        # 「エラーの山」になるだけなので、main() 側でキュー全体を即 halt する。
+        return "budget"
     if rc < 0:
         # POSIX: 負値はシグナル番号によるプロセス強制終了 (-9 = SIGKILL 等)。
         return "crash"
@@ -80,7 +99,7 @@ def classify_exit_code(rc):
     return "error"
 
 
-def run_job(dataset, config, limit):
+def run_job(dataset, config, limit, nim=False, notify=False):
     """1ジョブをサブプロセスで実行し、ログへ追記。returncode を返す。"""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{dataset}__{config}.log"
@@ -88,9 +107,13 @@ def run_job(dataset, config, limit):
            "run", "--dataset", dataset, "--config", config]
     if limit:
         cmd += ["--limit", str(limit)]
+    if notify:
+        cmd += ["--notify"]
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"   # cp932 リダイレクト先でも UTF-8 でログを残す
     env["PYTHONUNBUFFERED"] = "1"       # 途中クラッシュ時もログが最後まで書かれるように
+    if nim:
+        env["FUGU_BACKEND"] = "nim"     # サブプロセスの fugu_local が import 時に拾う
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n===== queue start {time.strftime('%Y-%m-%d %H:%M:%S')} "
                   f"cmd={' '.join(cmd)} =====\n")
@@ -104,25 +127,33 @@ def run_job(dataset, config, limit):
 def main():
     ap = argparse.ArgumentParser(description="fugu ベンチ直列キュー")
     ap.add_argument("--dry-run", action="store_true", help="ジョブ一覧の表示のみ")
+    ap.add_argument("--nim", action="store_true",
+                    help="NIM クラウドキューを実行 (FUGU_BACKEND=nim をジョブ env に付与)")
+    ap.add_argument("--notify", action="store_true", help="各ジョブに --notify (Slack) を付与")
     args = ap.parse_args()
 
+    queue = NIM_QUEUE if args.nim else QUEUE
     if args.dry_run:
-        for i, (ds, cfg, lim) in enumerate(QUEUE, 1):
-            print(f"{i:2}. {ds:10} {cfg:8} limit={lim or 'all'}")
+        for i, (ds, cfg, lim) in enumerate(queue, 1):
+            print(f"{i:2}. {ds:10} {cfg:10} limit={lim or 'all'}")
+        return
+    if args.nim and not os.environ.get("NVIDIA_API_KEY"):
+        print("ERROR: --nim には NVIDIA_API_KEY が必要です (build.nvidia.com で生成)")
         return
 
     status = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "pid": os.getpid(),
+              "backend": "nim" if args.nim else "ollama",
               "jobs": [], "current": None}
     t_all = time.time()
     halted_on_crash = False
-    for i, (ds, cfg, lim) in enumerate(QUEUE, 1):
+    for i, (ds, cfg, lim) in enumerate(queue, 1):
         job = {"n": i, "dataset": ds, "config": cfg, "limit": lim,
                "started": time.strftime("%Y-%m-%d %H:%M:%S")}
         status["current"] = job
         write_status(status)
         t0 = time.time()
         try:
-            rc = run_job(ds, cfg, lim)
+            rc = run_job(ds, cfg, lim, nim=args.nim, notify=args.notify)
         except Exception as e:            # サブプロセス起動自体の失敗でも記録して次へ
             rc = -1
             job["error"] = f"{type(e).__name__}: {e}"
@@ -146,6 +177,12 @@ def main():
             halted_on_crash = True
             print(f"!!! HALTING QUEUE: job {i} ({ds}/{cfg}) crashed (rc={rc}). "
                   f"Remaining jobs were NOT run. Investigate before restarting. !!!")
+            break
+        if category == "budget":
+            # NIM リクエスト予算到達。残りジョブも同じ理由で即死するだけなので全体を止める。
+            halted_on_crash = True
+            print(f"!!! HALTING QUEUE: job {i} ({ds}/{cfg}) hit the NIM request budget "
+                  f"(rc=42). Raise/unset FUGU_NIM_BUDGET and re-run to resume. !!!")
             break
     status["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
     status["total_seconds"] = round(time.time() - t_all, 1)
