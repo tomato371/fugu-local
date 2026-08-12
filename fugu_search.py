@@ -301,7 +301,7 @@ def search(question: str,
             if outcome is None:
                 continue                    # 生成失敗はノード化しない(予算は消費)
             _site, answer, score, report, model = outcome
-            node = add_child(_site, answer, score, report, model)
+            add_child(_site, answer, score, report, model)
             if selector and model:
                 selector.record(model, score)
             if score >= threshold:

@@ -101,7 +101,6 @@ def test_budget_flows_to_the_high_scoring_branch():
     factory, _ = _chat_factory_counter()
     # cand1 は強い(0.8)、以降の root 直下の新規は弱い(0.2)。
     # ただし cand1 の子孫(refine: プロンプトに Draft が入る)はやや高い 0.6。
-    seen = {}
 
     def scorer(question, answer):
         if answer == "cand1":

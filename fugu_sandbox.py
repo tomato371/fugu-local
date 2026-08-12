@@ -50,7 +50,7 @@ def _assign_windows_job(process, memory_mb: int):
         import ctypes
         import ctypes.wintypes as wintypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]  # Windows専用(non-Windowsではtypeshedに無い)
 
         class IO_COUNTERS(ctypes.Structure):
             _fields_ = [(name, ctypes.c_uint64) for name in (

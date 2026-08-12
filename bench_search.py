@@ -130,7 +130,7 @@ def fixed_plan(item):
             "selected_proposers": f.PROPOSERS[:3], "rounds": 1,
             "use_image_generation": False, "image_only": False,
             "make_pptx": False, "search_required": False,
-            "reason": f"bench_search", "_fallback": False}
+            "reason": "bench_search", "_fallback": False}
 
 
 def apply_council(council, aggregator=None):
