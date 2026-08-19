@@ -98,6 +98,7 @@ NIM_STREAM_IDLE_S = 600       # data 行が途絶えてよい最大秒数（ping
 _NIM_COOLDOWN = {}            # model_id -> epoch秒
 _NIM_COOLDOWN_LOCK = threading.Lock()
 NIM_MODEL_IDS = set()         # apply_nim_profile() が投入するディスパッチ実体
+NIM_VISION_MODEL = ""         # NIM 側で選ばれた vision 対応モデル（未検出なら空）
 NIM_STRUCTURED_OK = set()     # response_format=json_object を受けるモデル (プロファイルが投入)
 # 「無制限」が実はクレジット制だった場合の保険。0=無制限(既定)。上限到達で送信せず
 # SystemExit(42) — センチネル文字列で返すと SC 全滅→フォールバック→さらに消費の
@@ -359,6 +360,50 @@ def _nim_scale_of(mid):
     return 0.0, 0.0
 
 
+#: NIM カタログから vision 対応らしきモデルを拾う手掛かり。ID に現れる語で判定する。
+_NIM_VISION_RE = re.compile(
+    r"(vision|vlm|-vl\b|llava|pixtral|neva|nvlm|kosmos|internvl|qwen.*-vl|"
+    r"phi-3\.5-vision|florence|paligemma|molmo|maverick|scout)", re.I)
+
+
+#: vision 選抜用の除外規則。NIM_EXCLUDE_RE は「汎用テキスト合議に使わないもの」を
+#: 落とす規則で vision 自体を除外しているため、こちらでは使えない。ここでは
+#: 対話に使えない種別（埋め込み・OCR専用・音声・画像生成・生体分子等）だけを落とす。
+_NIM_VISION_EXCLUDE_RE = re.compile(
+    r"(embed|rerank|guard|safety|asr|tts|speech|riva|clip|retrieval|reward|"
+    r"diffusion|flux|stable|sana|maisi|protein|esm|genmol|diffdock|deplot|"
+    r"ocr|parse|nemoguard)", re.I)
+
+
+def _nim_rank_vision(catalog):
+    """vision 対応候補を規模の大きい順に並べる。"""
+    rows = []
+    for mid in catalog:
+        if not _NIM_VISION_RE.search(mid):
+            continue
+        if _NIM_VISION_EXCLUDE_RE.search(mid):
+            continue
+        total, active = _nim_scale_of(mid)
+        rows.append((0 if total else 1, -total, -active, mid))
+    rows.sort()
+    return [r[3] for r in rows]
+
+
+def _nim_pick_vision(catalog, need=1):
+    """カタログから生きている vision モデルを need 体選ぶ。見つからなければ空。
+
+    FUGU_NIM_VISION_MODEL で明示指定があればそれを最優先で試す（ID 直指定）。
+    """
+    forced = (os.environ.get("FUGU_NIM_VISION_MODEL") or "").strip()
+    ranked = _nim_rank_vision(catalog)
+    if forced:
+        ranked = [forced] + [m for m in ranked if m != forced]
+    if not ranked:
+        return []
+    picked, _ = _nim_pick_live(ranked, need)
+    return picked
+
+
 def _nim_rank_candidates(catalog):
     """汎用推論に使えそうなものを規模の大きい順に並べる。規模不明は既知大型の後ろ。"""
     rows = []
@@ -443,6 +488,51 @@ def _nim_diverse_three(picked):
     return chosen
 
 
+#: 布陣（選抜結果）のキャッシュ先。空なら従来どおり毎回プローブする。
+#: 起動ごとの生存プローブはカタログ102件に対して16体前後を叩くので 60〜90 秒かかる。
+#: ジョブを別プロセスで走らせる構成では、その都度これを払うと現実的でない。
+#: 親が一度プローブして書き、子はそれを読んで即起動する、という分担のための仕掛け。
+NIM_LINEUP_FILE = os.environ.get("FUGU_NIM_LINEUP", "").strip()
+#: キャッシュの寿命（秒）。0 で無期限。既定 1 時間 — モデルの提供終了に追随するため。
+NIM_LINEUP_TTL = int(os.environ.get("FUGU_NIM_LINEUP_TTL") or 3600)
+
+
+def _nim_load_lineup():
+    """布陣キャッシュを読む（未設定・古い・別バックエンドなら None）。"""
+    if not NIM_LINEUP_FILE:
+        return None
+    try:
+        d = json.loads(Path(NIM_LINEUP_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("url") != NIM_URL:
+        return None                       # バックエンドが変わったら作り直す
+    picked = [m for m in (d.get("picked") or []) if isinstance(m, str) and m]
+    if len(picked) < 4:
+        return None                       # 4体そろわない布陣は退避経路と同じ扱い
+    if NIM_LINEUP_TTL > 0 and time.time() - float(d.get("at") or 0) > NIM_LINEUP_TTL:
+        return None
+    return {"picked": picked, "conductor": d.get("conductor") or "",
+            "vision": d.get("vision") or ""}
+
+
+def _nim_save_lineup(picked, conductor, vision):
+    """選抜結果を書き出す（次回・子プロセスがプローブを省けるように）。"""
+    if not NIM_LINEUP_FILE or len(picked or []) < 4:
+        return
+    try:
+        path = Path(NIM_LINEUP_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(
+            {"at": time.time(), "url": NIM_URL, "picked": list(picked),
+             "conductor": conductor or "", "vision": vision or ""},
+            ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"[setup] nim: 布陣キャッシュを書けません: {exc}")
+
+
 def apply_nim_profile():
     """全ロールを NIM クラウドモデルへ一括切替。キー未設定なら False（setup() が中断）。"""
     global DESIRED_PROPOSERS, DESIRED_AGGREGATOR, DESIRED_CONDUCTOR, FALLBACK_MODEL
@@ -460,7 +550,14 @@ def apply_nim_profile():
     # 固定 ID は腐る（2026-08-08 実測: 4 体中 2 体が提供終了/カタログ消滅）。
     # /v1/models と突き合わせ、規模の大きい順に生存プローブして上位を採用する。
     picked = []
-    if NIM_AUTO_SELECT:
+    catalog = set()
+    pinned = _nim_load_lineup()
+    if pinned:
+        picked = pinned["picked"]
+        print(f"[setup] nim: 布陣キャッシュを使います（{len(picked)}体・生存プローブを省略）")
+        for n, mid in enumerate(picked, 1):
+            print(f"           {n}. {mid}")
+    elif NIM_AUTO_SELECT:
         catalog = _nim_catalog()
         if catalog:
             ranked = _nim_rank_candidates(catalog)
@@ -499,8 +596,8 @@ def apply_nim_profile():
         picked = [prop_a, prop_b, prop_c, prop_d, agg]
 
     # Conductor は「速くて JSON が崩れない」ことだけが要件なので大型は選ばない。
-    cond = ""
-    for cand in NIM_CONDUCTOR_CANDIDATES:
+    cond = (pinned or {}).get("conductor") or ""
+    for cand in ([] if cond else NIM_CONDUCTOR_CANDIDATES):
         if _nim_model_available(cand):
             cond = cand
             break
@@ -560,12 +657,37 @@ def apply_nim_profile():
     # 思考の効かせ方は ID 直指定ではなく系統から引く（選抜でモデルが入れ替わるため）
     for m in (cond, prop_a, prop_b, prop_c, prop_d, agg, second, sc_third):
         MODEL_CONFIG[m] = _nim_tuning_for(m)
+    # vision: NIM 側の VLM を選ぶ。既定の VISION_MODEL は Ollama 名（llama3.2-vision）で
+    # NIM では通らないため、カタログから生存する VLM を選んで差し替える。
+    # 見つからなければ VISION_MODEL は据え置き（＝Ollama が動いていればそちらへ）。
+    global VISION_MODEL, NIM_VISION_MODEL
+    NIM_VISION_MODEL = ""
+    if pinned and pinned.get("vision"):
+        vis = [pinned["vision"]]
+    else:
+        try:
+            vis = _nim_pick_vision(catalog or _nim_catalog(), 1)
+        except Exception as exc:
+            vis = []
+            print("[setup] nim vision 選抜に失敗: %s" % exc)
+    if vis:
+        NIM_VISION_MODEL = vis[0]
+        VISION_MODEL = vis[0]
+        print("[setup] nim: vision = %s（画像はモデルへ直接渡します）" % vis[0])
+    else:
+        print("[setup] nim: vision 対応モデルが見つかりませんでした"
+              "（画像添付は FUGU_NIM_VISION_MODEL で明示指定できます）")
+
+    if not pinned:                       # 選抜し直したので次回のために残す
+        _nim_save_lineup(picked, cond, NIM_VISION_MODEL)
     NIM_MODEL_IDS = {cond, prop_a, prop_b, prop_c, prop_d, agg, jp_agg, second, sc_third}
+    if NIM_VISION_MODEL:
+        NIM_MODEL_IDS.add(NIM_VISION_MODEL)
     # response_format={"type":"json_object"} を受ける保守的な集合。外れても 400 drop 再送 +
     # スキーマ文字列注入 + 既存 _fallback 経路の三段防衛があるため致命でない。
     NIM_STRUCTURED_OK = {cond, agg, second}
     # タイポ検出は固定布陣のときだけ。選抜経路はカタログ由来なので突合済み。
-    if not NIM_AUTO_SELECT or len(picked) < 4:
+    if not pinned and (not NIM_AUTO_SELECT or len(picked) < 4):
         catalog = _nim_catalog()
         missing = sorted(NIM_MODEL_IDS - catalog)
         if catalog and missing:
@@ -638,8 +760,10 @@ MAX_HISTORY_TURNS_SAVED = 50 # ファイルに保存する最大往復数（古�
 # duckduckgo_search パッケージ（pip install duckduckgo_search）が入っていれば
 # フル検索結果を取得。未インストール時は DuckDuckGo Instant Answer API（urllib 内蔵）
 # にフォールバック（インスタント回答のみ・件数少ない）。
-WEB_SEARCH_MAX_RESULTS = 5       # 1 クエリあたりの取得件数
-WEB_SEARCH_SNIPPET_CHARS = 400   # 各スニペットの文字数上限
+# 既定値は 8GB ローカル構成に合わせたもの。NIM 等の大コンテキスト構成では
+# FUGU_SEARCH_* で引き上げられる（未設定なら従来と完全に同じ）。
+WEB_SEARCH_MAX_RESULTS = int(os.environ.get("FUGU_SEARCH_MAX_RESULTS") or 5)
+WEB_SEARCH_SNIPPET_CHARS = int(os.environ.get("FUGU_SEARCH_SNIPPET_CHARS") or 400)
 WEB_SEARCH_TIMEOUT = 15          # 秒
 
 # --- 反復リサーチ ---
@@ -2400,6 +2524,28 @@ def _make_research_retrieve_fn(rag_dirs):
     return retrieve_fn
 
 
+def _research_int(name, default):
+    """Deep Research 用の環境変数を正の整数として読む（不正値は既定に戻す）。"""
+    try:
+        return max(1, int(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _research_model():
+    """FUGU_RESEARCH_MODEL を解決する。
+
+    役割名（aggregator / arbiter / conductor）でもモデル ID 直書きでも受ける。
+    NIM は起動ごとに生存プローブで布陣が変わるため、ID 直書きは腐る。役割名推奨。
+    未設定なら None を返し、従来どおり AskChat の既定（CONDUCTOR）になる。
+    """
+    v = (os.environ.get("FUGU_RESEARCH_MODEL") or "").strip()
+    if not v:
+        return None
+    return {"aggregator": AGGREGATOR, "arbiter": ARBITER_MODEL,
+            "conductor": CONDUCTOR}.get(v.lower()) or v
+
+
 def run_deep_research(question, rag_dirs=None):
     """fugu_rag.research.run_research を fugu-local の実装で駆動する (配線1d)。
 
@@ -2413,20 +2559,36 @@ def run_deep_research(question, rag_dirs=None):
         return ("__ERROR__: fugu_rag が見つかりません。"
                 "`pip install -e D:/repos/fugu-rag` で導入してください")
     import fugu_llm
+    fetch_chars = _research_int("FUGU_RESEARCH_FETCH_CHARS", 2000)
     fetch_fn = None
     try:
         import fugu_browser
-        fetch_fn = fugu_browser.as_fetcher(max_chars=2000)
+        fetch_fn = fugu_browser.as_fetcher(max_chars=fetch_chars)
     except ImportError:
         pass
-    chat = fugu_llm.AskChat(label="research", think=False)
+    # think=False はプランナー JSON の安定性のための既定。FUGU_RESEARCH_THINK=1 で
+    # 解除できる（大型ホストモデルは構造化出力が安定しているため）。
+    chat = fugu_llm.AskChat(
+        model=_research_model(), label="research",
+        think=True if os.environ.get("FUGU_RESEARCH_THINK") == "1" else False)
+    kwargs = dict(
+        retrieve_fn=_make_research_retrieve_fn(rag_dirs),
+        search_fn=_research_search_fn,
+        fetch_fn=fetch_fn,
+        max_branches=_research_int("FUGU_RESEARCH_BRANCHES", 3),
+        max_depth=_research_int("FUGU_RESEARCH_DEPTH", 2),
+        max_workers=_research_int("FUGU_RESEARCH_WORKERS", 1),
+    )
+    tunables = dict(
+        per_source=_research_int("FUGU_RESEARCH_PER_SOURCE", 3),
+        fetch_chars=fetch_chars,
+    )
     try:
-        report = run_research(
-            question, chat,
-            retrieve_fn=_make_research_retrieve_fn(rag_dirs),
-            search_fn=_research_search_fn,
-            fetch_fn=fetch_fn,
-            max_branches=3, max_depth=2, max_workers=1)
+        try:
+            report = run_research(question, chat, **kwargs, **tunables)
+        except TypeError:
+            # per_source / fetch_chars を受けない旧 fugu-rag でも従来どおり動かす
+            report = run_research(question, chat, **kwargs)
         return report.report
     except Exception as e:
         return f"__ERROR__: deep research failed: {e}"
@@ -2714,8 +2876,188 @@ def _deepconf_confidence(logprobs):
     return sum(groups[:k]) / k
 
 
+def _nim_image_parts(images):
+    """images（data URL か素の base64）を OpenAI 互換の image_url パートへ。"""
+    parts = []
+    for im in images or []:
+        s = str(im)
+        url = s if s.startswith("data:") else ("data:image/png;base64," + s)
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
+
+
+def _nim_attach_images(msgs, images):
+    """最後の user メッセージを「テキスト＋画像」のパート配列に組み替える。
+
+    NIM の VLM は OpenAI 互換のパート形式を受ける。呼び出し元の messages は
+    変異させない（SC の再送で同じ配列が使い回されるため）。
+    """
+    out = [dict(m) for m in msgs]
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            text = out[i].get("content")
+            parts = []
+            if isinstance(text, str) and text:
+                parts.append({"type": "text", "text": text})
+            elif isinstance(text, list):
+                parts.extend(text)
+            parts.extend(_nim_image_parts(images))
+            out[i]["content"] = parts
+            return out
+    out.append({"role": "user", "content": _nim_image_parts(images)})
+    return out
+
+
+def _nim_inline_images(msgs, images):
+    """パート形式を受けないモデル向けの退避形（NVIDIA の一部 VLM は本文に img タグ）。"""
+    out = [dict(m) for m in msgs]
+    tags = "".join('<img src="%s" />' % (
+        s if str(s).startswith("data:") else "data:image/png;base64," + str(s))
+        for s in (images or []))
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") == "user":
+            body = out[i].get("content")
+            if isinstance(body, list):      # 既にパート化されていたら文字列へ戻す
+                body = " ".join(x.get("text", "") for x in body
+                                if isinstance(x, dict) and x.get("type") == "text")
+            out[i]["content"] = (body or "") + " " + tags
+            return out
+    out.append({"role": "user", "content": tags})
+    return out
+
+
+# ------------------------------------------------------------------ ネイティブ思考
+# NIM の推論モデルは「どれだけ考えるか」を API で受け取れる。Nemotron 3 系は
+# extra_body の reasoning_budget（思考トークン数）、gpt-oss / mistral 系は
+# reasoning_effort（段階）。どちらも RL で長考するよう訓練されたモデルに対して
+# 思考の長さを指示するもので、Claude の extended thinking と同じ性質のつまみ。
+#
+# 従来 _nim_tuning_for() はこれを 16384 固定で送っていた。FUGU_THINKING_BUDGET を
+# 変えても動くのは fugu 側の外側ループ（fugu_thinking の reflections / min_rounds）
+# だけで、モデル自身の思考量は常に最大だった。ここで 2 つの軸を同じつまみに繋ぐ。
+#
+# 既定（FUGU_THINKING_BUDGET 未設定）では何もしない — 従来の固定値のまま。
+
+#: 思考レベル → モデル自身の思考トークン数。
+#: 範囲 256〜16384 は build.nvidia.com のサンプルが示すもの。
+#:
+#: minimal を 0（enable_thinking=False）にしないのは実測による。2026-08-19 に
+#: nemotron-3-ultra へ enable_thinking=False で投げたところ、本文も思考も空の
+#: ストリームが返り、SC の票が無効化されたまま次のリトライまで止まった。
+#: 推論前提で訓練されたモデルに「考えるな」と言うのは訓練分布の外側で、
+#: 出力が壊れる。最小段は「思考を切る」ではなく「documented な最小量に絞る」。
+NIM_THINK_TOKENS = {
+    "minimal": 256, "low": 512, "medium": 2048,
+    "high": 8192, "ultra": 16384, "max": 16384,
+}
+#: chat_template_kwargs の low_effort を立てる段階（思考量をさらに抑える公式のつまみ）。
+NIM_THINK_LOW_EFFORT = frozenset({"minimal"})
+#: 思考レベル → reasoning_effort（段階指定しか受けない系統向け）。None は不送信。
+NIM_THINK_EFFORT = {
+    "minimal": None, "low": "low", "medium": "medium",
+    "high": "high", "ultra": "high", "max": "high",
+}
+#: reasoning_budget を受ける系統（build.nvidia.com のサンプル準拠）。
+_NIM_BUDGET_RE = re.compile(r"nemotron-3|nemotron-4")
+#: reasoning_effort を受ける系統。
+_NIM_EFFORT_RE = re.compile(r"gpt-oss|mistral-medium|magistral")
+
+
+def thinking_level():
+    """いま有効な思考レベル（未設定・off・未知値は ""）。"""
+    level = (os.environ.get("FUGU_THINKING_BUDGET") or "").strip().lower()
+    return level if level in NIM_THINK_TOKENS else ""
+
+
+def resolve_thinking_level(question):
+    """"auto" を具体レベルへ解決する（追加のモデル呼び出しはしない）。
+
+    呼び出し側が実行前に 1 度だけ解決して環境変数に固定する想定。役割ごとに
+    プロンプトが変わる送信層で毎回分類すると、同じ質問の中で深さがばらつく。
+    """
+    level = (os.environ.get("FUGU_THINKING_BUDGET") or "").strip().lower()
+    if not level or level == "off":
+        return ""
+    if level in NIM_THINK_TOKENS:
+        return level
+    try:
+        import fugu_thinking
+        return fugu_thinking.heuristic_budget(question or "")
+    except Exception:
+        return ""
+
+
+def _nim_apply_think_level(model, payload, fmt):
+    """思考レベルをモデル自身の思考予算へ反映する。設定したキー名を返す。
+
+    fmt 付き（JSON スキーマ制約）の呼び出しは対象外 — 計画・分類は思考を
+    伸ばすほど JSON が崩れる。FUGU_RESEARCH_THINK を既定オフにしているのと
+    同じ判断で、ここでも構造化出力には手を出さない。
+    """
+    level = thinking_level()
+    if not level or fmt is not None:
+        return ()
+    tokens, effort = NIM_THINK_TOKENS[level], NIM_THINK_EFFORT[level]
+    touched = []
+    if _NIM_BUDGET_RE.search(model or ""):
+        kw = dict(payload.get("chat_template_kwargs") or {})
+        kw["enable_thinking"] = True
+        if level in NIM_THINK_LOW_EFFORT:
+            kw["low_effort"] = True
+        else:
+            kw.pop("low_effort", None)
+        payload["chat_template_kwargs"] = kw
+        payload["reasoning_budget"] = tokens
+        touched += ["chat_template_kwargs", "reasoning_budget"]
+    elif _NIM_EFFORT_RE.search(model or ""):
+        payload["reasoning_effort"] = effort or "low"
+        touched.append("reasoning_effort")
+    else:
+        # 系統不明。deepseek-r1 系のような「常時思考・パラメータ不要」に
+        # 余計なキーを送ると 400 → drop 再送で 1 往復無駄になるので送らない。
+        return ()
+    # 思考が max_tokens を食い尽くすと本文ゼロ（既存の A_think_only 失敗型）に
+    # なる。思考予算のぶんだけ出力上限を確保しておく。
+    need = min(tokens + 4096, NIM_MAX_TOKENS_CAP)
+    if payload.get("max_tokens") is None or payload["max_tokens"] < need:
+        payload["max_tokens"] = need
+    return tuple(touched)
+
+
+#: UI へ出すために思考本文を控える（既定 OFF。FUGU_KEEP_THINKING=1 で有効）。
+#: 継投用の NIM_THINK_TRACES とは別物 — あちらは「答えが出なかったとき」だけ、
+#: こちらは成功時も含めて全役割ぶんを控える。
+NIM_THINK_KEEP_MAX = 12          # 保持する本数（役割ぶん。超過は捨てる）
+NIM_THINK_KEEP_CHARS = 20000     # 1 本あたりの保持文字数（末尾から）
+NIM_THINKING = []                # [{"model","label","chars","text"}]
+_NIM_THINKING_LOCK = threading.Lock()
+
+
+def thinking_reset():
+    """質問ごとに呼ぶ。前の質問の思考が混ざらないようにする。"""
+    with _NIM_THINKING_LOCK:
+        del NIM_THINKING[:]
+
+
+def thinking_blocks():
+    """控えた思考のコピーを返す（新しい順ではなく発生順）。"""
+    with _NIM_THINKING_LOCK:
+        return [dict(b) for b in NIM_THINKING]
+
+
+def _keep_thinking(model, label, think):
+    if os.environ.get("FUGU_KEEP_THINKING") != "1" or not think:
+        return
+    with _NIM_THINKING_LOCK:
+        if len(NIM_THINKING) >= NIM_THINK_KEEP_MAX:
+            return
+        NIM_THINKING.append({"model": model, "label": label or "",
+                             "chars": len(think),
+                             "text": think[-NIM_THINK_KEEP_CHARS:]})
+
+
 def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
-             num_predict=None, num_ctx=None):
+             num_predict=None, num_ctx=None, images=None):
     """NIM (OpenAI 互換 /chat/completions) 送信層。シグネチャと「失敗は例外でなく
     __ERROR__: 文字列を返す」契約は ask() と完全に同一（13 呼び出し箇所を無改修で通すため）。
     num_ctx / keep_alive はクラウドでは意味を持たないので受けて無視する。
@@ -2740,11 +3082,13 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     if think is None:
         think = model_cfg(model, "think")
     msgs = messages
+    if images:
+        msgs = _nim_attach_images(msgs, images)
     if fmt is not None and isinstance(fmt, dict):
         schema_note = ("\n\n出力は次の JSON スキーマに厳密に従う単一の JSON オブジェクト"
                        "のみとせよ（前置き・コードフェンス禁止）: "
                        + json.dumps(fmt, ensure_ascii=False))
-        msgs = [dict(m) for m in messages]
+        msgs = [dict(m) for m in msgs]
         for m in msgs:
             if m.get("role") == "system":
                 m["content"] = (m.get("content") or "") + schema_note
@@ -2773,6 +3117,10 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     extra_keys = tuple(extra) if isinstance(extra, dict) else ()
     if extra_keys:
         payload.update(copy.deepcopy(extra))
+    # 思考レベルが指定されていれば、上の固定値を上書きする（未指定なら素通り）。
+    # 400 時の drop 対象にも入れる — 非対応モデルに当たっても 1 回で復帰できるように。
+    extra_keys = tuple(dict.fromkeys(
+        extra_keys + _nim_apply_think_level(model, payload, fmt)))
     if NIM_CAPTURE_LOGPROBS:
         payload["logprobs"] = True   # DeepConf 用（非対応モデルは 400 drop 再送で自然に外れる）
     _NIM_TLS.last_conf = None        # 呼び出しごとにリセット（成功ストリームだけが設定する）
@@ -2854,6 +3202,8 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                     if chs[0].get("finish_reason"):
                         finish = chs[0]["finish_reason"]
         result = "".join(parts).strip()
+        if result:
+            _keep_thinking(model, label, "".join(rparts).strip())
         if not result:
             # 従来はここで全部 "__ERROR__: truncated" に潰していた。内訳を分けて数え、
             # 思考テキストが残っている場合は回収を試みる(追加リクエストゼロ)。
@@ -2887,6 +3237,8 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     rate_budget = NIM_RATE_RETRIES
     dropped_params = False
     escalated_tokens = False
+    switched_image_form = False
+    restored_thinking = False
     while True:
         try:
             out = _send(payload)
@@ -2894,6 +3246,20 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
             # 16384 を食い尽くし finish_reason=length・本文ゼロ → 無効票、が gpt-oss 系で
             # 頻発した。1回だけ上限を倍に増額して再送し、票を救済する（attempt 不消費。
             # 増額しても打ち切られるなら実力として諦め、既存の __ERROR__ 契約に従う）。
+            # 思考を絞った状態で本文が空なら、1 度だけ通常量へ戻して再送する。
+            # 推論前提のモデルは思考を削られると空ストリームを返すことがある
+            # （2026-08-19 実測 / nemotron-3-ultra）。無効票を静かに増やさない。
+            if (not out and not restored_thinking
+                    and payload.get("reasoning_budget") is not None
+                    and payload["reasoning_budget"] < NIM_THINK_TOKENS["medium"]):
+                restored_thinking = True
+                payload["reasoning_budget"] = NIM_THINK_TOKENS["medium"]
+                kw = dict(payload.get("chat_template_kwargs") or {})
+                kw.pop("low_effort", None)
+                kw["enable_thinking"] = True
+                payload["chat_template_kwargs"] = kw
+                print(f"   [nim] {model}: 思考を絞ったら空応答 → 通常量へ戻して再送します")
+                continue
             if (out.startswith("__ERROR__: truncated") and not escalated_tokens
                     and payload.get("max_tokens")
                     and payload["max_tokens"] < NIM_MAX_TOKENS_CAP):
@@ -2920,6 +3286,13 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                     _NIM_COOLDOWN[model] = max(_NIM_COOLDOWN.get(model, 0.0),
                                                time.time() + wait)
                 time.sleep(wait)
+                continue
+            if e.code == 400 and images and not switched_image_form:
+                # 画像の渡し方には2系統ある（OpenAI 互換のパート配列／本文への img タグ）。
+                # パート配列で 400 が返るモデルのために、一度だけ後者へ切り替えて再送する。
+                switched_image_form = True
+                payload["messages"] = _nim_inline_images(messages, images)
+                print(f"   [nim] {model}: 画像をタグ形式へ切り替えて再送します")
                 continue
             if (e.code == 400 and not dropped_params
                     and ("reasoning_effort" in payload or "response_format" in payload
@@ -2973,7 +3346,7 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
       スキーマを与えると enum 値まで含めて妥当な JSON に拘束され、かつ高速（実測 ~14s）。"""
     if _is_nim(model):   # NIM レジストリ登録モデルはクラウド送信層へ（未登録なら完全不活性）
         return _ask_nim(model, messages, temperature, think=think, fmt=fmt, label=label,
-                        num_predict=num_predict, num_ctx=num_ctx)
+                        num_predict=num_predict, num_ctx=num_ctx, images=images)
     if think is None:
         think = model_cfg(model, "think")   # 呼び出し側が未指定ならモデル別設定を適用
     if images:
@@ -3299,6 +3672,10 @@ def code_check(answer):
 VISION_MODEL = os.environ.get("FUGU_VISION_MODEL", "llama3.2-vision")
 
 
+_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+
+
 def _encode_image_file(path):
     """画像ファイルを base64 文字列へ（Ollama /api/chat の images 仕様）。"""
     import base64
@@ -3306,16 +3683,29 @@ def _encode_image_file(path):
         return base64.b64encode(fh.read()).decode("ascii")
 
 
+def _encode_image_data_url(path):
+    """画像を data URL へ（NIM の OpenAI 互換 VLM 仕様。mime を保つ）。"""
+    mime = _IMAGE_MIME.get(Path(path).suffix.lower(), "image/png")
+    return "data:%s;base64,%s" % (mime, _encode_image_file(path))
+
+
 def _vision_answer(question, image_paths):
     """画像付き質問を VISION_MODEL へ直接ルートして回答文字列を返す。
     ペルソナ選定・MoA はバイパス（vision はパネル内に対応モデルが無いため）。
     失敗は ask() と同じ __ERROR__ センチネル規約で返す。"""
+    model = NIM_VISION_MODEL if (FUGU_BACKEND == "nim" and NIM_VISION_MODEL) else VISION_MODEL
+    if FUGU_BACKEND == "nim" and not NIM_VISION_MODEL:
+        return ("__ERROR__: NIM に vision 対応モデルが見つかりませんでした。"
+                "FUGU_NIM_VISION_MODEL でモデル ID を指定してください")
     try:
-        images = [_encode_image_file(p) for p in image_paths]
+        if FUGU_BACKEND == "nim":
+            images = [_encode_image_data_url(p) for p in image_paths]
+        else:
+            images = [_encode_image_file(p) for p in image_paths]
     except OSError as e:
         return f"__ERROR__: cannot read image: {e}"
     return ask(
-        VISION_MODEL,
+        model,
         [{"role": "user", "content": question}],
         0.2, label="vision", images=images,
     )
@@ -3798,11 +4188,64 @@ def _resolve_proposer(name):
         return m if m in PROPOSERS else None
     if name in PROPOSERS:
         return name
+    # UI から布陣を明示指名する経路（速度モード / 評議会の顔ぶれ選択）。
+    # ディスパッチ実体として登録済みの ID なら、提案役に限らず受ける
+    # — 統合役や Conductor を単体モードの回答役に指名できるようにするため。
+    # Conductor が出す plan はペルソナ名しか含まないので、自動経路の挙動は変わらない。
+    if name in NIM_MODEL_IDS:
+        return name
     key = str(name).strip().lower()
     for label, model in PERSONA_MODELS.items():
         if key in (label.lower(), label.lower().replace("proposer ", "")):
             return model if model in PROPOSERS else None
     return None
+
+
+def roster():
+    """いまの布陣を役割つきで返す（UI のモデル選択用。副作用なし）。
+
+    NIM は起動ごとに生存プローブで顔ぶれが変わるので、UI 側に ID を
+    ハードコードさせないための一覧。Ollama バックエンドでも同じ形で返る。
+    """
+    order = []
+
+    def _add(mid, role):
+        if not mid:
+            return
+        for e in order:
+            if e["id"] == mid:
+                if role not in e["roles"]:
+                    e["roles"].append(role)
+                return
+        order.append({"id": mid, "roles": [role]})
+
+    for label in sorted(PERSONA_MODELS):
+        _add(PERSONA_MODELS[label], label.lower().replace(" ", "_"))
+    _add(AGGREGATOR, "aggregator")
+    _add(CONDUCTOR, "conductor")
+    _add(ARBITER_MODEL, "arbiter")
+    _add(SECOND_OPINION_MODEL, "second_opinion")
+    for mid in REASONING_MODELS or []:
+        _add(mid, "sc")
+    _add(NIM_VISION_MODEL if FUGU_BACKEND == "nim" else VISION_MODEL, "vision")
+    for e in order:
+        try:
+            tot, act = _nim_scale_of(e["id"]) if FUGU_BACKEND == "nim" else (None, None)
+        except Exception:
+            tot, act = None, None
+        e["size"] = (f"{tot:.0f}B/a{act:.0f}B" if tot and act and act != tot
+                     else (f"{tot:.0f}B" if tot else ""))
+        e["persona"] = MODEL_TO_PERSONA.get(e["id"], "")
+    return {
+        "backend": FUGU_BACKEND,
+        "models": order,
+        "proposers": list(PROPOSERS),
+        "aggregator": AGGREGATOR,
+        "conductor": CONDUCTOR,
+        "arbiter": ARBITER_MODEL,
+        "vision": (NIM_VISION_MODEL if FUGU_BACKEND == "nim" else VISION_MODEL) or "",
+        "max_rounds": MAX_ROUNDS,
+    }
 
 
 def _persona_str(model):
@@ -7133,7 +7576,7 @@ def setup():
 def ask_fugu(question, baseline=SHOW_BASELINE, *,
              use_search=False, rag_dirs=None, out_file=None,
              history_file=None, office_attached=False, images=None,
-             deep_research=False):
+             deep_research=False, plan=None):
     """質問を Fugu パイプラインで処理する。
     use_search: True なら Web 検索を行いコンテキストに注入する（Conductor が
       search_required=true を出した場合も自動で有効化される）。
@@ -7143,6 +7586,14 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
     office_attached: Office 文書が添付されている旨を Conductor へ伝えるヒント。
     images: 画像ファイルパスのリスト。指定時は VISION_MODEL へ直行ルート
       （Conductor・MoA・履歴更新をバイパスする軽量経路）。
+    plan: 実行プランを外から与える（省略時は従来どおり Conductor が決める）。
+      呼び出し側が mode / 顔ぶれ / ラウンド数を決めている場合に、Conductor の
+      往復を丸ごと省くための入口。validate_plan と出力形態のガードレール
+      （PowerPoint・画像）は通すので「パワポを作って」は指定に関わらず正しく
+      合議へ回る。精度ガードレール（single→moa の格上げ）は通さない —
+      「速さを明示的に選んだ」という意思をここで覆さないため。
+      Conductor をスキップするので search_required の自動判定も働かない。
+      検索が要るなら use_search で明示すること。
     """
     global _HISTORY
     if not setup():
@@ -7183,11 +7634,17 @@ def ask_fugu(question, baseline=SHOW_BASELINE, *,
         return result
 
     # --- Conductor プランを先に取得（検索要否・画像生成・Office ルーティングを決める）---
-    print("\n[Fugu] Conductor がオーケストレーションを開始します...")
-    # FUGU_SPECULATE=1: conduct と並行してコンテキストを先読み（既定は None=無効）
-    prefetched = _speculate_context(question, use_search, rag_dirs or RAG_DIRS)
-    plan, _raw = conduct(question, history=list(_HISTORY),
-                         office_attached=office_attached)
+    if plan is not None:
+        plan = _apply_routing_guardrails(question, validate_plan(plan))
+        print("\n[Fugu] 指定されたプランで実行します（Conductor をスキップ: "
+              "mode=%s / %d体）" % (plan["mode"], len(plan.get("selected_proposers") or [])))
+        prefetched = None
+    else:
+        print("\n[Fugu] Conductor がオーケストレーションを開始します...")
+        # FUGU_SPECULATE=1: conduct と並行してコンテキストを先読み（既定は None=無効）
+        prefetched = _speculate_context(question, use_search, rag_dirs or RAG_DIRS)
+        plan, _raw = conduct(question, history=list(_HISTORY),
+                             office_attached=office_attached)
     if SHOW_PLAN:
         _print_plan(plan)
 
