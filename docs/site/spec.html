@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fugu-nim 改修仕様 — 分岐の廃止と合成性の導入</title>
+<title>Quorum 改修仕様 — 分岐の廃止と合成性の導入</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
@@ -113,7 +113,7 @@
 
 <header class="top">
   <div class="col">
-    <p class="crumb"><a href="index.html">← fugu-nim</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; SPEC</p>
+    <p class="crumb"><a href="index.html">← Quorum</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; SPEC</p>
     <h1>分岐を捨てて、<br>合成性を入れる</h1>
     <p>2 つの改修を 1 回で実装する。経路分岐の廃止と、推論の段ごとのプーリング。
        段階には分けず、機能ごとのフラグで寄与を切り分ける。</p>
@@ -667,7 +667,7 @@
 
 <footer>
   <div class="col">
-    fugu-nim — 統合 MoA 実装仕様（SPEC・実装完了 2026-08-05 / 測定済み 08-06）<br>
+    Quorum — 統合 MoA 実装仕様（SPEC・実装完了 2026-08-05 / 測定済み 08-06）<br>
     前提となる実測: fugu_bench/results/*.jsonl（AIME 90問・9構成・累計 9,486 req）<br>
     改修対象: fugu_local.py（追記のみ）, bench_fugu.py（CONFIGS 追加）<br>
     <a href="index.html">← 概要</a> ·

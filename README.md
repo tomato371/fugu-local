@@ -302,7 +302,7 @@ completion as usual, so a long `fugu_ask_start` job can ping you when it's done.
 | `test_fugu_offline.py` | Offline characterization checks (no model required) |
 | `tests/` | Offline pytest suite for every module above |
 | `bench_search.py`, `docs/search-benchmark.md` | AB-MCTS search benchmark + interim report |
-| `docs/site/` | Japanese project site for the NIM-backend experiment (open `docs/site/index.html`) |
+| `docs/site/` | **Quorum** (formerly fugu-nim) — Japanese project site for the NIM-backed SC-court orchestrator (open `docs/site/index.html`) |
 | `Dockerfile` | Container image for the app (web UI by default) |
 | `docker-compose.yml` | One-command stack: Ollama + fugu web UI |
 | `requirements.txt` | Optional deps (web UI + file I/O); core needs none |

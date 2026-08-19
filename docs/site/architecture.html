@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fugu-nim アーキテクチャ — モデル構成と実行経路</title>
+<title>Quorum アーキテクチャ — モデル構成と実行経路</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
@@ -150,7 +150,7 @@
 
 <header class="top">
   <div class="col">
-    <p class="crumb"><a href="index.html">← fugu-nim</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; ARCHITECTURE</p>
+    <p class="crumb"><a href="index.html">← Quorum</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; ARCHITECTURE</p>
     <h1>アーキテクチャと<br>モデル構成</h1>
     <p>質問が入ってから答えが出るまでに何が起き、どのモデルがどの役割を担い、
        クラウド越しの長時間推論をどう成立させているか。</p>
@@ -179,7 +179,7 @@
     <h2>全体像</h2>
     <div class="prose">
       <p>
-        fugu-nim は 4 つの層でできています。<strong>判定（Conductor）</strong>、
+        Quorum は 4 つの層でできています。<strong>判定（Conductor）</strong>、
         <strong>解法（SC 投票 / MoA 合議）</strong>、<strong>検証（PoT・Critic・裁定）</strong>、
         <strong>通信（NIM 送信層）</strong>。
       </p>
@@ -888,7 +888,7 @@
 
 <footer>
   <div class="col">
-    fugu-nim — Architecture reference<br>
+    Quorum — Architecture reference<br>
     実装参照: fugu_local.py（apply_nim_profile / _ask_nim / solve_verifiable / conduct / fugu_answer）<br>
     本ページの構成値・パラメータはすべて実装のソースから転記したものです（2026-08-05 時点）。<br>
     <a href="index.html">← 概要ページへ戻る</a>

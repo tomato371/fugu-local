@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fugu-nim テストタイム計算量スケーリング実測</title>
+<title>Quorum テストタイム計算量スケーリング実測</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
@@ -240,8 +240,8 @@
 
   <header class="mast">
     <p class="kicker">Benchmark report · 2026-08-05</p>
-    <p style="font-family:ui-monospace,monospace;font-size:12.5px;letter-spacing:.08em;opacity:.75;margin:0 0 14px"><a href="index.html">← fugu-nim</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; SCALING</p>
-<h1>fugu-nim：テストタイム計算量は<br>どこで効かなくなるか</h1>
+    <p style="font-family:ui-monospace,monospace;font-size:12.5px;letter-spacing:.08em;opacity:.75;margin:0 0 14px"><a href="index.html">← Quorum</a> &nbsp;/&nbsp; <a href="usage.html">使い方</a> &nbsp;/&nbsp; <a href="roadmap.html">ロードマップ</a> &nbsp;/&nbsp; <a href="design.html">次期設計</a> &nbsp;/&nbsp; SCALING</p>
+<h1>Quorum：テストタイム計算量は<br>どこで効かなくなるか</h1>
     <p class="dek">
       NVIDIA NIM 上で動かした動的 MoA オーケストレータ fugu の、9 構成・累計 9,486 リクエストの実測。
       「計算量を積めば精度が上がる」がどこで止まり、そこから先は何が効いたのかを、
@@ -259,7 +259,7 @@
     <div class="stat">
       <p class="lab">AIME26 最終</p>
       <p class="val win">30 / 30</p>
-      <p class="sub">Fable 29/30 を上回る。<br>fugu-nim が初めて基準を超えた</p>
+      <p class="sub">Fable 29/30 を上回る。<br>Quorum が初めて基準を超えた</p>
     </div>
     <div class="stat">
       <p class="lab">AIME 90問 合計</p>
@@ -680,9 +680,9 @@
 
     <div class="tbl-wrap">
       <table>
-        <caption>最終スコア比較（fugu-nim 全構成合算 vs Fable vs ローカル8GB版）</caption>
+        <caption>最終スコア比較（Quorum 全構成合算 vs Fable vs ローカル8GB版）</caption>
         <thead>
-          <tr><th>ベンチ</th><th>fugu-nim</th><th>Fable</th><th>ローカル(vibe)</th><th>判定</th></tr>
+          <tr><th>ベンチ</th><th>Quorum</th><th>Fable</th><th>ローカル(vibe)</th><th>判定</th></tr>
         </thead>
         <tbody>
           <tr><td class="num">AIME26</td><td class="num">30/30</td><td class="num">29/30</td><td class="num">23/30</td><td style="color:var(--good);font-weight:700">勝ち</td></tr>
@@ -697,7 +697,7 @@
         </tfoot>
       </table>
     </div>
-    <p class="lede" style="font-size:13px"><strong>2026-08-06 訂正:</strong> この表の fugu-nim 側は<strong>全構成の和集合</strong>（どれか1構成で解けたら正解）である。単一構成の最良合計は <strong>187/210</strong>（AIME 90問では 75/90）で、単一モデルである Fable の 199.5/210 と直接比較できるのはこちら。和集合はオラクル上限であり到達可能な成績ではない。詳細は <a href="design.html">次期設計ページ</a>。</p>
+    <p class="lede" style="font-size:13px"><strong>2026-08-06 訂正:</strong> この表の Quorum 側は<strong>全構成の和集合</strong>（どれか1構成で解けたら正解）である。単一構成の最良合計は <strong>187/210</strong>（AIME 90問では 75/90）で、単一モデルである Fable の 199.5/210 と直接比較できるのはこちら。和集合はオラクル上限であり到達可能な成績ではない。詳細は <a href="design.html">次期設計ページ</a>。</p>
     <p class="lede" style="font-size:13px">
       * ローカル 8GB 版の HumanEval は qwen3.6:35b が HTTP 500 で 2 問とも落ちており、比較に足るデータが無い。
       未解決の 3 問は <code>aime24-2024-I-12</code>, <code>aime24-2024-II-15</code>, <code>aime25-13</code>。

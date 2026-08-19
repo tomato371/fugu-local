@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>fugu-nim — 動的 Mixture-of-Agents オーケストレータ</title>
+<title>Quorum — 動的 Mixture-of-Agents オーケストレータ</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
@@ -254,7 +254,7 @@
 
 <header class="mast">
   <div class="col">
-    <p class="brandline"><span>FUGU-NIM</span><span class="tag">RESEARCH PROTOTYPE</span><span>v. 2026-08-05</span></p>
+    <p class="brandline"><span>QUORUM</span><span class="tag">RESEARCH PROTOTYPE</span><span class="tag">旧称 fugu-nim</span><span>v. 2026-08-05</span></p>
     <h1>設計は、<span class="thin">どこまで</span><br>モデルの代わりになるか</h1>
     <p class="sub">Dynamic Mixture-of-Agents orchestrator on NVIDIA NIM</p>
     <p class="lead">
@@ -296,13 +296,14 @@
     <h2>一行で言うと</h2>
     <div class="prose">
       <p>
-        <strong>fugu-nim は、複数の異なる大規模言語モデルに同じ問題を独立に解かせ、投票と対審で 1 つの答えに収束させるオーケストレータです。</strong>
+        <strong>Quorum は、複数の異なる大規模言語モデルに同じ問題を独立に解かせ、投票と対審で 1 つの答えに収束させるオーケストレータです。</strong>
         単一モデルへの問い合わせを置き換えるものではなく、単一モデルでは届かない精度に、時間と引き換えに到達するための層です。
+        名前の <em>Quorum</em>（定足数）は、複数モデルの独立した投票が定足数に達してはじめて答えを採択する、というこの設計そのものを指しています。
       </p>
       <p>
         中核にあるのは 1 つの主張です。<strong>誤りが相関していない複数のモデルを合議させれば、個々のモデルより正確になる。</strong>
         これはアンサンブル学習の古典的な原理ですが、言語モデルに適用するとき難しいのは「誤りを相関させないこと」の方です。
-        fugu-nim の設計の大半は、この相関を壊すために費やされています。
+        Quorum の設計の大半は、この相関を壊すために費やされています。
       </p>
     </div>
 
@@ -384,7 +385,7 @@
     <h2>3 つの設計原則</h2>
     <div class="prose">
       <p>
-        fugu-nim は 8GB VRAM のノート PC 向けに設計された <code>fugu_local</code> の派生です。
+        Quorum は 8GB VRAM のノート PC 向けに設計された <code>fugu_local</code> の派生です。
         制約から出発したことが、そのまま設計原則になっています。
       </p>
     </div>
@@ -435,7 +436,7 @@
       <table>
         <caption>ベンチマーク結果（2026-08-05 時点）</caption>
         <thead>
-          <tr><th>ベンチマーク</th><th>fugu-nim</th><th>基準モデル</th><th>n</th><th>req / 問</th><th>判定</th></tr>
+          <tr><th>ベンチマーク</th><th>Quorum</th><th>基準モデル</th><th>n</th><th>req / 問</th><th>判定</th></tr>
         </thead>
         <tbody>
           <tr><td>AIME 2026</td><td>30/30</td><td>29/30</td><td>30</td><td>—</td><td><span class="pill w">上回る</span></td></tr>
@@ -468,11 +469,11 @@
     <div class="box verified">
       <h3>最も意味のある数字は、順位ではありません</h3>
       <p>
-        同一のモデル群を単発で呼ぶと約 40%、同じモデル群を fugu-nim のオーケストレーションに通すと 97%（AIME26）。
+        同一のモデル群を単発で呼ぶと約 40%、同じモデル群を Quorum のオーケストレーションに通すと 97%（AIME26）。
         <strong>差の 57 ポイントが「設計の寄与」です。</strong>モデルは同じなので、この差はモデルの性能ではありません。
       </p>
       <p>
-        逆に言えば、fugu-nim 単体には性能がありません。fugu-nim は<strong>モデルを増幅する層</strong>であり、
+        逆に言えば、Quorum 単体には性能がありません。Quorum は<strong>モデルを増幅する層</strong>であり、
         増幅率を測れる形で実装されていることが、このプロジェクトの主張です。
       </p>
     </div>
@@ -985,7 +986,7 @@ python bench_fugu.py run --dataset humaneval --config coder@nim --limit 30
 
 <footer>
   <div class="col">
-    fugu-nim — Dynamic Mixture-of-Agents orchestrator<br>
+    Quorum — Dynamic Mixture-of-Agents orchestrator<br>
     実装: fugu_local.py（5,099 行・Python 標準ライブラリのみ） / bench_fugu.py<br>
     測定期間: 2026-08-02 〜 2026-08-06 ／ 累計 NIM リクエスト 15,000+ ／ 外部課金 ¥0<br>
     本ページの数値はすべて fugu_bench/results/*.jsonl の生データから再集計したものです。
