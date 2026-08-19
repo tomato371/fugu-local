@@ -211,7 +211,7 @@
           <!-- Conductor -->
           <rect x="290" y="64" width="320" height="60" rx="3" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="1.6"/>
           <text x="450" y="87" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ai)">Conductor</text>
-          <text x="450" y="107" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-2)">llama-3.1-8b · temp 0.1 · JSON スキーマ拘束</text>
+          <text x="450" y="107" text-anchor="middle" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-2)">gemma-4-31b-it · temp 0.1 · JSON スキーマ拘束</text>
           <text x="620" y="80" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">出力: mode / task_type /</text>
           <text x="620" y="95" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">selected_proposers /</text>
           <text x="620" y="110" font-family="ui-monospace, monospace" font-size="11" fill="var(--ink-3)">rounds / search_required</text>
@@ -297,8 +297,10 @@
         <tbody>
           <tr>
             <td><strong>Conductor / Critic</strong></td>
-            <td class="m">meta/llama-3.1-8b-instruct</td>
-            <td>経路判定と批評。JSON 出力が安定し軽量。判定は毎回走るため速度が要る</td>
+            <td class="m">google/gemma-4-31b-it</td>
+            <td>経路判定と批評。毎問走る。速度より<strong>分類精度</strong>を取り 2026-08-19 に
+              Gemma 4 へ変更（実測 task_type 4/4 正・中央値 11〜20 秒。llama-3.1-8b は 2 秒だが
+              コード/知識/挨拶を chat に潰して 1/4）。<code>FUGU_CONDUCTOR</code> で差し替え可</td>
           </tr>
           <tr>
             <td><strong>Proposer A</strong><br><span class="pill e">GPT 役</span></td>

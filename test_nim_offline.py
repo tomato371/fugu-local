@@ -251,6 +251,35 @@ check("400drop: think=True は high に写像",
                             lambda: f.ask("test/model", MSGS, 0.5, think=True))[1][0]
                  ).get("reasoning_effort") == "high")
 
+# ---------- 7b. think_style=template（gemma-4 系: effort ではなく chat_template_kwargs）----------
+# gemma-4 は reasoning_effort を 400 にせず黙って無視するため、think を効かせるには
+# chat_template_kwargs.enable_thinking を送るしかない（2026-08-19 実測）。
+_saved_ts = copy.deepcopy(f.MODEL_CONFIG)
+try:
+    f.MODEL_CONFIG["test/model"] = {"think_style": "template"}
+    p = payload_of(run_mocked([(ok_body())],
+                              lambda: f.ask("test/model", MSGS, 0.5, think=True))[1][0])
+    check("think_style: think=True は enable_thinking で開く（effort は送らない）",
+          p.get("chat_template_kwargs") == {"enable_thinking": True}
+          and "reasoning_effort" not in p)
+    p = payload_of(run_mocked([(ok_body())],
+                              lambda: f.ask("test/model", MSGS, 0.5, think=False))[1][0])
+    check("think_style: think=False は enable_thinking=False で明示的に閉じる",
+          p.get("chat_template_kwargs") == {"enable_thinking": False})
+    f.MODEL_CONFIG["test/model"] = {"think_style": "template", "reasoning_budget": 4096}
+    p = payload_of(run_mocked([(ok_body())],
+                              lambda: f.ask("test/model", MSGS, 0.5, think=True))[1][0])
+    check("think_style: reasoning_budget があれば併送", p.get("reasoning_budget") == 4096)
+    _o, _s, _ = run_mocked([http_error(400, body=b"param not supported"), (ok_body("ok3"))],
+                           lambda: f.ask("test/model", MSGS, 0.5, think=True))
+    check("think_style: 400 なら chat_template_kwargs も落として再送",
+          _o == "ok3" and len(_s) == 2
+          and "chat_template_kwargs" not in payload_of(_s[1])
+          and "reasoning_budget" not in payload_of(_s[1]))
+finally:
+    f.MODEL_CONFIG.clear()
+    f.MODEL_CONFIG.update(_saved_ts)
+
 # ---------- 8. スキーマ（fmt）の扱い ----------
 schema = {"type": "object", "properties": {"mode": {"type": "string"}}}
 out, sent, _ = run_mocked([(ok_body())],
@@ -399,8 +428,10 @@ try:
     check("選抜: 埋め込み/コード専用はそもそも候補に入らない",
           "baai/bge-m3" not in f.NIM_MODEL_IDS
           and "meta/codellama-70b" not in f.NIM_MODEL_IDS)
-    check("選抜: Conductor は大型ではなく軽量機を選ぶ",
-          f.DESIRED_CONDUCTOR == "meta/llama-3.1-8b-instruct")
+    check("選抜: Conductor は候補先頭の Gemma 4（フロンティア機）を採る",
+          f.DESIRED_CONDUCTOR == "google/gemma-4-31b-it")
+    check("選抜: Conductor に think_style=template が付く（effort が効かない系統）",
+          f.MODEL_CONFIG["google/gemma-4-31b-it"].get("think_style") == "template")
     check("選抜: SC 3 系統はベンダーが重複しない",
           len({m.split("/")[0] for m in f.REASONING_MODELS}) == 3)
     check("選抜: 思考の効かせ方は系統から引く（gpt-oss は effort / nemotron は template）",
@@ -422,6 +453,23 @@ try:
           applied3 is True
           and "nvidia/nemotron-3-ultra-550b-a55b" in f.DESIRED_PROPOSERS
           and "⚠" in _log3)
+
+    # Conductor が落ちていれば従来の軽量機へ退避する（可用性は落とさない）
+    applied4, _log4 = _profile_with(dead={"google/gemma-4-31b-it"})
+    check("選抜: Conductor が死んでいれば軽量機へ退避",
+          applied4 is True and f.DESIRED_CONDUCTOR == "meta/llama-3.1-8b-instruct")
+
+    # FUGU_CONDUCTOR は選抜より優先（プローブ結果に関わらず固定）
+    _saved_ovr = f.CONDUCTOR_OVERRIDE
+    try:
+        f.CONDUCTOR_OVERRIDE = "meta/llama-3.3-70b-instruct"
+        applied5, _log5 = _profile_with()
+        check("選抜: FUGU_CONDUCTOR は選抜より優先される",
+              applied5 is True
+              and f.DESIRED_CONDUCTOR == "meta/llama-3.3-70b-instruct"
+              and "FUGU_CONDUCTOR 指定" in _log5)
+    finally:
+        f.CONDUCTOR_OVERRIDE = _saved_ovr
 
     f._nim_catalog, f._nim_probe = _orig_cat, _orig_avail
     # キー未設定なら False

@@ -62,6 +62,9 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 NIM_URL = os.environ.get("NIM_URL", "https://integrate.api.nvidia.com/v1")
 NIM_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 FUGU_BACKEND = os.environ.get("FUGU_BACKEND", "ollama")
+# Conductor(司令塔)の明示指定。両バックエンド共通で、選抜にも布陣キャッシュにも優先する。
+# 例: FUGU_CONDUCTOR=google/gemma-4-31b-it (NIM) / FUGU_CONDUCTOR=gemma4:26b (Ollama)
+CONDUCTOR_OVERRIDE = os.environ.get("FUGU_CONDUCTOR", "").strip()
 NIM_TIMEOUT = 600             # クラウドはローカル逐次 (7200) と違い 10 分あれば十分
 NIM_MAX_CONCURRENCY = 4       # ≈40 RPM 制限下で 429 を踏みすぎない同時送信数
 NIM_RETRY_AFTER_CAP = 120     # Retry-After をそのまま信じる上限秒
@@ -146,8 +149,13 @@ NIM_EXCLUDE_RE = re.compile(
     r"palmyra-(?:med|fin|creative)|chatqa|cosmos|ising|sea-lion|"
     r"code|starcoder|codestral|codegemma|codellama|"
     r"llama2-|recurrentgemma|minitron|nemotron-mini|zamba", re.I)
-# Conductor は毎問通る司令塔。要件は「速い・JSON が崩れない」だけなので大型は選ばない。
+# Conductor は毎問通る司令塔。要件は「速い・JSON が崩れない」こと。
+# 2026-08-19: 先頭を Gemma 4 のフロンティア機に変更（Sakana の Conductor 検証に倣う）。
+# 実測 (google/gemma-4-31b-it): task_type 4/4 正分類・中央値 11〜20s。
+# llama-3.1-8b は 2s と速いがコード/知識/挨拶を chat に潰して 1/4 しか当たらず、
+# 挨拶を MoA に回す誤経路のほうが高くつく。落ちていれば以下の軽量機へ順に退避する。
 NIM_CONDUCTOR_CANDIDATES = [
+    "google/gemma-4-31b-it",
     "meta/llama-3.1-8b-instruct",
     "nvidia/llama-3.1-nemotron-nano-8b-v1",
     "ibm/granite-3.0-8b-instruct",
@@ -168,7 +176,7 @@ _NIM_MOE_RE = re.compile(r"(\d+(?:\.\d+)?)b-a(\d+(?:\.\d+)?)b", re.I)
 # 順序はペルソナ A,B,C,D に対応させる（gemma-4-26b-a4b の実タグは gemma4:26b）。
 DESIRED_PROPOSERS = ["gpt-oss:20b", "qwen3-coder:30b", "gemma4:26b", "qwen3.6:35b"]
 DESIRED_AGGREGATOR = "qwen3-coder:30b"
-DESIRED_CONDUCTOR = "qwen3:4b"
+DESIRED_CONDUCTOR = CONDUCTOR_OVERRIDE or "qwen3:4b"
 FALLBACK_MODEL = "qwen3:4b"
 
 # --- ペルソナ層（3大AIオールスター）---
@@ -463,6 +471,12 @@ def _nim_tuning_for(mid):
     cfg = {"num_predict": 16384}
     if "gpt-oss" in mid or "mistral-medium" in mid or "magistral" in mid:
         cfg["think"] = "high"                      # reasoning_effort が効く系統
+    elif re.search(r"gemma-?4", mid):
+        # gemma-4 は reasoning_effort を 400 にせず「黙って無視」する（2026-08-19 実測:
+        # effort=high でも reasoning_tokens=0）。思考は chat_template_kwargs でしか開かない。
+        # ただし nemotron のように常時 ON にはしない — Conductor 兼 Critic は
+        # 「プラン JSON=非思考で速く / 再検算=思考 ON」を think 引数で使い分けるため。
+        cfg["think_style"] = "template"
     elif re.search(r"nemotron-3|nemotron-4", mid):
         # build.nvidia.com のサンプル準拠。chat_template_kwargs で思考を開ける
         cfg["nim_extra"] = {"chat_template_kwargs": {"enable_thinking": True},
@@ -595,8 +609,9 @@ def apply_nim_profile():
         sc_third = "minimaxai/minimax-m3"
         picked = [prop_a, prop_b, prop_c, prop_d, agg]
 
-    # Conductor は「速くて JSON が崩れない」ことだけが要件なので大型は選ばない。
-    cond = (pinned or {}).get("conductor") or ""
+    # Conductor は毎問通る司令塔。候補の先頭 (Gemma 4) から生存プローブして採る。
+    # FUGU_CONDUCTOR 指定時は選抜にも布陣キャッシュにも優先（意図した固定として尊重）。
+    cond = CONDUCTOR_OVERRIDE or (pinned or {}).get("conductor") or ""
     for cand in ([] if cond else NIM_CONDUCTOR_CANDIDATES):
         if _nim_model_available(cand):
             cond = cand
@@ -604,7 +619,8 @@ def apply_nim_profile():
     if not cond:
         cond = NIM_CONDUCTOR_CANDIDATES[0]
         print(f"⚠ [nim] Conductor 候補が全滅。{cond} をそのまま使います")
-    print(f"[setup] nim: conductor = {cond}")
+    print(f"[setup] nim: conductor = {cond}"
+          + (" (FUGU_CONDUCTOR 指定)" if CONDUCTOR_OVERRIDE else ""))
     jp_agg = agg                   # 日本語統合。qwen 系が消滅したため統合役を兼ねる
 
     DESIRED_PROPOSERS = [prop_a, prop_b, prop_c, prop_d]
@@ -2958,7 +2974,7 @@ NIM_THINK_EFFORT = {
     "high": "high", "ultra": "high", "max": "high",
 }
 #: reasoning_budget を受ける系統（build.nvidia.com のサンプル準拠）。
-_NIM_BUDGET_RE = re.compile(r"nemotron-3|nemotron-4")
+_NIM_BUDGET_RE = re.compile(r"nemotron-3|nemotron-4|gemma-?4")
 #: reasoning_effort を受ける系統。
 _NIM_EFFORT_RE = re.compile(r"gpt-oss|mistral-medium|magistral")
 
@@ -3105,7 +3121,23 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         payload["max_tokens"] = num_predict
     if fmt is not None and model in NIM_STRUCTURED_OK:
         payload["response_format"] = {"type": "json_object"}
-    if isinstance(think, str):
+    # 思考の効かせ方は系統で違う。reasoning_effort を読む系統 (gpt-oss/mistral 等) と、
+    # chat_template_kwargs.enable_thinking でしか開かない系統 (gemma-4 等) がある。
+    # 後者に reasoning_effort を送っても 400 にはならず黙って無視されるため、
+    # MODEL_CONFIG の "think_style" で送るキーそのものを切り替える。
+    think_keys = ()
+    if model_cfg(model, "think_style") == "template":
+        if think is True or isinstance(think, str):
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
+            _budget = model_cfg(model, "reasoning_budget")
+            if _budget:
+                payload["reasoning_budget"] = _budget
+        elif think is False:
+            # 明示的に閉じる。Conductor のプラン JSON は速度が命なので思考させない。
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        think_keys = tuple(k for k in ("chat_template_kwargs", "reasoning_budget")
+                           if k in payload)
+    elif isinstance(think, str):
         payload["reasoning_effort"] = think
     elif think is True:
         payload["reasoning_effort"] = "high"
@@ -3296,14 +3328,14 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                 continue
             if (e.code == 400 and not dropped_params
                     and ("reasoning_effort" in payload or "response_format" in payload
-                         or "logprobs" in payload or extra_keys)):
+                         or "logprobs" in payload or extra_keys or think_keys)):
                 # 非対応モデルへの拡張パラメータが 400 の原因である可能性 → 落として
                 # 即再送（attempt 不消費・高々 1 回。既存 thinking 非対応 400 処理と同型）
                 dropped_params = True
                 payload.pop("reasoning_effort", None)
                 payload.pop("response_format", None)
                 payload.pop("logprobs", None)
-                for k in extra_keys:
+                for k in extra_keys + think_keys:
                     payload.pop(k, None)
                 continue
             out = f"__ERROR__: {e} {err_body}"

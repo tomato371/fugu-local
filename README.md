@@ -164,6 +164,7 @@ from `fugu_launcher.py`'s settings screen (option `8`) instead of exporting them
 | `FUGU_DEBATE=1` | Mutual-critique debate when proposals diverge + per-domain model score matrix (`FUGU_SCORE_PATH`) |
 | `FUGU_VISION_MODEL=<model>` | Vision model for `--image` (default `llama3.2-vision`; use `llava` on Ollama builds that lack `mllama` support — e.g. some Vulkan/D3D12 builds) |
 | `FUGU_HIGH_VRAM=1` | Relax the 8 GB context limits on bigger GPUs |
+| `FUGU_CONDUCTOR=<model>` | Pin the Conductor (routing + critic) model on either backend. Defaults: `qwen3:4b` on Ollama, `google/gemma-4-31b-it` on NIM (falls back to lighter candidates if it is unavailable) |
 | `FUGU_TOOL_CALLING=1` | Runtime tool selection from the registry (`fugu_tools.py`); results injected into the context |
 | `FUGU_TASKS=1` | Decompose multi-step requests into a persistent, checkpointed task board (`FUGU_TASKS_DIR` sets the board directory; resume with `--resume BOARD_ID`) |
 | `FUGU_REQUIRE_APPROVAL=1` | Block arbitrary-code execution and evolve merges until `POST /approve/{run_id}` (timeout = deny; `FUGU_APPROVAL_TIMEOUT` seconds) |

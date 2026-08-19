@@ -528,7 +528,10 @@ python bench_fugu.py run --dataset aime26 --config sc6@nim --limit 5
 python bench_fugu.py report
 
 <span class="c"># 消費が心配なら上限を決めておく（到達で安全停止）</span>
-<span class="k">$env:</span>FUGU_NIM_BUDGET = <span class="k">"300"</span></pre>
+<span class="k">$env:</span>FUGU_NIM_BUDGET = <span class="k">"300"</span>
+
+<span class="c"># 司令塔(Conductor)を差し替える。既定は google/gemma-4-31b-it（落ちていれば軽量機へ退避）</span>
+<span class="k">$env:</span>FUGU_CONDUCTOR = <span class="k">"meta/llama-3.1-8b-instruct"</span>  <span class="c"># 速さ優先に戻す</span></pre>
 
     <div class="prose">
       <p>

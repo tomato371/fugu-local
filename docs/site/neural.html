@@ -123,7 +123,7 @@
 
     <figure>
       <div class="figwrap">
-        <svg viewBox="0 0 1000 680" role="img" aria-label="fugu-nimをニューラルネットとして描いた配線図。入力はllama-8bのゲートに入り、math/mcq経路では3つのモデルとPython実行が並列に発火して多数決プーリングを経て法廷層へ、それ以外の経路では4つのモデルが並列発火してglm-5.2で統合され、critic層から再帰結合が戻る。">
+        <svg viewBox="0 0 1000 680" role="img" aria-label="fugu-nimをニューラルネットとして描いた配線図。入力はgemma-4-31bのゲートに入り、math/mcq経路では3つのモデルとPython実行が並列に発火して多数決プーリングを経て法廷層へ、それ以外の経路では4つのモデルが並列発火してglm-5.2で統合され、critic層から再帰結合が戻る。">
           <defs>
             <marker id="n1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
               <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
@@ -159,8 +159,8 @@
           <!-- gate -->
           <line x1="96" y1="330" x2="182" y2="330" stroke="currentColor" stroke-width="1.5" marker-end="url(#n1)"/>
           <circle cx="212" cy="330" r="30" fill="var(--ai-soft)" stroke="var(--ai)" stroke-width="2"/>
-          <text x="212" y="326" text-anchor="middle" font-size="11.5" fill="var(--ai)" font-weight="700">llama</text>
-          <text x="212" y="341" text-anchor="middle" font-size="11.5" fill="var(--ai)" font-weight="700">3.1-8b</text>
+          <text x="212" y="326" text-anchor="middle" font-size="11.5" fill="var(--ai)" font-weight="700">gemma-4</text>
+          <text x="212" y="341" text-anchor="middle" font-size="11.5" fill="var(--ai)" font-weight="700">31b-it</text>
           <text x="212" y="381" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10.5" fill="var(--ink-2)">Conductor</text>
           <text x="212" y="396" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">疎活性化ゲート</text>
           <text x="212" y="410" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">どの素子を発火させるか</text>
@@ -255,8 +255,8 @@
 
           <line x1="704" y1="524" x2="806" y2="524" stroke="currentColor" stroke-width="1.5" marker-end="url(#n1)"/>
           <circle cx="840" cy="524" r="27" fill="var(--panel)" stroke="currentColor" stroke-width="1.6"/>
-          <text x="840" y="520" text-anchor="middle" font-size="10" fill="currentColor">llama</text>
-          <text x="840" y="533" text-anchor="middle" font-size="10" fill="currentColor">8b</text>
+          <text x="840" y="520" text-anchor="middle" font-size="10" fill="currentColor">gemma-4</text>
+          <text x="840" y="533" text-anchor="middle" font-size="10" fill="currentColor">31b</text>
           <text x="840" y="568" text-anchor="middle" font-family="ui-monospace, monospace" font-size="10" fill="var(--ink-3)">Critic</text>
           <circle cx="916" cy="470" r="24" fill="var(--panel)" stroke="currentColor" stroke-width="1.4"/>
           <text x="916" y="466" text-anchor="middle" font-size="9.5" fill="currentColor">mistral</text>
@@ -305,7 +305,7 @@
         </thead>
         <tbody>
           <tr><td>ニューロン</td><td class="m">deepseek-v4-pro / gpt-oss-120b / …</td><td>○</td></tr>
-          <tr><td>ゲーティングネットワーク（MoE）</td><td class="m">Conductor（llama-3.1-8b）が発火する素子を選ぶ</td><td>○ ほぼそのまま</td></tr>
+          <tr><td>ゲーティングネットワーク（MoE）</td><td class="m">Conductor（gemma-4-31b）が発火する素子を選ぶ</td><td>○ ほぼそのまま</td></tr>
           <tr><td>並列な隠れユニット</td><td class="m">Proposer A–D / SC の 3 系統</td><td>○</td></tr>
           <tr><td>確率的発火（dropout 的）</td><td class="m">temp 0.7 で同一素子を n 回サンプリング</td><td>○</td></tr>
           <tr><td>プーリング</td><td class="m">vote_answers() — 同値類でまとめて argmax</td><td>△ <strong>微分不可・学習なし</strong></td></tr>
