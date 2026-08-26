@@ -19,7 +19,6 @@ fugu と Fable の両方を同じ手続きで採点し、**IDの積集合**だ�
     python regrade_strict.py --results ~/fugu_bench/results --out ./strict_regrade.json
 """
 import argparse
-import glob
 import json
 import os
 
