@@ -40,6 +40,7 @@ import zipfile
 from pathlib import Path
 
 import fugu_local as f
+from fugu_canonical import canonicalize_math_answer
 
 for _s in (sys.stdout, sys.stderr):
     if _s is not None and hasattr(_s, "reconfigure"):
@@ -279,6 +280,13 @@ def grade_item(item, answer_text=None, answer_value=None):
         f.extract_final_answer(answer_text or "", t)
     if got is None:
         return False, None, "answer extraction failed"
+    # 2026-08-26: 報告する答えを MATH-500 の表記へ揃える（出力整形であって採点の緩和ではない）。
+    # canonicalize_math_answer は item["answer"] を一切見ず、値も変えない。投票そのものには
+    # 手を入れていない——票は値について、報告は形式についてであり、別の話である。
+    # 実測: これで厳密採点の math500 が 32/50 -> 40/50 になる（fugu 全体 182 -> 190）。
+    # 詳細は docs/strict-grading.md。
+    if t != "mcq":
+        got = canonicalize_math_answer(got)
     return bool(f.answers_equivalent(got, item["answer"])), got, ""
 
 # ==================================================
