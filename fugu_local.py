@@ -5095,6 +5095,34 @@ SC_SELECT_MAX_CAND = 10         # 提示する候補の上限
 SC_SELECT_PREDICT = 12288
 SC_DATASET_HINT = ""            # 答えの形の制約に使う(ベンチ側が問題 id から設定する)
 
+# ============================================================
+# 検証済みトレースのディスク保存 (2026-08-20, FUGU_TRACE_DIR で opt-in)
+#   SC は 1 問あたり 7〜55 本の推論を生成するが、これまでディスクに残していたのは
+#   最終答えとモデル名だけで、推論本文はプロセスが終われば消えていた。蒸留
+#   (rejection sampling fine-tuning)の材料は「問題 + 推論本文 + 多数決で検証された
+#   答え」の3つ組であり、最も高価な推論本文だけが捨てられているのが唯一の欠落だった。
+#   各サンプルには agrees(最終答えと同値か)を付ける — これが採否のフィルタになる。
+#   既定 OFF(空文字)。設定時のみ 1 問 1 行の JSONL を追記する。ファイルは pid ごとに
+#   分ける: ジョブは別プロセスで走るので、同一ファイルへの追記は行が壊れうる。
+# ============================================================
+SC_TRACE_DIR = os.getenv("FUGU_TRACE_DIR", "").strip()
+SC_TRACE_MAX_CHARS = int(os.getenv("FUGU_TRACE_MAX_CHARS", "0") or 0)  # 0 = 無制限
+# 既定で <think> を含む生応答を残す。strip_think 後の本文だけでは思考が失われ、
+# 「本文はディスクに無い」という元の欠落を作り直してしまう。
+SC_TRACE_THINK = os.getenv("FUGU_TRACE_THINK", "1") not in ("0", "false", "False")
+_SC_TRACE_LOCK = threading.Lock()
+_SC_TRACE_WARNED = False
+
+# ============================================================
+# Sakana AI の TRINITY / Conductor 機構 (2026-08-20, いずれも既定 OFF)
+#   実装は fugu_core/sakana.py。論文の機構の再実装であり、Sakana の重みや
+#   コードは使っていない(製品側は非公開)。詳細は同ファイルの docstring。
+# ============================================================
+TRINITY_ENABLED = os.getenv("FUGU_TRINITY", "0") == "1"
+TRINITY_TURNS = int(os.getenv("FUGU_TRINITY_TURNS", "5") or 5)   # 論文の K=5
+TOPOLOGY_ENABLED = os.getenv("FUGU_TOPOLOGY", "0") == "1"
+TOPOLOGY_WORKERS = int(os.getenv("FUGU_TOPOLOGY_WORKERS", "4") or 4)
+
 SELECT_SYS = (
     "Several independent attempts at one problem produced DIFFERENT answers, so voting "
     "cannot decide. Your job is to VERIFY, not to vote. Work out enough of the problem "
@@ -5872,6 +5900,20 @@ def answers_equivalent(a, b):
     # 戻り値は常にFalseになるが、意図を明示するため case-insensitive 比較として書く。
     if re.fullmatch(r"[A-Ea-e]", na) and re.fullmatch(r"[A-Ea-e]", nb):
         return na.upper() == nb.upper()
+    # 2026-08-20: 末尾 '%' の有無だけが違う組を決定的に「非同値」と確定させる。
+    # normalize_answer は '\%'/'％' の綴りを '%' に揃える一方、記号そのものは
+    # 「50% と 50 は別の値」として絶対に落とさない(同関数のコメント参照)。ところが
+    # math_verify を導入した環境(この開発機は 2026-08 時点で導入済み。コメントに残る
+    # 「未インストール」は当時の話)では parse("$50%$") が 50*(1/100) を返したうえで
+    # verify が 50 とも 0.5 とも True を返すため、最後のフォールバックが
+    # normalize_answer の意図を裏から覆していた(test_nim_offline.py の
+    # 「norm: % は従来どおり保持」が唯一落ち続けていた原因)。直上の選択肢文字 A-E
+    # ガードと同じ型の決定的ガードとして、数値コアが一致し '%' の有無だけが違う場合は
+    # ここで False を確定させる。'50%' vs '0.5' のような「同じ値の別表記」は値が
+    # 変わらないため従来どおり下の math_verify に委ねる。
+    if (na.endswith("%") != nb.endswith("%")
+            and na.rstrip("%").strip().lower() == nb.rstrip("%").strip().lower()):
+        return False
     try:
         from fractions import Fraction
         if Fraction(na.replace(" ", "")) == Fraction(nb.replace(" ", "")):
@@ -6400,6 +6442,10 @@ def _sc_sample(model, question, task_type, pot=False, history=None):
               + [{"role": "user", "content": question}],
               SC_TEMP, think=proposer_think_for(model),
               num_predict=proposer_predict_for(model), label="sc")
+    # 2026-08-20: 生応答(<think> 込み)をスレッドローカルに退避する。strip_think 後の
+    # text しか samples に残らないと、蒸留用トレースから思考部が丸ごと落ちる。
+    # last_conf(L3263)と同じ受け渡し規約 — 呼び出しスレッド内で直後に読む。
+    _NIM_TLS.last_raw = raw
     if raw.startswith("__ERROR__"):
         return None, raw
     text = strip_think(raw)
@@ -6570,6 +6616,76 @@ def _arbitrate(question, task_type, samples, classes):
     return None
 
 
+def _sakana_pool():
+    """TRINITY/Conductor が使うモデルプール。SC と同じ導入フィルタ。"""
+    pool = [m for m in REASONING_MODELS if m in PROPOSERS or _is_nim(m)]
+    return pool or list(PROPOSERS[:3])
+
+
+def _sakana_runner(model, prompt, system=None, json_mode=False):
+    """fugu_core.sakana への実行アダプタ。失敗は __ERROR__ 文字列のまま返す
+    (モジュール側が死票として扱い、機構ごと止まらない)。
+    json_mode は指揮者への構造化要求 — 温度を下げ、思考を閉じ、JSON を強制する。"""
+    msgs = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": "user", "content": prompt}]
+    raw = ask(model, msgs,
+              0.2 if json_mode else SC_TEMP,
+              think=False if json_mode else proposer_think_for(model),
+              fmt="json" if json_mode else None,
+              num_predict=1024 if json_mode else proposer_predict_for(model),
+              label="sakana")
+    if not raw or raw.startswith("__ERROR__"):
+        return raw or "__ERROR__: empty"
+    return strip_think(raw)
+
+
+def _sc_trace_dump(question, task_type, samples, final, votes, decided_by):
+    """SC の全サンプルを 1 問 1 行の JSONL に落とす(蒸留用の検証済みトレース)。
+    FUGU_TRACE_DIR 未設定なら何もしない。書けなくても解答経路は絶対に止めない —
+    保存はおまけであって、失敗を理由に問題を落としてはならない。
+    agrees は「そのサンプルの答えが最終答えと同値か」。rejection sampling は
+    これで採否を決める。final=None(無回答)の問題も落とさず残す — 失敗の分析材料
+    になるうえ、後から採点し直せば救済できる場合がある。"""
+    global _SC_TRACE_WARNED
+    if not SC_TRACE_DIR or not samples:
+        return
+    try:
+        recs = []
+        for s in samples:
+            meta = s.get("meta") or {}
+            raw = meta.get("raw")
+            text = raw if (SC_TRACE_THINK and raw) else s.get("text")
+            text = text or ""
+            if SC_TRACE_MAX_CHARS and len(text) > SC_TRACE_MAX_CHARS:
+                text = text[:SC_TRACE_MAX_CHARS]
+            agrees = None
+            if final is not None and s.get("answer") is not None:
+                try:
+                    agrees = bool(answers_equivalent(str(s["answer"]), str(final)))
+                except Exception:
+                    agrees = None
+            recs.append({"model": s.get("model"), "pot": bool(s.get("pot")),
+                         "conf": s.get("conf"), "answer": s.get("answer"),
+                         "agrees": agrees, "relayed": bool(s.get("relayed")),
+                         "sys": meta.get("sys"), "prompt": meta.get("prompt"),
+                         "text": text})
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "task_type": task_type,
+               "question": question, "final": final, "decided_by": decided_by,
+               "votes": votes, "n_samples": len(samples),
+               "n_agree": sum(1 for r in recs if r["agrees"]), "samples": recs}
+        out = Path(SC_TRACE_DIR).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"sc-{time.strftime('%Y%m%d')}-{os.getpid()}.jsonl"
+        line = json.dumps(rec, ensure_ascii=False)
+        with _SC_TRACE_LOCK:
+            with open(path, "a", encoding="utf-8", newline="\n") as fh:
+                print(line, file=fh)
+    except Exception as exc:
+        if not _SC_TRACE_WARNED:
+            print(f"   [trace] 保存に失敗(以後この警告は出しません): {exc}")
+            _SC_TRACE_WARNED = True
+
+
 def solve_verifiable(question, task_type="math", history=None):
     """Self-Consistency + PoT で math/mcq を解く。
     戻り値: {"answer", "text", "votes", "n_samples"}。票が全く得られなければ None
@@ -6615,14 +6731,17 @@ def solve_verifiable(question, task_type="math", history=None):
             s = strategies[next(_strat_counter) % len(strategies)]
             q = (question + "\n\n[Strategy directive: solve using this approach and no "
                  f"other: {s}]")
+        _NIM_TLS.last_raw = None
         ans, text = _sc_sample(model, q, task_type, pot=pot, history=history)
         conf = None if pot else getattr(_NIM_TLS, "last_conf", None)
-        return ans, text, conf
+        meta = {"raw": getattr(_NIM_TLS, "last_raw", None), "prompt": q,
+                "sys": "pot" if pot else ("mcq" if task_type == "mcq" else "math")}
+        return ans, text, conf, meta
 
     def add(model, pot=False):
-        ans, text, conf = _sample_with_conf(model, pot)
+        ans, text, conf, meta = _sample_with_conf(model, pot)
         samples.append({"answer": ans, "text": text, "model": model, "pot": pot,
-                        "conf": conf})
+                        "conf": conf, "meta": meta})
         kind = "PoT" if pot else "CoT"
         print(f"   [SC {len(samples)}] {model} ({kind}) -> {ans if ans else '(抽出失敗)'}")
 
@@ -6689,11 +6808,11 @@ def solve_verifiable(question, task_type="math", history=None):
                 futs = [ex.submit(_sample_with_conf, m, pot) for m, pot in jobs]
                 for (m, pot), fut in zip(jobs, futs):
                     try:
-                        ans, text, conf = fut.result()
+                        ans, text, conf, meta = fut.result()
                     except Exception as exc:   # スレッド死は無効票1票に留める（バッチは道連れにしない）
-                        ans, text, conf = None, f"__ERROR__: {exc}", None
+                        ans, text, conf, meta = None, f"__ERROR__: {exc}", None, {}
                     samples.append({"answer": ans, "text": text, "model": m, "pot": pot,
-                                    "conf": conf})
+                                    "conf": conf, "meta": meta})
                     kind = "PoT" if pot else "CoT"
                     print(f"   [SC {len(samples)}] {m} ({kind}) -> {ans if ans else '(抽出失敗)'}")
             return
@@ -6768,6 +6887,7 @@ def solve_verifiable(question, task_type="math", history=None):
             top, cnt, classes = vote_answers(answers)
             print(f"   [relay] 無回答を {len(relayed)} 票で救済 → 暫定 {top}")
     if top is None:
+        _sc_trace_dump(question, task_type, samples, None, {}, "no_votes")
         return None
     # DeepConf 集約 (2026-08-04, SC_CONF_VOTE=True の sc4 経路のみ。既定 False で以降は不変):
     # 低自信トレースを除外した自信度加重多数決が素の多数決と異なる勝者を出したら
@@ -6900,15 +7020,23 @@ def solve_verifiable(question, task_type="math", history=None):
                               if answers_equivalent(picked, c[0])), None)
                 print(f"   [SC/select] 散票から検証で選抜: {picked} "
                       f"(票 {match[1] if match else 0}/{len(answers)})")
+                _sc_trace_dump(question, task_type, samples, picked,
+                               {c[0]: c[1] for c in classes}, "verify_select")
                 return {"answer": picked,
                         "text": _representative_text(samples, picked) or "",
                         "votes": {c[0]: c[1] for c in classes},
                         "n_samples": len(samples), "selected": True}
         print(f"   [SC] 確定票が {cnt} 票のみ (< SC_MIN_VOTES={SC_MIN_VOTES}) → MoA フォールバックへ")
+        _sc_trace_dump(question, task_type, samples, None,
+                       {c[0]: c[1] for c in classes}, "below_floor")
         return None
     if rep is None:
         rep = _representative_text(samples, top)
     print(f"   [SC] 確定: {top}  (票 {cnt}/{len(answers)}, サンプル計 {len(samples)})")
+    _sc_trace_dump(question, task_type, samples, top,
+                   {c[0]: c[1] for c in classes},
+                   "conf" if conf_decided else "court" if court_decided
+                   else "machine" if machine_decided else "vote")
     return {"answer": top, "text": rep,
             "votes": {c[0]: c[1] for c in classes}, "n_samples": len(samples)}
 
@@ -7369,6 +7497,27 @@ def fugu_answer(question, plan=None, history=None):
     _emit("plan", mode=plan.get("mode"), task_type=plan.get("task_type"),
           rounds=plan.get("rounds"))
 
+    # ---------- TRINITY (FUGU_TRINITY=1 のみ。既定 OFF で以降は不変) ----------
+    # 役割つき多ターン協調。答えが出なければ黙って SC へ落ちる。
+    if (TRINITY_ENABLED and plan.get("task_type") in ("math", "mcq")
+            and not plan.get("image_only") and not plan.get("make_pptx")
+            and not plan.get("use_image_generation")):
+        from fugu_core import sakana as fugu_sakana
+        _pool = _sakana_pool()
+        print(f"   [TRINITY] {len(_pool)} 体で役割つき協調 "
+              f"(最大 {TRINITY_TURNS} ターン, 指揮者 {CONDUCTOR})")
+        _tri = fugu_sakana.solve(
+            question, _pool, runner=_sakana_runner, coordinator=CONDUCTOR,
+            max_turns=TRINITY_TURNS, task_type=plan["task_type"],
+            extract=lambda t: extract_final_answer(t, plan["task_type"]),
+            on_turn=lambda i, m, r, o: print(
+                f"   [TRINITY {i + 1}] {m} as {r}" + ("" if o else "  (無効)")))
+        if _tri and _tri.get("answer"):
+            print(f"   [TRINITY] 確定: {_tri['answer']} "
+                  f"({_tri['turns']} ターン, ACCEPT={_tri['accepted']})")
+            return _tri["text"]
+        print("   [TRINITY] 答えを確定できず → 自己一貫性投票へフォールバック")
+
     # ---------- 検証可能タスク（math/mcq）: 自己一貫性投票で解く ----------
     if (SC_ENABLED and plan.get("task_type") in ("math", "mcq")
             and not plan.get("image_only") and not plan.get("make_pptx")
@@ -7413,6 +7562,25 @@ def fugu_answer(question, plan=None, history=None):
                 txt += boxed_note if ok else plain_note
             return txt
         print("   [SC] 投票不成立 → 通常の合議へフォールバック")
+
+    # ---------- Conductor トポロジ (FUGU_TOPOLOGY=1 のみ。既定 OFF で以降は不変) ----------
+    # 固定の MoA の代わりに、指揮者が「誰が誰の出力を読むか」と各人への個別指示を設計する。
+    if (TOPOLOGY_ENABLED and not plan.get("image_only") and not plan.get("make_pptx")
+            and not plan.get("use_image_generation")):
+        from fugu_core import sakana as fugu_sakana
+        _topo = fugu_sakana.plan_topology(
+            question, _sakana_pool(), coordinator=CONDUCTOR, runner=_sakana_runner,
+            max_workers=TOPOLOGY_WORKERS)
+        print("   [topology] " + "  ".join(
+            f"{w['id']}:{w['model'].split('/')[-1]}"
+            + ("<-" + "+".join(w["inputs"]) if w["inputs"] else "")
+            for w in _topo["workers"]))
+        _out = fugu_sakana.run_topology(
+            question, _topo, runner=_sakana_runner,
+            on_worker=lambda wid, m, o: print(f"   [topology] {wid} ({m}) 完了"))
+        if _out and _out.get("text"):
+            return _out["text"]
+        print("   [topology] 全ワーカー失敗 → 通常の合議へフォールバック")
 
     seed_answer = None  # エスカレーション時、単体回答を捨てずに合議の初期ドラフトにする
     seed_issue = None   # Critic の指摘も合議側へ伝える

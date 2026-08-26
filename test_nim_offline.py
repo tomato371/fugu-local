@@ -1272,11 +1272,88 @@ check("norm: x \\in [-2,7] == [-2,7]", f.answers_equivalent("[-2,7]", "x \\in [-
 check("norm: \\text{(C)} == C", f.answers_equivalent("C", "\\text{(C)}"))
 check("norm: 288 \\pi == 288\\pi", f.answers_equivalent("288\\pi", "288 \\pi"))
 check("norm: % は従来どおり保持(50% != 50)", not f.answers_equivalent("50%", "50"))
+check("norm: 100% != 100 も同様", not f.answers_equivalent("100%", "100"))
+check("norm: \%表記は素の%と同値のまま", f.answers_equivalent("50\%", "50%"))
+check("norm: 全角％も同値のまま", f.answers_equivalent("５０％", "50%"))
+check("norm: 別のパーセント値は不一致", not f.answers_equivalent("12%", "13%"))
 check("norm: 別の度数値は不一致のまま", not f.answers_equivalent("30", "60^\\circ"))
 check("norm: 式中間の^\\circは触らない",
       f.normalize_answer("30^\\circ + 5") == "30^\\circ + 5")
 check("norm: (C)単独はC", f.normalize_answer("(C)") == "C")
 check("norm: 散文の括弧は触らない", f.normalize_answer("(see C)") == "(see C)")
+
+# ---------- 14. 蒸留用トレースの保存 (2026-08-20, FUGU_TRACE_DIR) ----------
+_tr_saved = (f.SC_TRACE_DIR, f.SC_TRACE_MAX_CHARS, f.SC_TRACE_THINK, f._SC_TRACE_WARNED)
+_TR_SAMPLES = [
+    {"answer": "42", "text": "body A", "model": "m1", "pot": False, "conf": -0.2,
+     "meta": {"raw": "<think>reasoning</think>body A", "prompt": "Q?", "sys": "math"}},
+    {"answer": "43", "text": "body B", "model": "m2", "pot": False, "conf": -0.9,
+     "meta": {"raw": "<think>wrong</think>body B", "prompt": "Q?", "sys": "math"}},
+    {"answer": None, "text": "__ERROR__: boom", "model": "m3", "pot": False,
+     "conf": None, "meta": {}},
+]
+
+
+def _dump_and_read(**over):
+    """一時ディレクトリに 1 問ぶん書き出して (生バイト, レコード) を返す。"""
+    d = tempfile.mkdtemp(prefix="fugu_trace_")
+    f.SC_TRACE_DIR = d
+    f.SC_TRACE_MAX_CHARS, f.SC_TRACE_THINK = 0, True
+    for k, v in over.items():
+        setattr(f, k, v)
+    f._sc_trace_dump("Q?", "math", _TR_SAMPLES, "42", {"42": 1, "43": 1}, "vote")
+    files = list(Path(d).glob("*.jsonl"))
+    if not files:
+        return None, None
+    b = files[0].read_bytes()
+    return b, json.loads(b.decode("utf-8"))
+
+
+try:
+    # 既定(未設定)では書かない。書けないパスでも例外を外に出さない。
+    f.SC_TRACE_DIR = ""
+    _raised = False
+    try:
+        f._sc_trace_dump("Q?", "math", _TR_SAMPLES, "42", {}, "vote")
+        f.SC_TRACE_DIR = "Z:/no/such/dir"
+        f._sc_trace_dump("Q?", "math", _TR_SAMPLES, "42", {}, "vote")
+    except Exception:
+        _raised = True
+    check("trace: 未設定/書込不能でも例外を出さない(解答経路を止めない)", not _raised)
+
+    _b, _r = _dump_and_read()
+    check("trace: 1 問 1 行の JSONL が書かれる", _r is not None)
+    check("trace: 行末は LF (JSONL を CRLF で汚さない)", _b is not None and b"\r" not in _b)
+    check("trace: サンプル全数(死票も)を残す", _r["n_samples"] == 3 and len(_r["samples"]) == 3)
+    check("trace: agrees が最終答えとの同値で付く",
+          [s["agrees"] for s in _r["samples"]] == [True, False, None])
+    check("trace: n_agree は採用トレース数", _r["n_agree"] == 1)
+    check("trace: 決着経路と票を残す",
+          _r["decided_by"] == "vote" and _r["votes"] == {"42": 1, "43": 1})
+    check("trace: プロンプトと系統を残す(SFT の入力側)",
+          _r["samples"][0]["prompt"] == "Q?" and _r["samples"][0]["sys"] == "math")
+    check("trace: 既定では <think> 込みの生本文を残す",
+          "<think>" in _r["samples"][0]["text"])
+
+    _b, _r = _dump_and_read(SC_TRACE_THINK=False)
+    check("trace: FUGU_TRACE_THINK=0 なら strip_think 後の本文",
+          _r["samples"][0]["text"] == "body A")
+
+    _b, _r = _dump_and_read(SC_TRACE_MAX_CHARS=4)
+    check("trace: FUGU_TRACE_MAX_CHARS で切り詰める",
+          all(len(s["text"]) <= 4 for s in _r["samples"]))
+
+    # 無回答の問題も落とさない(失敗の分析材料・後からの再採点用)
+    f.SC_TRACE_DIR = _d = tempfile.mkdtemp(prefix="fugu_trace_none_")
+    f.SC_TRACE_MAX_CHARS, f.SC_TRACE_THINK = 0, True
+    f._sc_trace_dump("Q?", "math", _TR_SAMPLES, None, {}, "no_votes")
+    _r = json.loads(list(Path(_d).glob("*.jsonl"))[0].read_text(encoding="utf-8"))
+    check("trace: 無回答(final=None)も残し agrees は判定不能",
+          _r["final"] is None and _r["n_agree"] == 0
+          and all(s["agrees"] is None for s in _r["samples"]))
+finally:
+    (f.SC_TRACE_DIR, f.SC_TRACE_MAX_CHARS, f.SC_TRACE_THINK,
+     f._SC_TRACE_WARNED) = _tr_saved
 
 # ---------- 後始末・結果 ----------
 for k, v in _SAVED.items():

@@ -61,6 +61,21 @@ NIM_QUEUE = [
     ("gpqa",      "sc@nim",  30),
 ]
 
+# 2026-08-21 再計測キュー (--remeasure)。210 問すべてを 1 本の直列キューで測り直す。
+# 構成は 2026-08-08 に 200/210 を確定させた最終構成と同一で、結果ファイルだけ分離
+# している (bench_fugu.py の r0821/rc0821/rq0821 の注記を参照)。
+# 順序は「速く終わるものを先に」— 途中で止まっても部分結果が読めるようにする。
+# 所要見積り (旧走の実測 seconds から): jmmlu 1.6h, humaneval 4.7h, aime26 3.1h,
+# math500 4.1h, aime25 3.5h, aime24 9.4h ≒ 27h + adapt の第2バッチ増分。
+REMEASURE_QUEUE = [
+    ("jmmlu",     "rq0821@nim", 40),
+    ("humaneval", "rc0821@nim", 30),
+    ("aime26",    "r0821@nim",  None),
+    ("math500",   "r0821@nim",  50),
+    ("aime25",    "r0821@nim",  None),
+    ("aime24",    "r0821@nim",  None),
+]
+
 
 def write_status(status):
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -130,13 +145,25 @@ def main():
     ap.add_argument("--nim", action="store_true",
                     help="NIM クラウドキューを実行 (FUGU_BACKEND=nim をジョブ env に付与)")
     ap.add_argument("--notify", action="store_true", help="各ジョブに --notify (Slack) を付与")
+    ap.add_argument("--remeasure", action="store_true",
+                    help="2026-08-21 再計測キュー (210問全部・別名の結果ファイル)")
+    ap.add_argument("--status-file", default=None,
+                    help="進捗 JSON の出力先 (既定 ~/fugu_bench/queue_status.json)")
     args = ap.parse_args()
 
-    queue = NIM_QUEUE if args.nim else QUEUE
+    global STATUS_FILE
+    if args.status_file:
+        STATUS_FILE = Path(args.status_file)
+    elif args.remeasure:
+        STATUS_FILE = BENCH_DIR / "queue_status_remeasure.json"
+
+    queue = REMEASURE_QUEUE if args.remeasure else (NIM_QUEUE if args.nim else QUEUE)
     if args.dry_run:
         for i, (ds, cfg, lim) in enumerate(queue, 1):
             print(f"{i:2}. {ds:10} {cfg:10} limit={lim or 'all'}")
         return
+    if args.remeasure:
+        args.nim = True          # 再計測キューは全ジョブ @nim
     if args.nim and not os.environ.get("NVIDIA_API_KEY"):
         print("ERROR: --nim には NVIDIA_API_KEY が必要です (build.nvidia.com で生成)")
         return

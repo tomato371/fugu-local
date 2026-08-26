@@ -165,6 +165,13 @@ from `fugu_launcher.py`'s settings screen (option `8`) instead of exporting them
 | `FUGU_VISION_MODEL=<model>` | Vision model for `--image` (default `llama3.2-vision`; use `llava` on Ollama builds that lack `mllama` support — e.g. some Vulkan/D3D12 builds) |
 | `FUGU_HIGH_VRAM=1` | Relax the 8 GB context limits on bigger GPUs |
 | `FUGU_CONDUCTOR=<model>` | Pin the Conductor (routing + critic) model on either backend. Defaults: `qwen3:4b` on Ollama, `google/gemma-4-31b-it` on NIM (falls back to lighter candidates if it is unavailable) |
+| `FUGU_TRACE_DIR=<dir>` | Write every self-consistency sample (full reasoning body, the prompt it saw, and whether it agreed with the verified answer) to one JSONL line per question — the raw material for rejection-sampling distillation. Off when unset |
+| `FUGU_TRACE_THINK=0` | Store the `strip_think`-ed body instead of the raw `<think>` completion (default: keep the thinking) |
+| `FUGU_TRACE_MAX_CHARS=<n>` | Truncate each stored trace body (default `0` = unlimited) |
+| `FUGU_TRINITY=1` | TRINITY-style coordination on math/mcq: each turn the Conductor picks one model and one role (Thinker / Worker / Verifier); the run stops as soon as a Verifier answers ACCEPT. Falls back to self-consistency voting if no answer emerges |
+| `FUGU_TRINITY_TURNS=<n>` | TRINITY turn budget (default `5`, the paper's K) |
+| `FUGU_TOPOLOGY=1` | Conductor-designed communication topology instead of the fixed MoA: the Conductor decides which workers run independently, which ones read whose output, and writes a tailored instruction per worker (it may also pick itself) |
+| `FUGU_TOPOLOGY_WORKERS=<n>` | Maximum workers in a designed topology (default `4`) |
 | `FUGU_TOOL_CALLING=1` | Runtime tool selection from the registry (`fugu_tools.py`); results injected into the context |
 | `FUGU_TASKS=1` | Decompose multi-step requests into a persistent, checkpointed task board (`FUGU_TASKS_DIR` sets the board directory; resume with `--resume BOARD_ID`) |
 | `FUGU_REQUIRE_APPROVAL=1` | Block arbitrary-code execution and evolve merges until `POST /approve/{run_id}` (timeout = deny; `FUGU_APPROVAL_TIMEOUT` seconds) |
@@ -299,6 +306,10 @@ completion as usual, so a long `fugu_ask_start` job can ping you when it's done.
 | `bench_fugu.py` | Benchmark runner (accuracy) |
 | `bench_queue.py` | Batch/queue benchmarking |
 | `eval_fugu.py` | Evaluation utilities |
+| `grading_paths.py` | Grades fugu and the baseline with one identical grader and reports which stage credited each answer (raw / whitespace / normalization / `Fraction` / `math_verify`) |
+| `traces_to_sft.py` | Turns `FUGU_TRACE_DIR` traces into a rejection-sampled SFT dataset |
+| `fugu_core/sakana.py` | Re-implementation of Sakana AI's TRINITY coordinator and Conductor topology mechanisms (papers only — no Sakana weights or code are used) |
+| `test_sakana_offline.py` | Offline checks for role assignment, the ACCEPT stop rule, topology validation and every fallback path |
 | `test_fugu_offline.py` | Offline characterization checks (no model required) |
 | `tests/` | Offline pytest suite for every module above |
 | `bench_search.py`, `docs/search-benchmark.md` | AB-MCTS search benchmark + interim report |
