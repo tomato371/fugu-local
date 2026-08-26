@@ -45,6 +45,20 @@ benchmarked against Fable 5.
    The current equivalence/normalization layer currently helps fugu's answer format more than
    Fable's — that's a real, unresolved weak point in output normalization, not a rounding
    error.
+
+   > **Update 2026-08-26.** This was audited against the 2026-08-21..23 remeasurement data and
+   > reproduced: **fugu 182 / Fable 191 strict (-9)**, while lenient is **199 / 199 (tie)**.
+   > The entire gap is in MATH-500 — the other five datasets score identically strict and
+   > lenient for both systems. Of fugu's 18 strict failures in MATH-500, **17 are formatting
+   > and only 1 is a wrong answer**; Fable loses 8 to formatting on the same set. So the -9 is
+   > an output-formatting gap, not a capability gap.
+   >
+   > `fugu_canonical.canonicalize_math_answer()` was added to clean fugu's *emitted* answer
+   > (never the grader — it does not see `expected`). Measured on the recorded data it
+   > recovers **8 of the 17**, taking fugu to **190 strict**. Note also that the MATH-500
+   > reference answers are themselves inconsistent (`\frac` vs `\dfrac`, `-13x+3` vs
+   > `288 \pi`), so a perfect strict score is not attainable; parity with Fable is the
+   > meaningful target. Full breakdown: [`strict-grading.md`](strict-grading.md).
 3. **Cost:** $0 (NVIDIA NIM free tier), 24,758 API requests for the full run.
 4. This is an **opt-in cloud experiment**, not the project's default. The headline "100%
    local, no API keys, no cloud" claim in the main README refers to the Ollama backend, not
