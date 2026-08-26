@@ -54,15 +54,31 @@ On 8 GB VRAM, large models run with automatic RAM offload (absorbed by 48 GB RAM
 
 Separately from the local-only design above, the `feature/nim-backend` branch (merged into
 `main`) swaps Ollama for hosted [NVIDIA NIM](https://build.nvidia.com/) models to test how the
-same dynamic-MoA design performs once the 8 GB VRAM ceiling is removed. Measured result against
-Fable 5 on 210 questions (AIME 2024/2025/2026, MATH-500, HumanEval, JMMLU), 36/36
-regression-tested:
+same dynamic-MoA design performs once the 8 GB VRAM ceiling is removed. Measured against Fable 5
+on 210 questions (AIME 2024/2025/2026, MATH-500, HumanEval, JMMLU).
 
-**200/210 vs. Fable 5's 199/210 (+1) — but the win is thin and isn't math.** fugu loses on AIME
-2024/2025 and ties on the contamination-free AIME 2026 set; the entire margin comes from JMMLU
-and HumanEval. Re-graded with strict exact-match instead of the current lenient equivalence
-checker, the result flips to 189/199 (**-10**). Full breakdown and caveats:
-[`docs/nim-benchmark-results.md`](docs/nim-benchmark-results.md).
+**199/210 — level with Fable 5, not ahead of it.** The 2026-08-21..23 re-run puts a single
+configuration through all 210 questions in one serial queue and scores 199/210 against Fable 5's
+199/210: a tie. An earlier run (2026-08-08, 36/36 regression-tested) reported 200/210 (+1), but
+it used a base configuration plus two override passes — the tie is the figure that survives
+being measured one way, so that is the one to cite.
+
+Under **strict exact-match grading applied identically to both systems**, the result is
+**fugu 182 / Fable 191 (-9)**. That is not the "189/199 (-10)" this README used to report: that
+figure graded fugu strictly against Fable *leniently*, and Fable scores 191 under strict
+grading, not 199. The entire gap is answer *notation* inside MATH-500 — the other five datasets
+score identically strict and lenient for both systems. Of fugu's 18 strict failures there, 17
+are correctly-valued answers written differently and 1 is a genuinely wrong answer; Fable loses
+8 the same way. Nothing in the lenient 199 is inflated: no answer scored correct turns out to
+be wrong.
+
+Canonicalizing fugu's *emitted* answer — never the grader, and never looking at the expected
+value — recovers 8 of the 17, for **190 / 191**. The remaining one is a single space
+(`-13x + 3` vs `-13x+3`) and is deliberately left alone: MATH-500's own reference answers are
+split 12-to-12 on whether to space operators, so a rule that wins that question is fitting the
+sample rather than following a convention. Full breakdown and caveats:
+[`docs/nim-benchmark-results.md`](docs/nim-benchmark-results.md) and
+[`docs/strict-grading.md`](docs/strict-grading.md).
 
 ## Features
 
