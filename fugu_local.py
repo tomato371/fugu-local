@@ -34,6 +34,14 @@ import urllib.parse
 import concurrent.futures  # 並列処理用（8GB では既定で逐次）
 from pathlib import Path
 
+# 最終回答の表記を MATH-500 の慣習へ揃える純関数（値は変えない）。
+# fugu_local.py 単体を切り出して配布された場合でも動くよう、無ければ恒等関数へ縮退する。
+try:
+    from fugu_canonical import canonicalize_math_answer as _canonicalize_answer
+except Exception:      # pragma: no cover - 単体配布時のみ通る
+    def _canonicalize_answer(s):
+        return s
+
 # Windows の cp932 コンソール/パイプでは ⚠ ✓ ❌ ⤴ ↻ 等の表示記号が encode できず、
 # print 自体が UnicodeEncodeError で落ちる（実測 2026-07-04: 保険1の通知 print がクラッシュし、
 # 空返答の救済パスそのものが死んだ）。記号が化けるのは許容し、encode 不能文字は置換して続行する。
@@ -7032,6 +7040,15 @@ def solve_verifiable(question, task_type="math", history=None):
         return None
     if rep is None:
         rep = _representative_text(samples, top)
+    # 2026-08-27: 報告する答えだけを MATH-500 の表記へ揃える（値は変えない）。
+    # 投票はここまでで終わっており、votes には投じられた生の表記をそのまま残す——
+    # 票は値について、報告は形式についてであり、別の話である。
+    # これまで canonicalize は bench_fugu.grade_item の「採点直前」にしか無く、
+    # ベンチの中でしか効いていなかった。実運用では採点器は他人が握るのだから、
+    # 直すべきは生成側であって採点側ではない（docs/strict-grading.md の配線の問題）。
+    # mcq は選択肢ラベルなので触らない（bench_fugu 側の t != "mcq" と同じ条件）。
+    if task_type != "mcq":
+        top = _canonicalize_answer(top)
     print(f"   [SC] 確定: {top}  (票 {cnt}/{len(answers)}, サンプル計 {len(samples)})")
     _sc_trace_dump(question, task_type, samples, top,
                    {c[0]: c[1] for c in classes},
@@ -7528,7 +7545,13 @@ def fugu_answer(question, plan=None, history=None):
             txt = res.get("text") or ""
             # 裁定で答えが差し替わった場合など、本文の結論と投票結果がずれたら明示する
             body_ans = extract_final_answer(txt, plan["task_type"])
-            if not (body_ans and answers_equivalent(body_ans, res["answer"])):
+            # 2026-08-27: 判定を「同値か」から「文字列として同じか」へ広げた。
+            # canonicalize を solve_verifiable 側へ移したことで res["answer"] は
+            # 正規表記（例 \\frac{35}{9}）になるが、本文は素の表記（-35/9）の
+            # ままなので、同値判定では注記が付かずテキストには従来表記だけが残る。
+            # 戻り値のテキストを読む外部の採点器・人間にも正規表記が渡るよう、
+            # 表記が違うだけの場合も注記を付ける。値は変わらないので結論は動かない。
+            if not (body_ans and body_ans == res["answer"]):
                 # 2026-07-27: bench_fugu の主要config 'fugu'（run_fugu）は grade_item に
                 # answer_value=None を渡し、fugu_answer の戻り値「テキスト」から
                 # extract_final_answer で答えを再抽出して採点する（res["answer"] は

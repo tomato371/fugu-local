@@ -1759,8 +1759,14 @@ finally:
     f.installed_models = _orig_installed
 
 _valid_votes_eq = sum(1 for lab, _m in _arb_calls3b if lab != "arbiter")
-check("arb-eq: 裁定役が同値・別表記('0.5')を返す → answer はその文字列そのもの",
-      _res_arb_eq is not None and _res_arb_eq["answer"] == "0.5")
+# 2026-08-27: 報告する答えを canonicalize するようにしたため（solve_verifiable の報告直前・
+# docs/strict-grading.md の「配線先の問題」）、裁定役が返した小数表記 '0.5' は正規表記で
+# 報告される。値は変わらない。このケースが本来ロックしているのは直下の「票の二重計上なし」
+# であり、そちらの契約は変わっていない。
+check("arb-eq: 裁定役が同値・別表記('0.5')を返す → answer は正規表記・値は不変",
+      _res_arb_eq is not None
+      and f.answers_equivalent(_res_arb_eq["answer"], "0.5")
+      and _res_arb_eq["answer"] == f._canonicalize_answer("0.5"))
 check("arb-eq: votes に '0.5' が一度だけ載り、旧代表 '1/2' キーは残らない(二重計上なし)",
       _res_arb_eq is not None and _res_arb_eq["votes"].get("0.5") is not None
       and "1/2" not in _res_arb_eq["votes"])

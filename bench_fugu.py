@@ -285,6 +285,12 @@ def grade_item(item, answer_text=None, answer_value=None):
     # 手を入れていない——票は値について、報告は形式についてであり、別の話である。
     # 実測: これで厳密採点の math500 が 32/50 -> 40/50 になる（fugu 全体 182 -> 190）。
     # 詳細は docs/strict-grading.md。
+    #
+    # 2026-08-27: 本体側（fugu_local.solve_verifiable の報告直前）へ移設済み。ここに
+    # だけ置くと「ベンチの中でしか効かない」——実運用では採点器は他人が握るので、
+    # 生成側で正規化していなければ点は資産にならない。この行は非 SC 経路
+    # （answer_value=None で answer_text から抽出する run_fugu 等）のための保険として
+    # 残す。canonicalize は冪等なので二重適用でも結果は変わらない。
     if t != "mcq":
         got = canonicalize_math_answer(got)
     return bool(f.answers_equivalent(got, item["answer"])), got, ""
