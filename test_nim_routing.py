@@ -8,6 +8,13 @@ test_nim_offline.py と同じスクリプト形式（check() + 終了コード�
 """
 import fugu_local as f
 
+# 実 API を叩かないテストなので、リトライの待機に実時間を使わせない。
+# このファイルは待ち方そのものを検査していない（その担当は test_nim_offline.py の
+# run_mocked）。にもかかわらず 410 再送や空応答再送の実待機が積み上がり、
+# 冒頭に書いた「実 API 不要・数秒で完走」という契約から 449 秒まで乖離していた。
+# _wait_visibly は max_ticks で自分を打ち切るので、no-op sleep でも必ず抜ける。
+f.time.sleep = lambda _s: None
+
 _FAILS = []
 
 

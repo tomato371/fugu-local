@@ -233,11 +233,22 @@ check("空応答: 戻したら本文が返る", out == "戻したら出た")
 
 _set("FUGU_THINKING_BUDGET", "minimal")
 out, sent = run_mocked([empty], lambda: f.ask(NEMO, MSGS, 0.5))
-check("空応答: 戻しても空なら諦める（無限ループしない）", len(sent) == 2 and out == "")
+# 上限は「戻し再送 1 回 + 空応答再送 NIM_EMPTY_RETRIES 回」。
+# 2026-09-02 に後者を追加したので 2 → 2 + N になった。意図（必ず止まる）は不変。
+check("空応答: 戻しても空なら諦める（無限ループしない）",
+      len(sent) == 2 + f.NIM_EMPTY_RETRIES and out == "")
 
 _set("FUGU_THINKING_BUDGET", "ultra")
 out, sent = run_mocked([empty, ok_body("x")], lambda: f.ask(NEMO, MSGS, 0.5))
-check("空応答: 元から大きい予算では戻し再送をしない", len(sent) == 1 and out == "")
+# 予算が元から大きいので「思考を通常量へ戻す」再送は起きない（payload は据え置き）。
+check("空応答: 元から大きい予算では思考予算を戻さない",
+      all(payload_of(r).get("reasoning_budget")
+          == payload_of(sent[0]).get("reasoning_budget") for r in sent))
+# ただし空応答そのものは 2026-09-02 以降、別予算で再送する。
+# 旧版はここを len(sent) == 1（＝何もせず諦める）で固定していたが、それは
+# 実運用で nemotron-3-ultra が思考有のまま空を返して死票になった当の挙動だった。
+check("空応答: 元から大きい予算でも空応答は再送する（死票にしない）",
+      len(sent) == 2 and out == "x")
 
 # ---------- 8. 思考本文の回収 ----------
 f.thinking_reset()

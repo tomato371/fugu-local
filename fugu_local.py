@@ -78,6 +78,21 @@ NIM_MAX_CONCURRENCY = 4       # ≈40 RPM 制限下で 429 を踏みすぎない
 NIM_RETRY_AFTER_CAP = 120     # Retry-After をそのまま信じる上限秒
 NIM_RATE_RETRIES = 10         # 429/503 専用リトライ予算（通常予算とは別勘定）
 NIM_MAX_TOKENS_CAP = 32768    # 打ち切り自動増額の上限（思考が16kを食い尽くす難問対策）
+# 完全な空応答 (B_both_empty) 専用の再送予算 (2026-09-02)。
+# finish_reason 無し・本文も思考も 0 字は「モデルが答えなかった」ではなく
+# 「ストリームが何も産まずに終わった」= 一過性の伝送障害である。2026-08-19 に
+# 「思考を絞ったせいで空」の経路だけは救済したが、思考が通常量でもこれは出る
+# (nemotron-3-ultra-550b。2026-09-02 22:21 の実運用ログで確認)。再送しないと
+# 無効票が静かに 1 つ増え、Phase 0 で測った抽出失敗の一角がここに居座る。
+# 429 と同じく通常の attempt 予算は消費しない別勘定。
+# 過去の走行を再現したいときは FUGU_NIM_EMPTY_RETRIES=0 で従来挙動に戻る。
+try:
+    NIM_EMPTY_RETRIES = max(0, int(os.environ.get("FUGU_NIM_EMPTY_RETRIES", "2")))
+except ValueError:
+    NIM_EMPTY_RETRIES = 2
+NIM_EMPTY_RETRY_WAIT = 4.0    # 再送前の待機秒。伝送障害なので長く待つ必要はない。
+# ASK_RETRY_BACKOFF (2,5,10) と重ならない値にしてある——ログと
+# テストで「どのリトライ経路が発火したか」を待ち時間だけで見分けられるようにするため。
 # --- DeepConf 型の自信度収集 (2026-08-04, Meta AI "Deep Think with Confidence" 準拠) ---
 # gpt-oss-120b 単体で AIME25 97.0%→99.9% を実証した手法のオフライン版。トレース生成中の
 # トークン logprob（NIM は logprobs:true で返すことを実測確認済み）からトレース自信度を
@@ -3279,6 +3294,8 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     escalated_tokens = False
     switched_image_form = False
     restored_thinking = False
+    empty_budget = NIM_EMPTY_RETRIES
+    empty_retried = False
     while True:
         try:
             out = _send(payload)
@@ -3300,12 +3317,31 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                 payload["chat_template_kwargs"] = kw
                 print(f"   [nim] {model}: 思考を絞ったら空応答 → 通常量へ戻して再送します")
                 continue
+            # 完全な空応答の再送 (2026-09-02 実測対応)。直上の restored_thinking は
+            # 「思考を絞ったせいで空」しか救わない。思考が通常量でも finish_reason 無しの
+            # 空応答は出るため、ここで別予算の再送を入れる。attempt は消費しない。
+            # finish=="length" は out が "__ERROR__: truncated" になるのでここには来ず、
+            # 従来どおり下の max_tokens 増額が担当する（経路を横取りしない）。
+            if not out and empty_budget > 0:
+                empty_budget -= 1
+                empty_retried = True
+                with _NIM_FAIL_LOCK:
+                    NIM_FAIL_COUNTS["B_retried"] += 1
+                # main には _wait_visibly が無い（chat-profile 側の追加）ので
+                # 429 経路と同じ素の print + time.sleep で待つ。
+                print(f"   [nim] {model}: 空応答 → "
+                      f"{NIM_EMPTY_RETRY_WAIT:.0f}秒待って再送します")
+                time.sleep(NIM_EMPTY_RETRY_WAIT)
+                continue
             if (out.startswith("__ERROR__: truncated") and not escalated_tokens
                     and payload.get("max_tokens")
                     and payload["max_tokens"] < NIM_MAX_TOKENS_CAP):
                 escalated_tokens = True
                 payload["max_tokens"] = min(payload["max_tokens"] * 2, NIM_MAX_TOKENS_CAP)
                 continue
+            if empty_retried and out and not out.startswith("__ERROR__"):
+                with _NIM_FAIL_LOCK:
+                    NIM_FAIL_COUNTS["B_retry_answered"] += 1
             break
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
@@ -5047,6 +5083,7 @@ NIM_SALVAGE_LOG = True         # 回収可否と失敗種別をログに出す(�
 #   D: PoT のコード実行失敗(同上)
 NIM_FAIL_COUNTS = {"A_think_only": 0, "B_both_empty": 0,
                    "A_salvaged": 0, "A_salvage_failed": 0,
+                   "B_retried": 0, "B_retry_answered": 0,
                    "relay_tried": 0, "relay_answered": 0, "relay_unknown": 0}
 _NIM_FAIL_LOCK = threading.Lock()
 

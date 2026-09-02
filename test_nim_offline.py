@@ -1355,6 +1355,55 @@ finally:
     (f.SC_TRACE_DIR, f.SC_TRACE_MAX_CHARS, f.SC_TRACE_THINK,
      f._SC_TRACE_WARNED) = _tr_saved
 
+# ---------- 完全な空応答の再送 (2026-09-02) ----------
+# 本文も reasoning_content も 0 字・finish_reason 無しの応答は「モデルが答えなかった」
+# ではなく伝送障害。従来はここに再送が無く、無効票が静かに 1 つ増えていた。
+
+
+def empty_body(finish=None):
+    """B_both_empty の実測形（delta が一度も content/reasoning を運ばない）。"""
+    lines = []
+    if finish:
+        lines.append(("data: " + json.dumps(
+            {"choices": [{"delta": {}, "finish_reason": finish}]}) + "\n").encode())
+    lines.append(b"data: [DONE]\n")
+    return FakeResponse(sse_lines=lines)
+
+
+_c0 = dict(f.NIM_FAIL_COUNTS)
+out, sent, sleeps = run_mocked([empty_body(), empty_body(), ok_body("recovered")],
+                              lambda: f.ask("test/model", MSGS, 0.5))
+check("empty: 空応答を再送して回復する", out == "recovered")
+check("empty: 送信は 3 回（初回+再送2）", len(sent) == 3)
+check("empty: 再送前に待つ", bool(sleeps) and sleeps[0] == f.NIM_EMPTY_RETRY_WAIT)
+check("empty: 再送回数を数える",
+      f.NIM_FAIL_COUNTS["B_retried"] == _c0["B_retried"] + 2)
+check("empty: 回復を数える",
+      f.NIM_FAIL_COUNTS["B_retry_answered"] == _c0["B_retry_answered"] + 1)
+check("empty: 通常予算の指数バックオフは混ざらない",
+      all(s not in f.ASK_RETRY_BACKOFF for s in sleeps))
+
+# 予算を使い切ったら諦める（無限リトライしない）
+out, sent, _ = run_mocked([empty_body()], lambda: f.ask("test/model", MSGS, 0.5))
+check("empty: 予算を超えて再送しない", len(sent) == f.NIM_EMPTY_RETRIES + 1)
+check("empty: 諦めたら従来どおり空文字を返す", out == "")
+
+# finish_reason=length は従来の max_tokens 増額の経路。空応答再送に横取りさせない
+_c1 = dict(f.NIM_FAIL_COUNTS)
+out, sent, _ = run_mocked([empty_body("length")], lambda: f.ask("test/model", MSGS, 0.5))
+check("empty: finish=length は空応答再送の対象外",
+      f.NIM_FAIL_COUNTS["B_retried"] == _c1["B_retried"])
+check("empty: finish=length は従来の truncated 契約のまま",
+      isinstance(out, str) and out.startswith("__ERROR__: truncated"))
+
+# 過去の走行を再現するための逃げ道
+_saved_er = f.NIM_EMPTY_RETRIES
+f.NIM_EMPTY_RETRIES = 0
+out, sent, _ = run_mocked([empty_body()], lambda: f.ask("test/model", MSGS, 0.5))
+check("empty: FUGU_NIM_EMPTY_RETRIES=0 で 08-23 走行と同じ挙動（再送なし）",
+      len(sent) == 1 and out == "")
+f.NIM_EMPTY_RETRIES = _saved_er
+
 # ---------- 後始末・結果 ----------
 for k, v in _SAVED.items():
     setattr(f, k, v)
