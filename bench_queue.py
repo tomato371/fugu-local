@@ -76,6 +76,19 @@ REMEASURE_QUEUE = [
     ("aime24",    "r0821@nim",  None),
 ]
 
+# 2026-09-03 再計測キュー (--remeasure0903)。構成・順序は 08-21 と同じで、
+# 結果ファイルだけ r0903 系へ分離する。08-21 の JSONL は一切触らない。
+# 布陣は再現不能（限界 7 / bench_fugu.py の r0903 注記）なので、
+# 走らせる前に FUGU_NIM_LINEUP で当日の布陣を固定すること。TTL=0 も必須。
+REMEASURE_QUEUE_0903 = [
+    ("jmmlu",     "rq0903@nim", 40),
+    ("humaneval", "rc0903@nim", 30),
+    ("aime26",    "r0903@nim",  None),
+    ("math500",   "r0903@nim",  50),
+    ("aime25",    "r0903@nim",  None),
+    ("aime24",    "r0903@nim",  None),
+]
+
 
 def write_status(status):
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +160,8 @@ def main():
     ap.add_argument("--notify", action="store_true", help="各ジョブに --notify (Slack) を付与")
     ap.add_argument("--remeasure", action="store_true",
                     help="2026-08-21 再計測キュー (210問全部・別名の結果ファイル)")
+    ap.add_argument("--remeasure0903", action="store_true",
+                    help="2026-09-03 再計測キュー (canonicalize + 空応答再送の実運用検証)")
     ap.add_argument("--status-file", default=None,
                     help="進捗 JSON の出力先 (既定 ~/fugu_bench/queue_status.json)")
     args = ap.parse_args()
@@ -154,15 +169,20 @@ def main():
     global STATUS_FILE
     if args.status_file:
         STATUS_FILE = Path(args.status_file)
+    elif args.remeasure0903:
+        STATUS_FILE = BENCH_DIR / "queue_status_remeasure_0903.json"
     elif args.remeasure:
         STATUS_FILE = BENCH_DIR / "queue_status_remeasure.json"
 
-    queue = REMEASURE_QUEUE if args.remeasure else (NIM_QUEUE if args.nim else QUEUE)
+    if args.remeasure0903:
+        queue = REMEASURE_QUEUE_0903
+    else:
+        queue = REMEASURE_QUEUE if args.remeasure else (NIM_QUEUE if args.nim else QUEUE)
     if args.dry_run:
         for i, (ds, cfg, lim) in enumerate(queue, 1):
             print(f"{i:2}. {ds:10} {cfg:10} limit={lim or 'all'}")
         return
-    if args.remeasure:
+    if args.remeasure or args.remeasure0903:
         args.nim = True          # 再計測キューは全ジョブ @nim
     if args.nim and not os.environ.get("NVIDIA_API_KEY"):
         print("ERROR: --nim には NVIDIA_API_KEY が必要です (build.nvidia.com で生成)")

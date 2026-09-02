@@ -923,6 +923,27 @@ CONFIGS.update({
     "r0821@nim": run_adapt,           # aime24/25/26, math500
     "rc0821@nim": run_coder2,         # humaneval (= coder5@nim, CODE_CANDIDATES=5)
     "rq0821@nim": lambda it: run_sc(it, pot=False),   # jmmlu (= scmcq@nim)
+    # ------------------------------------------------------------------
+    # 2026-09-03 再計測 (r0903@nim / rc0903@nim / rq0903@nim)
+    #   ランナーは r0821 と完全に同一。別名にする理由も同じで、
+    #   (1) 既存 JSONL に追記すると load_done_ids の resume が効いて全問
+    #       スキップされ「再計測」にならない、(2) 08-21 の数字を上書きしない。
+    #
+    #   08-21 走行と違うのは次の 2 点。どちらも本測定の目的である。
+    #     (1) canonicalize_math_answer が solve_verifiable 側へ配線済み (4b035fd)。
+    #         記録済みデータで測った +8 を実運用で検証するのが主目的。
+    #     (2) 空応答の再送 (FUGU_NIM_EMPTY_RETRIES 既定 2) が入っている。
+    #         寄与は NIM_FAIL_COUNTS の B_retried / B_retry_answered で事後分離できる。
+    #
+    #   ただし 08-21 の布陣は再現できない。stepfun-ai/step-3.7-flash,
+    #   thinkingmachines/inkling (統合役), meta/llama-3.1-8b-instruct (Conductor) の
+    #   3 体が NIM のカタログから消えている (2026-09-03 実測。README の限界 7)。
+    #   したがって本走行は 199/210 との厳密な A/B ではなく、
+    #   **現行構成の実測**である。布陣は lineup_20260903.json に固定して走らせること。
+    # ------------------------------------------------------------------
+    "r0903@nim": run_adapt,           # aime24/25/26, math500
+    "rc0903@nim": run_coder2,         # humaneval
+    "rq0903@nim": lambda it: run_sc(it, pot=False),   # jmmlu
 })
 
 # ==================================================
