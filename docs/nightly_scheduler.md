@@ -10,13 +10,16 @@ merge まで無人にしたくない場合は `--pr-mode` を付け、翌朝 `au
 
 > **2026-10-10 時点の状態: このタスク `fugu-evolve-nightly` は未登録**（`schtasks /query /fo LIST` に
 > 存在しない。`\Nakayama\` 配下にあるのは koyomi・quorum・soroban の 3 つ）。
-> 以下は登録する場合の手順である。作業ディレクトリは `D:\repos\fugu-local-integ`（現存しない）ではなく、
+> 登録する場合の作業ディレクトリは `D:\repos\fugu-local-integ`（現存しない）ではなく、
 > 現在のリポジトリ `D:\株式会社中山龍也\R&D\quorum\fugu-local-integ` を指す。
 
-```powershell
-schtasks /create /tn "fugu-evolve-nightly" /sc daily /st 03:00 `
-  /tr "cmd /c cd /d \"D:\株式会社中山龍也\R&D\quorum\fugu-local-integ\" && python -m fugu_evolve --repo . --nightly --pr-mode --max-proposals 1 >> %USERPROFILE%\fugu_evolve_nightly.log 2>&1"
-```
+> **登録コマンドは載せない（2026-10-10）**: 現在のパスは `&`（`R&D`）を含むため、
+> `schtasks /tr "cmd /c cd /d ..."` の形では cmd の引用が壊れる（同じ事情で、会社フォルダ直下の
+> `quorum_start_hidden.vbs` は `&` を含まない場所に置いたラッパーにしてある）。PowerShell の文字列では
+> `\"` がエスケープにならないので、`\"` で包んだ書き方（2026-10-10 に一度書いたが、構文エラーになるため取り下げた）も使えない。
+> `&` を含まない場所にラッパー（.bat／.vbs）を置くか、`New-ScheduledTaskAction -WorkingDirectory` で
+> 作業ディレクトリを指定して `Register-ScheduledTask` に渡す。**未登録・未検証（2026-10-10）**。
+> 旧パス（`D:\repos\...`）時代のコマンドは `git show 5754e0d^:docs/nightly_scheduler.md` にある。
 
 - 削除: `schtasks /delete /tn "fugu-evolve-nightly" /f`
 - 即時試run: `schtasks /run /tn "fugu-evolve-nightly"`
