@@ -8,9 +8,14 @@
 merge まで無人にしたくない場合は `--pr-mode` を付け、翌朝 `auto-evolve/*`
 ブランチを人間がレビューして merge する運用を推奨する。
 
+> **2026-10-10 時点の状態: このタスク `fugu-evolve-nightly` は未登録**（`schtasks /query /fo LIST` に
+> 存在しない。`\Nakayama\` 配下にあるのは koyomi・quorum・soroban の 3 つ）。
+> 以下は登録する場合の手順である。作業ディレクトリは `D:\repos\fugu-local-integ`（現存しない）ではなく、
+> 現在のリポジトリ `D:\株式会社中山龍也\R&D\quorum\fugu-local-integ` を指す。
+
 ```powershell
 schtasks /create /tn "fugu-evolve-nightly" /sc daily /st 03:00 `
-  /tr "cmd /c cd /d D:\repos\fugu-local-integ && python -m fugu_evolve --repo . --nightly --pr-mode --max-proposals 1 >> %USERPROFILE%\fugu_evolve_nightly.log 2>&1"
+  /tr "cmd /c cd /d \"D:\株式会社中山龍也\R&D\quorum\fugu-local-integ\" && python -m fugu_evolve --repo . --nightly --pr-mode --max-proposals 1 >> %USERPROFILE%\fugu_evolve_nightly.log 2>&1"
 ```
 
 - 削除: `schtasks /delete /tn "fugu-evolve-nightly" /f`

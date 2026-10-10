@@ -10,6 +10,9 @@ fugu 189 / Fable 199 に反転する」——を再現し、**その差がどこ
 python regrade_strict.py --results ~/fugu_bench/results --out ./strict_regrade.json
 ```
 
+`./strict_regrade.json` は**このスクリプトが実行時に作る出力ファイル**であり、リポジトリには含まれない
+（2026-10-10 時点で実在しない。実行したカレントディレクトリに書き出される）。
+
 ## 採点を4段階に分解する
 
 | 段階 | 判定 |
@@ -155,6 +158,7 @@ Fable の 191 まであと1問。
 | 空白詰めによる +1 | **測ったうえで棄却**（参照解答 500 件で 12 対 12・規約なし） |
 
 > **配線先の問題（2026-08-27）— +8 はまだベンチの中でしか効いていない。**
+> （→ 同日中に解決済み。直後の「解決（2026-08-27）」を参照。2026-10-10 時点でこの見出しは現状ではない）
 >
 > `canonicalize_math_answer()` は `bench_fugu.py:289` の `grade_item()` から呼ばれている。
 > つまり**ベンチが自分の出力を採点する直前**に整形しているだけで、`fugu_local.py` の
@@ -216,7 +220,9 @@ Fable の 191 まであと1問。
 
 ## 追記（同日）— 2026-08-20 に同種の分析が既にあった
 
-この監査を書いたあと、`D:\repos\fugu-nim-cowork\fugu_bench\analysis\RESUME.md`（2026-08-20 更新）に
+この監査を書いたあと、`D:\repos\fugu-nim-cowork\fugu_bench\analysis\RESUME.md`（2026-08-20 更新）
+（→ 2026-09-02 に `D:\株式会社中山龍也\R&D\quorum\fugu-nim-cowork\` へ移動済み。現在の所在は
+`R&D\quorum\fugu-nim-cowork\fugu_bench\analysis\RESUME.md`）に
 `grading_paths.py` による採点の段別内訳が残っているのを見つけた。結論はこうだった。
 
 > 生の文字列一致のみなら **fugu 186 / Fable 191（-5）** で、-10 ではない。
@@ -264,9 +270,12 @@ Fable の 191 まであと1問。
 > `C:\Users\nk108\fugu_live_work` があり、そちらも見ていなかった。作業ツリーが 3 か所
 > （`R&D\quorum\fugu-local-integ` / `D:\repos\fugu-nim-cowork` /
 > `C:\Users\nk108\fugu_live_work`）に分かれていること自体が原因である。
+> （→ 2026-10-10 追記: このうち `D:\repos\fugu-nim-cowork` は 2026-09-02 に
+> `R&D\quorum\fugu-nim-cowork` へ移動済み。`D:\repos\fugu-nim-cowork` は現存しない）
 
 ### 反省点
 
 `RESUME.md` は会社フォルダの外（`D:\repos`）にあるため、この監査を始める前に読めていなかった。
 **未処理#1「`D:\repos\fugu-nim-cowork` を `R&D\quorum\` へ移動」が片付いていない実害がこれである。**
+（→ 2026-09-02 に移動済み。以下は 2026-08-27 時点の記述）
 単なる整理の問題ではなく、判断材料が消える問題だった。
