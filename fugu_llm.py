@@ -35,11 +35,14 @@ class AskChat:
     """
 
     def __init__(self, model: Optional[str] = None, label: Optional[str] = None,
-                 think: Optional[Any] = None, num_predict: Optional[int] = None):
+                 think: Optional[Any] = None, num_predict: Optional[int] = None,
+                 stream_max_s: Optional[float] = None):
         self.model = model
         self.label = label
         self.think = think
         self.num_predict = num_predict
+        #: 1ストリームの壁時計上限（秒）。短い用事に長考用の枠を継がせない。
+        self.stream_max_s = stream_max_s
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
                  fmt: Format = None, temperature: float = 0.2,
@@ -51,10 +54,16 @@ class AskChat:
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+        # stream_max_s は「指定されたときだけ」渡す。常に足すと、ask() を
+        # 従来のシグネチャで差し替えている既存の偽物（tests/ の fake_ask 等）が
+        # TypeError で落ちる。任意の追加機能が既定の呼び出し契約を変えるのは筋が悪い。
+        extra = {}
+        if self.stream_max_s is not None:
+            extra["stream_max_s"] = self.stream_max_s
         out = fugu_local.ask(
             model, messages, temperature,
             think=self.think, fmt=fmt, label=self.label,
-            num_predict=self.num_predict, images=images,
+            num_predict=self.num_predict, images=images, **extra,
         )
         if out.startswith("__ERROR__"):
             raise RuntimeError(out)

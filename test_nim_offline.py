@@ -343,6 +343,76 @@ out, sent, _ = run_mocked(
 check("stream: data 行が来ない ping 飢餓も __ERROR__ に落ちる",
       isinstance(out, str) and out.startswith("__ERROR__"))
 
+# ---------- 8d. stream_max_s の配線（AskChat → ask → _ask_nim → 壁時計上限）----------
+# 本番 quorum が AskChat(..., stream_max_s=...) を呼ぶ。以前はどの層もこの引数を
+# 持たず TypeError で回答が返らなかった（空回答の書き直し／チームの分解・まとめ）。
+import inspect
+import fugu_llm
+
+_sig = inspect.signature(fugu_llm.AskChat.__init__).parameters
+check("stream_max_s: AskChat.__init__ は model/label/think/num_predict/stream_max_s を受ける",
+      all(k in _sig for k in ("model", "label", "think", "num_predict", "stream_max_s")))
+check("stream_max_s: AskChat の既定は None", _sig["stream_max_s"].default is None)
+check("stream_max_s: ask() / _ask_nim() が引数を持つ",
+      all("stream_max_s" in inspect.signature(fn).parameters for fn in (f.ask, f._ask_nim)))
+
+_orig_ask = f.ask
+_ask_calls = []
+
+
+def _recording_ask(model, messages, temperature, **kw):
+    _ask_calls.append(kw)
+    return "ok"
+
+
+f.ask = _recording_ask
+try:
+    fugu_llm.AskChat(model="test/model").complete("q")
+    check("stream_max_s: 未指定なら ask() へ kwarg を渡さない（従来の偽 ask を壊さない）",
+          len(_ask_calls) == 1 and "stream_max_s" not in _ask_calls[0])
+    fugu_llm.AskChat(model="test/model", stream_max_s=90.0).complete("q")
+    check("stream_max_s: 指定時は ask() へ渡る",
+          len(_ask_calls) == 2 and _ask_calls[1].get("stream_max_s") == 90.0)
+finally:
+    f.ask = _orig_ask
+
+_orig_ask_nim = f._ask_nim
+_nim_calls = []
+
+
+def _recording_ask_nim(model, messages, temperature, **kw):
+    _nim_calls.append(kw)
+    return "ok"
+
+
+f._ask_nim = _recording_ask_nim
+try:
+    f.ask("test/model", MSGS, 0.5, stream_max_s=45)
+    f.ask("test/model", MSGS, 0.5)
+    check("stream_max_s: ask() は NIM モデルで _ask_nim へ引き継ぐ",
+          _nim_calls[0].get("stream_max_s") == 45)
+    check("stream_max_s: 未指定なら _ask_nim へ None が渡る",
+          _nim_calls[1].get("stream_max_s") is None)
+finally:
+    f._ask_nim = _orig_ask_nim
+
+# _ask_nim が指定値を壁時計上限に使う。40 秒/行 × 3 行 = 120 秒は既定の 40 分枠には
+# 収まるが、stream_max_s=60 の枠は超える。
+_SLOW_LINES = ok_body("done")._sse
+out, sent, _ = run_mocked([_slow_sse(40, _SLOW_LINES)],
+                          lambda: f.ask("test/model", MSGS, 0.5, stream_max_s=60))
+check("stream_max_s: 指定した上限を超えたストリームは __ERROR__ に落ちる",
+      isinstance(out, str) and out.startswith("__ERROR__"))
+check("stream_max_s: エラー文言は指定値（60s）を示す（既定の 2400s ではない）",
+      "stream exceeded 60s" in out and f"{f.NIM_STREAM_MAX_S}s" not in out)
+out, sent, _ = run_mocked([_slow_sse(40, _SLOW_LINES)],
+                          lambda: f.ask("test/model", MSGS, 0.5))
+check("stream_max_s: 未指定なら同じストリームが既定の NIM_STREAM_MAX_S で通る",
+      out == "done")
+out, sent, _ = run_mocked([_slow_sse(40, _SLOW_LINES)],
+                          lambda: f.ask("test/model", MSGS, 0.5, stream_max_s=600))
+check("stream_max_s: 十分大きい指定なら通る", out == "done")
+
 # ---------- 9. <think> 混入は呼び出し側 strip_think の責務（Ollama 経路と同一分担）----------
 out, _, _ = run_mocked([(ok_body("<think>reasoning...</think>42"))],
                        lambda: f.ask("test/model", MSGS, 0.5))

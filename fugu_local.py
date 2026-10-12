@@ -3138,7 +3138,7 @@ def _keep_thinking(model, label, think):
 
 
 def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
-             num_predict=None, num_ctx=None, images=None):
+             num_predict=None, num_ctx=None, images=None, stream_max_s=None):
     """NIM (OpenAI 互換 /chat/completions) 送信層。シグネチャと「失敗は例外でなく
     __ERROR__: 文字列を返す」契約は ask() と完全に同一（13 呼び出し箇所を無改修で通すため）。
     num_ctx / keep_alive はクラウドでは意味を持たないので受けて無視する。
@@ -3259,13 +3259,18 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         lps = []                       # DeepConf: 選択トークンの logprob 列
         t_stream = time.time()
         last_data = t_stream
+        # 壁時計上限は役割ごとに変えられる。NIM_STREAM_MAX_S(40分) は「利用者の
+        # 難問を長考させる」ための枠で、分解や要約のような短い用事がそれを継ぐと、
+        # 数分で済むはずの呼び出しが 40 分返らない（2026-09-02 実測: チームの分解が
+        # 40 分。呼び出し側は「分解中」のまま固まって見える）。
+        cap_s = stream_max_s or NIM_STREAM_MAX_S
         with _NIM_SEMAPHORE:
             with urllib.request.urlopen(req, timeout=NIM_TIMEOUT) as r:
                 for raw_line in r:
                     now = time.time()
-                    if now - t_stream > NIM_STREAM_MAX_S:
+                    if now - t_stream > cap_s:
                         raise TimeoutError(
-                            f"stream exceeded {NIM_STREAM_MAX_S}s (wall clock cap)")
+                            f"stream exceeded {cap_s}s (wall clock cap)")
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         if now - last_data > NIM_STREAM_IDLE_S:
@@ -3441,13 +3446,15 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
 
 
 def ask(model, messages, temperature, think=None, fmt=None, label=None, num_predict=None,
-        num_ctx=None, images=None):
+        num_ctx=None, images=None, stream_max_s=None):
     """Ollama native /api/chat を叩く。num_ctx を必ず options で渡して context を安全域に固定する
     （/v1 互換エンドポイントは num_ctx を無視するため使わない）。失敗時は __ERROR__: を返す。
     一過性の失敗(HTTP 500 等)には ASK_RETRY_ATTEMPTS 回まで、ASK_RETRY_BACKOFF の間隔で
     再試行する(2026-07-27: 固定2回・sleep(2)固定から有界バックオフへ拡張。詳細はモジュール
     冒頭の ASK_RETRY_ATTEMPTS/ASK_RETRY_BACKOFF 付近のコメントを参照)。
     num_predict: 生成トークン上限（None=無制限）。思考モデルの暴走保険として役割別に渡す。
+    stream_max_s: 1ストリームの壁時計上限（None=NIM_STREAM_MAX_S）。分解・要約のような
+      短い用事に、長考用の 40 分枠を継がせないために役割別で渡す。Ollama 経路では無視。
     num_ctx: コンテキスト長の明示指定。None なら MODEL_CONFIG > MODEL_NUM_CTX の順で解決。
       「必ず明示 pin する」不変条件は維持（未指定だと Ollama がモデル最大を確保して 8GB VRAM で
       クラッシュするため）。
@@ -3464,7 +3471,8 @@ def ask(model, messages, temperature, think=None, fmt=None, label=None, num_pred
       スキーマを与えると enum 値まで含めて妥当な JSON に拘束され、かつ高速（実測 ~14s）。"""
     if _is_nim(model):   # NIM レジストリ登録モデルはクラウド送信層へ（未登録なら完全不活性）
         return _ask_nim(model, messages, temperature, think=think, fmt=fmt, label=label,
-                        num_predict=num_predict, num_ctx=num_ctx, images=images)
+                        num_predict=num_predict, num_ctx=num_ctx, images=images,
+                        stream_max_s=stream_max_s)
     if think is None:
         think = model_cfg(model, "think")   # 呼び出し側が未指定ならモデル別設定を適用
     if images:
