@@ -352,6 +352,9 @@ def test_non_nim_backend_passes_nothing_extra(monkeypatch):
 # --------------------------------------------------------------------------
 @pytest.fixture
 def verify_env(monkeypatch):
+    # 「Critic 失敗は再検算せず未検証で採用」は FAIL_SOFT=1（quorum サーバー）のときだけ。
+    # 無効時（既定・ベンチ）の旧挙動は test_fail_soft_off_* で固定している。
+    monkeypatch.setattr(f, "FAIL_SOFT", True)
     monkeypatch.setattr(f, "CONDUCTOR", "cond/model")
     monkeypatch.setattr(f, "SECOND_OPINION_MODEL", "second/model")
     monkeypatch.setattr(f, "_SECOND_OPINION_DISABLED", False)
@@ -442,3 +445,66 @@ def test_critique_recheck_failure_after_a_real_ng_is_unchanged(verify_env):
     verify_env(['{"ok": false, "issue": "wrong"}', "__ERROR__: boom"])
     ok, issue = f.critique("q", "a")
     assert ok is False and issue.startswith("critic call failed")
+
+
+# --------------------------------------------------------------------------
+# FAIL_SOFT=0（既定・ベンチ）: (b)(c) は 2f08b52 以前と失敗時も含めて同じ挙動
+# --------------------------------------------------------------------------
+def test_fail_soft_off_critic_error_still_rechecks_with_thinking(verify_env, monkeypatch):
+    """verify_single: Critic __ERROR__ → think=True 再検算。再検算も失敗なら (False, 'critic call failed...')。"""
+    calls = verify_env(["__ERROR__: boom", "__ERROR__: boom again"])
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    ok, issue = f.verify_single("q", "a")
+    assert ok is False and issue.startswith("critic call failed")
+    assert calls == [("critic", False), ("critic", True)]       # 再検算を投げる
+
+
+def test_fail_soft_off_critic_error_recheck_can_still_approve(verify_env, monkeypatch):
+    calls = verify_env(["__ERROR__: boom", '{"ok": true, "issue": ""}'])
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    assert f.verify_single("q", "a") == (True, "")
+    assert calls == [("critic", False), ("critic", True)]
+
+
+def test_fail_soft_off_critic_error_with_failing_second_opinion(verify_env, monkeypatch):
+    """旧挙動: second_opinion が NG でも Critic が失敗でも、最終審判は think=True 再検算。"""
+    calls = verify_env(["__ERROR__: boom", "__ERROR__: boom"],
+                       second=(False, "answer is wrong"))
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    ok, issue = f.verify_single("q", "a")
+    assert ok is False and issue.startswith("critic call failed")
+    assert calls == [("critic", False), ("critic", True)]
+
+
+def test_fail_soft_off_critique_error_still_rechecks_with_thinking(verify_env, monkeypatch):
+    calls = verify_env(["__ERROR__: boom", "__ERROR__: boom again"])
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    ok, issue = f.critique("q", "a")
+    assert ok is False and issue.startswith("critic call failed")
+    assert calls == [("critic", False), ("critic", True)]
+
+
+def test_fail_soft_off_critique_error_recheck_can_still_approve(verify_env, monkeypatch):
+    calls = verify_env(["__ERROR__: boom", '{"ok": true, "issue": ""}'])
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    assert f.critique("q", "a") == (True, "")
+    assert calls == [("critic", False), ("critic", True)]
+
+
+def _import_fail_soft(env_updates):
+    env = {k: v for k, v in os.environ.items() if k != "FUGU_FAIL_SOFT"}
+    env.update(env_updates)
+    env["PYTHONIOENCODING"] = "utf-8"
+    here = os.path.dirname(os.path.abspath(f.__file__))
+    out = subprocess.run(
+        [sys.executable, "-c", "import fugu_local as f; print(f.FAIL_SOFT)"],
+        cwd=here, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.split()[-1] == "True"
+
+
+def test_fail_soft_defaults_to_off_and_follows_env():
+    """env 未設定（ベンチ）は無効。FUGU_FAIL_SOFT=1 のときだけ有効。"""
+    assert _import_fail_soft({}) is False
+    assert _import_fail_soft({"FUGU_FAIL_SOFT": "0"}) is False
+    assert _import_fail_soft({"FUGU_FAIL_SOFT": "1"}) is True

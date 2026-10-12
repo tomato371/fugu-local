@@ -49,12 +49,15 @@ def profile(monkeypatch):
     monkeypatch.setattr(f, "NIM_AUTO_SELECT", True)
     monkeypatch.setattr(f, "NIM_ALWAYS", [])
     monkeypatch.setattr(f, "CONDUCTOR_OVERRIDE", "")
+    # 退避は FAIL_SOFT=1（quorum サーバー）のときだけ。無効時（既定・ベンチ）の旧挙動は
+    # test_fail_soft_off_* で固定している。
+    monkeypatch.setattr(f, "FAIL_SOFT", True)
 
-    def run(catalog, dead=()):
+    def run(catalog, dead=(), probe=None):
         dead = set(dead)
         monkeypatch.setattr(f, "_nim_catalog", lambda: set(catalog))
         monkeypatch.setattr(f, "_nim_probe",
-                            lambda m, timeout=None: "gone" if m in dead else "ok")
+                            probe or (lambda m, timeout=None: "gone" if m in dead else "ok"))
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             applied = f.apply_nim_profile()
@@ -144,6 +147,7 @@ def test_fallback_chooser_ranking():
 # --------------------------------------------------------------------------
 @pytest.fixture
 def conduct_env(monkeypatch):
+    monkeypatch.setattr(f, "FAIL_SOFT", True)       # 既定プランへの即時退避は FAIL_SOFT=1 のときだけ
     monkeypatch.setattr(f, "PROPOSERS", ["m1", "m2", "m3", "m4"])
     monkeypatch.setattr(f, "CONDUCTOR", "cond/model")
     calls = []
@@ -194,3 +198,85 @@ def test_conduct_healthy_reply_is_a_single_call(conduct_env):
     plan, _raw = f.conduct("q")
     assert calls == ["conductor"]
     assert plan["_fallback"] is False
+
+
+# --------------------------------------------------------------------------
+# FAIL_SOFT=0（既定・ベンチ）: (a)(d) は 2f08b52 以前と失敗時も含めて同じ挙動
+# --------------------------------------------------------------------------
+def test_fail_soft_off_dead_candidates_use_the_first_candidate_as_before(profile, monkeypatch):
+    """旧挙動: 候補全滅 → NIM_CONDUCTOR_CANDIDATES[0] をそのまま使う（退避ロジックは呼ばれない）。"""
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+
+    def _boom(picked):
+        raise AssertionError("FAIL_SOFT=0 では退避先を選ばない")
+
+    monkeypatch.setattr(f, "_nim_conductor_fallback", _boom)
+    dead = set(f.NIM_CONDUCTOR_CANDIDATES)
+    catalog = REAL_LINEUP | set(f.NIM_CONDUCTOR_CANDIDATES)
+    log = profile(catalog, dead=dead)
+    assert f.DESIRED_CONDUCTOR == GEMMA == f.NIM_CONDUCTOR_CANDIDATES[0]
+    assert f.FALLBACK_MODEL == GEMMA
+    assert f"Conductor 候補が全滅。{GEMMA} をそのまま使います" in log
+    assert "採用済み" not in log
+
+
+def test_fail_soft_off_fixed_lineup_also_uses_the_first_candidate(profile, monkeypatch):
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    log = profile(set(), dead=f.NIM_CONDUCTOR_CANDIDATES)       # カタログ不通 = 固定布陣
+    assert f.DESIRED_CONDUCTOR == f.NIM_CONDUCTOR_CANDIDATES[0]
+    assert "そのまま使います" in log and "実測" not in log
+
+
+def test_fail_soft_off_live_candidate_is_unchanged(profile, monkeypatch):
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    catalog = REAL_LINEUP | set(f.NIM_CONDUCTOR_CANDIDATES)
+    profile(catalog, dead=())
+    assert f.DESIRED_CONDUCTOR == GEMMA
+
+
+def test_fail_soft_on_returns_to_first_candidate_when_nothing_responds(profile):
+    """有効時でも、候補も退避先も全て応答しないなら、プローブしていない機体を充てず
+    従来どおり NIM_CONDUCTOR_CANDIDATES[0] に戻す（一時的な 429 / ネット断で全プローブが
+    slow のとき、提案機体に替わらない）。"""
+    seen = {}
+
+    def probe(m, timeout=None):
+        seen[m] = seen.get(m, 0) + 1
+        if m in f.NIM_CONDUCTOR_CANDIDATES:
+            return "gone"
+        return "ok" if seen[m] == 1 else "slow"       # 選抜では生きていたが、退避の再確認は全滅
+
+    catalog = REAL_LINEUP | set(f.NIM_CONDUCTOR_CANDIDATES)
+    log = profile(catalog, probe=probe)
+    assert f.DESIRED_CONDUCTOR == GEMMA                # 提案機体（REAL_LINEUP）には替わらない
+    assert f.DESIRED_CONDUCTOR not in REAL_LINEUP
+    assert all(seen[m] >= 2 for m in REAL_LINEUP)      # 退避先は全て再確認している
+    assert "退避先も応答なし" in log and "そのまま使います" in log
+
+
+def test_fail_soft_off_conduct_error_body_is_parsed_and_retried_as_before(conduct_env, monkeypatch):
+    """旧挙動: __ERROR__ 本文も extract_json に通し（JSON が混じっていれば plan になる）、
+    取れなければ 1 回引き直す。"""
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    calls = conduct_env(['__ERROR__: HTTP Error 500 {"mode": "single", "task_type": "math"}'])
+    plan, raw = f.conduct("q")
+    assert calls == ["conductor"]                    # JSON が取れたので引き直さない（旧挙動）
+    assert plan["_fallback"] is False and plan["mode"] == "single"
+    assert raw.startswith("__ERROR__")
+
+
+def test_fail_soft_off_conduct_error_is_retried_once(conduct_env, monkeypatch):
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    calls = conduct_env(["__ERROR__: timed out",
+                         '{"mode": "moa", "task_type": "knowledge", "rounds": 1}'])
+    plan, _raw = f.conduct("q")
+    assert calls == ["conductor", "conductor"]       # 旧挙動: __ERROR__ でも 1 回引き直す
+    assert plan["_fallback"] is False
+
+
+def test_fail_soft_off_conduct_double_error_falls_back_after_two_calls(conduct_env, monkeypatch):
+    monkeypatch.setattr(f, "FAIL_SOFT", False)
+    calls = conduct_env(["__ERROR__: a", "__ERROR__: b"])
+    plan, raw = f.conduct("q")
+    assert calls == ["conductor", "conductor"]
+    assert plan["_fallback"] is True and raw == "__ERROR__: b"

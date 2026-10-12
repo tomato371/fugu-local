@@ -131,6 +131,12 @@ CONDUCTOR_STREAM_MAX_S = _env_seconds("FUGU_CONDUCTOR_STREAM_MAX_S", 0)
 # bench_recheck.py は 1 本 60〜300 秒を見込んでおり、健全な再検算を切らない余裕として、
 # サーバー側で設定する値は 600 秒（fugu_remote が FUGU_CRITIC_THINK_STREAM_MAX_S=600 を設定）。
 CRITIC_THINK_STREAM_MAX_S = _env_seconds("FUGU_CRITIC_THINK_STREAM_MAX_S", 0)
+# 失敗時に「柔らかく倒れる」挙動の総スイッチ（env FUGU_FAIL_SOFT。既定 "0"=無効、"1" で有効）。
+# 有効時だけ: (a) conduct の __ERROR__ は引き直さず既定プラン (b) verify_single / (c) critique の
+# Critic __ERROR__ は再検算せず未検証で採用 (d) Conductor 候補全滅時は採用済みの生きた機体へ退避。
+# 無効時は上の 4 つとも 2f08b52 以前の挙動（失敗も含めて同一）で、fugu_local を直接走らせる
+# ベンチの採点・検証を緩めない。quorum サーバー（fugu-remote）だけが起動時に env で "1" にする。
+FAIL_SOFT = os.environ.get("FUGU_FAIL_SOFT", "0").strip().lower() in ("1", "true", "yes", "on")
 # 429 対策の要（2026-08-03 実測）: NIM の 429 は Retry-After ヘッダを付けてこない。
 # 旧実装の「既定10秒待ちで各ワーカーが独立に再送」は、並列4本の再送(毎10秒×4)自体が
 # 40 RPM 制限を叩き続けてスロットルが解けない自己増幅ループになり、SC全票が
@@ -379,8 +385,9 @@ def apply_high_vram_profile():
 # global 一括上書き。setup() が FUGU_BACKEND=="nim" を判定して呼ぶ。
 # モデル ID は 2026-08 時点の build.nvidia.com カタログ準拠。実在照合は本関数内で
 # /v1/models と突合して警告する（ネットワーク不通なら黙ってスキップ＝致命でない）。
-def _nim_probe(model, timeout=None):
-    """モデル可用性の軽量プローブ（1リクエスト・非ストリーム・max_tokens=4）。
+def _nim_probe_http(model, timeout=None):
+    """モデル可用性の軽量プローブ（1リクエスト・非ストリーム・max_tokens=4）。実際に叩く層。
+    呼び出し側は結果メモ付きの _nim_probe() を使う（メモが無効なら素通し）。
 
     'ok' / 'gone'（恒久的に使えない）/ 'slow'（冷え・混雑。再試行の価値あり）を返す。
     2026-08-08 実測: カタログ掲載でもアカウントに付与されていないものは
@@ -403,6 +410,41 @@ def _nim_probe(model, timeout=None):
         return "gone" if e.code in (401, 403, 404, 410) else "slow"
     except Exception:
         return "slow"
+
+
+#: apply_nim_profile() 1 回（= setup 1 回）の中だけ有効な、生存プローブ結果のメモ。
+#: None は無効（setup の外・テスト・直接呼び出しは従来どおり毎回叩く）。有効時は
+#: {model: [(status, 使った timeout, 所要秒), ...]}。setup の開始時に空にし、終了時に捨てる。
+#: 2026-10-13 00:20 の再起動は受付可能まで 535 秒かかった。FUGU_NIM_ALWAYS の kimi-k3 は
+#: 実測 148 秒前後で、同じ setup の中で ALWAYS 先行（200 秒）→ 規模順ループ（20 秒）→ 冷え再確認
+#: （75 秒）→ 固定布陣への退避（200 秒）と最大 4 回プローブされていた。
+_NIM_PROBE_MEMO = None
+_NIM_PROBE_MEMO_LOCK = threading.Lock()
+
+
+def _nim_probe(model, timeout=None):
+    """_nim_probe_http のメモ付き版。メモが有効なとき、結果が確実に同じになる場合だけ再利用する:
+      - 'gone'（401/403/404/410。恒久失敗）は常に。
+      - 'slow' は、より長い（同じ以上の）timeout で 'slow' だったとき。
+      - 'ok' は、所要秒が今回の timeout 以内だったとき（短い timeout なら slow だったかもしれない
+        ので、148 秒かかった 'ok' を 20 秒の問い合わせには流用しない）。
+    それ以外は実際に叩き、結果を追記する。メモ無効時は _nim_probe_http と完全に同じ。"""
+    memo = _NIM_PROBE_MEMO
+    if memo is None:
+        return _nim_probe_http(model, timeout)
+    eff = timeout or NIM_PROBE_TIMEOUT
+    with _NIM_PROBE_MEMO_LOCK:
+        for status, used, took in memo.get(model, ()):
+            if (status == "gone" or (status == "slow" and used >= eff)
+                    or (status == "ok" and took <= eff)):
+                return status
+    t0 = time.time()
+    status = _nim_probe_http(model, timeout)
+    took = time.time() - t0
+    with _NIM_PROBE_MEMO_LOCK:
+        if _NIM_PROBE_MEMO is memo:        # 呼び出し中に setup が終わって捨てられていたら残さない
+            memo.setdefault(model, []).append((status, eff, took))
+    return status
 
 
 def _nim_model_available(model):
@@ -667,7 +709,21 @@ def _nim_save_lineup(picked, conductor, vision):
 
 
 def apply_nim_profile():
-    """全ロールを NIM クラウドモデルへ一括切替。キー未設定なら False（setup() が中断）。"""
+    """全ロールを NIM クラウドモデルへ一括切替。キー未設定なら False（setup() が中断）。
+
+    生存プローブの結果メモ（_NIM_PROBE_MEMO）をこの 1 回の中だけ有効にする: 開始時に空にし、
+    終了時（例外含む）に捨てる。同じモデルを同じ setup の中で何度も長い待ちで叩かないため。"""
+    global _NIM_PROBE_MEMO
+    with _NIM_PROBE_MEMO_LOCK:
+        _NIM_PROBE_MEMO = {}
+    try:
+        return _apply_nim_profile()
+    finally:
+        with _NIM_PROBE_MEMO_LOCK:
+            _NIM_PROBE_MEMO = None
+
+
+def _apply_nim_profile():
     global DESIRED_PROPOSERS, DESIRED_AGGREGATOR, DESIRED_CONDUCTOR, FALLBACK_MODEL
     global PERSONA_MODELS, PERSONA_IDENTITY, MODEL_TO_PERSONA, PROPOSER_PROFILES
     global JP_AGGREGATOR, JP_AGGREGATOR_STRONG, AGGREGATOR_REASONING, SECOND_OPINION_MODEL
@@ -747,30 +803,30 @@ def apply_nim_profile():
         if _nim_model_available(cand):
             cond = cand
             break
-    if not cond:
-        # 候補が全滅。死んだ先頭候補をそのまま使うと conduct / critic が毎回数百秒張り付く
-        # （2026-10-12 実測: 1709 秒）。採用済みの機体から速いものを充てる。
+    if not cond and FAIL_SOFT:
+        # FAIL_SOFT 有効時のみ。候補が全滅。死んだ先頭候補をそのまま使うと conduct / critic が
+        # 毎回数百秒張り付く（2026-10-12 実測: 1709 秒）。採用済みの機体から、今この場で
+        # 再プローブして応答したものを充てる。
         _tried = set()
-        _first = ("", "")
         while True:
             _m, _note = _nim_conductor_fallback([p for p in picked if p not in _tried])
             if not _m:
                 break
-            if not _first[0]:
-                _first = (_m, _note)
             if _nim_model_available(_m):
                 cond = _m
                 print(f"⚠ [nim] Conductor 候補が全滅 → 採用済みの {cond} を Conductor に充てます"
                       f"（{_note}）")
                 break
             _tried.add(_m)
-        if not cond and _first[0]:
-            cond = _first[0]
-            print(f"⚠ [nim] Conductor 候補が全滅・退避先も応答なし → {cond} を試します"
-                  f"（{_first[1]}）")
+        # 退避先も全て応答しないときは、プローブしていない機体を充てず従来どおり先頭候補に戻す
+        # （一時的な 429 / ネット断で全プローブが slow のとき、提案機体に替わるのを避ける）。
         if not cond:
             cond = NIM_CONDUCTOR_CANDIDATES[0]
-            print(f"⚠ [nim] Conductor 候補が全滅。{cond} をそのまま使います")
+            print(f"⚠ [nim] Conductor 候補が全滅・退避先も応答なし。{cond} をそのまま使います")
+    if not cond:
+        # 無効時（ベンチ・既定）は 2f08b52 以前どおり: 候補が全滅なら先頭候補をそのまま使う。
+        cond = NIM_CONDUCTOR_CANDIDATES[0]
+        print(f"⚠ [nim] Conductor 候補が全滅。{cond} をそのまま使います")
     print(f"[setup] nim: conductor = {cond}"
           + (" (FUGU_CONDUCTOR 指定)" if CONDUCTOR_OVERRIDE else ""))
     jp_agg = agg                   # 日本語統合。qwen 系が消滅したため統合役を兼ねる
@@ -4841,16 +4897,18 @@ def conduct(question, history=None, office_attached=False):
         label="conductor",
         **_short_job_kwargs(),
     )
-    if _is_ask_error(raw):
-        # 通信/モデル失敗（__ERROR__）。エラー本文に JSON が混じっていても plan として
-        # 読まず、引き直しもせず（死んだモデルに同じ待ちをもう一度払うだけ）、
+    if FAIL_SOFT and _is_ask_error(raw):
+        # FAIL_SOFT 有効時のみ。通信/モデル失敗（__ERROR__）。エラー本文に JSON が混じっていても
+        # plan として読まず、引き直しもせず（死んだモデルに同じ待ちをもう一度払うだけ）、
         # validate_plan(None) = default_plan() の既定プランへ落とす。
+        # 無効時（ベンチ）は 2f08b52 以前どおり: __ERROR__ 本文も extract_json に通し、plan が
+        # 取れなければ 1 回引き直す。
         print(f"   ⚠ Conductor({CONDUCTOR}) が失敗 → 既定プランで続行します: "
               f"{strip_think(raw)[:120]}")
         plan = None
     else:
         plan = extract_json(raw)
-    if plan is None and not _is_ask_error(raw):
+    if plan is None and not (FAIL_SOFT and _is_ask_error(raw)):
         # スキーマ強制でも稀に JSON が崩れる(実測 ~1/10 程度の一過性)。固定フォールバック
         # プランより正しいプランの方が良いので、1 回だけ引き直す。
         raw = ask(
@@ -4859,7 +4917,7 @@ def conduct(question, history=None, office_attached=False):
             num_predict=NUM_PREDICT_JUDGE, label="conductor",
             **_short_job_kwargs(),
         )
-        plan = None if _is_ask_error(raw) else extract_json(raw)
+        plan = None if (FAIL_SOFT and _is_ask_error(raw)) else extract_json(raw)
     plan = _apply_routing_guardrails(question, validate_plan(plan))
     plan = _apply_accuracy_guardrails(question, plan)
     plan = _apply_office_guardrail(plan, office_attached)
@@ -4889,6 +4947,12 @@ def _critic_judge(question, answer, think):
     # ok=True にすると verify_single() の最終審判（think=True critic）が事実上
     # 無審査で通ってしまい、精度優先の方針に反するため ok=False にしてエスカレーション
     # させる（呼び出し元は MoA パネルへフォールバックできる）。
+    # この関数自体は FAIL_SOFT に関わらず常に ok=False を返す（"critic call failed:" で識別可能）。
+    # 唯一の例外は FAIL_SOFT=1（quorum サーバー）のときの *呼び出し側*: verify_single() /
+    # critique() は、think=False の Critic が __ERROR__ ならこの ok=False を「疑義」とは読まず、
+    # think=True の再検算もせず未検証として採用する（死んだ Critic に同じ待ちを払い直さないため。
+    # verify_single は別系統の second_opinion が本物の NG を出していればそれを残す）。
+    # FAIL_SOFT=0（既定・ベンチ）では呼び出し側も従来どおり再検算し、失敗なら False のまま。
     if strip_think(raw).startswith("__ERROR__"):
         return False, f"critic call failed: {strip_think(raw)}"[:200]
     p = extract_json(raw) or {}
@@ -4938,7 +5002,8 @@ def critique(question, answer):
     ok, issue1 = _critic_judge(question, answer, think=False)
     if ok:
         return True, ""
-    if _is_critic_call_failure(issue1):
+    if FAIL_SOFT and _is_critic_call_failure(issue1):
+        # （FAIL_SOFT 有効時のみ。無効時は 2f08b52 以前どおり下の think=True 再検算へ進む。）
         # Critic の呼び出し自体が失敗（__ERROR__）。審査できていないだけで回答に問題が
         # あるという意味ではなく、死んでいるモデルへ think=True の再検算をもう一度投げても
         # 同じ待ちを払うだけ（2026-10-12 実測: critic 2 回で 1085 秒）なので、再検算せず
@@ -5009,7 +5074,8 @@ def verify_single(question, answer):
     ok1, issue1 = _critic_judge(question, answer, think=False)
     ok2, issue2 = second_opinion(question, answer)
 
-    if not ok1 and _is_critic_call_failure(issue1):
+    if FAIL_SOFT and not ok1 and _is_critic_call_failure(issue1):
+        # （FAIL_SOFT 有効時のみ。無効時は 2f08b52 以前どおり下の分岐・think=True 再検算へ進む。）
         # Critic の呼び出し自体が失敗（__ERROR__）。審査していないだけで回答に問題があると
         # いう意味ではない。死んでいるモデルへ think=True の再検算をもう一度投げても同じ
         # 待ちを払うだけ（2026-10-12 実測: critic 2 回で 1085 秒）なので、再検算せず採用する。
