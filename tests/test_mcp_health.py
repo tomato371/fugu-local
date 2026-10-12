@@ -15,6 +15,25 @@ HEALTH = {
 }
 
 
+# fugu_remote /api/stats の実形状(_compute_stats)
+REAL_STATS = {
+    "generated_at": "2026-10-13T12:00:00", "subtasks": False,
+    "windows": {
+        "24h": {"total": 40,
+                "kinds": {"ok": 33, "empty": 2, "failed": 1, "salvaged": 3,
+                          "partial": 1, "cancelled": 0},
+                "ok_elapsed_sec": {"n": 33, "median": 41.5, "p90": 120.0},
+                "latest_bad": [{"id": "20261013-110000-ab", "kind": "empty",
+                                "reason": "回答が空"}]},
+        "7d": {"total": 200,
+               "kinds": {"ok": 180, "empty": 4, "failed": 3, "broken": 2,
+                         "salvaged": 11},
+               "ok_elapsed_sec": {"n": 180, "median": 50.0, "p90": 130.0},
+               "latest_bad": []},
+    },
+}
+
+
 def _stub(monkeypatch, routes):
     """routes: {path: (status, obj, err)}。未登録の path は 404。呼ばれた path を記録。"""
     calls = []
@@ -36,7 +55,7 @@ def _clean_env(monkeypatch):
 def test_server_up_with_stats(monkeypatch):
     health = dict(HEALTH, lineup=["a", "b"], conductor={"model": "c"},
                   bad_outcomes_24h=3, api_token="SECRET-VALUE")
-    stats = {"window": "24h", "total": 40, "bad_by_kind": {"empty": 2, "timeout": 1}}
+    stats = REAL_STATS
     calls = _stub(monkeypatch, {"/api/health": (200, health, ""),
                                 "/api/stats": (200, stats, "")})
     text = M._job_server_text()
@@ -46,7 +65,8 @@ def test_server_up_with_stats(monkeypatch):
     assert "backend: \"nim\"" in text and "backend_up: true" in text
     assert "queued: 2" in text and "version: \"1.2.3\"" in text
     assert "lineup: " in text and "conductor: " in text and "bad_outcomes_24h: 3" in text
-    assert "24h: total=40 / bad=3 (empty=2, timeout=1)" in text
+    assert "24h: 計40件 / 問題3件 (failed=1, empty=2)" in text
+    assert "7d: 計200件 / 問題9件" in text
     assert "SECRET-VALUE" not in text            # 秘密っぽいキーは出さない
 
 
@@ -175,3 +195,30 @@ def test_http_get_json_maps_errors(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen",
                         lambda req, timeout=None: _Resp(200, b"<html>"))
     assert M._http_get_json("/x")[0] == 200 and M._http_get_json("/x")[1] is None
+
+
+def test_stats_line_real_shape():
+    assert M._stats_line(REAL_STATS).splitlines() == [
+        "24h: 計40件 / 問題3件 (failed=1, empty=2) / 救済4件 (salvaged=3, partial=1)"
+        " / ok所要 中央値41.5秒 / p90 120.0秒 (n=33)",
+        "7d: 計200件 / 問題9件 (failed=3, empty=4, broken=2) / 救済11件 (salvaged=11)",
+    ]
+
+
+def test_stats_line_real_shape_quiet_and_empty():
+    quiet = {"windows": {
+        "24h": {"total": 0, "kinds": {},
+                "ok_elapsed_sec": {"n": 0, "median": None, "p90": None},
+                "latest_bad": []},
+        "7d": {"total": 5, "kinds": {"ok": 5}}}}
+    assert M._stats_line(quiet).splitlines() == ["24h: 計0件 / 問題0件",
+                                                 "7d: 計5件 / 問題0件"]
+
+
+@pytest.mark.parametrize("stats", [
+    {"windows": {}}, {"windows": "x"}, {"windows": {"24h": 5}},
+    {"windows": {"24h": {}}}, {"windows": {"24h": {"total": "n", "kinds": [1],
+                                                  "ok_elapsed_sec": "z"}}},
+])
+def test_stats_line_real_shape_defensive(stats):
+    assert isinstance(M._stats_line(stats), str)

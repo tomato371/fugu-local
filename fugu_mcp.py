@@ -242,8 +242,59 @@ def _compact(value, limit=200) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+# fugu_remote の OUTCOME_BAD(+ 壊れた job.json = broken)。回答を受け取れなかった結果。
+_STATS_BAD_KINDS = ("failed", "interrupted", "empty", "error_answer", "broken")
+# 回答は出たが品質が落ちた結果(問題件数には数えず、救済として別掲)。
+_STATS_SALVAGE_KINDS = ("salvaged", "partial")
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _kind_counts(kinds, order):
+    """kinds から order の種類だけ(0 件は除く)取り出し (合計, 'k=n, ...') を返す。"""
+    nums = {k: kinds[k] for k in order
+            if _is_num(kinds.get(k)) and kinds[k] > 0}
+    return sum(nums.values()), ", ".join(f"{k}={v}" for k, v in nums.items())
+
+
+def _window_line(name, w, with_timing=False) -> str:
+    kinds = w.get("kinds") if isinstance(w.get("kinds"), dict) else {}
+    total = w.get("total")
+    parts = [f"{name}: 計{total}件" if _is_num(total) else f"{name}: 計?件"]
+    nbad, bad_txt = _kind_counts(kinds, _STATS_BAD_KINDS)
+    parts.append(f"問題{nbad}件" + (f" ({bad_txt})" if bad_txt else ""))
+    nsal, sal_txt = _kind_counts(kinds, _STATS_SALVAGE_KINDS)
+    if nsal:
+        parts.append(f"救済{nsal}件 ({sal_txt})")
+    ok = w.get("ok_elapsed_sec")
+    if with_timing and isinstance(ok, dict) and _is_num(ok.get("median")):
+        txt = f"ok所要 中央値{ok['median']}秒"
+        if _is_num(ok.get("p90")):
+            txt += f" / p90 {ok['p90']}秒"
+        if _is_num(ok.get("n")):
+            txt += f" (n={ok['n']})"
+        parts.append(txt)
+    return " / ".join(parts)
+
+
 def _stats_line(stats) -> str:
-    """/api/stats の 1 行要約(キー名が未確定なので総当たりで防御的に)。"""
+    """/api/stats の要約。fugu_remote の実形状 {"windows": {"24h": {...}, "7d": {...}}}
+    を優先して読み、知らない形なら汎用の総当たり(_stats_line_generic)に落とす。
+    複数行になりうる(24h の次の行に 7d)。"""
+    wins = stats.get("windows") if isinstance(stats, dict) else None
+    if isinstance(wins, dict):
+        picked = [(n, wins[n]) for n in ("24h", "7d")
+                  if isinstance(wins.get(n), dict)]
+        if picked:
+            return "\n".join(_window_line(n, w, with_timing=(n == "24h"))
+                             for n, w in picked)
+    return _stats_line_generic(stats)
+
+
+def _stats_line_generic(stats) -> str:
+    """未知の形状向けの 1 行要約(キー名を総当たりで防御的に)。"""
     if not isinstance(stats, dict):
         return _compact(stats)
     for key in ("last_24h", "24h", "window_24h"):   # 入れ子ならそちらを見る
@@ -301,7 +352,7 @@ def _job_server_text() -> str:
             lines.append("  [NG] backend が落ちています(NIM / Ollama への接続を確認)")
         s_status, stats, _ = _http_get_json("/api/stats")
         if s_status == 200 and stats is not None:
-            lines.append("  " + _stats_line(stats))
+            lines.extend("  " + ln for ln in _stats_line(stats).splitlines())
         elif s_status is None or s_status != 404:
             lines.append(f"  stats: 取得できず(HTTP {s_status})" if s_status
                          else "  stats: 取得できず(接続エラー)")

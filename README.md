@@ -290,7 +290,7 @@ claude mcp add --scope user fugu -- python /path/to/fugu-local/fugu_mcp.py
 |---|---|
 | `fugu_ask` | Answer via the full MoA pipeline (blocking — for quick questions) |
 | `fugu_ask_start` / `fugu_ask_status` | Job-style ask for multi-minute questions: start returns a `job_id` immediately, poll for the answer |
-| `fugu_health` | Instant preflight: Ollama up? models pulled? optional deps installed? |
+| `fugu_health` | Instant preflight: Ollama up? models pulled? optional deps installed? Also checks the job server (`:8800`, the production path): reachable? backend up? queue, version, and a 24h/7d outcome summary from `/api/stats` (override with `FUGU_JOB_SERVER_URL` / `FUGU_REMOTE_TOKEN`) |
 
 Progress output goes to stderr (visible in MCP logs) so the JSON-RPC channel stays clean;
 jobs run one at a time (8 GB VRAM). Slack notification (`FUGU_SLACK_WEBHOOK`) fires on
