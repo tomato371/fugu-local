@@ -27,6 +27,7 @@ import shutil
 import tempfile
 import argparse
 import copy
+import contextlib
 import threading
 import subprocess
 import urllib.request
@@ -110,6 +111,22 @@ DEEPCONF_FILTER_ETA = 0.5     # 投票前に除外する低自信トレースの
 # リセットされるため、壁時計上限と「data 行が一定時間来ない」検知の二段で有界化する。
 NIM_STREAM_MAX_S = 2400       # 1ストリームの壁時計上限（40分。minimax の正当な長考は ~30分）
 NIM_STREAM_IDLE_S = 600       # data 行が途絶えてよい最大秒数（ping だけの状態を切る）
+# Conductor / Critic のような「短い用事」の ask() 1 回全体の期限（stream_max_s として渡す）。
+# 2026-10-12: Conductor の gemma が死んでいると conduct が 467 秒・critic 2 回が 1085 秒
+# 張り付き、チームの子ジョブは 60 分無応答だった。健全時の実測は conduct が最大 35 秒
+# （fugu-remote/jobs の 17 件・中央値 6 秒・gemma 以外の時期を含む）なので、180 秒は約 5 倍の余裕。
+# 0 以下で無効（従来どおり NIM_STREAM_MAX_S の 40 分枠）。NIM 以外のバックエンドでは渡さない。
+def _env_seconds(name, default):
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return float(default)
+
+
+CONDUCTOR_STREAM_MAX_S = _env_seconds("FUGU_CONDUCTOR_STREAM_MAX_S", 180)
+# Critic の再検算（think=True・最大 NUM_PREDICT_JUDGE_THINK=6144 トークン）は短い用事ではない。
+# bench_recheck.py は 1 本 60〜300 秒を見込んでおり、健全な再検算を切らない余裕として 600 秒。
+CRITIC_THINK_STREAM_MAX_S = _env_seconds("FUGU_CRITIC_THINK_STREAM_MAX_S", 600)
 # 429 対策の要（2026-08-03 実測）: NIM の 429 は Retry-After ヘッダを付けてこない。
 # 旧実装の「既定10秒待ちで各ワーカーが独立に再送」は、並列4本の再送(毎10秒×4)自体が
 # 40 RPM 制限を叩き続けてスロットルが解けない自己増幅ループになり、SC全票が
@@ -123,6 +140,7 @@ NIM_STREAM_IDLE_S = 600       # data 行が途絶えてよい最大秒数（ping
 # 道連れにして SC 全体が凍る。キーはモデル ID、値は「その時刻まで送信を控える」epoch 秒。
 _NIM_COOLDOWN = {}            # model_id -> epoch秒
 _NIM_COOLDOWN_LOCK = threading.Lock()
+_NIM_COOLDOWN_SEEN = {}       # model_id -> 告知済みのクールダウン終了時刻（同一クールダウンの重複告知を抑える）
 NIM_MODEL_IDS = set()         # apply_nim_profile() が投入するディスパッチ実体
 NIM_VISION_MODEL = ""         # NIM 側で選ばれた vision 対応モデル（未検出なら空）
 NIM_STRUCTURED_OK = set()     # response_format=json_object を受けるモデル (プロファイルが投入)
@@ -3202,6 +3220,34 @@ def _keep_thinking(model, label, think):
                              "text": think[-NIM_THINK_KEEP_CHARS:]})
 
 
+@contextlib.contextmanager
+def _nim_slot(deadline=None):
+    """同時送信セマフォ。deadline(epoch秒) 指定時は、取れないまま期限を過ぎたら TimeoutError。
+    deadline=None（stream_max_s 未指定）は従来の `with _NIM_SEMAPHORE:` と完全に同じ。"""
+    if deadline is None:
+        with _NIM_SEMAPHORE:
+            yield
+        return
+    if not _NIM_SEMAPHORE.acquire(timeout=max(0.0, deadline - time.time())):
+        raise TimeoutError("ask() deadline exceeded while waiting for a send slot")
+    try:
+        yield
+    finally:
+        _NIM_SEMAPHORE.release()
+
+
+def _short_job_kwargs(think_recheck=False):
+    """Conductor / Critic のような短い用事の ask() に付ける kwargs。
+
+    NIM の Conductor のときだけ stream_max_s を渡す（Ollama・テストの偽 ask・無効化
+    (<=0) のときは空 = 従来どおり何も渡さない）。think_recheck=True は Critic の
+    再検算（長めの枠）。"""
+    if not _is_nim(CONDUCTOR):
+        return {}
+    cap = CRITIC_THINK_STREAM_MAX_S if think_recheck else CONDUCTOR_STREAM_MAX_S
+    return {"stream_max_s": cap} if cap and cap > 0 else {}
+
+
 def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
              num_predict=None, num_ctx=None, images=None, stream_max_s=None):
     """NIM (OpenAI 互換 /chat/completions) 送信層。シグネチャと「失敗は例外でなく
@@ -3224,9 +3270,16 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
 
     リトライ: 通常失敗は ASK_RETRY_ATTEMPTS/ASK_RETRY_BACKOFF 踏襲。429/503 は別予算
     (NIM_RATE_RETRIES) で Retry-After を尊重して待つ — レート制限は待てば直るので、通常予算と
-    混ぜると SC 票が黙って死ぬ。セマフォは urlopen 区間のみ保持（sleep 中は解放）。"""
+    混ぜると SC 票が黙って死ぬ。セマフォは urlopen 区間のみ保持（sleep 中は解放）。
+
+    stream_max_s を指定したときだけ、これは ask() 1 回全体の期限にもなる（開始 + stream_max_s）。
+    期限を過ぎる再送（通常/429・503/空応答/打ち切り増額など）は行わず __ERROR__ を返し、
+    1 回のストリームの壁時計はセマフォ取得後から測る。未指定なら従来どおり（期限なし・
+    ストリームの壁時計は NIM_STREAM_MAX_S）。"""
     if think is None:
         think = model_cfg(model, "think")
+    _t_begin = time.time()
+    deadline = (_t_begin + stream_max_s) if stream_max_s else None   # 指定時のみ
     msgs = messages
     if images:
         msgs = _nim_attach_images(msgs, images)
@@ -3300,9 +3353,18 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         # モデル別クールダウン: 誰かがこのモデルで 429 を踏んだら同モデルへの送信を控える
         # （セマフォ取得前に待つ = 待機中も他モデルのリクエストをブロックしない）
         while True:
-            wait = _NIM_COOLDOWN.get(model, 0.0) - time.time()
+            until = _NIM_COOLDOWN.get(model, 0.0)
+            wait = until - time.time()
             if wait <= 0:
                 break
+            if deadline is not None and time.time() >= deadline:
+                raise TimeoutError("ask() deadline exceeded while waiting for cooldown")
+            with _NIM_COOLDOWN_LOCK:       # 同じクールダウンの告知は待ちに入るとき 1 回だけ
+                _announce = _NIM_COOLDOWN_SEEN.get(model) != until
+                _NIM_COOLDOWN_SEEN[model] = until
+            if _announce:
+                print(f"   [nim] {model}: クールダウン中（429/503 を受けたため）→ "
+                      f"あと約{wait:.0f}秒待ってから送信します")
             time.sleep(min(wait, 5.0))
         # 【ストリーミング必須 (2026-08-03 実測)】非ストリーミングだと、思考モデルの長い
         # 生成中に NIM のゲートウェイが応答を待ちきれず HTTP 504 を返す（nemotron-550b ×
@@ -3329,8 +3391,14 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
         # 数分で済むはずの呼び出しが 40 分返らない（2026-09-02 実測: チームの分解が
         # 40 分。呼び出し側は「分解中」のまま固まって見える）。
         cap_s = stream_max_s or NIM_STREAM_MAX_S
-        with _NIM_SEMAPHORE:
-            with urllib.request.urlopen(req, timeout=NIM_TIMEOUT) as r:
+        with _nim_slot(deadline):
+            if stream_max_s:
+                # 指定時のみ: 1 ストリームの壁時計はセマフォ取得後から測る
+                # （他の呼び出しの送信待ちを、この呼び出しの生成時間に数えない）
+                t_stream = last_data = time.time()
+            with urllib.request.urlopen(
+                    req, timeout=(min(NIM_TIMEOUT, stream_max_s) if stream_max_s
+                                  else NIM_TIMEOUT)) as r:
                 for raw_line in r:
                     now = time.time()
                     if now - t_stream > cap_s:
@@ -3408,7 +3476,22 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
     restored_thinking = False
     empty_budget = NIM_EMPTY_RETRIES
     empty_retried = False
+
+    def _deadline_hit(wait=0.0):
+        """stream_max_s 指定時のみ: あと wait 秒待って再送すると期限を過ぎるか。"""
+        return deadline is not None and time.time() + wait >= deadline
+
+    def _deadline_out(last):
+        print(f"   [nim] {model}: ask() の期限 {stream_max_s:g}秒を超過 → 再送せず打ち切ります")
+        return (f"__ERROR__: ask() deadline {stream_max_s:g}s exceeded; retry skipped "
+                f"(last: {str(last)[:300]})")
+
+    _resend = False
     while True:
+        if _resend and _deadline_hit():
+            out = _deadline_out(out)
+            break
+        _resend = True
         try:
             out = _send(payload)
             # 打ち切り自動増額 (2026-08-03 実測対応): AIME 級の難問では思考が max_tokens
@@ -3435,6 +3518,9 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
             # finish=="length" は out が "__ERROR__: truncated" になるのでここには来ず、
             # 従来どおり下の max_tokens 増額が担当する（経路を横取りしない）。
             if not out and empty_budget > 0:
+                if _deadline_hit(NIM_EMPTY_RETRY_WAIT):
+                    out = _deadline_out(out)
+                    break
                 empty_budget -= 1
                 empty_retried = True
                 with _NIM_FAIL_LOCK:
@@ -3442,7 +3528,8 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                 # main には _wait_visibly が無い（chat-profile 側の追加）ので
                 # 429 経路と同じ素の print + time.sleep で待つ。
                 print(f"   [nim] {model}: 空応答 → "
-                      f"{NIM_EMPTY_RETRY_WAIT:.0f}秒待って再送します")
+                      f"{NIM_EMPTY_RETRY_WAIT:.0f}秒待って再送します"
+                      f"（空応答再送 {NIM_EMPTY_RETRIES - empty_budget}/{NIM_EMPTY_RETRIES}）")
                 time.sleep(NIM_EMPTY_RETRY_WAIT)
                 continue
             if (out.startswith("__ERROR__: truncated") and not escalated_tokens
@@ -3473,6 +3560,11 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
                 with _NIM_COOLDOWN_LOCK:
                     _NIM_COOLDOWN[model] = max(_NIM_COOLDOWN.get(model, 0.0),
                                                time.time() + wait)
+                if _deadline_hit(wait):
+                    out = _deadline_out(f"{e} {err_body}")
+                    break
+                print(f"   [nim] {model}: HTTP {e.code} → {wait:.0f}秒待って再送します"
+                      f"（レート制限リトライ {NIM_RATE_RETRIES - rate_budget}/{NIM_RATE_RETRIES}）")
                 time.sleep(wait)
                 continue
             if e.code == 400 and images and not switched_image_form:
@@ -3497,12 +3589,24 @@ def _ask_nim(model, messages, temperature, think=None, fmt=None, label=None,
             out = f"__ERROR__: {e} {err_body}"
             if attempt >= ASK_RETRY_ATTEMPTS:
                 break
+            if _deadline_hit(ASK_RETRY_BACKOFF[attempt - 1]):
+                out = _deadline_out(out)
+                break
+            print(f"   [nim] {model}: HTTP {e.code} で失敗 → "
+                  f"{ASK_RETRY_BACKOFF[attempt - 1]}秒待って再送します"
+                  f"（試行 {attempt + 1}/{ASK_RETRY_ATTEMPTS}）")
             time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
             attempt += 1
         except Exception as e:
             out = f"__ERROR__: {e}"
             if attempt >= ASK_RETRY_ATTEMPTS:
                 break
+            if _deadline_hit(ASK_RETRY_BACKOFF[attempt - 1]):
+                out = _deadline_out(out)
+                break
+            print(f"   [nim] {model}: 失敗（{str(e)[:80]}）→ "
+                  f"{ASK_RETRY_BACKOFF[attempt - 1]}秒待って再送します"
+                  f"（試行 {attempt + 1}/{ASK_RETRY_ATTEMPTS}）")
             time.sleep(ASK_RETRY_BACKOFF[attempt - 1])
             attempt += 1
     if SHOW_TIMING:
@@ -4731,6 +4835,7 @@ def conduct(question, history=None, office_attached=False):
         fmt=CONDUCTOR_SCHEMA,
         num_predict=NUM_PREDICT_JUDGE,
         label="conductor",
+        **_short_job_kwargs(),
     )
     if _is_ask_error(raw):
         # 通信/モデル失敗（__ERROR__）。エラー本文に JSON が混じっていても plan として
@@ -4748,6 +4853,7 @@ def conduct(question, history=None, office_attached=False):
             CONDUCTOR, msgs, CONDUCTOR_TEMP,
             think=False, fmt=CONDUCTOR_SCHEMA,
             num_predict=NUM_PREDICT_JUDGE, label="conductor",
+            **_short_job_kwargs(),
         )
         plan = None if _is_ask_error(raw) else extract_json(raw)
     plan = _apply_routing_guardrails(question, validate_plan(plan))
@@ -4770,6 +4876,7 @@ def _critic_judge(question, answer, think):
         fmt=CRITIC_SCHEMA,
         num_predict=(NUM_PREDICT_JUDGE_THINK if think else NUM_PREDICT_JUDGE),
         label="critic",
+        **_short_job_kwargs(think_recheck=bool(think)),
     )
     # 2026-07-22: __ERROR__ センチネル（ask() の通信/モデル失敗）と、空文字や
     # パース不能だが正常な出力とを区別する。後者は gpt-oss:20b の思考予算切れで
@@ -4782,6 +4889,14 @@ def _critic_judge(question, answer, think):
         return False, f"critic call failed: {strip_think(raw)}"[:200]
     p = extract_json(raw) or {}
     return bool(p.get("ok", True)), str(p.get("issue", ""))[:200]
+
+
+_CRITIC_CALL_FAILED_PREFIX = "critic call failed:"
+
+
+def _is_critic_call_failure(issue):
+    """_critic_judge / second_opinion が返す「呼び出し失敗」の issue か（本物の NG と区別する）。"""
+    return isinstance(issue, str) and issue.startswith(_CRITIC_CALL_FAILED_PREFIX)
 
 
 def _tdc_check(question, answer):
@@ -4875,6 +4990,17 @@ def verify_single(question, answer):
         return False, code_issue
     ok1, issue1 = _critic_judge(question, answer, think=False)
     ok2, issue2 = second_opinion(question, answer)
+
+    if not ok1 and _is_critic_call_failure(issue1):
+        # Critic の呼び出し自体が失敗（__ERROR__）。審査していないだけで回答に問題があると
+        # いう意味ではない。死んでいるモデルへ think=True の再検算をもう一度投げても同じ
+        # 待ちを払うだけ（2026-10-12 実測: critic 2 回で 1085 秒）なので、再検算せず採用する。
+        # 別系統の second_opinion が実際に NG を出していたら、その疑義は握りつぶさない。
+        if ok2 or _is_critic_call_failure(issue2):
+            print(f"   ⚠ Critic({CONDUCTOR}) の呼び出しが失敗 → 未検証のまま採用します: "
+                  f"{issue1[:120]}")
+            return True, ""
+        return False, f"second opinion ({SECOND_OPINION_MODEL}): {issue2}"
 
     if _SECOND_OPINION_DISABLED:
         doubt = issue1
