@@ -377,6 +377,58 @@ def _stats_line_generic(stats) -> str:
     return "24h: " + " / ".join(parts)
 
 
+def _alert_lines(health, shown) -> list:
+    """health["alerts"] = [{code, message, since}] を警告行にする。キーが無ければ何も出さない。"""
+    if "alerts" not in health:                      # アラート未対応の古いサーバー
+        return []
+    shown.add("alerts")
+    alerts = health["alerts"]
+    if not isinstance(alerts, list):
+        return [f"  [警告] alerts の形式が想定外: {_compact(alerts, 120)}"]
+    if not alerts:
+        return ["  アラートなし"]
+    out = []
+    for a in alerts:
+        if not isinstance(a, dict):
+            out.append(f"  [警告] {_compact(a, 160)}")
+            continue
+        msg = a.get("message") or a.get("code") or "(内容不明)"
+        since = a.get("since")
+        out.append(f"  [警告] {msg}" + (f" (since {since})" if since else ""))
+    return out
+
+
+def _lineup_lines(health, shown) -> list:
+    """conductor(代替表示つき)・lineup(カンマ区切り)・setup_sec(丸め)。"""
+    out = []
+    if "conductor" in health:
+        shown.update(("conductor", "conductor_fallback"))
+        cond = health["conductor"]
+        if isinstance(cond, str) and cond:
+            out.append(f"  conductor: {cond}"
+                       + (" (代替)" if health.get("conductor_fallback") is True else ""))
+        elif isinstance(cond, str):
+            out.append("  conductor: (未確定)")
+        else:
+            out.append(f"  conductor: {_compact(cond, 120)}")
+    if "lineup" in health:
+        shown.add("lineup")
+        lineup = health["lineup"]
+        if isinstance(lineup, list):
+            names = [x if isinstance(x, str) else _compact(x, 60) for x in lineup]
+            out.append("  lineup: " + (", ".join(names) if names else "(未確定)"))
+        else:
+            out.append(f"  lineup: {_compact(lineup, 200)}")
+    if "setup_sec" in health:
+        shown.add("setup_sec")
+        sec = health["setup_sec"]
+        if _is_num(sec):
+            out.append(f"  setup_sec: {round(sec, 1):g}")
+        elif sec is not None:
+            out.append(f"  setup_sec: {_compact(sec, 40)}")
+    return out
+
+
 def _job_server_text() -> str:
     """ジョブサーバー(本番経路)の健全性。到達不能でも例外を出さず明示する。"""
     base = _job_server_base()
@@ -405,10 +457,12 @@ def _job_server_text() -> str:
             return "\n".join(lines)
         lines.append("[OK] 応答あり")
         shown = set()
+        lines.extend(_alert_lines(health, shown))     # 警告は最初に目立たせる
         for key, label in _HEALTH_FIELDS:
             if key in health:
                 shown.add(key)
                 lines.append(f"  {label}: {_compact(health[key], 120)}")
+        lines.extend(_lineup_lines(health, shown))
         for key in health:
             low = str(key).lower()
             if (key not in shown and any(h in low for h in _HEALTH_EXTRA_HINTS)

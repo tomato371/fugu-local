@@ -315,3 +315,62 @@ def test_urlopen_bypasses_proxies(monkeypatch):
     (ph,) = seen["handlers"]
     assert isinstance(ph, urllib.request.ProxyHandler) and ph.proxies == {}
     assert seen["timeout"] == 7
+
+
+# ---------------------------------------- alerts / conductor / lineup / setup_sec
+
+DIAG = dict(HEALTH, lineup=["llama-3.3", "qwen3", "deepseek-v3"],
+            conductor="qwen3-next", conductor_fallback=True, setup_sec=12.345,
+            conductor_note="本命が応答せず、qwen3-next に替わっています",
+            alerts=[{"code": "conductor_fallback", "since": "2026-10-13T09:00:00",
+                     "message": "司令塔（Conductor）が代替機で動いています: qwen3-next"},
+                    {"code": "x", "message": "二つ目", "since": None}])
+
+
+def test_alerts_printed_first_and_diag_fields_formatted(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (200, DIAG, "")})
+    lines = M._job_server_text().splitlines()
+    i_ok = lines.index("[OK] 応答あり")
+    assert lines[i_ok + 1] == ("  [警告] 司令塔（Conductor）が代替機で動いています: qwen3-next"
+                               " (since 2026-10-13T09:00:00)")
+    assert lines[i_ok + 2] == "  [警告] 二つ目"              # since なしは括弧なし
+    text = "\n".join(lines)
+    assert "  conductor: qwen3-next (代替)" in text
+    assert "  lineup: llama-3.3, qwen3, deepseek-v3" in text
+    assert "  setup_sec: 12.3" in text
+    assert "conductor_fallback:" not in text                # (代替) 表示に統合
+    assert "conductor_note:" in text                        # 他の関連キーは汎用表示のまま
+    assert text.count("conductor: ") == 1
+
+
+def test_no_alerts_and_primary_conductor(monkeypatch):
+    h = dict(DIAG, alerts=[], conductor_fallback=False, setup_sec=40.0)
+    _stub(monkeypatch, {"/api/health": (200, h, "")})
+    text = M._job_server_text()
+    assert "  アラートなし" in text and "[警告]" not in text
+    assert "conductor: qwen3-next\n" in text + "\n" and "(代替)" not in text
+    assert "setup_sec: 40\n" in text + "\n"
+
+
+def test_old_server_without_diag_keys_prints_no_alert_line(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (200, HEALTH, "")})
+    text = M._job_server_text()
+    assert "アラートなし" not in text and "[警告]" not in text
+    assert "lineup" not in text and "conductor" not in text
+
+
+@pytest.mark.parametrize("diag", [
+    {"alerts": "oops"}, {"alerts": [1, None, {"code": "c"}, {}]},
+    {"conductor": None, "lineup": None, "setup_sec": "x"},
+    {"conductor": "", "lineup": [], "setup_sec": None},
+    {"lineup": [1, {"a": 1}], "conductor_fallback": "yes", "conductor": "m"},
+])
+def test_diag_keys_are_defensive(monkeypatch, diag):
+    _stub(monkeypatch, {"/api/health": (200, dict(HEALTH, **diag), "")})
+    assert "[OK]" in M._job_server_text()
+
+
+def test_empty_conductor_and_lineup_shown_as_undetermined(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (200, dict(HEALTH, conductor="", lineup=[]), "")})
+    text = M._job_server_text()
+    assert "conductor: (未確定)" in text and "lineup: (未確定)" in text
