@@ -177,5 +177,6 @@ def test_redirect_stdio_reserves_rpc_channel(monkeypatch):
 def test_health_uses_launcher_preflight(monkeypatch):
     import fugu_launcher as L
     monkeypatch.setattr(L, "installed_models", lambda url, timeout=2.0: ["qwen3:4b"])
+    monkeypatch.setattr(M, "_job_server_text", lambda: "(job server stub)")
     text = M._health_text()
     assert "Ollama OK" in text

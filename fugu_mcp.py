@@ -107,7 +107,8 @@ TOOLS = [
     },
     {
         "name": "fugu_health",
-        "description": "Ollama の生死・導入済みモデル・任意依存の充足を即時チェックする。",
+        "description": ("Ollama の生死・導入済みモデル・任意依存の充足と、"
+                        "ジョブサーバー(実運用の経路)の稼働状況を即時チェックする。"),
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
@@ -177,10 +178,143 @@ class Jobs:
         return out
 
 
-def _health_text() -> str:
+def _ollama_health_text() -> str:
     """ランチャーの preflight を流用(fugu_local を import しない軽量チェック)。"""
     from fugu_launcher import check_env, format_check, load_settings
     return format_check(check_env(load_settings()))
+
+
+# ---------------------------------------------------------------- ジョブサーバー
+# 実運用の経路は fugu_ctl.py(:8800 プロキシ)→ fugu_remote.py(NVIDIA NIM)。
+# Ollama だけ見て "OK" と言っても本番の健全性は分からないので、ここでも見る。
+
+_JOB_SERVER_TIMEOUT = 5.0
+_SECRETISH = ("token", "secret", "password", "api_key", "apikey")
+# /api/health の既知キー(表示順とラベル)。未知・欠落は黙って飛ばす。
+_HEALTH_FIELDS = [
+    ("backend", "backend"), ("backend_up", "backend_up"),
+    ("backend_url", "backend_url"), ("setup_done", "setup_done"),
+    ("setup_ok", "setup_ok"), ("queued", "queued"), ("running", "running"),
+    ("current", "current"), ("phase", "phase"), ("parallel", "parallel"),
+    ("version", "version"),
+]
+_HEALTH_EXTRA_HINTS = ("lineup", "conductor", "bad")   # 名前に含むキーも拾う
+
+
+def _job_server_base() -> str:
+    """ジョブサーバーの base URL。FUGU_JOB_SERVER_URL > FUGU_REMOTE_PORT > 8800。"""
+    url = os.environ.get("FUGU_JOB_SERVER_URL", "").strip()
+    if url:
+        return url.rstrip("/")
+    port = os.environ.get("FUGU_REMOTE_PORT", "").strip() or "8800"
+    return f"http://127.0.0.1:{port}"
+
+
+def _http_get_json(path: str, timeout: float = _JOB_SERVER_TIMEOUT):
+    """ジョブサーバーへ GET → (HTTP ステータス or None, JSON or None, エラー文)。
+
+    認証は fugu_remote と同じ X-Fugu-Token ヘッダ(環境変数 FUGU_REMOTE_TOKEN)。
+    例外は投げない(到達不能も戻り値で表す)。
+    """
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(_job_server_base() + path)
+    token = os.environ.get("FUGU_REMOTE_TOKEN", "").strip()
+    if token:
+        req.add_header("X-Fugu-Token", token)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, None, f"HTTP {exc.code}"
+    except Exception as exc:                       # URLError / timeout / reset 等
+        reason = getattr(exc, "reason", None) or exc
+        return None, None, f"{type(exc).__name__}: {reason}"
+    try:
+        return status, json.loads(raw.decode("utf-8", "replace")), ""
+    except ValueError:
+        return status, None, "JSON ではない応答"
+
+
+def _compact(value, limit=200) -> str:
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                      default=str)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _stats_line(stats) -> str:
+    """/api/stats の 1 行要約(キー名が未確定なので総当たりで防御的に)。"""
+    if not isinstance(stats, dict):
+        return _compact(stats)
+    for key in ("last_24h", "24h", "window_24h"):   # 入れ子ならそちらを見る
+        if isinstance(stats.get(key), dict):
+            stats = stats[key]
+            break
+    total = next((stats[k] for k in ("total", "jobs", "count", "n")
+                  if isinstance(stats.get(k), int)
+                  and not isinstance(stats.get(k), bool)), None)
+    bad = next((stats[k] for k in ("bad_by_kind", "bad", "bad_outcomes",
+                                   "bad_kinds") if k in stats), None)
+    if total is None and bad is None:
+        return _compact(stats)                      # 形が分からなければそのまま
+    parts = [f"total={total}" if total is not None else "total=?"]
+    if isinstance(bad, dict):
+        nums = {k: v for k, v in bad.items()
+                if isinstance(v, int) and not isinstance(v, bool)}
+        kinds = ", ".join(f"{k}={v}" for k, v in nums.items())
+        parts.append(f"bad={sum(nums.values())}" + (f" ({kinds})" if kinds else ""))
+    elif isinstance(bad, int) and not isinstance(bad, bool):
+        parts.append(f"bad={bad}")
+    elif bad is not None:
+        parts.append(f"bad={_compact(bad, 80)}")
+    return "24h: " + " / ".join(parts)
+
+
+def _job_server_text() -> str:
+    """ジョブサーバー(本番経路)の健全性。到達不能でも例外を出さず明示する。"""
+    base = _job_server_base()
+    lines = ["== ジョブサーバー(実運用の経路) ==", f"URL: {base}"]
+    try:
+        status, health, err = _http_get_json("/api/health")
+        if status is None:
+            lines.append(f"[NG] ジョブサーバーに到達できません: {err}")
+            lines.append("     fugu_ctl.py / fugu_remote.py が落ちている可能性があります。")
+            return "\n".join(lines)
+        if status in (401, 403):
+            lines.append(f"[NG] 認証エラー(HTTP {status}): 環境変数 FUGU_REMOTE_TOKEN を確認")
+            return "\n".join(lines)
+        if status != 200 or not isinstance(health, dict):
+            lines.append(f"[NG] 応答が異常です(HTTP {status}): {err or _compact(health, 120)}")
+            return "\n".join(lines)
+        lines.append("[OK] 応答あり")
+        shown = set()
+        for key, label in _HEALTH_FIELDS:
+            if key in health:
+                shown.add(key)
+                lines.append(f"  {label}: {_compact(health[key], 120)}")
+        for key in health:
+            low = str(key).lower()
+            if (key not in shown and any(h in low for h in _HEALTH_EXTRA_HINTS)
+                    and not any(s in low for s in _SECRETISH)):
+                lines.append(f"  {key}: {_compact(health[key])}")
+        if health.get("backend_up") is False:
+            lines.append("  [NG] backend が落ちています(NIM / Ollama への接続を確認)")
+        s_status, stats, _ = _http_get_json("/api/stats")
+        if s_status == 200 and stats is not None:
+            lines.append("  " + _stats_line(stats))
+        elif s_status is None or s_status != 404:
+            lines.append(f"  stats: 取得できず(HTTP {s_status})" if s_status
+                         else "  stats: 取得できず(接続エラー)")
+        else:
+            lines.append("  stats: 未対応(/api/stats は 404)")
+    except Exception as exc:                        # 診断が診断対象を壊さない
+        lines.append(f"[NG] ジョブサーバーの確認中にエラー: {type(exc).__name__}: {exc}")
+    return "\n".join(lines)
+
+
+def _health_text() -> str:
+    """Ollama(ローカル)+ ジョブサーバー(実運用)の二段チェック。"""
+    return _ollama_health_text() + "\n\n" + _job_server_text()
 
 
 # ---------------------------------------------------------------- JSON-RPC 処理

@@ -1,0 +1,177 @@
+# Copyright 2026 fugu-local contributors
+# SPDX-License-Identifier: Apache-2.0
+"""fugu_health のジョブサーバー節のオフラインテスト(HTTP は全部スタブ、ネット不要)。"""
+import urllib.error
+
+import pytest
+
+import fugu_mcp as M
+
+HEALTH = {
+    "backend": "nim", "backend_up": True, "backend_url": "https://integrate.api.nvidia.com/v1",
+    "setup_done": True, "setup_ok": True, "queued": 2, "running": ["j1"],
+    "current": "j1", "phase": "aggregate", "parallel": 1, "version": "1.2.3",
+    "search_ready": True,
+}
+
+
+def _stub(monkeypatch, routes):
+    """routes: {path: (status, obj, err)}。未登録の path は 404。呼ばれた path を記録。"""
+    calls = []
+
+    def fake(path, timeout=5.0):
+        calls.append(path)
+        return routes.get(path, (404, None, "HTTP 404"))
+
+    monkeypatch.setattr(M, "_http_get_json", fake)
+    return calls
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    for var in ("FUGU_JOB_SERVER_URL", "FUGU_REMOTE_PORT", "FUGU_REMOTE_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_server_up_with_stats(monkeypatch):
+    health = dict(HEALTH, lineup=["a", "b"], conductor={"model": "c"},
+                  bad_outcomes_24h=3, api_token="SECRET-VALUE")
+    stats = {"window": "24h", "total": 40, "bad_by_kind": {"empty": 2, "timeout": 1}}
+    calls = _stub(monkeypatch, {"/api/health": (200, health, ""),
+                                "/api/stats": (200, stats, "")})
+    text = M._job_server_text()
+    assert calls == ["/api/health", "/api/stats"]
+    assert "http://127.0.0.1:8800" in text
+    assert "[OK]" in text
+    assert "backend: \"nim\"" in text and "backend_up: true" in text
+    assert "queued: 2" in text and "version: \"1.2.3\"" in text
+    assert "lineup: " in text and "conductor: " in text and "bad_outcomes_24h: 3" in text
+    assert "24h: total=40 / bad=3 (empty=2, timeout=1)" in text
+    assert "SECRET-VALUE" not in text            # 秘密っぽいキーは出さない
+
+
+def test_server_up_stats_404(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (200, HEALTH, "")})   # /api/stats は 404
+    text = M._job_server_text()
+    assert "[OK]" in text
+    assert "/api/stats は 404" in text
+    assert "NG" not in text
+
+
+def test_server_down_is_reported_clearly(monkeypatch):
+    calls = _stub(monkeypatch, {"/api/health": (None, None, "URLError: [WinError 10061]")})
+    text = M._job_server_text()
+    assert "到達できません" in text and "WinError 10061" in text
+    assert calls == ["/api/health"]              # 落ちているなら stats は叩かない
+
+
+def test_unauthorized_and_bad_responses(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (401, None, "HTTP 401")})
+    assert "FUGU_REMOTE_TOKEN" in M._job_server_text()
+    _stub(monkeypatch, {"/api/health": (503, None, "HTTP 503")})
+    assert "応答が異常" in M._job_server_text()
+    _stub(monkeypatch, {"/api/health": (200, ["not", "a", "dict"], "")})
+    assert "応答が異常" in M._job_server_text()
+
+
+def test_backend_down_flagged(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (200, dict(HEALTH, backend_up=False), "")})
+    assert "backend が落ちています" in M._job_server_text()
+
+
+@pytest.mark.parametrize("health", [{}, {"unexpected": 1}, {"queued": None, "running": None}])
+def test_missing_or_unknown_keys_do_not_crash(monkeypatch, health):
+    _stub(monkeypatch, {"/api/health": (200, health, "")})
+    assert "[OK]" in M._job_server_text()
+
+
+@pytest.mark.parametrize("stats", [
+    [], "x", 5, {}, {"foo": "bar"}, {"total": "many"},
+    {"total": 3, "bad": 1}, {"last_24h": {"total": 9, "bad_by_kind": {"x": 1}}},
+    {"total": 4, "bad": "weird"},
+])
+def test_stats_line_is_defensive(stats):
+    assert isinstance(M._stats_line(stats), str)
+
+
+def test_stats_line_values():
+    assert M._stats_line({"last_24h": {"total": 9, "bad_by_kind": {"x": 1, "y": 2}}}) \
+        == "24h: total=9 / bad=3 (x=1, y=2)"
+    assert M._stats_line({"total": 3, "bad": 1}) == "24h: total=3 / bad=1"
+
+
+def test_exception_inside_is_contained(monkeypatch):
+    def boom(path, timeout=5.0):
+        raise RuntimeError("kaboom")
+    monkeypatch.setattr(M, "_http_get_json", boom)
+    assert "kaboom" in M._job_server_text()
+
+
+def test_health_text_combines_ollama_and_job_server(monkeypatch):
+    monkeypatch.setattr(M, "_ollama_health_text", lambda: "Ollama OK")
+    _stub(monkeypatch, {"/api/health": (200, HEALTH, "")})
+    text = M._health_text()
+    assert text.startswith("Ollama OK")
+    assert "== ジョブサーバー" in text
+
+
+def test_health_tool_reports_down_server_without_error(monkeypatch):
+    monkeypatch.setattr(M, "_ollama_health_text", lambda: "Ollama OK")
+    _stub(monkeypatch, {"/api/health": (None, None, "URLError: refused")})
+    res = M.call_tool("fugu_health", {}, M.Jobs(runner=lambda *a: ""))
+    assert "isError" not in res
+    assert "到達できません" in res["content"][0]["text"]
+
+
+def test_base_url_resolution(monkeypatch):
+    assert M._job_server_base() == "http://127.0.0.1:8800"
+    monkeypatch.setenv("FUGU_REMOTE_PORT", "9000")
+    assert M._job_server_base() == "http://127.0.0.1:9000"
+    monkeypatch.setenv("FUGU_JOB_SERVER_URL", "http://100.1.2.3:8800/")
+    assert M._job_server_base() == "http://100.1.2.3:8800"
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_http_get_json_sends_token_header_and_parses(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"], seen["timeout"] = req.full_url, timeout
+        seen["tok"] = req.get_header("X-fugu-token")
+        return _Resp(200, '{"a": 1}'.encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setenv("FUGU_REMOTE_TOKEN", "tok123")
+    assert M._http_get_json("/api/health") == (200, {"a": 1}, "")
+    assert seen == {"url": "http://127.0.0.1:8800/api/health", "timeout": 5.0,
+                    "tok": "tok123"}
+
+
+def test_http_get_json_maps_errors(monkeypatch):
+    def http_err(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "nf", {}, None)
+
+    def conn_err(req, timeout=None):
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", http_err)
+    assert M._http_get_json("/api/stats") == (404, None, "HTTP 404")
+    monkeypatch.setattr("urllib.request.urlopen", conn_err)
+    status, obj, err = M._http_get_json("/api/health")
+    assert status is None and obj is None and "refused" in err
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda req, timeout=None: _Resp(200, b"<html>"))
+    assert M._http_get_json("/x")[0] == 200 and M._http_get_json("/x")[1] is None
