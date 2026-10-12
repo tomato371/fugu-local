@@ -115,7 +115,10 @@ NIM_STREAM_IDLE_S = 600       # data 行が途絶えてよい最大秒数（ping
 # 2026-10-12: Conductor の gemma が死んでいると conduct が 467 秒・critic 2 回が 1085 秒
 # 張り付き、チームの子ジョブは 60 分無応答だった。健全時の実測は conduct が最大 35 秒
 # （fugu-remote/jobs の 17 件・中央値 6 秒・gemma 以外の時期を含む）なので、180 秒は約 5 倍の余裕。
-# 0 以下で無効（従来どおり NIM_STREAM_MAX_S の 40 分枠）。NIM 以外のバックエンドでは渡さない。
+# 既定は 0（無効＝従来どおり NIM_STREAM_MAX_S の 40 分枠）。quorum サーバー（fugu-remote）は
+# 起動時に env で 180/600 を設定する。ベンチ（fugu_local 直接実行）では無効＝従来どおりで、
+# 429 連発時に conduct/critic が 180 秒で諦めて default_plan に落ちる、という計測条件の変化を持ち込まない。
+# NIM 以外のバックエンドでは渡さない。
 def _env_seconds(name, default):
     try:
         return float(os.environ.get(name, "") or default)
@@ -123,10 +126,11 @@ def _env_seconds(name, default):
         return float(default)
 
 
-CONDUCTOR_STREAM_MAX_S = _env_seconds("FUGU_CONDUCTOR_STREAM_MAX_S", 180)
+CONDUCTOR_STREAM_MAX_S = _env_seconds("FUGU_CONDUCTOR_STREAM_MAX_S", 0)
 # Critic の再検算（think=True・最大 NUM_PREDICT_JUDGE_THINK=6144 トークン）は短い用事ではない。
-# bench_recheck.py は 1 本 60〜300 秒を見込んでおり、健全な再検算を切らない余裕として 600 秒。
-CRITIC_THINK_STREAM_MAX_S = _env_seconds("FUGU_CRITIC_THINK_STREAM_MAX_S", 600)
+# bench_recheck.py は 1 本 60〜300 秒を見込んでおり、健全な再検算を切らない余裕として、
+# サーバー側で設定する値は 600 秒（fugu_remote が FUGU_CRITIC_THINK_STREAM_MAX_S=600 を設定）。
+CRITIC_THINK_STREAM_MAX_S = _env_seconds("FUGU_CRITIC_THINK_STREAM_MAX_S", 0)
 # 429 対策の要（2026-08-03 実測）: NIM の 429 は Retry-After ヘッダを付けてこない。
 # 旧実装の「既定10秒待ちで各ワーカーが独立に再送」は、並列4本の再送(毎10秒×4)自体が
 # 40 RPM 制限を叩き続けてスロットルが解けない自己増幅ループになり、SC全票が
@@ -4931,8 +4935,22 @@ def critique(question, answer):
         tdc = _tdc_check(question, answer)
         if tdc is not None:
             return tdc
-    ok, _issue = _critic_judge(question, answer, think=False)
+    ok, issue1 = _critic_judge(question, answer, think=False)
     if ok:
+        return True, ""
+    if _is_critic_call_failure(issue1):
+        # Critic の呼び出し自体が失敗（__ERROR__）。審査できていないだけで回答に問題が
+        # あるという意味ではなく、死んでいるモデルへ think=True の再検算をもう一度投げても
+        # 同じ待ちを払うだけ（2026-10-12 実測: critic 2 回で 1085 秒）なので、再検算せず
+        # 「未検証」として扱う。戻り値は (True, "")＝問題なし相当。契約上これが安全な理由:
+        #   - 呼び出し側は NG のときだけ issue を使い、NG は「追加ラウンド/再統合/次候補へ」
+        #     の意味になる。死んだ Critic で NG を返すと、同じく死んだ Critic のまま提案モデル
+        #     を何度も呼び直すだけで改善の見込みがない（verify_single と同じ判断）。
+        #   - verify() は続けて second_opinion（別系統）を呼ぶので、そちらが NG を出せば
+        #     疑義は握りつぶされない。
+        #   - 正常応答時の挙動（1 回目 ok→True、NG→think=True 再検算）は変えない。
+        print(f"   ⚠ Critic({CONDUCTOR}) の呼び出しが失敗 → 未検証のまま通します: "
+              f"{issue1[:120]}")
         return True, ""
     return _critic_judge(question, answer, think=True)
 

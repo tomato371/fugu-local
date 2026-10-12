@@ -7,12 +7,19 @@
       1 ストリームの壁時計はセマフォ取得後から測る。未指定時は従来の再送回数・挙動のまま。
   (c) verify_single: Critic が __ERROR__ → think=True で再検算せず未検証のまま採用。
       Critic が正常応答したときの挙動は変えない。
-  + Conductor / Critic への stream_max_s の配線（NIM のときだけ・無効化可）と、
+  + Conductor / Critic への stream_max_s の配線（NIM のときだけ・env で有効化・既定は無効）と、
     クールダウン / 再送の可観測性（print）。
+  (d) critique(): 1 回目の Critic が __ERROR__ → think=True の再検算をせず未検証として通す。
+
+既定は 0（無効）: fugu_local を直接走らせるベンチは従来どおりの呼び出しになる。180/600 は
+quorum サーバー（fugu-remote）が起動時に env で設定する。
 """
 import email.message
 import io
 import json
+import os
+import subprocess
+import sys
 import urllib.error
 
 import pytest
@@ -236,7 +243,14 @@ def test_retry_prints_name_reason_wait_and_attempt(net, capsys):
 # --------------------------------------------------------------------------
 # Conductor / Critic への stream_max_s の配線
 # --------------------------------------------------------------------------
-def test_short_job_kwargs_only_for_nim_and_can_be_disabled(monkeypatch):
+@pytest.fixture
+def server_caps(monkeypatch):
+    """quorum サーバー（fugu-remote）が env で設定する 180/600 を、モジュール定数に反映した状態。"""
+    monkeypatch.setattr(f, "CONDUCTOR_STREAM_MAX_S", 180.0)
+    monkeypatch.setattr(f, "CRITIC_THINK_STREAM_MAX_S", 600.0)
+
+
+def test_short_job_kwargs_only_for_nim_and_can_be_disabled(monkeypatch, server_caps):
     monkeypatch.setattr(f, "NIM_MODEL_IDS", {"test/conductor"})
     monkeypatch.setattr(f, "CONDUCTOR", "test/conductor")
     assert f._short_job_kwargs() == {"stream_max_s": f.CONDUCTOR_STREAM_MAX_S}
@@ -250,7 +264,51 @@ def test_short_job_kwargs_only_for_nim_and_can_be_disabled(monkeypatch):
     assert f._short_job_kwargs() == {}
 
 
-def test_conduct_and_critic_pass_stream_max_s_on_nim(monkeypatch):
+def _import_caps(env_updates):
+    """fugu_local を新しいプロセスで import し、(CONDUCTOR_STREAM_MAX_S, CRITIC_THINK_STREAM_MAX_S) を返す。"""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("FUGU_CONDUCTOR_STREAM_MAX_S", "FUGU_CRITIC_THINK_STREAM_MAX_S")}
+    env.update(env_updates)
+    env["PYTHONIOENCODING"] = "utf-8"
+    here = os.path.dirname(os.path.abspath(f.__file__))
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import fugu_local as f; print(f.CONDUCTOR_STREAM_MAX_S, f.CRITIC_THINK_STREAM_MAX_S)"],
+        cwd=here, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert out.returncode == 0, out.stderr
+    a, b = out.stdout.split()[-2:]
+    return float(a), float(b)
+
+
+def test_caps_default_to_disabled_and_follow_env():
+    """env 未設定なら 0（無効＝ベンチは従来どおり）。env を設定したときだけ有効。"""
+    assert _import_caps({}) == (0.0, 0.0)
+    assert _import_caps({"FUGU_CONDUCTOR_STREAM_MAX_S": "180",
+                         "FUGU_CRITIC_THINK_STREAM_MAX_S": "600"}) == (180.0, 600.0)
+
+
+def test_unset_env_passes_no_stream_max_s_to_ask(monkeypatch):
+    """既定（0）のとき、NIM でも conduct / critic の ask に stream_max_s を一切渡さない。"""
+    monkeypatch.setattr(f, "CONDUCTOR_STREAM_MAX_S", 0.0)
+    monkeypatch.setattr(f, "CRITIC_THINK_STREAM_MAX_S", 0.0)
+    monkeypatch.setattr(f, "NIM_MODEL_IDS", {"test/conductor"})
+    monkeypatch.setattr(f, "CONDUCTOR", "test/conductor")
+    monkeypatch.setattr(f, "PROPOSERS", ["m1", "m2", "m3", "m4"])
+    assert f._short_job_kwargs() == {} and f._short_job_kwargs(think_recheck=True) == {}
+    seen = []
+
+    def fake_ask(model, messages, temperature, **kw):
+        seen.append(set(kw))
+        return '{"mode": "moa", "task_type": "knowledge", "rounds": 1}'             if kw.get("label") == "conductor" else '{"ok": true, "issue": ""}'
+
+    monkeypatch.setattr(f, "ask", fake_ask)
+    f.conduct("q")
+    f._critic_judge("q", "a", think=False)
+    f._critic_judge("q", "a", think=True)
+    assert len(seen) == 3 and all("stream_max_s" not in keys for keys in seen)
+
+
+def test_conduct_and_critic_pass_stream_max_s_on_nim(monkeypatch, server_caps):
     monkeypatch.setattr(f, "NIM_MODEL_IDS", {"test/conductor"})
     monkeypatch.setattr(f, "CONDUCTOR", "test/conductor")
     monkeypatch.setattr(f, "PROPOSERS", ["m1", "m2", "m3", "m4"])
@@ -352,4 +410,35 @@ def test_recheck_failure_after_a_real_ng_is_unchanged(verify_env):
     """最初の審査が正常に NG を出した後の再検算が失敗した場合は従来どおり NG（エスカレーション）。"""
     verify_env(['{"ok": false, "issue": "wrong"}', "__ERROR__: boom"])
     ok, issue = f.verify_single("q", "a")
+    assert ok is False and issue.startswith("critic call failed")
+
+
+# --------------------------------------------------------------------------
+# (d) critique(): 1 回目の Critic が __ERROR__ → 再検算せず未検証として通す
+# --------------------------------------------------------------------------
+def test_critique_error_skips_the_thinking_recheck(verify_env, capsys):
+    calls = verify_env(["__ERROR__: stream exceeded 180s (wall clock cap)"])
+    assert f.critique("日本の首都は？", "東京です。") == (True, "")
+    assert calls == [("critic", False)]          # think=True の再検算を投げない
+    assert "未検証のまま通します" in capsys.readouterr().out
+
+
+def test_critique_ok_reply_behaves_as_before(verify_env):
+    calls = verify_env(['{"ok": true, "issue": ""}'])
+    assert f.critique("q", "a") == (True, "")
+    assert calls == [("critic", False)]
+
+
+def test_critique_real_ng_still_triggers_the_thinking_recheck(verify_env):
+    calls = verify_env(['{"ok": false, "issue": "wrong"}', '{"ok": true, "issue": ""}'])
+    assert f.critique("q", "a") == (True, "")
+    assert calls == [("critic", False), ("critic", True)]
+    calls.clear()
+    verify_env(['{"ok": false, "issue": "wrong"}', '{"ok": false, "issue": "still wrong"}'])
+    assert f.critique("q", "a") == (False, "still wrong")
+
+
+def test_critique_recheck_failure_after_a_real_ng_is_unchanged(verify_env):
+    verify_env(['{"ok": false, "issue": "wrong"}', "__ERROR__: boom"])
+    ok, issue = f.critique("q", "a")
     assert ok is False and issue.startswith("critic call failed")
