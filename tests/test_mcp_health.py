@@ -173,10 +173,10 @@ def test_http_get_json_sends_token_header_and_parses(monkeypatch):
         seen["tok"] = req.get_header("X-fugu-token")
         return _Resp(200, '{"a": 1}'.encode())
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(M, "_urlopen", fake_urlopen)
     monkeypatch.setenv("FUGU_REMOTE_TOKEN", "tok123")
     assert M._http_get_json("/api/health") == (200, {"a": 1}, "")
-    assert seen == {"url": "http://127.0.0.1:8800/api/health", "timeout": 5.0,
+    assert seen == {"url": "http://127.0.0.1:8800/api/health", "timeout": 10.0,
                     "tok": "tok123"}
 
 
@@ -187,12 +187,12 @@ def test_http_get_json_maps_errors(monkeypatch):
     def conn_err(req, timeout=None):
         raise urllib.error.URLError("refused")
 
-    monkeypatch.setattr("urllib.request.urlopen", http_err)
+    monkeypatch.setattr(M, "_urlopen", http_err)
     assert M._http_get_json("/api/stats") == (404, None, "HTTP 404")
-    monkeypatch.setattr("urllib.request.urlopen", conn_err)
+    monkeypatch.setattr(M, "_urlopen", conn_err)
     status, obj, err = M._http_get_json("/api/health")
     assert status is None and obj is None and "refused" in err
-    monkeypatch.setattr("urllib.request.urlopen",
+    monkeypatch.setattr(M, "_urlopen",
                         lambda req, timeout=None: _Resp(200, b"<html>"))
     assert M._http_get_json("/x")[0] == 200 and M._http_get_json("/x")[1] is None
 
@@ -222,3 +222,96 @@ def test_stats_line_real_shape_quiet_and_empty():
 ])
 def test_stats_line_real_shape_defensive(stats):
     assert isinstance(M._stats_line(stats), str)
+
+
+# ---------------------------------------------------- 査読指摘の修正分
+
+def test_health_uses_longer_timeout_than_stats(monkeypatch):
+    seen = {}
+
+    def fake(path, timeout=None):
+        seen[path] = timeout
+        return {"/api/health": (200, HEALTH, "")}.get(path, (404, None, "HTTP 404"))
+
+    monkeypatch.setattr(M, "_http_get_json", fake)
+    M._job_server_text()
+    assert seen == {"/api/health": 10.0, "/api/stats": 5.0}
+
+
+def test_timeout_vs_refused_are_distinguished(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (None, None, "timeout: timed out")})
+    text = M._job_server_text()
+    assert "応答なし(ハングの可能性)" in text and "接続拒否" not in text
+    _stub(monkeypatch, {"/api/health": (None, None, "refused: [WinError 10061]")})
+    text = M._job_server_text()
+    assert "接続拒否(停止中)" in text and "ハング" not in text
+    _stub(monkeypatch, {"/api/health": (None, None, "gaierror: no such host")})
+    text = M._job_server_text()
+    assert "到達できません" in text and "ハング" not in text and "接続拒否" not in text
+
+
+def test_classify_exc_real_exceptions():
+    import socket
+    assert M._classify_exc(socket.timeout("timed out")).startswith("timeout:")
+    assert M._classify_exc(urllib.error.URLError(socket.timeout("timed out"))
+                           ).startswith("timeout:")
+    assert M._classify_exc(urllib.error.URLError(ConnectionRefusedError("no"))
+                           ).startswith("refused:")
+    assert M._classify_exc(ConnectionResetError("rst")).startswith("ConnectionResetError")
+
+
+def test_http_503_body_detail_is_shown(monkeypatch):
+    import io
+    body = '{"detail": "fugu_remote は停止中です (exit 1)"}'.encode()
+
+    def err503(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 503, "x", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(M, "_urlopen", err503)
+    assert M._http_get_json("/api/health") == (
+        503, {"detail": "fugu_remote は停止中です (exit 1)"}, "HTTP 503")
+    text = M._job_server_text()
+    assert "HTTP 503" in text and "fugu_remote は停止中です (exit 1)" in text
+
+
+def test_stats_error_is_shown_not_discarded(monkeypatch):
+    _stub(monkeypatch, {"/api/health": (200, HEALTH, ""),
+                        "/api/stats": (500, {"detail": "boom"}, "HTTP 500")})
+    assert "stats: 取得できず(HTTP 500: boom)" in M._job_server_text()
+    _stub(monkeypatch, {"/api/health": (200, HEALTH, ""),
+                        "/api/stats": (None, None, "timeout: timed out")})
+    assert "stats: 取得できず(timeout: timed out)" in M._job_server_text()
+    _stub(monkeypatch, {"/api/health": (200, HEALTH, ""),
+                        "/api/stats": (200, None, "JSON ではない応答")})
+    assert "JSON ではない応答" in M._job_server_text()
+
+
+def test_url_userinfo_and_query_are_masked(monkeypatch):
+    monkeypatch.setenv("FUGU_JOB_SERVER_URL", "http://user:pw123@10.0.0.5:8800/?token=abc")
+    _stub(monkeypatch, {"/api/health": (200, HEALTH, "")})
+    text = M._job_server_text()
+    assert "http://***@10.0.0.5:8800/" in text
+    for secret in ("pw123", "user:", "token=abc"):
+        assert secret not in text
+    assert M._display_url("http://127.0.0.1:8800") == "http://127.0.0.1:8800"
+    assert M._display_url("garbage") == "(不正な URL)"
+
+
+def test_urlopen_bypasses_proxies(monkeypatch):
+    import urllib.request
+    seen = {}
+
+    class FakeOpener:
+        def open(self, req, timeout=None):
+            seen["timeout"] = timeout
+            return "resp"
+
+    def fake_build(*handlers):
+        seen["handlers"] = handlers
+        return FakeOpener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", fake_build)
+    assert M._urlopen(object(), 7) == "resp"
+    (ph,) = seen["handlers"]
+    assert isinstance(ph, urllib.request.ProxyHandler) and ph.proxies == {}
+    assert seen["timeout"] == 7

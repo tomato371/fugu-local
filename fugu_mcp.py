@@ -188,7 +188,14 @@ def _ollama_health_text() -> str:
 # 実運用の経路は fugu_ctl.py(:8800 プロキシ)→ fugu_remote.py(NVIDIA NIM)。
 # Ollama だけ見て "OK" と言っても本番の健全性は分からないので、ここでも見る。
 
-_JOB_SERVER_TIMEOUT = 5.0
+# /api/health はサーバー側で NIM の生死確認(urlopen timeout=5、60 秒キャッシュ)を
+# 行うことがあり、それだけで ~5 秒かかりうる。5 秒だと「NIM が遅い」を「サーバーが
+# 落ちている」と誤診するので 10 秒取る。stats は jobs/ 走査(30 秒キャッシュ)なので 5 秒。
+# 最悪ケースの合計は 10 + 5 = 15 秒(health が応答なし/拒否ならそこで打ち切り=最大 10 秒)。
+_HEALTH_TIMEOUT = 10.0
+_STATS_TIMEOUT = 5.0
+_ERR_TIMEOUT = "timeout"      # _http_get_json の err 文字列の先頭に付く分類タグ
+_ERR_REFUSED = "refused"
 _SECRETISH = ("token", "secret", "password", "api_key", "apikey")
 # /api/health の既知キー(表示順とラベル)。未知・欠落は黙って飛ばす。
 _HEALTH_FIELDS = [
@@ -210,11 +217,48 @@ def _job_server_base() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def _http_get_json(path: str, timeout: float = _JOB_SERVER_TIMEOUT):
+def _display_url(url: str) -> str:
+    """表示用 URL。userinfo(user:pass@)と query/fragment(?token=...)は出さない。"""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host:                             # IPv6 リテラル
+            host = f"[{host}]"
+        netloc = host + (f":{parts.port}" if parts.port else "")
+        if parts.username is not None or parts.password is not None:
+            netloc = "***@" + netloc
+        return f"{parts.scheme}://{netloc}{parts.path}" if parts.scheme else "(不正な URL)"
+    except ValueError:
+        return "(不正な URL)"
+
+
+def _urlopen(req, timeout):
+    """プロキシを経由せずに開く(127.0.0.1 宛の診断が HTTP(S)_PROXY で曲がらないように)。"""
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(req, timeout=timeout)
+
+
+def _classify_exc(exc) -> str:
+    """接続系の例外を (timeout / refused / その他) に分けて err 文字列にする。"""
+    import socket
+    reason = getattr(exc, "reason", None)
+    inner = reason if isinstance(reason, BaseException) else exc
+    if isinstance(inner, (socket.timeout, TimeoutError)) or "timed out" in str(inner):
+        return f"{_ERR_TIMEOUT}: {inner}"
+    if isinstance(inner, ConnectionRefusedError):
+        return f"{_ERR_REFUSED}: {inner}"
+    return f"{type(inner).__name__}: {inner}"
+
+
+def _http_get_json(path: str, timeout: float = _HEALTH_TIMEOUT):
     """ジョブサーバーへ GET → (HTTP ステータス or None, JSON or None, エラー文)。
 
     認証は fugu_remote と同じ X-Fugu-Token ヘッダ(環境変数 FUGU_REMOTE_TOKEN)。
-    例外は投げない(到達不能も戻り値で表す)。
+    例外は投げない(到達不能も戻り値で表す)。接続失敗の err は先頭が
+    "timeout:" / "refused:" のどちらかなら原因が分かっている。HTTP エラー
+    (fugu_ctl の 503 {"detail": ...} 等)でも本文が JSON ならそれを返す。
     """
     import urllib.error
     import urllib.request
@@ -223,17 +267,29 @@ def _http_get_json(path: str, timeout: float = _JOB_SERVER_TIMEOUT):
     if token:
         req.add_header("X-Fugu-Token", token)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout) as resp:
             status, raw = resp.status, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, None, f"HTTP {exc.code}"
+        body = None
+        try:
+            body = json.loads(exc.read(65536).decode("utf-8", "replace"))
+        except Exception:                          # 本文なし/非 JSON は無視
+            pass
+        return exc.code, body, f"HTTP {exc.code}"
     except Exception as exc:                       # URLError / timeout / reset 等
-        reason = getattr(exc, "reason", None) or exc
-        return None, None, f"{type(exc).__name__}: {reason}"
+        return None, None, _classify_exc(exc)
     try:
         return status, json.loads(raw.decode("utf-8", "replace")), ""
     except ValueError:
         return status, None, "JSON ではない応答"
+
+
+def _detail_of(obj, err="") -> str:
+    """エラー応答の detail(無ければ err か本文の要約)。"""
+    if isinstance(obj, dict) and "detail" in obj:
+        d = obj["detail"]
+        return d if isinstance(d, str) else _compact(d, 160)
+    return err or (_compact(obj, 120) if obj is not None else "")
 
 
 def _compact(value, limit=200) -> str:
@@ -324,18 +380,28 @@ def _stats_line_generic(stats) -> str:
 def _job_server_text() -> str:
     """ジョブサーバー(本番経路)の健全性。到達不能でも例外を出さず明示する。"""
     base = _job_server_base()
-    lines = ["== ジョブサーバー(実運用の経路) ==", f"URL: {base}"]
+    lines = ["== ジョブサーバー(実運用の経路) ==", f"URL: {_display_url(base)}"]
     try:
-        status, health, err = _http_get_json("/api/health")
+        status, health, err = _http_get_json("/api/health", _HEALTH_TIMEOUT)
         if status is None:
-            lines.append(f"[NG] ジョブサーバーに到達できません: {err}")
-            lines.append("     fugu_ctl.py / fugu_remote.py が落ちている可能性があります。")
+            if err.startswith(_ERR_TIMEOUT):
+                lines.append(f"[NG] 応答なし(ハングの可能性): {_HEALTH_TIMEOUT:g} 秒待っても"
+                             f"返事がありません ({err})")
+                lines.append("     ポートは開いているのに返事が無い状態です。"
+                             "fugu_remote の詰まり、または NIM 確認の遅延が疑われます。")
+            elif err.startswith(_ERR_REFUSED):
+                lines.append(f"[NG] 接続拒否(停止中): {err}")
+                lines.append("     fugu_ctl.py が起動していません(START_FUGU_REMOTE.bat 等で起動)。")
+            else:
+                lines.append(f"[NG] ジョブサーバーに到達できません: {err}")
+                lines.append("     fugu_ctl.py / fugu_remote.py が落ちている可能性があります。")
             return "\n".join(lines)
         if status in (401, 403):
             lines.append(f"[NG] 認証エラー(HTTP {status}): 環境変数 FUGU_REMOTE_TOKEN を確認")
             return "\n".join(lines)
         if status != 200 or not isinstance(health, dict):
-            lines.append(f"[NG] 応答が異常です(HTTP {status}): {err or _compact(health, 120)}")
+            lines.append(f"[NG] 応答が異常です(HTTP {status}): "
+                         f"{_detail_of(health, err)}")
             return "\n".join(lines)
         lines.append("[OK] 応答あり")
         shown = set()
@@ -350,14 +416,15 @@ def _job_server_text() -> str:
                 lines.append(f"  {key}: {_compact(health[key])}")
         if health.get("backend_up") is False:
             lines.append("  [NG] backend が落ちています(NIM / Ollama への接続を確認)")
-        s_status, stats, _ = _http_get_json("/api/stats")
+        s_status, stats, s_err = _http_get_json("/api/stats", _STATS_TIMEOUT)
         if s_status == 200 and stats is not None:
             lines.extend("  " + ln for ln in _stats_line(stats).splitlines())
-        elif s_status is None or s_status != 404:
-            lines.append(f"  stats: 取得できず(HTTP {s_status})" if s_status
-                         else "  stats: 取得できず(接続エラー)")
-        else:
+        elif s_status == 404:
             lines.append("  stats: 未対応(/api/stats は 404)")
+        else:
+            why = _detail_of(stats, s_err) or "不明"
+            lines.append(f"  stats: 取得できず({why})" if s_status is None
+                         else f"  stats: 取得できず(HTTP {s_status}: {why})")
     except Exception as exc:                        # 診断が診断対象を壊さない
         lines.append(f"[NG] ジョブサーバーの確認中にエラー: {type(exc).__name__}: {exc}")
     return "\n".join(lines)
