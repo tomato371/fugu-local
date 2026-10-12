@@ -5207,6 +5207,13 @@ def aggregate(question, proposals):
     good = [(m, strip_think(a)) for (m, a) in proposals if not a.startswith("__ERROR__")]
     if not good:
         return "__ERROR__: 全プロポーザーが失敗しました（モデル/Ollama/VRAM を確認）。"
+    # FAIL_SOFT（quorum サーバー）のときだけ: 空の提案（思考だけで本文が空になった票）は
+    # 統合役の材料にも保険2の候補にもならず、混ざると「空を返す」危険だけが増える。
+    # 空でない提案が 1 つでもあれば空を除く。全て空なら従来どおり（ベンチは FAIL_SOFT=0 で不変）。
+    if FAIL_SOFT:
+        _nonempty = [(m, a) for (m, a) in good if a.strip()]
+        if _nonempty:
+            good = _nonempty
     # コード付き提案には実行結果の証拠を添える。どの案が実際に動くかは決定的情報なので、
     # アグリゲータの取捨選択の判断材料として最強（AGGREGATOR_SYS のルール6が対応）。
     # 【2026-07-22 修正】以前はここで `good` 自体をタグ付き版で上書きしていたため、
@@ -5279,6 +5286,12 @@ def aggregate(question, proposals):
         candidates = [(m, a) for i, (m, a) in enumerate(good) if i not in failed_idxs]
         if not candidates:
             candidates = good
+        # FAIL_SOFT のときだけ: 空でない候補を優先する（空の提案を critique に回さず、
+        # 最後の max(len) でも空を返さない）。無効時は従来どおり。
+        if FAIL_SOFT:
+            _ne = [(m, a) for (m, a) in candidates if a.strip()]
+            if _ne:
+                candidates = _ne
         for _m, a in candidates:
             ok, _issue = critique(question, a)
             if ok:
