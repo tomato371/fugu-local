@@ -199,6 +199,18 @@ NIM_CONDUCTOR_CANDIDATES = [
 ]
 _NIM_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", re.I)
 _NIM_MOE_RE = re.compile(r"(\d+(?:\.\d+)?)b-a(\d+(?:\.\d+)?)b", re.I)
+# Conductor 候補が全滅したとき、死んだ候補をそのまま使わず「採用済み（生存確認済み）の
+# 機体」から速いものを充てる。順位付けに使う実測値（コード内コメントの既存情報。単位: 秒、
+# 生存プローブ max_tokens=4 の応答時間）。2026-10-12: 死んだ gemma を採用し続けた結果、
+# 「日本の首都は？」に 1709 秒（conductor 467 秒 + critic 1085 秒）かかった。
+NIM_MEASURED_LATENCY_S = {
+    "nvidia/nemotron-3-super-120b-a12b": 0.7,
+    "nvidia/nemotron-3.5-lightning-30b-a3b": 1.9,
+    "openai/gpt-oss-20b": 2.0,
+    "nvidia/nemotron-3-ultra-550b-a55b": 19.0,
+    "moonshotai/kimi-k3": 148.0,
+}
+NIM_CONDUCTOR_SLOW_S = 15.0    # 実測がこれ以上の機体は Conductor（毎問通る）に充てない
 
 # --- モデルの役割 ---
 # Conductor + Critic: qwen3:4b（軽量・高速・JSON安定。ルーティング専用、VRAM常駐最小化）
@@ -555,6 +567,38 @@ def _nim_diverse_three(picked):
     return chosen
 
 
+def _nim_conductor_fallback(picked):
+    """Conductor 候補が全滅したときの退避先を、採用済みの機体（picked）から選ぶ。
+
+    (model, note) を返す。picked が空なら ("", "")。生存確認は呼び出し側で済んでいる前提。
+    並び順（小さい順に優先）: (1) 実測が遅い機体は最後 (2) 思考が強制される機体
+    （nim_extra / think を持つ系統）は後ろ — Conductor の呼び出しは think=False・
+    max_tokens=768 で、nemotron-3 系は nim_extra の enable_thinking が think=False でも
+    残るため打ち切られやすい (3) 実測秒の短い順 (4) 活性パラメータの小さい順
+    （規模不明は後ろ）(5) picked の並び。"""
+    pool = list(dict.fromkeys(m for m in (picked or []) if isinstance(m, str) and m))
+    if not pool:
+        return "", ""
+
+    def _key(item):
+        idx, mid = item
+        cfg = _nim_tuning_for(mid)
+        lat = NIM_MEASURED_LATENCY_S.get(mid)
+        slow = 1 if (lat is not None and lat >= NIM_CONDUCTOR_SLOW_S) else 0
+        forced = 1 if (cfg.get("nim_extra") or cfg.get("think")) else 0
+        _tot, act = _nim_scale_of(mid)
+        return (slow, forced, lat if lat is not None else 99.0,
+                act if act else 9999.0, idx)
+
+    best = min(enumerate(pool), key=_key)[1]
+    lat = NIM_MEASURED_LATENCY_S.get(best)
+    cfg = _nim_tuning_for(best)
+    note = (f"実測 {lat:g}s" if lat is not None else "実測なし・活性パラメータが小さい順")
+    if cfg.get("nim_extra") or cfg.get("think"):
+        note += "・思考型のため Conductor の JSON が打ち切られる場合は既定プランに落ちます"
+    return best, note
+
+
 #: 布陣（選抜結果）のキャッシュ先。空なら従来どおり毎回プローブする。
 #: 起動ごとの生存プローブはカタログ102件に対して16体前後を叩くので 60〜90 秒かかる。
 #: ジョブを別プロセスで走らせる構成では、その都度これを払うと現実的でない。
@@ -682,8 +726,29 @@ def apply_nim_profile():
             cond = cand
             break
     if not cond:
-        cond = NIM_CONDUCTOR_CANDIDATES[0]
-        print(f"⚠ [nim] Conductor 候補が全滅。{cond} をそのまま使います")
+        # 候補が全滅。死んだ先頭候補をそのまま使うと conduct / critic が毎回数百秒張り付く
+        # （2026-10-12 実測: 1709 秒）。採用済みの機体から速いものを充てる。
+        _tried = set()
+        _first = ("", "")
+        while True:
+            _m, _note = _nim_conductor_fallback([p for p in picked if p not in _tried])
+            if not _m:
+                break
+            if not _first[0]:
+                _first = (_m, _note)
+            if _nim_model_available(_m):
+                cond = _m
+                print(f"⚠ [nim] Conductor 候補が全滅 → 採用済みの {cond} を Conductor に充てます"
+                      f"（{_note}）")
+                break
+            _tried.add(_m)
+        if not cond and _first[0]:
+            cond = _first[0]
+            print(f"⚠ [nim] Conductor 候補が全滅・退避先も応答なし → {cond} を試します"
+                  f"（{_first[1]}）")
+        if not cond:
+            cond = NIM_CONDUCTOR_CANDIDATES[0]
+            print(f"⚠ [nim] Conductor 候補が全滅。{cond} をそのまま使います")
     print(f"[setup] nim: conductor = {cond}"
           + (" (FUGU_CONDUCTOR 指定)" if CONDUCTOR_OVERRIDE else ""))
     jp_agg = agg                   # 日本語統合。qwen 系が消滅したため統合役を兼ねる
@@ -4551,6 +4616,11 @@ def _apply_office_guardrail(plan, office_attached):
     return plan
 
 
+def _is_ask_error(text):
+    """ask() の失敗センチネル（"__ERROR__: ..."、<think> 前置きがあっても可）かどうか。"""
+    return isinstance(text, str) and strip_think(text).startswith("__ERROR__")
+
+
 def default_plan():
     return {
         "mode": "moa",
@@ -4662,8 +4732,16 @@ def conduct(question, history=None, office_attached=False):
         num_predict=NUM_PREDICT_JUDGE,
         label="conductor",
     )
-    plan = extract_json(raw)
-    if plan is None:
+    if _is_ask_error(raw):
+        # 通信/モデル失敗（__ERROR__）。エラー本文に JSON が混じっていても plan として
+        # 読まず、引き直しもせず（死んだモデルに同じ待ちをもう一度払うだけ）、
+        # validate_plan(None) = default_plan() の既定プランへ落とす。
+        print(f"   ⚠ Conductor({CONDUCTOR}) が失敗 → 既定プランで続行します: "
+              f"{strip_think(raw)[:120]}")
+        plan = None
+    else:
+        plan = extract_json(raw)
+    if plan is None and not _is_ask_error(raw):
         # スキーマ強制でも稀に JSON が崩れる(実測 ~1/10 程度の一過性)。固定フォールバック
         # プランより正しいプランの方が良いので、1 回だけ引き直す。
         raw = ask(
@@ -4671,7 +4749,7 @@ def conduct(question, history=None, office_attached=False):
             think=False, fmt=CONDUCTOR_SCHEMA,
             num_predict=NUM_PREDICT_JUDGE, label="conductor",
         )
-        plan = extract_json(raw)
+        plan = None if _is_ask_error(raw) else extract_json(raw)
     plan = _apply_routing_guardrails(question, validate_plan(plan))
     plan = _apply_accuracy_guardrails(question, plan)
     plan = _apply_office_guardrail(plan, office_attached)
