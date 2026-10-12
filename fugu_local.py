@@ -425,7 +425,10 @@ _NIM_PROBE_MEMO_LOCK = threading.Lock()
 def _nim_probe(model, timeout=None):
     """_nim_probe_http のメモ付き版。メモが有効なとき、結果が確実に同じになる場合だけ再利用する:
       - 'gone'（401/403/404/410。恒久失敗）は常に。
-      - 'slow' は、より長い（同じ以上の）timeout で 'slow' だったとき。
+      - 'slow' は、より長い（同じ以上の）timeout で、実際にその待ちを使い切って 'slow' だった
+        とき（所要が timeout の 9 割以上）。429/500/503 や接続エラーは数百 ms で 'slow' を返す
+        ことがあり、それは「長く待っても応答なし」ではない（再プローブなら 'ok' かもしれない）
+        ので流用しない。
       - 'ok' は、所要秒が今回の timeout 以内だったとき（短い timeout なら slow だったかもしれない
         ので、148 秒かかった 'ok' を 20 秒の問い合わせには流用しない）。
     それ以外は実際に叩き、結果を追記する。メモ無効時は _nim_probe_http と完全に同じ。"""
@@ -435,7 +438,8 @@ def _nim_probe(model, timeout=None):
     eff = timeout or NIM_PROBE_TIMEOUT
     with _NIM_PROBE_MEMO_LOCK:
         for status, used, took in memo.get(model, ()):
-            if (status == "gone" or (status == "slow" and used >= eff)
+            if (status == "gone"
+                    or (status == "slow" and used >= eff and took >= 0.9 * used)
                     or (status == "ok" and took <= eff)):
                 return status
     t0 = time.time()

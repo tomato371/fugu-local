@@ -59,6 +59,32 @@ def test_slow_at_a_longer_timeout_is_reused_for_shorter_ones(http, monkeypatch):
     assert calls == [(KIMI, 200)]
 
 
+def test_instant_slow_is_never_reused(http, monkeypatch):
+    """429/500/503・接続エラーは数百 ms で 'slow' を返す。長い待ちを使い切ったわけではないので、
+    その 'slow' を後の問い合わせに流用しない（再プローブなら 'ok' かもしれない）。"""
+    calls, results = http
+    _on(monkeypatch)
+    results[KIMI] = ("slow", 0.1)
+    for t in (200, 20, 75, 200):
+        assert f._nim_probe(KIMI, t) == "slow"
+    assert [c[1] for c in calls] == [200, 20, 75, 200]       # 毎回実際に叩く
+    results[KIMI] = ("ok", 3.0)
+    assert f._nim_probe(KIMI, 20) == "ok"                     # 後から生きていれば拾える
+
+
+def test_slow_that_used_up_most_of_its_wait_is_reused(http, monkeypatch):
+    calls, results = http
+    _on(monkeypatch)
+    results[KIMI] = ("slow", 190.0)                           # 200 秒待ちの 95%
+    assert f._nim_probe(KIMI, 200) == "slow"
+    assert f._nim_probe(KIMI, 20) == "slow"
+    assert len(calls) == 1
+    results["b/m"] = ("slow", 100.0)                          # 200 秒待ちの半分で slow = 使い切っていない
+    f._nim_probe("b/m", 200)
+    f._nim_probe("b/m", 20)
+    assert [c for c in calls if c[0] == "b/m"] == [("b/m", 200), ("b/m", 20)]
+
+
 def test_slow_at_a_shorter_timeout_is_not_reused_for_longer_ones(http, monkeypatch):
     calls, results = http
     _on(monkeypatch)
