@@ -144,11 +144,23 @@ NIM_AUTO_SELECT = os.environ.get("FUGU_NIM_PIN", "") == ""   # FUGU_NIM_PIN=1 �
 NIM_PICK_COUNT = int(os.environ.get("FUGU_NIM_PICKS", "5") or "5")
 NIM_PROBE_MAX = 16            # プローブ回数の上限(1体1リクエスト)。40RPM を踏まない範囲
 NIM_PROBE_WORKERS = 4
-NIM_PROBE_TIMEOUT = 20        # 1回目の生存プローブ
-NIM_PROBE_TIMEOUT_SLOW = 75   # コールドスタート組の再確認（glm-5.2 が該当）
+NIM_PROBE_TIMEOUT = int(os.environ.get("FUGU_NIM_PROBE_TIMEOUT", "20") or "20")
+# 遅くても必ず布陣に入れたいモデル（カンマ区切り）。規模順プローブは「need 体そろったら打ち切り」
+# なので、初回 20 秒に間に合わない機体は再確認まで到達せず毎回落ちる。ここに書いた機体だけは
+# 先に NIM_PROBE_TIMEOUT_SLOW の待ちで確かめ、生きていれば無条件で採用する。
+# **死んでいれば入れない**（応答が無いものをピン留めしても毎ラウンド溶かすだけなので）。
+NIM_ALWAYS = [m.strip() for m in os.environ.get("FUGU_NIM_ALWAYS", "").split(",") if m.strip()]
+# コールドスタート組の再確認。2026-09-15: kimi-k3 が実測 148 秒（本体は生きている）で
+# 75 秒では取りこぼしていたため 180 秒へ。環境変数 FUGU_NIM_PROBE_TIMEOUT_SLOW で変更可。
+# **遅いモデルを布陣に入れると毎ラウンドがその分遅くなる**ので、上げるときは待ち時間と引き換え。
+NIM_PROBE_TIMEOUT_SLOW = int(os.environ.get("FUGU_NIM_PROBE_TIMEOUT_SLOW", "75") or "75")
+# FUGU_NIM_ALWAYS の機体だけに使う待ち時間。**これを一般の再確認に使ってはいけない** ——
+# 冷えた機体すべてに長い待ちを掛けると起動が何分も延びる（2026-09-16 に実際にそうしてしまった）。
+NIM_ALWAYS_TIMEOUT = int(os.environ.get("FUGU_NIM_ALWAYS_TIMEOUT", "200") or "200")
 # ID に規模が書かれていないフラッグシップの公称規模(概算)。順位付けにのみ使い、
 # 表に無いものは規模不明として既知大型の後ろへ回す(除外はしない)。
 NIM_NOMINAL_B = {
+    "moonshotai/kimi-k3": 1000,      # 2026-09-15 生存確認（実測 148 秒。遅いが通る）
     "moonshotai/kimi-k2.6": 1000,
     "minimaxai/minimax-m3": 456,
     "ai21labs/jamba-1.5-large-instruct": 398,
@@ -431,7 +443,7 @@ def _nim_pick_vision(catalog, need=1):
         ranked = [forced] + [m for m in ranked if m != forced]
     if not ranked:
         return []
-    picked, _ = _nim_pick_live(ranked, need)
+    picked, _ = _nim_pick_live(ranked, need, use_always=False)
     return picked
 
 
@@ -448,7 +460,7 @@ def _nim_rank_candidates(catalog):
     return [r[3] for r in rows]
 
 
-def _nim_pick_live(ranked, need):
+def _nim_pick_live(ranked, need, use_always=True):
     """規模順に生存プローブし、生きているものを need 体そろえる。
 
     上位から NIM_PROBE_WORKERS 体ずつ試し、そろった時点で打ち切る。全部生きていれば
@@ -457,14 +469,32 @@ def _nim_pick_live(ranked, need):
     もう一度だけ叩く。glm-5.2 のようなコールドスタート組を取りこぼさないため。
     """
     alive, slow, checked = [], [], 0
+    # 必ず入れたい機体を先に、NIM_ALWAYS_TIMEOUT の待ちで確かめる（規模順ループは途中で打ち切るため）。
+    # **use_always=False の呼び出し（vision の選抜など）には効かせない** ——
+    # 2026-09-16 にここを共通で効かせてしまい、画像用に kimi-k3 が選ばれる不具合を出した。
+    for mid in (NIM_ALWAYS if use_always else []):
+        status = _nim_probe(mid, NIM_ALWAYS_TIMEOUT)
+        checked += 1
+        if status == "ok":
+            alive.append(mid)
+            print(f"[setup] nim probe: {mid} = OK（FUGU_NIM_ALWAYS で常時採用）")
+        else:
+            print(f"[setup] nim probe: {mid} = "
+                  f"{'NG（未付与/廃止）' if status == 'gone' else '応答なし'}"
+                  f"（FUGU_NIM_ALWAYS 指定だが生きていないので外す）")
+    if len(alive) >= need:
+        return alive[:need], checked
     for i in range(0, min(len(ranked), NIM_PROBE_MAX), NIM_PROBE_WORKERS):
-        batch = ranked[i:i + NIM_PROBE_WORKERS]
+        batch = [m for m in ranked[i:i + NIM_PROBE_WORKERS] if m not in alive]
+        if not batch:
+            continue
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as ex:
             results = list(ex.map(_nim_probe, batch))
         checked += len(batch)
         for mid, status in zip(batch, results):
             if status == "ok":
-                alive.append(mid)
+                if mid not in alive:          # FUGU_NIM_ALWAYS で既に入っていることがある
+                    alive.append(mid)
             else:
                 if status == "slow":
                     slow.append(mid)
@@ -481,7 +511,7 @@ def _nim_pick_live(ranked, need):
             results = list(ex.map(lambda m: _nim_probe(m, NIM_PROBE_TIMEOUT_SLOW), batch))
         checked += len(batch)
         for mid, status in zip(batch, results):
-            if status == "ok":
+            if status == "ok" and mid not in alive:   # ALWAYS で既に入っていることがある
                 print(f"[setup] nim probe: {mid} = OK（再試行で応答）")
                 alive.append(mid)
         if len(alive) >= need:
@@ -619,18 +649,30 @@ def apply_nim_profile():
         second = picked[1]          # conductor と別系統の独立チェック
         sc_third = _nim_diverse_three(picked)[2]
     else:
-        # 退避: 2026-08-02 に実在確認した固定布陣。FUGU_NIM_PIN=1 でもここへ来る。
+        # 退避先の固定布陣。**2026-09-16 に実測で全機体の生存を確認して入れ替えた。**
+        # 旧版（2026-08-02 確認）は gpt-oss-120b / mistral-medium-3.5-128b /
+        # deepseek-v4-pro / glm-5.2 の 4 体が 410 Gone になっており、
+        # 生存プローブが 4 体に満たないたびにここへ落ちて、死んだ布陣が UI に出ていた。
+        # **退避先こそ生きている必要がある**（プローブが失敗した状況で使われるので）。
         if NIM_AUTO_SELECT:
             print("⚠ [nim] 生存モデルが 4 体に満たないため固定布陣へ退避します")
-        prop_a = "openai/gpt-oss-120b"
-        kimi = "moonshotai/kimi-k2.6"
-        prop_b = kimi if _nim_model_available(kimi) else "mistralai/mistral-medium-3.5-128b"
-        prop_c = "nvidia/nemotron-3-ultra-550b-a55b"
-        prop_d = "deepseek-ai/deepseek-v4-pro"
-        agg = "z-ai/glm-5.2"
-        second = "mistralai/mistral-medium-3.5-128b"
-        sc_third = "minimaxai/minimax-m3"
-        picked = [prop_a, prop_b, prop_c, prop_d, agg]
+        # 2026-09-16 実測の生存機体。**重複させない**（同じ ID が 2 枠に入ると合議が 1 系統減る）。
+        # kimi-k3 は 148 秒かかるので、既定 20 秒の _nim_model_available では必ず落ちる。
+        # NIM_ALWAYS_TIMEOUT の待ちで確かめてから入れる。
+        kimi = "moonshotai/kimi-k3"
+        order = ["nvidia/nemotron-3-ultra-550b-a55b"]      # 550B 実測 19.0s
+        if _nim_probe(kimi, NIM_ALWAYS_TIMEOUT) == "ok":
+            order.append(kimi)                             # 実測 148s（遅いが生存）
+        order += ["nvidia/nemotron-3-super-120b-a12b",     # 実測 0.7s
+                  "openai/gpt-oss-20b",                    # 実測 2.0s（別系統）
+                  "nvidia/nemotron-3.5-lightning-30b-a3b"] # 実測 1.9s
+        order = list(dict.fromkeys(order))                 # 念のため重複を落とす
+        # 4 枠に満たないときだけ、やむを得ず先頭から埋め直す（4 体未満では合議が成り立たないため）
+        prop_a, prop_b, prop_c, prop_d = (order * 4)[:4]
+        agg = order[-1]            # 統合は毎回通るので、並びの最後（速い機体）を充てる
+        second = order[2] if len(order) > 2 else order[-1]
+        sc_third = order[3] if len(order) > 3 else order[-1]
+        picked = list(dict.fromkeys(order))
 
     # Conductor は毎問通る司令塔。候補の先頭 (Gemma 4) から生存プローブして採る。
     # FUGU_CONDUCTOR 指定時は選抜にも布陣キャッシュにも優先（意図した固定として尊重）。
